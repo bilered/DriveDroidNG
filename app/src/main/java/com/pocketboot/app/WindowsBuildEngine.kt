@@ -59,18 +59,18 @@ enum class WinFeatureVersion(
 }
 
 enum class WinBuildTier(val sectionTitle: String, val badgeLabel: String) {
-    RECOMMENDED("Recommended · Stable & Latest", "Stable"),
+    STABLE("Recommended · Stable & Latest", "Stable"),
     PREVIEW("Release Preview & Beta", "Preview"),
     INSIDER("Dev & Canary Insider", "Insider")
 }
 
 data class GroupedWindowsBuilds(
-    val recommended: List<WindowsChannelBuild> = emptyList(),
+    val stable: List<WindowsChannelBuild> = emptyList(),
     val preview: List<WindowsChannelBuild> = emptyList(),
     val insider: List<WindowsChannelBuild> = emptyList()
 ) {
-    val isEmpty: Boolean get() = recommended.isEmpty() && preview.isEmpty() && insider.isEmpty()
-    val totalCount: Int get() = recommended.size + preview.size + insider.size
+    val isEmpty: Boolean get() = stable.isEmpty() && preview.isEmpty() && insider.isEmpty()
+    val totalCount: Int get() = stable.size + preview.size + insider.size
 }
 
 enum class WinDownloadMethod(val label: String, val subtitle: String) {
@@ -92,7 +92,7 @@ enum class WinBuildOutputMode(val label: String, val subtitle: String, val recom
 
 data class WindowsChannelBuild(
     val uuid: String, val title: String, val build: String, val arch: String,
-    val createdEpoch: Long, val tier: WinBuildTier = WinBuildTier.RECOMMENDED, val channelBadge: String = "Stable"
+    val createdEpoch: Long, val tier: WinBuildTier = WinBuildTier.STABLE, val channelBadge: String = "Stable"
 ) {
     val archDisplay: String get() = when (arch.lowercase()) { "amd64" -> "x64"; "arm64" -> "ARM64"; "x86" -> "x86"; else -> arch.uppercase() }
     val createdDateLabel: String get() = if (createdEpoch > 0L) runCatching { SimpleDateFormat("MMM d, yyyy", Locale.US).format(Date(createdEpoch * 1000L)) }.getOrDefault("") else ""
@@ -790,7 +790,7 @@ object WindowsBuildEngine {
                 emitLog("win-dl", "Found ${targetFiles.size} package(s) (${UsbGadgetEngine.formatBytes(totalBytes)}) · Method=${config.downloadMethod.name}")
 
                 _downloadState.value = WindowsBuildJobState(jobTitle, "Checking cached packages...", "Verifying SHA-1 hashes", 0.03f, 0L, totalBytes, activeThreads = maxConns, filesTotal = targetFiles.size, autoMount = dlAutoMountLive, workDirPath = workRootPath)
-                val alreadyVerified = batchVerifyExistingPackages(appCtx, pkgDir, targetFiles)
+                val alreadyVerified = batchVerifyExistingPackages(pkgDir.absolutePath, targetFiles)
                 val cachedBytes = targetFiles.filter { it.name in alreadyVerified }.sumOf { it.sizeBytes }
                 val filesDoneCounter = AtomicInteger(alreadyVerified.size)
                 val downloadedCounter = AtomicLong(cachedBytes)
@@ -1005,7 +1005,7 @@ object WindowsBuildEngine {
                 val sliceBase = 0.28f + (idx.toFloat() / metaList.size.toFloat()) * spanTotal
                 val sliceSpan = spanTotal / metaList.size.toFloat()
                 publishConv("Step 3/4 · Exporting edition ${idx + 1}/${metaList.size}...", "${effectiveComp.label} · 0%", sliceBase)
-                val wimPollJob = launch {
+                val wimPollJob = scope.launch {
                     val pctRegex = Regex("""(\d{1,3})%""")
                     while (isActive && !convCancelledFlag.get()) {
                         delay(700L)
@@ -1035,7 +1035,7 @@ object WindowsBuildEngine {
 
             if (useTwoStageSolidEsd) {
                 publishConv("Step 3/4 · Compressing to Solid ESD (LZMS)...", "0%", 0.66f)
-                val esdPoll = launch {
+                val esdPoll = scope.launch {
                     val pctRegex = Regex("""(\d{1,3})%""")
                     while (isActive && !convCancelledFlag.get()) {
                         delay(800L)
@@ -1118,7 +1118,7 @@ object WindowsBuildEngine {
                 val volId = "WIN_${config.build.build.substringBefore('.')}".take(28).uppercase()
                 val estIsoBytes = Shell.cmd("du -sb $qIsoDir 2>/dev/null | awk '{print \$1}'").exec().out.firstOrNull()?.trim()?.toLongOrNull()?.coerceAtLeast(1L) ?: (5L * 1024L * 1024L * 1024L)
                 publishConv("Step 4/4 · Packing bootable ISO...", finalFileName, 0.86f)
-                val isoPollJob = launch {
+                val isoPollJob = scope.launch {
                     while (isActive && !convCancelledFlag.get()) {
                         delay(600L)
                         val curSz = Shell.cmd("stat -c '%s' $qOutIso 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L

@@ -252,7 +252,7 @@ fun PocketBootApp(initialShortcutPath: String = "") {
         }
     }
 
-    LaunchedEffect(images.size, settings.defaultDir, winChannelBuildState, windowsBuildJob, ventoyBuildJob) {
+    LaunchedEffect(images.size, settings.defaultDir, winChannelDlState, winChannelConvState, windowsBuildJob, ventoyBuildJob) {
         withContext(Dispatchers.IO) {
             drivesFreeBytes = UsbGadgetEngine.getFreeSpaceBytes(settings.defaultDir)
             tempCacheBytes = UsbGadgetEngine.getTempStorageStats(context, settings.scanDirs + settings.defaultDir).totalBytes
