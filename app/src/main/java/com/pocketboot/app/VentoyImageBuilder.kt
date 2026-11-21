@@ -24,6 +24,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Album
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.CloudDownload
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Eject
@@ -135,7 +136,10 @@ data class VentoyDriveContents(
     val freeBytes: Long,
     val files: List<VentoyIsoItem>,
     val win11BypassCheck: Boolean,
-    val win11BypassNro: Boolean
+    val win11BypassNro: Boolean,
+    val savedExperience: WindowsExperienceConfig = WindowsExperienceConfig(bypassRequirements = win11BypassCheck, bypassMicrosoftAccount = win11BypassNro),
+    val savedWinUtil: WinUtilTweaksConfig = WinUtilTweaksConfig(),
+    val hasDriversZip: Boolean = false
 )
 
 data class VentoyBuildConfig(
@@ -146,6 +150,9 @@ data class VentoyBuildConfig(
     val filesystem: VentoyFilesystem = VentoyFilesystem.AUTO,
     val win11BypassCheck: Boolean = true,
     val win11BypassNro: Boolean = true,
+    val experience: WindowsExperienceConfig = WindowsExperienceConfig(bypassRequirements = win11BypassCheck, bypassMicrosoftAccount = win11BypassNro),
+    val winUtil: WinUtilTweaksConfig = WinUtilTweaksConfig(),
+    val driversDir: String = "",
     val initialIsoToAdd: ImageFile? = null,
     val moveInitialIso: Boolean = false,
     val autoMountAfterBuild: Boolean = true
@@ -610,20 +617,106 @@ object VentoyImageBuilder {
         ).exec()
     }
 
-    private fun writeVentoyJsonOnMounted(context: Context, bypassCheck: Boolean, bypassNro: Boolean) {
-        val controlArr = JSONArray().apply {
+    private fun findWindowsIsoRelPathsOnMounted(): List<String> {
+        val out = Shell.cmd("cd $TEMP_VENTOY_MNT 2>/dev/null && find . -maxdepth 2 -type f -iname '*.iso' ! -path './ventoy/*' 2>/dev/null || true").exec().out
+        return out.map { it.trim().removePrefix("./") }
+            .filter { rel -> rel.isNotBlank() && IsoInspector.quickGuessByName(rel.substringAfterLast('/')) == IsoOsType.WINDOWS }
+            .map { "/$it" }.distinct().sorted()
+    }
+
+    private fun packDriversInjectionOnMounted(context: Context, driversDir: String): Boolean {
+        if (driversDir.isBlank()) return false
+        val srcDir = UsbGadgetEngine.resolveDirectPath(driversDir).trimEnd('/')
+        val sevenZip = WindowsImageBuilder.findBundledBinary(context, "lib7zzs.so", listOf("7zz", "7z")) ?: return false
+        val stageDir = "/data/local/tmp/pb_vtoy_drv_stage"; val tmpZip = "/data/local/tmp/pb_vtoy_drivers.zip"
+        val tmpBat = File(context.cacheDir, "VentoyAutoRun.bat").apply {
+            writeText("@echo off\r\nif exist \"X:\\Drivers\" (for /r \"X:\\Drivers\" %%F in (*.inf) do drvload \"%%~fF\" >nul 2>&1)\r\nexit /b 0\r\n", Charsets.UTF_8)
+        }
+        return try {
+            Shell.cmd("""
+                if [ -d ${shellQuote(srcDir)} ]; then
+                    rm -rf $stageDir $tmpZip && mkdir -p $stageDir/Drivers && cp -rf ${shellQuote(srcDir)}/. $stageDir/Drivers/ &&
+                    cp -f ${shellQuote(tmpBat.absolutePath)} $stageDir/VentoyAutoRun.bat &&
+                    cd $stageDir && ${shellQuote(sevenZip)} a -tzip -y $tmpZip . >/dev/null 2>&1 &&
+                    mkdir -p $TEMP_VENTOY_MNT/ventoy && cp -f $tmpZip $TEMP_VENTOY_MNT/ventoy/drivers_inject.zip && rm -rf $stageDir $tmpZip
+                else exit 1; fi
+            """.trimIndent()).exec().isSuccess
+        } finally { tmpBat.delete() }
+    }
+
+    private fun writeVentoyJsonOnMounted(context: Context, bypassCheck: Boolean, bypassNro: Boolean, experience: WindowsExperienceConfig? = null, winUtil: WinUtilTweaksConfig? = null, driversDir: String? = null) {
+        val existingRaw = Shell.cmd("cat $TEMP_VENTOY_MNT/ventoy/ventoy.json 2>/dev/null").exec().out.joinToString("\n")
+        val rootObj = runCatching { if (existingRaw.isNotBlank()) JSONObject(existingRaw) else JSONObject() }.getOrDefault(JSONObject())
+        rootObj.put("control", JSONArray().apply {
             put(JSONObject().put("VTOY_WIN11_BYPASS_CHECK", if (bypassCheck) "1" else "0"))
             put(JSONObject().put("VTOY_WIN11_BYPASS_NRO", if (bypassNro) "1" else "0"))
+        })
+        if (experience != null && winUtil != null) {
+            if (experience.hasAnyActive() || winUtil.hasAnyActive()) {
+                val tmpXml = File(context.cacheDir, "pocketboot_unattend.xml").apply { writeText(WindowsCustomizationEngine.generateVentoySelfContainedXml(experience, winUtil, "amd64"), Charsets.UTF_8) }
+                try { Shell.cmd("mkdir -p $TEMP_VENTOY_MNT/ventoy/scripts && cp -f ${shellQuote(tmpXml.absolutePath)} $TEMP_VENTOY_MNT/ventoy/scripts/pocketboot_unattend.xml").exec() } finally { tmpXml.delete() }
+            } else Shell.cmd("rm -f $TEMP_VENTOY_MNT/ventoy/scripts/pocketboot_unattend.xml 2>/dev/null").exec()
+            val metaObj = JSONObject().apply {
+                put("bypassRequirements", experience.bypassRequirements)
+                put("bypassMicrosoftAccount", experience.bypassMicrosoftAccount)
+                put("disableDataCollection", experience.disableDataCollection)
+                put("disableBitLocker", experience.disableBitLocker)
+                put("qolImprovements", experience.qolImprovements)
+                put("disableSponsoredApps", experience.disableSponsoredApps)
+                put("classicContextMenu", experience.classicContextMenu)
+                put("skipWifiSetup", experience.skipWifiSetup)
+                put("createLocalUser", experience.createLocalUser)
+                put("localUsername", experience.localUsername)
+                put("skipOobe", experience.skipOobe)
+                put("applySkuSiPolicy", experience.applySkuSiPolicy)
+                put("winUtilJson", winUtil.toJsonString())
+            }
+            val tmpMeta = File(context.cacheDir, "pb_vtoy_meta.json").apply { writeText(metaObj.toString(), Charsets.UTF_8) }
+            try { Shell.cmd("mkdir -p $TEMP_VENTOY_MNT/ventoy && cp -f ${shellQuote(tmpMeta.absolutePath)} $TEMP_VENTOY_MNT/ventoy/pocketboot_meta.json").exec() } finally { tmpMeta.delete() }
         }
-        val json = JSONObject().put("control", controlArr).toString(2)
-        val tmpJson = File(context.cacheDir, "ventoy.json").apply { writeText(json, Charsets.UTF_8) }
-        try {
-            Shell.cmd(
-                "mkdir -p $TEMP_VENTOY_MNT/ventoy && cp ${shellQuote(tmpJson.absolutePath)} $TEMP_VENTOY_MNT/ventoy/ventoy.json"
-            ).exec()
-        } finally {
-            tmpJson.delete()
+        if (driversDir != null) {
+            if (driversDir.isNotBlank()) packDriversInjectionOnMounted(context, driversDir)
+            else Shell.cmd("rm -f $TEMP_VENTOY_MNT/ventoy/drivers_inject.zip 2>/dev/null").exec()
         }
+        val hasXml = Shell.cmd("[ -f $TEMP_VENTOY_MNT/ventoy/scripts/pocketboot_unattend.xml ] && echo 1 || echo 0").exec().out.lastOrNull()?.trim() == "1"
+        val hasDrvZip = Shell.cmd("[ -f $TEMP_VENTOY_MNT/ventoy/drivers_inject.zip ] && echo 1 || echo 0").exec().out.lastOrNull()?.trim() == "1"
+        val winIsos = findWindowsIsoRelPathsOnMounted()
+        if (hasXml && winIsos.isNotEmpty()) {
+            val autoArr = JSONArray()
+            winIsos.forEach { rel -> autoArr.put(JSONObject().apply { put("image", rel); put("template", JSONArray().put("/ventoy/scripts/pocketboot_unattend.xml")); put("autosel", 1); put("timeout", 3) }) }
+            rootObj.put("auto_install", autoArr)
+        } else rootObj.remove("auto_install")
+        if (hasDrvZip && winIsos.isNotEmpty()) {
+            val injArr = JSONArray()
+            winIsos.forEach { rel -> injArr.put(JSONObject().apply { put("image", rel); put("archive", "/ventoy/drivers_inject.zip") }) }
+            rootObj.put("injection", injArr)
+        } else rootObj.remove("injection")
+        val tmpJson = File(context.cacheDir, "ventoy.json").apply { writeText(rootObj.toString(2), Charsets.UTF_8) }
+        try { Shell.cmd("mkdir -p $TEMP_VENTOY_MNT/ventoy && cp -f ${shellQuote(tmpJson.absolutePath)} $TEMP_VENTOY_MNT/ventoy/ventoy.json").exec() } finally { tmpJson.delete() }
+    }
+
+    private fun readPocketBootMetaOnMounted(defaultCheck: Boolean, defaultNro: Boolean): Triple<WindowsExperienceConfig, WinUtilTweaksConfig, Boolean> {
+        val hasDrv = Shell.cmd("[ -f $TEMP_VENTOY_MNT/ventoy/drivers_inject.zip ] && echo 1 || echo 0").exec().out.lastOrNull()?.trim() == "1"
+        val raw = Shell.cmd("cat $TEMP_VENTOY_MNT/ventoy/pocketboot_meta.json 2>/dev/null").exec().out.joinToString("\n")
+        if (raw.isBlank()) return Triple(WindowsExperienceConfig(bypassRequirements = defaultCheck, bypassMicrosoftAccount = defaultNro), WinUtilTweaksConfig(), hasDrv)
+        return runCatching {
+            val o = JSONObject(raw)
+            val exp = WindowsExperienceConfig(
+                bypassRequirements = o.optBoolean("bypassRequirements", defaultCheck),
+                bypassMicrosoftAccount = o.optBoolean("bypassMicrosoftAccount", defaultNro),
+                disableDataCollection = o.optBoolean("disableDataCollection", true),
+                disableBitLocker = o.optBoolean("disableBitLocker", true),
+                qolImprovements = o.optBoolean("qolImprovements", true),
+                disableSponsoredApps = o.optBoolean("disableSponsoredApps", false),
+                classicContextMenu = o.optBoolean("classicContextMenu", false),
+                skipWifiSetup = o.optBoolean("skipWifiSetup", true),
+                createLocalUser = o.optBoolean("createLocalUser", false),
+                localUsername = o.optString("localUsername", ""),
+                skipOobe = o.optBoolean("skipOobe", false),
+                applySkuSiPolicy = o.optBoolean("applySkuSiPolicy", false)
+            )
+            Triple(exp, WinUtilTweaksConfig.fromJsonString(o.optString("winUtilJson", "")), hasDrv)
+        }.getOrDefault(Triple(WindowsExperienceConfig(bypassRequirements = defaultCheck, bypassMicrosoftAccount = defaultNro), WinUtilTweaksConfig(), hasDrv))
     }
 
     private fun readVentoyJsonOnMounted(): Pair<Boolean, Boolean> {
@@ -769,9 +862,6 @@ object VentoyImageBuilder {
             onProgress(WindowsBuildProgress("Configuring Multi-Boot...", "Writing boot configuration", 0.70f, false))
             val mntType = mountVentoyPartition1(context, loopDev)
             if (mntType != null) {
-                writeVentoyJsonOnMounted(context, config.win11BypassCheck, config.win11BypassNro)
-                entries.add(LogEntry(ts, "ventoy", "Mounted Partition 1 via $mntType and wrote ventoy.json"))
-
                 config.initialIsoToAdd?.let { iso ->
                     val srcPath = UsbGadgetEngine.resolveDirectPath(iso.path)
                     val destName = iso.name
@@ -812,6 +902,8 @@ object VentoyImageBuilder {
                         entries.add(LogEntry(ts, "ventoy", "Warning: could not add $destName: ${(cpRes.out + cpRes.err).joinToString(" ").take(140)}", true))
                     }
                 }
+                writeVentoyJsonOnMounted(context, config.experience.bypassRequirements, config.experience.bypassMicrosoftAccount, config.experience, config.winUtil, config.driversDir)
+                entries.add(LogEntry(ts, "ventoy", "Mounted Partition 1 via $mntType and wrote ventoy.json (synced Windows auto_install & drivers)"))
             }
 
             onProgress(WindowsBuildProgress("Finalizing Multi-Boot drive...", "Syncing & fixing storage permissions", 0.96f, false))
@@ -868,6 +960,7 @@ object VentoyImageBuilder {
             }.sortedBy { it.name.lowercase() }
 
             val (bypassCheck, bypassNro) = readVentoyJsonOnMounted()
+            val (savedExp, savedWu, hasDrvZip) = readPocketBootMetaOnMounted(bypassCheck, bypassNro)
             VentoyDriveContents(
                 info = info,
                 fsType = fsLabel,
@@ -875,7 +968,10 @@ object VentoyImageBuilder {
                 freeBytes = freeB,
                 files = items,
                 win11BypassCheck = bypassCheck,
-                win11BypassNro = bypassNro
+                win11BypassNro = bypassNro,
+                savedExperience = savedExp,
+                savedWinUtil = savedWu,
+                hasDriversZip = hasDrvZip
             )
         } finally {
             unmountVentoyPartition1(loopDev)
@@ -955,6 +1051,8 @@ object VentoyImageBuilder {
                 Shell.cmd("rm -f ${shellQuote(resolvedSrc)} 2>/dev/null").exec()
             }
 
+            val (curChk, curNro) = readVentoyJsonOnMounted()
+            writeVentoyJsonOnMounted(context, curChk, curNro)
             onProgress(WindowsBuildProgress("Syncing Multi-Boot drive...", "Flushing writes safely", 0.97f, false))
             entries.add(LogEntry(ts, "ventoy", "${if (moveFile) "Moved" else "Copied"} $isoName into ${resolvedImg.substringAfterLast('/')}"))
             ActionResult(true, "${if (moveFile) "Moved" else "Added"} $isoName to Multi-Boot drive.", entries = entries)
@@ -976,6 +1074,7 @@ object VentoyImageBuilder {
                 ?: return@withContext ActionResult(false, "Could not mount Multi-Boot partition.")
             val target = "$TEMP_VENTOY_MNT/${relativePath.trimStart('/')}"
             val res = Shell.cmd("rm -f ${shellQuote(target)} 2>&1").exec()
+            if (res.isSuccess) { val (curChk, curNro) = readVentoyJsonOnMounted(); writeVentoyJsonOnMounted(context, curChk, curNro) }
             ActionResult(
                 success = res.isSuccess,
                 userMessage = if (res.isSuccess) "Removed ${relativePath.substringAfterLast('/')} from Multi-Boot drive." else "Could not remove file."
@@ -1001,6 +1100,18 @@ object VentoyImageBuilder {
         } finally {
             unmountVentoyPartition1(loopDev)
         }
+    }
+
+    suspend fun updateVentoyCustomization(context: Context, ventoyImgPath: String, experience: WindowsExperienceConfig, winUtil: WinUtilTweaksConfig, driversDir: String? = null): ActionResult = withContext(Dispatchers.IO) {
+        val resolvedImg = UsbGadgetEngine.resolveDirectPath(ventoyImgPath)
+        val info = probeVentoyImage(resolvedImg) ?: return@withContext ActionResult(false, "Not a valid Multi-Boot image.")
+        val loopDev = attachPartition1Loop(resolvedImg, info.part1OffsetBytes, info.part1SizeBytes)
+        if (loopDev.isBlank() || !loopDev.startsWith("/dev/")) return@withContext ActionResult(false, "Could not attach Multi-Boot partition.")
+        return@withContext try {
+            mountVentoyPartition1(context, loopDev) ?: return@withContext ActionResult(false, "Could not mount Multi-Boot partition.")
+            writeVentoyJsonOnMounted(context, experience.bypassRequirements, experience.bypassMicrosoftAccount, experience, winUtil, driversDir)
+            ActionResult(true, "Saved Windows Experience, WinUtil tweaks & drivers to Multi-Boot drive.")
+        } finally { unmountVentoyPartition1(loopDev) }
     }
 
     /**
@@ -1262,10 +1373,13 @@ object VentoyImageBuilder {
 fun VentoyBuilderSheet(
     defaultDir: String,
     initialIso: ImageFile?,
+    presets: List<AutounattendPreset> = emptyList(),
     building: Boolean,
     progress: WindowsBuildProgress,
     onDismiss: () -> Unit,
     onCancelBuild: () -> Unit,
+    onSavePreset: (AutounattendPreset) -> Unit = {},
+    onDeletePreset: (String) -> Unit = {},
     onStartBuild: (VentoyBuildConfig) -> Unit,
     onMessage: (String, Boolean) -> Unit
 ) {
@@ -1282,8 +1396,10 @@ fun VentoyBuilderSheet(
     var customUnit by remember { mutableStateOf(MultiBootSizeUnit.GB) }
     var scheme by remember { mutableStateOf(PartitionScheme.GPT) }
     var filesystem by remember { mutableStateOf(VentoyFilesystem.AUTO) }
-    var bypassCheck by remember { mutableStateOf(true) }
-    var bypassNro by remember { mutableStateOf(true) }
+    var experience by remember { mutableStateOf(WindowsExperienceConfig()) }
+    var winUtil by remember { mutableStateOf(WinUtilTweaksConfig()) }
+    var driversDir by remember { mutableStateOf("") }
+    var showDriversPicker by remember { mutableStateOf(false) }
     var includeInitial by remember(initialIso?.path) { mutableStateOf(initialIso != null) }
     var moveInitial by remember { mutableStateOf(false) }
     var autoMount by remember { mutableStateOf(true) }
@@ -1689,42 +1805,26 @@ fun VentoyBuilderSheet(
                     }
                 }
 
-                // Win 11 Bypass toggles (ventoy.json)
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    color = PocketColors.surfaceInput,
-                    border = BorderStroke(0.5.dp, PocketColors.border)
-                ) {
-                    Column {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { bypassCheck = !bypassCheck }
-                                .padding(horizontal = 14.dp, vertical = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text("Windows 11 TPM / Secure Boot / RAM Bypass", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
-                                Text("Automatically skips Win 11 hardware checks at boot", fontSize = 11.sp, color = PocketColors.textSecondary)
-                            }
-                            PocketSwitch(checked = bypassCheck, onCheckedChange = { bypassCheck = it }, activeColor = PocketColors.success)
+                WindowsTwoPaneCustomizer(
+                    osKind = WindowsOsKind.WIN11, arch = "amd64", experience = experience, winUtil = winUtil, presets = presets,
+                    showCa2023Option = false, showCustomScriptOption = false, defaultBrowseDir = defaultDir,
+                    onExperienceChange = { experience = it }, onWinUtilChange = { winUtil = it },
+                    onApplyPreset = { p ->
+                        experience = WindowsExperienceConfig(p.bypassRequirements, p.bypassMicrosoftAccount, p.disableDataCollection, p.disableBitLocker, p.qolImprovements, p.disableSponsoredApps, p.classicContextMenu, p.skipWifiSetup, p.createLocalUser, p.localUsername, "", p.skipOobe, p.useCa2023Bootloaders, p.applySkuSiPolicy)
+                        winUtil = WinUtilTweaksConfig.fromJsonString(p.winUtilJson)
+                    },
+                    onSavePreset = { n -> onSavePreset(AutounattendPreset(n, scheme.name, experience.bypassRequirements, experience.bypassMicrosoftAccount, experience.disableDataCollection, experience.disableBitLocker, experience.disableSponsoredApps, experience.classicContextMenu, experience.skipWifiSetup, experience.createLocalUser, experience.localUsername, experience.skipOobe, experience.qolImprovements, experience.useCa2023Bootloaders, experience.applySkuSiPolicy, winUtil.toJsonString())) },
+                    onDeletePreset = onDeletePreset
+                )
+                Surface(modifier = Modifier.fillMaxWidth().bounceClick { showDriversPicker = true }, shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.75.dp, if (driversDir.isNotBlank()) PocketColors.accent else PocketColors.border)) {
+                    Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 11.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Icon(Icons.Rounded.FolderOpen, null, tint = PocketColors.accentSoft, modifier = Modifier.size(18.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Inject Windows Drivers Folder (Optional)", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                            Text(if (driversDir.isNotBlank()) driversDir.replace("/data/media/0", "/sdcard") else "Auto-loads .inf storage/Wi-Fi drivers in WinPE via Ventoy injection", fontSize = 11.sp, color = if (driversDir.isNotBlank()) PocketColors.accentSoft else PocketColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
-                        PocketHairlineDivider()
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { bypassNro = !bypassNro }
-                                .padding(horizontal = 14.dp, vertical = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text("Windows 11 Local Account Bypass (NRO)", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
-                                Text("Allows offline local account setup on Win 11", fontSize = 11.sp, color = PocketColors.textSecondary)
-                            }
-                            PocketSwitch(checked = bypassNro, onCheckedChange = { bypassNro = it }, activeColor = PocketColors.success)
-                        }
+                        if (driversDir.isNotBlank()) { IconButton(onClick = { driversDir = "" }, modifier = Modifier.size(28.dp)) { Icon(Icons.Rounded.Close, "Clear", tint = PocketColors.textMuted, modifier = Modifier.size(15.dp)) } }
+                        else Text("Browse", style = MaterialTheme.typography.labelSmall, color = PocketColors.accentSoft)
                     }
                 }
 
@@ -1801,8 +1901,11 @@ fun VentoyBuilderSheet(
                                 sizeMb = effectiveSizeMb,
                                 scheme = scheme,
                                 filesystem = filesystem,
-                                win11BypassCheck = bypassCheck,
-                                win11BypassNro = bypassNro,
+                                win11BypassCheck = experience.bypassRequirements,
+                                win11BypassNro = experience.bypassMicrosoftAccount,
+                                experience = experience,
+                                winUtil = winUtil,
+                                driversDir = driversDir,
                                 initialIsoToAdd = if (includeInitial) initialIso else null,
                                 moveInitialIso = moveInitial,
                                 autoMountAfterBuild = autoMount
@@ -1821,7 +1924,10 @@ fun VentoyBuilderSheet(
             Spacer(modifier = Modifier.height(22.dp))
         }
     }
+
+    if (showDriversPicker) RootFolderPickerSheet("Select Drivers Folder (Ventoy Injection)", "Packed into /ventoy/drivers_inject.zip for Windows ISOs", driversDir.ifBlank { defaultDir }, { showDriversPicker = false }) { driversDir = it; showDriversPicker = false }
 }
+
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -1829,6 +1935,10 @@ fun VentoyManagerSheet(
     ventoyFile: ImageFile,
     isMountedToPc: Boolean,
     availableIsos: List<ImageFile>,
+    presets: List<AutounattendPreset> = emptyList(),
+    defaultDir: String = "/data/media/0/Download",
+    onSavePreset: (AutounattendPreset) -> Unit = {},
+    onDeletePreset: (String) -> Unit = {},
     onDismiss: () -> Unit,
     onUnmountFirst: () -> Unit,
     onLibraryChanged: () -> Unit,
@@ -1839,6 +1949,11 @@ fun VentoyManagerSheet(
     var loading by remember { mutableStateOf(true) }
     var contents by remember { mutableStateOf<VentoyDriveContents?>(null) }
     var opBusy by remember { mutableStateOf(false) }
+    var mgrExp by remember { mutableStateOf(WindowsExperienceConfig()) }
+    var mgrWinUtil by remember { mutableStateOf(WinUtilTweaksConfig()) }
+    var mgrDriversDir by remember { mutableStateOf("") }
+    var showMgrDriversPicker by remember { mutableStateOf(false) }
+    var showMgrTweaksPanel by remember { mutableStateOf(false) }
     var opProgress by remember { mutableStateOf(WindowsBuildProgress()) }
     var showAddIsoPicker by remember { mutableStateOf(false) }
     var showResizeDialog by remember { mutableStateOf(false) }
@@ -1852,7 +1967,12 @@ fun VentoyManagerSheet(
         }
         scope.launch {
             loading = true
-            contents = VentoyImageBuilder.inspectDriveContents(context, ventoyFile.path)
+            val loaded = VentoyImageBuilder.inspectDriveContents(context, ventoyFile.path)
+            contents = loaded
+            if (loaded != null) {
+                mgrExp = loaded.savedExperience
+                mgrWinUtil = loaded.savedWinUtil
+            }
             loading = false
         }
     }
@@ -2202,6 +2322,50 @@ fun VentoyManagerSheet(
                         }
                     }
                 }
+
+                Surface(modifier = Modifier.fillMaxWidth().bounceClick { showMgrTweaksPanel = !showMgrTweaksPanel }, shape = RoundedCornerShape(12.dp), color = PocketColors.accentBg, border = BorderStroke(0.75.dp, PocketColors.accent)) {
+                    Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 11.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Windows Experience, WinUtil & Drivers Injection", style = MaterialTheme.typography.labelLarge, color = PocketColors.accentSoft)
+                            Text("Applies to all Windows ISOs on this drive (Linux ISOs untouched)", fontSize = 11.sp, color = PocketColors.textSecondary)
+                        }
+                        Text(if (showMgrTweaksPanel) "Hide" else "Configure", style = MaterialTheme.typography.labelSmall, color = PocketColors.accentSoft)
+                    }
+                }
+                if (showMgrTweaksPanel) {
+                    WindowsTwoPaneCustomizer(
+                        osKind = WindowsOsKind.WIN11, arch = "amd64", experience = mgrExp, winUtil = mgrWinUtil, presets = presets,
+                        showCa2023Option = false, showCustomScriptOption = false, defaultBrowseDir = defaultDir,
+                        onExperienceChange = { mgrExp = it }, onWinUtilChange = { mgrWinUtil = it },
+                        onApplyPreset = { p ->
+                            mgrExp = WindowsExperienceConfig(p.bypassRequirements, p.bypassMicrosoftAccount, p.disableDataCollection, p.disableBitLocker, p.qolImprovements, p.disableSponsoredApps, p.classicContextMenu, p.skipWifiSetup, p.createLocalUser, p.localUsername, "", p.skipOobe, p.useCa2023Bootloaders, p.applySkuSiPolicy)
+                            mgrWinUtil = WinUtilTweaksConfig.fromJsonString(p.winUtilJson)
+                        },
+                        onSavePreset = { n -> onSavePreset(AutounattendPreset(n, PartitionScheme.GPT.name, mgrExp.bypassRequirements, mgrExp.bypassMicrosoftAccount, mgrExp.disableDataCollection, mgrExp.disableBitLocker, mgrExp.disableSponsoredApps, mgrExp.classicContextMenu, mgrExp.skipWifiSetup, mgrExp.createLocalUser, mgrExp.localUsername, mgrExp.skipOobe, mgrExp.qolImprovements, mgrExp.useCa2023Bootloaders, mgrExp.applySkuSiPolicy, mgrWinUtil.toJsonString())) },
+                        onDeletePreset = onDeletePreset
+                    )
+                    Surface(modifier = Modifier.fillMaxWidth().bounceClick { showMgrDriversPicker = true }, shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.75.dp, if (mgrDriversDir.isNotBlank()) PocketColors.accent else PocketColors.border)) {
+                        Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Icon(Icons.Rounded.FolderOpen, null, tint = PocketColors.accentSoft, modifier = Modifier.size(18.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Inject Drivers Folder (/ventoy/drivers_inject.zip)", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                                Text(when { mgrDriversDir.isNotBlank() -> mgrDriversDir.replace("/data/media/0", "/sdcard"); c.hasDriversZip -> "Active (/ventoy/drivers_inject.zip) · Tap to replace"; else -> "Tap to browse folder" }, fontSize = 11.sp, color = PocketColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                            Text("Browse", style = MaterialTheme.typography.labelSmall, color = PocketColors.accentSoft)
+                        }
+                    }
+                    Button(
+                        onClick = {
+                            scope.launch {
+                                opBusy = true; opProgress = WindowsBuildProgress("Applying Windows tweaks & drivers...", ventoyFile.name, 0.5f, true)
+                                val res = VentoyImageBuilder.updateVentoyCustomization(context, ventoyFile.path, mgrExp, mgrWinUtil, mgrDriversDir.ifBlank { null })
+                                opBusy = false; onMessage(res.userMessage, !res.success); reloadContents()
+                            }
+                        },
+                        enabled = !opBusy, modifier = Modifier.fillMaxWidth().height(46.dp), shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)
+                    ) { Text("Apply Tweaks & Drivers to Multi-Boot", fontWeight = FontWeight.SemiBold) }
+                }
             }
 
             Spacer(modifier = Modifier.height(22.dp))
@@ -2364,4 +2528,6 @@ fun VentoyManagerSheet(
             }
         )
     }
+
+    if (showMgrDriversPicker) RootFolderPickerSheet("Select Drivers Folder (Ventoy Injection)", "Packed into /ventoy/drivers_inject.zip for Windows ISOs", mgrDriversDir.ifBlank { defaultDir }, { showMgrDriversPicker = false }) { mgrDriversDir = it; showMgrDriversPicker = false }
 }

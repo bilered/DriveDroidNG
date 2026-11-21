@@ -1,6 +1,7 @@
 package com.pocketboot.app
 
 import android.content.Context
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -36,6 +37,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -44,8 +46,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.topjohnwu.superuser.Shell
@@ -57,493 +59,354 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+enum class LinuxUsbMode(val title: String, val subtitle: String) {
+    WITHOUT_PERSISTENCE("Without Persistence", "Standard Live USB (Hybrid ISO or FAT32)"),
+    WITH_PERSISTENCE("With Persistence", "Saves files, Wi-Fi & settings across reboots")
+}
+
+enum class LinuxWriteMethod(val title: String, val subtitle: String) {
+    HYBRID_DD("Hybrid DD / ISO", "Fastest · keeps exact ISO sectors"),
+    EXTRACTED_FAT32("Extracted FAT32 (Rufus ISO)", "Clean FAT32 USB · best for tools & extra files")
+}
+
 enum class LinuxPersistenceStyle(val title: String, val volumeLabel: String, val subtitle: String) {
-    CASPER_RW("Ubuntu / Mint / Pop!_OS", "casper-rw", "ext4 partition labeled casper-rw"),
-    DEBIAN_KALI("Debian / Kali / Tails", "persistence", "ext4 labeled persistence + persistence.conf")
+    UBUNTU_WRITABLE("Ubuntu 20+ / Mint / Rescuezilla", "writable", "ext4 labeled writable (modern Casper)"),
+    CASPER_RW("Pop!_OS / Legacy Ubuntu", "casper-rw", "ext4 labeled casper-rw"),
+    DEBIAN_KALI("Debian / Kali / GParted / Tails", "persistence", "ext4 labeled persistence + persistence.conf")
 }
 
 data class LinuxBuildConfig(
     val isoFile: ImageFile,
     val outputDir: String,
     val outputName: String,
+    val usbMode: LinuxUsbMode = LinuxUsbMode.WITH_PERSISTENCE,
+    val writeMethod: LinuxWriteMethod = LinuxWriteMethod.HYBRID_DD,
+    val scheme: PartitionScheme = PartitionScheme.MBR,
     val persistenceGb: Int = 2,
-    val style: LinuxPersistenceStyle = LinuxPersistenceStyle.CASPER_RW,
+    val style: LinuxPersistenceStyle = LinuxPersistenceStyle.UBUNTU_WRITABLE,
     val autoMountAfterBuild: Boolean = true
 )
 
 object LinuxImageBuilder {
-
     private const val TEMP_LINUX_MNT = "/data/local/tmp/pb_linux_persist"
+    private const val TEMP_FAT_MNT = "/data/local/tmp/pb_linux_fat"
+    private const val FAT32_MAX_FILE_BYTES = 4_294_967_295L
 
     private fun nowTs(): String = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
-
     private fun shellQuote(value: String): String = "'${value.replace("'", "'\\''")}'"
 
-    suspend fun buildLinuxPersistentImage(
-        context: Context,
-        config: LinuxBuildConfig,
-        onProgress: (WindowsBuildProgress) -> Unit
-    ): ActionResult = withContext(Dispatchers.IO) {
+    suspend fun inspectMaxFileBytesInIso(context: Context, isoPath: String): Long = withContext(Dispatchers.IO) {
+        val bundled7z = WindowsImageBuilder.findBundledBinary(context, "lib7zzs.so", listOf("7zz", "7z")) ?: return@withContext 0L
+        Shell.cmd("${shellQuote(bundled7z)} l -slt ${shellQuote(UsbGadgetEngine.resolveDirectPath(isoPath))} 2>/dev/null | awk -F' = ' '/^Size = /{if (\$2+0 > m) m=\$2+0} END{print m+0}'")
+            .exec().out.lastOrNull()?.trim()?.toLongOrNull() ?: 0L
+    }
+
+    suspend fun buildLinuxPersistentImage(context: Context, config: LinuxBuildConfig, onProgress: (WindowsBuildProgress) -> Unit): ActionResult = withContext(Dispatchers.IO) {
+        if (config.writeMethod == LinuxWriteMethod.EXTRACTED_FAT32) buildExtractedFat32Image(context, config, onProgress)
+        else buildHybridDdImage(context, config, onProgress)
+    }
+
+    private suspend fun buildHybridDdImage(context: Context, config: LinuxBuildConfig, onProgress: (WindowsBuildProgress) -> Unit): ActionResult = withContext(Dispatchers.IO) {
         val ts = nowTs()
         val entries = mutableListOf<LogEntry>()
         val safeDir = UsbGadgetEngine.resolveDirectPath(config.outputDir).trimEnd('/')
-        val safeName = config.outputName.trim().let {
-            if (it.endsWith(".img", ignoreCase = true)) it else "$it.img"
-        }
+        val safeName = config.outputName.trim().let { if (it.endsWith(".img", true)) it else "$it.img" }
         val outPath = "$safeDir/$safeName"
-        val srcIsoPath = UsbGadgetEngine.resolveDirectPath(config.isoFile.path)
-        val qIso = shellQuote(srcIsoPath)
-        val qOut = shellQuote(outPath)
-        val qDir = shellQuote(safeDir)
+        val qIso = shellQuote(UsbGadgetEngine.resolveDirectPath(config.isoFile.path))
+        val qOut = shellQuote(outPath); val qDir = shellQuote(safeDir)
         var loopDev = ""
-
         fun cleanup(deletePartial: Boolean) {
-            Shell.cmd(
-                """
-                sync 2>/dev/null
-                umount $TEMP_LINUX_MNT 2>/dev/null || umount -l $TEMP_LINUX_MNT 2>/dev/null
-                [ -n ${shellQuote(loopDev)} ] && losetup -d ${shellQuote(loopDev)} 2>/dev/null
-                rm -rf $TEMP_LINUX_MNT 2>/dev/null
-                """.trimIndent()
-            ).exec()
-            if (deletePartial) {
-                Shell.cmd("rm -f $qOut 2>/dev/null").exec()
-            }
+            Shell.cmd("sync 2>/dev/null; umount $TEMP_LINUX_MNT 2>/dev/null || umount -l $TEMP_LINUX_MNT 2>/dev/null; [ -n ${shellQuote(loopDev)} ] && losetup -d ${shellQuote(loopDev)} 2>/dev/null; rm -rf $TEMP_LINUX_MNT 2>/dev/null").exec()
+            if (deletePartial) Shell.cmd("rm -f $qOut 2>/dev/null").exec()
         }
-
         return@withContext runCatching {
-            if (!Shell.getShell().isRoot) {
-                return@withContext ActionResult(false, "Root access is required.", entries = entries)
-            }
-
-            onProgress(WindowsBuildProgress("Checking Linux ISO...", config.isoFile.name, 0.05f, true))
-
-            val isoSize = Shell.cmd("stat -c '%s' $qIso 2>/dev/null")
-                .exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: config.isoFile.sizeBytes
-            if (isoSize <= 0L) {
-                return@withContext ActionResult(false, "Source Linux ISO not found or empty.", entries = entries)
-            }
-
-            val persistBytes = config.persistenceGb.coerceIn(1, 32).toLong() * 1024L * 1024L * 1024L
+            if (!Shell.getShell().isRoot) return@withContext ActionResult(false, "Root access is required.", entries = entries)
+            onProgress(WindowsBuildProgress("Checking ISO image...", config.isoFile.name, 0.05f, true))
+            val isoSize = Shell.cmd("stat -c '%s' $qIso 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: config.isoFile.sizeBytes
+            if (isoSize <= 0L) return@withContext ActionResult(false, "Source ISO not found or empty.", entries = entries)
+            val withPersistence = config.usbMode == LinuxUsbMode.WITH_PERSISTENCE
+            val persistBytes = if (withPersistence) config.persistenceGb.coerceIn(1, 32).toLong() * 1024L * 1024L * 1024L else 0L
             val alignBytes = 1024L * 1024L
             val persistOffsetBytes = ((isoSize + alignBytes - 1L) / alignBytes) * alignBytes
-            val totalBytes = persistOffsetBytes + persistBytes
-            val persistStartLba = persistOffsetBytes / 512L
-            val persistSectors = persistBytes / 512L
-
+            val totalBytes = if (withPersistence) persistOffsetBytes + persistBytes else isoSize
             val freeSpace = UsbGadgetEngine.getFreeSpaceBytes(safeDir)
-            if (freeSpace > 0L && freeSpace < totalBytes + (64L * 1024L * 1024L)) {
-                val msg = "Not enough free space. Need ${UsbGadgetEngine.formatBytes(totalBytes)}, have ${UsbGadgetEngine.formatBytes(freeSpace)}."
-                entries.add(LogEntry(ts, "linux-build", msg, true))
-                return@withContext ActionResult(false, msg, entries = entries)
-            }
-
-            onProgress(
-                WindowsBuildProgress(
-                    stage = "Copying Linux ISO...",
-                    detail = "${UsbGadgetEngine.formatBytes(isoSize)} + ${config.persistenceGb} GB ${config.style.volumeLabel}",
-                    progress = 0.28f,
-                    isIndeterminate = true
-                )
-            )
-
+            if (freeSpace > 0L && freeSpace < totalBytes + (64L * 1024L * 1024L)) return@withContext ActionResult(false, "Not enough free space. Need ${UsbGadgetEngine.formatBytes(totalBytes)}, have ${UsbGadgetEngine.formatBytes(freeSpace)}.", entries = entries)
+            onProgress(WindowsBuildProgress("Copying ISO image...", if (withPersistence) "${UsbGadgetEngine.formatBytes(isoSize)} + ${config.persistenceGb} GB ${config.style.volumeLabel}" else UsbGadgetEngine.formatBytes(isoSize), 0.28f, true))
             val cpRes = Shell.cmd("mkdir -p $qDir && rm -f $qOut && cp -f $qIso $qOut 2>&1").exec()
-            if (!isActive) {
-                cleanup(deletePartial = true)
-                return@withContext ActionResult(false, "Build cancelled.", entries = entries)
+            if (!isActive) { cleanup(true); return@withContext ActionResult(false, "Build cancelled.", entries = entries) }
+            if (!cpRes.isSuccess) { cleanup(true); return@withContext ActionResult(false, "Failed to copy ISO: ${(cpRes.out + cpRes.err).joinToString(" ").take(200)}", entries = entries) }
+
+            if (withPersistence) {
+                if (!Shell.cmd("truncate -s $totalBytes $qOut 2>&1 || dd if=/dev/zero of=$qOut bs=1M count=0 seek=${totalBytes / (1024L * 1024L)} 2>&1").exec().isSuccess) { cleanup(true); return@withContext ActionResult(false, "Failed to expand image for persistence.", entries = entries) }
+                onProgress(WindowsBuildProgress("Adding persistence partition...", "Updating MBR partition table", 0.58f, false))
+                val tmpIn = File(context.cacheDir, "pb_linux_mbr_in.bin"); val tmpOut = File(context.cacheDir, "pb_linux_mbr_out.bin")
+                try {
+                    Shell.cmd("dd if=$qOut of=${shellQuote(tmpIn.absolutePath)} bs=512 count=1 2>/dev/null").exec()
+                    val patched = DiskPartitioner.appendLinuxPersistenceMbr(if (tmpIn.exists()) tmpIn.readBytes() else ByteArray(0), persistOffsetBytes / 512L, persistBytes / 512L)
+                    if (patched == null) { cleanup(true); return@withContext ActionResult(false, "Could not append persistence partition (try Extracted FAT32 mode).", entries = entries) }
+                    tmpOut.writeBytes(patched)
+                    Shell.cmd("dd if=${shellQuote(tmpOut.absolutePath)} of=$qOut bs=512 count=1 conv=notrunc 2>/dev/null").exec()
+                } finally { tmpIn.delete(); tmpOut.delete() }
+                onProgress(WindowsBuildProgress("Formatting ext4 persistence...", "Label: ${config.style.volumeLabel}", 0.74f, false))
+                loopDev = attachLoopSlice(qOut, persistOffsetBytes, persistBytes)
+                if (loopDev.isBlank() || !loopDev.startsWith("/dev/")) { cleanup(true); return@withContext ActionResult(false, "Could not attach loop device.", entries = entries) }
+                formatExt4AndInit(shellQuote(loopDev), config.style, entries, ts)?.let { cleanup(true); return@withContext ActionResult(false, it, entries = entries) }
             }
-            if (!cpRes.isSuccess) {
-                val err = (cpRes.out + cpRes.err).joinToString(" ").take(200)
-                cleanup(deletePartial = true)
-                return@withContext ActionResult(false, "Failed to copy ISO: $err", entries = entries)
-            }
-
-            val expandRes = Shell.cmd(
-                "truncate -s $totalBytes $qOut 2>&1 || dd if=/dev/zero of=$qOut bs=1M count=0 seek=${totalBytes / (1024L * 1024L)} 2>&1"
-            ).exec()
-            if (!expandRes.isSuccess) {
-                cleanup(deletePartial = true)
-                return@withContext ActionResult(false, "Failed to expand image for persistence.", entries = entries)
-            }
-
-            onProgress(WindowsBuildProgress("Adding persistence partition...", "Updating MBR partition table", 0.58f, false))
-
-            val tmpMbrIn = File(context.cacheDir, "pb_linux_mbr_in.bin")
-            val tmpMbrOut = File(context.cacheDir, "pb_linux_mbr_out.bin")
-            try {
-                Shell.cmd("dd if=$qOut of=${shellQuote(tmpMbrIn.absolutePath)} bs=512 count=1 2>/dev/null").exec()
-                val origMbr = if (tmpMbrIn.exists()) tmpMbrIn.readBytes() else ByteArray(0)
-                val patchedMbr = DiskPartitioner.appendLinuxPersistenceMbr(origMbr, persistStartLba, persistSectors)
-                if (patchedMbr == null) {
-                    entries.add(LogEntry(ts, "linux-build", "All 4 MBR slots occupied or non-hybrid ISO header", true))
-                    cleanup(deletePartial = true)
-                    return@withContext ActionResult(false, "Could not append persistence partition (MBR slots full).", entries = entries)
-                }
-                tmpMbrOut.writeBytes(patchedMbr)
-                Shell.cmd("dd if=${shellQuote(tmpMbrOut.absolutePath)} of=$qOut bs=512 count=1 conv=notrunc 2>/dev/null").exec()
-            } finally {
-                tmpMbrIn.delete()
-                tmpMbrOut.delete()
-            }
-            entries.add(LogEntry(ts, "linux-build", "Appended ext4 partition at LBA=$persistStartLba (${config.persistenceGb} GB)"))
-
-            onProgress(WindowsBuildProgress("Formatting ext4 persistence...", "Label: ${config.style.volumeLabel}", 0.74f, false))
-
-            val loopCmd = """
-                L=${'$'}(losetup -f -s -o $persistOffsetBytes -S $persistBytes $qOut 2>/dev/null)
-                if [ -z "${'$'}L" ]; then
-                    L=${'$'}(losetup -f --show -o $persistOffsetBytes --sizelimit $persistBytes $qOut 2>/dev/null)
-                fi
-                if [ -z "${'$'}L" ]; then
-                    CAND=${'$'}(losetup -f 2>/dev/null)
-                    if [ -n "${'$'}CAND" ]; then
-                        if losetup -o $persistOffsetBytes -S $persistBytes "${'$'}CAND" $qOut 2>/dev/null || \
-                           losetup -o $persistOffsetBytes --sizelimit $persistBytes "${'$'}CAND" $qOut 2>/dev/null; then
-                            L="${'$'}CAND"
-                        fi
-                    fi
-                fi
-                echo "${'$'}L"
-            """.trimIndent()
-            loopDev = Shell.cmd(loopCmd).exec().out.lastOrNull().orEmpty().trim()
-            if (loopDev.isBlank() || !loopDev.startsWith("/dev/")) {
-                cleanup(deletePartial = true)
-                return@withContext ActionResult(false, "Could not attach loop device for persistence partition.", entries = entries)
-            }
-
-            val qLoop = shellQuote(loopDev)
-            val label = config.style.volumeLabel
-            val ext4Res = Shell.cmd(
-                """
-                if command -v mke2fs >/dev/null 2>&1; then
-                    mke2fs -t ext4 -F -L $label $qLoop 2>&1
-                elif command -v mkfs.ext4 >/dev/null 2>&1; then
-                    mkfs.ext4 -F -L $label $qLoop 2>&1
-                elif [ -x /system/bin/mke2fs ]; then
-                    /system/bin/mke2fs -t ext4 -F -L $label $qLoop 2>&1
-                else
-                    echo "No mke2fs/mkfs.ext4 binary found on device"
-                    exit 1
-                fi
-                """.trimIndent()
-            ).exec()
-            if (!ext4Res.isSuccess) {
-                val err = (ext4Res.out + ext4Res.err).joinToString(" ").take(220)
-                entries.add(LogEntry(ts, "linux-build", "ext4 format failed: $err", true))
-                cleanup(deletePartial = true)
-                return@withContext ActionResult(false, "ext4 format failed: $err", entries = entries)
-            }
-
-            if (config.style == LinuxPersistenceStyle.DEBIAN_KALI) {
-                onProgress(WindowsBuildProgress("Writing persistence.conf...", "/ union", 0.88f, false))
-                val confRes = Shell.cmd(
-                    """
-                    mkdir -p $TEMP_LINUX_MNT &&
-                    mount -t ext4 -o rw $qLoop $TEMP_LINUX_MNT 2>&1 &&
-                    printf '/ union\n' > $TEMP_LINUX_MNT/persistence.conf
-                    """.trimIndent()
-                ).exec()
-                if (confRes.isSuccess) {
-                    entries.add(LogEntry(ts, "linux-build", "Created /persistence.conf (/ union)"))
-                }
-            }
-
-            onProgress(WindowsBuildProgress("Finalizing Linux USB...", "Syncing & fixing permissions", 0.95f, false))
-            cleanup(deletePartial = false)
-
+            onProgress(WindowsBuildProgress("Finalizing USB image...", "Syncing & fixing permissions", 0.95f, false))
+            cleanup(false)
             UsbGadgetEngine.fixUserStoragePermissions(context, safeDir, isDir = true)
             UsbGadgetEngine.fixUserStoragePermissions(context, outPath, isDir = false)
-
             onProgress(WindowsBuildProgress("Done!", safeName, 1f, false))
-            entries.add(LogEntry(ts, "linux-build", "Built Persistent Linux USB: $outPath"))
+            val msg = if (withPersistence) "Built $safeName with ${config.persistenceGb} GB ${config.style.volumeLabel}." else "Built standard live USB image $safeName."
+            entries.add(LogEntry(ts, "linux-build", msg))
+            ActionResult(true, msg, createdPath = outPath, entries = entries)
+        }.getOrElse { e -> cleanup(true); ActionResult(false, "Linux/Tool build failed: ${e.message ?: "Unexpected error"}", entries = entries) }
+    }
 
-            ActionResult(
-                success = true,
-                userMessage = "Built $safeName with ${config.persistenceGb} GB ${config.style.volumeLabel}.",
-                createdPath = outPath,
-                entries = entries
-            )
-        }.getOrElse { e ->
-            cleanup(deletePartial = true)
-            entries.add(LogEntry(ts, "linux-build", "Build error: ${e.message}", true))
-            ActionResult(false, "Linux build failed: ${e.message ?: "Unexpected error"}", entries = entries)
+    private suspend fun buildExtractedFat32Image(context: Context, config: LinuxBuildConfig, onProgress: (WindowsBuildProgress) -> Unit): ActionResult = withContext(Dispatchers.IO) {
+        val ts = nowTs()
+        val entries = mutableListOf<LogEntry>()
+        val safeDir = UsbGadgetEngine.resolveDirectPath(config.outputDir).trimEnd('/')
+        val safeName = config.outputName.trim().let { if (it.endsWith(".img", true)) it else "$it.img" }
+        val outPath = "$safeDir/$safeName"
+        val srcIsoPath = UsbGadgetEngine.resolveDirectPath(config.isoFile.path)
+        val qIso = shellQuote(srcIsoPath); val qOut = shellQuote(outPath); val qDir = shellQuote(safeDir)
+        var fatLoop = ""; var extLoop = ""
+        fun cleanup(deletePartial: Boolean) {
+            Shell.cmd("sync 2>/dev/null; umount $TEMP_FAT_MNT 2>/dev/null || umount -l $TEMP_FAT_MNT 2>/dev/null; umount $TEMP_LINUX_MNT 2>/dev/null || umount -l $TEMP_LINUX_MNT 2>/dev/null; [ -n ${shellQuote(fatLoop)} ] && losetup -d ${shellQuote(fatLoop)} 2>/dev/null; [ -n ${shellQuote(extLoop)} ] && losetup -d ${shellQuote(extLoop)} 2>/dev/null; rm -rf $TEMP_FAT_MNT $TEMP_LINUX_MNT 2>/dev/null").exec()
+            if (deletePartial) Shell.cmd("rm -f $qOut 2>/dev/null").exec()
         }
+        return@withContext runCatching {
+            if (!Shell.getShell().isRoot) return@withContext ActionResult(false, "Root access is required.", entries = entries)
+            val bin7z = WindowsImageBuilder.findBundledBinary(context, "lib7zzs.so", listOf("7zz", "7z")) ?: return@withContext ActionResult(false, "Bundled 7zz binary missing.", entries = entries)
+            onProgress(WindowsBuildProgress("Checking ISO contents...", config.isoFile.name, 0.05f, true))
+            val maxFile = inspectMaxFileBytesInIso(context, srcIsoPath)
+            if (maxFile > FAT32_MAX_FILE_BYTES) return@withContext ActionResult(false, "ISO contains a file over 4 GB (${UsbGadgetEngine.formatBytes(maxFile)}). Use Hybrid DD / ISO mode instead.", entries = entries)
+            val isoSize = Shell.cmd("stat -c '%s' $qIso 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: config.isoFile.sizeBytes
+            val withPersistence = config.usbMode == LinuxUsbMode.WITH_PERSISTENCE
+            val fatBytes = ((isoSize / (1024L * 1024L)) + 256L).coerceAtLeast(512L) * 1024L * 1024L
+            val persistBytes = if (withPersistence) config.persistenceGb.coerceIn(1, 32).toLong() * 1024L * 1024L * 1024L else 0L
+            val part1OffsetBytes = 1024L * 1024L
+            val part2OffsetBytes = part1OffsetBytes + fatBytes
+            val totalBytes = part2OffsetBytes + persistBytes + (2L * 1024L * 1024L)
+            val freeSpace = UsbGadgetEngine.getFreeSpaceBytes(safeDir)
+            if (freeSpace > 0L && freeSpace < totalBytes + (64L * 1024L * 1024L)) return@withContext ActionResult(false, "Not enough free space. Need ${UsbGadgetEngine.formatBytes(totalBytes)}, have ${UsbGadgetEngine.formatBytes(freeSpace)}.", entries = entries)
+            onProgress(WindowsBuildProgress("Allocating FAT32 USB image...", UsbGadgetEngine.formatBytes(totalBytes), 0.14f, false))
+            if (!Shell.cmd("mkdir -p $qDir && rm -f $qOut && truncate -s $totalBytes $qOut 2>&1").exec().isSuccess) return@withContext ActionResult(false, "Failed to allocate image file.", entries = entries)
+            val mbrBytes = ByteArray(512)
+            fun putLe32(buf: ByteArray, off: Int, v: Long) { buf[off] = (v and 0xFF).toByte(); buf[off+1] = ((v ushr 8) and 0xFF).toByte(); buf[off+2] = ((v ushr 16) and 0xFF).toByte(); buf[off+3] = ((v ushr 24) and 0xFF).toByte() }
+            mbrBytes[446] = 0x80.toByte(); mbrBytes[450] = 0x0C.toByte(); putLe32(mbrBytes, 454, part1OffsetBytes / 512L); putLe32(mbrBytes, 458, fatBytes / 512L)
+            if (withPersistence) { mbrBytes[466] = 0x83.toByte(); putLe32(mbrBytes, 470, part2OffsetBytes / 512L); putLe32(mbrBytes, 474, persistBytes / 512L) }
+            mbrBytes[510] = 0x55.toByte(); mbrBytes[511] = 0xAA.toByte()
+            val tmpMbr = File(context.cacheDir, "pb_fat_mbr.bin").apply { writeBytes(mbrBytes) }
+            try { Shell.cmd("dd if=${shellQuote(tmpMbr.absolutePath)} of=$qOut bs=512 count=1 conv=notrunc 2>/dev/null").exec() } finally { tmpMbr.delete() }
+            WindowsImageBuilder.findBundledBinary(context, "libms_sys.so", listOf("ms-sys"))?.let { msSys -> Shell.cmd("${shellQuote(msSys)} -s -f $qOut >/dev/null 2>&1 || ${shellQuote(msSys)} -7 -f $qOut >/dev/null 2>&1 || true").exec() }
+
+            onProgress(WindowsBuildProgress("Formatting FAT32 partition...", "${fatBytes / (1024L * 1024L)} MB", 0.28f, false))
+            fatLoop = attachLoopSlice(qOut, part1OffsetBytes, fatBytes)
+            if (fatLoop.isBlank() || !fatLoop.startsWith("/dev/")) { cleanup(true); return@withContext ActionResult(false, "Could not attach loop device for FAT32.", entries = entries) }
+            val qFatLoop = shellQuote(fatLoop)
+            val mkFatBin = WindowsImageBuilder.findBundledBinary(context, "libmkfs_fat.so", listOf("mkfs.vfat", "mkfs.fat", "newfs_msdos"))
+            val fatFmtCmd = when {
+                mkFatBin != null && mkFatBin.contains("newfs_msdos") -> "${shellQuote(mkFatBin)} -F 32 -L POCKETBOOT $qFatLoop 2>&1"
+                mkFatBin != null -> "${shellQuote(mkFatBin)} -F 32 -n POCKETBOOT $qFatLoop 2>&1"
+                else -> "mkfs.vfat -F 32 -n POCKETBOOT $qFatLoop 2>&1 || newfs_msdos -F 32 -L POCKETBOOT $qFatLoop 2>&1"
+            }
+            val fatFmtRes = Shell.cmd(fatFmtCmd).exec()
+            if (!fatFmtRes.isSuccess) { cleanup(true); return@withContext ActionResult(false, "FAT32 format failed: ${(fatFmtRes.out + fatFmtRes.err).joinToString(" ").take(200)}", entries = entries) }
+
+            onProgress(WindowsBuildProgress("Extracting ISO files...", config.isoFile.name, 0.45f, true))
+            if (!Shell.cmd("mkdir -p $TEMP_FAT_MNT && mount -t vfat -o rw $qFatLoop $TEMP_FAT_MNT 2>&1").exec().isSuccess) { cleanup(true); return@withContext ActionResult(false, "Could not mount FAT32 partition.", entries = entries) }
+            val extRes = Shell.cmd("${shellQuote(bin7z)} x -y -o$TEMP_FAT_MNT $qIso 2>&1").exec()
+            if (!isActive) { cleanup(true); return@withContext ActionResult(false, "Build cancelled.", entries = entries) }
+            if (!extRes.isSuccess) { cleanup(true); return@withContext ActionResult(false, "ISO extraction failed: ${(extRes.out + extRes.err).takeLast(4).joinToString(" ").take(200)}", entries = entries) }
+
+            if (withPersistence) {
+                val bootParam = if (config.style == LinuxPersistenceStyle.DEBIAN_KALI) "persistence" else "persistent"
+                Shell.cmd("for cfg in $TEMP_FAT_MNT/boot/grub/grub.cfg $TEMP_FAT_MNT/EFI/BOOT/grub.cfg $TEMP_FAT_MNT/isolinux/isolinux.cfg $TEMP_FAT_MNT/syslinux/syslinux.cfg $TEMP_FAT_MNT/boot/grub/loopback.cfg; do [ -f \"\${cfg}\" ] && sed -i 's/boot=casper/boot=casper $bootParam/g; s/boot=live/boot=live $bootParam/g' \"\${cfg}\" 2>/dev/null || true; done").exec()
+                entries.add(LogEntry(ts, "linux-build", "Injected '$bootParam' kernel boot flag"))
+                onProgress(WindowsBuildProgress("Formatting ext4 persistence...", "${config.persistenceGb} GB ${config.style.volumeLabel}", 0.78f, false))
+                extLoop = attachLoopSlice(qOut, part2OffsetBytes, persistBytes)
+                if (extLoop.isBlank() || !extLoop.startsWith("/dev/")) { cleanup(true); return@withContext ActionResult(false, "Could not attach persistence loop.", entries = entries) }
+                formatExt4AndInit(shellQuote(extLoop), config.style, entries, ts)?.let { cleanup(true); return@withContext ActionResult(false, it, entries = entries) }
+            }
+
+            onProgress(WindowsBuildProgress("Finalizing FAT32 USB...", "Syncing & fixing permissions", 0.95f, false))
+            cleanup(false)
+            UsbGadgetEngine.fixUserStoragePermissions(context, safeDir, isDir = true)
+            UsbGadgetEngine.fixUserStoragePermissions(context, outPath, isDir = false)
+            val msg = if (withPersistence) "Built FAT32 USB $safeName + ${config.persistenceGb} GB ${config.style.volumeLabel}." else "Built Extracted FAT32 USB $safeName."
+            entries.add(LogEntry(ts, "linux-build", msg))
+            onProgress(WindowsBuildProgress("Done!", safeName, 1f, false))
+            ActionResult(true, msg, createdPath = outPath, entries = entries)
+        }.getOrElse { e -> cleanup(true); ActionResult(false, "Linux/Tool USB build failed: ${e.message ?: "Unexpected error"}", entries = entries) }
+    }
+
+    private fun attachLoopSlice(qOut: String, offsetBytes: Long, sizeBytes: Long): String {
+        val loopCmd = """
+            L=${'$'}(losetup -f -s -o $offsetBytes -S $sizeBytes $qOut 2>/dev/null)
+            if [ -z "${'$'}L" ]; then L=${'$'}(losetup -f --show -o $offsetBytes --sizelimit $sizeBytes $qOut 2>/dev/null); fi
+            if [ -z "${'$'}L" ]; then
+                CAND=${'$'}(losetup -f 2>/dev/null)
+                if [ -n "${'$'}CAND" ] && (losetup -o $offsetBytes -S $sizeBytes "${'$'}CAND" $qOut 2>/dev/null || losetup -o $offsetBytes --sizelimit $sizeBytes "${'$'}CAND" $qOut 2>/dev/null); then L="${'$'}CAND"; fi
+            fi
+            echo "${'$'}L"
+        """.trimIndent()
+        return Shell.cmd(loopCmd).exec().out.lastOrNull().orEmpty().trim()
+    }
+
+    private fun formatExt4AndInit(qLoop: String, style: LinuxPersistenceStyle, entries: MutableList<LogEntry>, ts: String): String? {
+        val label = style.volumeLabel
+        val ext4Res = Shell.cmd("""
+            if command -v mke2fs >/dev/null 2>&1; then mke2fs -t ext4 -F -L $label $qLoop 2>&1
+            elif command -v mkfs.ext4 >/dev/null 2>&1; then mkfs.ext4 -F -L $label $qLoop 2>&1
+            elif [ -x /system/bin/mke2fs ]; then /system/bin/mke2fs -t ext4 -F -L $label $qLoop 2>&1
+            else echo "No mke2fs/mkfs.ext4 binary found on device"; exit 1; fi
+        """.trimIndent()).exec()
+        if (!ext4Res.isSuccess) return "ext4 format failed: ${(ext4Res.out + ext4Res.err).joinToString(" ").take(200)}"
+        if (style == LinuxPersistenceStyle.DEBIAN_KALI) {
+            if (Shell.cmd("mkdir -p $TEMP_LINUX_MNT && mount -t ext4 -o rw $qLoop $TEMP_LINUX_MNT 2>&1 && printf '/ union\\n' > $TEMP_LINUX_MNT/persistence.conf").exec().isSuccess) {
+                entries.add(LogEntry(ts, "linux-build", "Created /persistence.conf (/ union)"))
+            }
+        }
+        return null
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LinuxBuilderSheet(
-    isoFile: ImageFile,
-    defaultDir: String,
-    building: Boolean,
-    progress: WindowsBuildProgress,
-    onDismiss: () -> Unit,
-    onCancelBuild: () -> Unit,
-    onStartBuild: (LinuxBuildConfig) -> Unit
+    isoFile: ImageFile, defaultDir: String, building: Boolean, progress: WindowsBuildProgress,
+    onDismiss: () -> Unit, onCancelBuild: () -> Unit, onStartBuild: (LinuxBuildConfig) -> Unit
 ) {
+    val context = LocalContext.current
     val defaultStyle = remember(isoFile.name) {
         val low = isoFile.name.lowercase()
-        if (low.contains("kali") || low.contains("debian") || low.contains("tails") || low.contains("parrot")) {
-            LinuxPersistenceStyle.DEBIAN_KALI
-        } else {
-            LinuxPersistenceStyle.CASPER_RW
+        when {
+            low.contains("kali") || low.contains("debian") || low.contains("tails") || low.contains("gparted") || low.contains("clonezilla") || low.contains("parrot") -> LinuxPersistenceStyle.DEBIAN_KALI
+            low.contains("pop-os") || low.contains("pop_os") -> LinuxPersistenceStyle.CASPER_RW
+            else -> LinuxPersistenceStyle.UBUNTU_WRITABLE
         }
     }
-    val baseName = remember(isoFile.name) {
-        isoFile.name.substringBeforeLast('.').take(34) + "-Persist.img"
-    }
-    var outputName by remember(isoFile.path) { mutableStateOf(baseName) }
+    var usbMode by remember(isoFile.path) { mutableStateOf(LinuxUsbMode.WITH_PERSISTENCE) }
+    var writeMethod by remember(isoFile.path) { mutableStateOf(LinuxWriteMethod.HYBRID_DD) }
     var style by remember(isoFile.path) { mutableStateOf(defaultStyle) }
     var persistGb by remember { mutableIntStateOf(2) }
     var autoMount by remember { mutableStateOf(true) }
+    var maxIsoFileBytes by remember(isoFile.path) { mutableStateOf(0L) }
+    LaunchedEffect(isoFile.path) { maxIsoFileBytes = LinuxImageBuilder.inspectMaxFileBytesInIso(context, isoFile.path) }
 
-    val estNeeded = isoFile.sizeBytes + (persistGb.toLong() * 1024L * 1024L * 1024L) + (8L * 1024L * 1024L)
+    val defaultOutName = remember(isoFile.name, usbMode) {
+        val stem = isoFile.name.substringBeforeLast('.').take(32)
+        if (usbMode == LinuxUsbMode.WITH_PERSISTENCE) "$stem-Persist.img" else "$stem-USB.img"
+    }
+    var outputName by remember(defaultOutName) { mutableStateOf(defaultOutName) }
+    val fat32Blocked = maxIsoFileBytes > 4_294_967_295L
+    val estNeeded = isoFile.sizeBytes + (if (usbMode == LinuxUsbMode.WITH_PERSISTENCE) persistGb.toLong() * 1024L * 1024L * 1024L else 0L) + (if (writeMethod == LinuxWriteMethod.EXTRACTED_FAT32) 256L * 1024L * 1024L else 16L * 1024L * 1024L)
     val freeSpace = remember(defaultDir) { UsbGadgetEngine.getFreeSpaceBytes(defaultDir) }
     val lowSpace = freeSpace in 1 until estNeeded
 
-    ModalBottomSheet(
-        onDismissRequest = { if (!building) onDismiss() },
-        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
-        containerColor = PocketColors.surfaceCard
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 20.dp)
-                .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(42.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(PocketColors.successBg),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(Icons.Rounded.Terminal, null, tint = PocketColors.success, modifier = Modifier.size(22.dp))
-                }
-                Column(modifier = Modifier.weight(1f)) {
-                    Text("Linux Persistent USB", style = MaterialTheme.typography.titleLarge, color = PocketColors.textPrimary)
-                    Text(
-                        text = "${isoFile.name} • ${UsbGadgetEngine.formatBytes(isoFile.sizeBytes)}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = PocketColors.textSecondary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-            }
-
+    ModalBottomSheet(onDismissRequest = { if (!building) onDismiss() }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), containerColor = PocketColors.surfaceCard) {
+        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(13.dp)) {
+            PocketSheetHeader(icon = Icons.Rounded.Terminal, tint = PocketColors.accentSoft, iconBg = PocketColors.accentBg, title = "Linux & Tool USB Builder", subtitle = "${isoFile.name} · ${UsbGadgetEngine.formatBytes(isoFile.sizeBytes)}", subtitleMono = true)
             if (building) {
-                Surface(
-                    shape = RoundedCornerShape(14.dp),
-                    color = PocketColors.surfaceInput,
-                    border = BorderStroke(1.dp, PocketColors.success)
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
+                Surface(shape = RoundedCornerShape(14.dp), color = PocketColors.surfaceInput, border = BorderStroke(1.dp, PocketColors.accent)) {
+                    Column(modifier = Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         Text(progress.stage, style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary)
-                        if (progress.detail.isNotBlank()) {
-                            Text(progress.detail, style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary)
-                        }
-                        if (progress.isIndeterminate) {
-                            LinearProgressIndicator(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(7.dp)
-                                    .clip(RoundedCornerShape(999.dp)),
-                                color = PocketColors.success,
-                                trackColor = PocketColors.surfaceSubtle
-                            )
-                        } else {
-                            LinearProgressIndicator(
-                                progress = { progress.progress.coerceIn(0f, 1f) },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(7.dp)
-                                    .clip(RoundedCornerShape(999.dp)),
-                                color = PocketColors.success,
-                                trackColor = PocketColors.surfaceSubtle
-                            )
-                        }
+                        if (progress.detail.isNotBlank()) Text(progress.detail, style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary)
+                        if (progress.isIndeterminate) LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(7.dp).clip(RoundedCornerShape(999.dp)), color = PocketColors.accent, trackColor = PocketColors.surfaceSubtle)
+                        else LinearProgressIndicator(progress = { progress.progress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth().height(7.dp).clip(RoundedCornerShape(999.dp)), color = PocketColors.accent, trackColor = PocketColors.surfaceSubtle)
                     }
                 }
-
-                OutlinedButton(
-                    onClick = onCancelBuild,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(48.dp),
-                    shape = RoundedCornerShape(12.dp),
-                    border = BorderStroke(1.dp, PocketColors.danger)
-                ) {
-                    Icon(Icons.Rounded.Close, null, tint = PocketColors.danger, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Cancel Build", color = PocketColors.danger, fontWeight = FontWeight.SemiBold)
+                OutlinedButton(onClick = onCancelBuild, modifier = Modifier.fillMaxWidth().height(48.dp), shape = RoundedCornerShape(12.dp), border = BorderStroke(1.dp, PocketColors.danger)) {
+                    Icon(Icons.Rounded.Close, null, tint = PocketColors.danger, modifier = Modifier.size(18.dp)); Spacer(modifier = Modifier.width(6.dp)); Text("Cancel Build", color = PocketColors.danger, fontWeight = FontWeight.SemiBold)
                 }
             } else {
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Distro Persistence Format", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        LinuxPersistenceStyle.entries.forEach { s ->
-                            val selected = style == s
-                            Surface(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .bounceClick { style = s },
-                                shape = RoundedCornerShape(12.dp),
-                                color = if (selected) PocketColors.successBg else PocketColors.surfaceInput,
-                                border = BorderStroke(if (selected) 1.5.dp else 1.dp, if (selected) PocketColors.success else PocketColors.border)
-                            ) {
-                                Column(
-                                    modifier = Modifier.padding(12.dp),
-                                    verticalArrangement = Arrangement.spacedBy(2.dp)
-                                ) {
-                                    Text(
-                                        text = s.title,
-                                        style = MaterialTheme.typography.labelLarge,
-                                        color = if (selected) PocketColors.success else PocketColors.textPrimary
-                                    )
-                                    Text(s.subtitle, fontSize = 11.sp, color = PocketColors.textSecondary)
+                    Text("USB Mode (Rufus-Style)", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        LinuxUsbMode.entries.forEach { mode ->
+                            val selected = usbMode == mode
+                            Surface(modifier = Modifier.weight(1f).bounceClick { usbMode = mode }, shape = RoundedCornerShape(12.dp), color = if (selected) PocketColors.accentBg else PocketColors.surfaceInput, border = BorderStroke(if (selected) 1.5.dp else 0.75.dp, if (selected) PocketColors.accent else PocketColors.border)) {
+                                Column(modifier = Modifier.padding(11.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    Text(mode.title, style = MaterialTheme.typography.labelLarge, color = if (selected) PocketColors.accentSoft else PocketColors.textPrimary)
+                                    Text(mode.subtitle, fontSize = 10.5.sp, color = PocketColors.textSecondary)
                                 }
                             }
                         }
                     }
                 }
-
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Persistent Storage Size (ext4)", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        listOf(1, 2, 4, 8).forEach { gb ->
-                            val selected = persistGb == gb
-                            Surface(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .bounceClick { persistGb = gb },
-                                shape = RoundedCornerShape(10.dp),
-                                color = if (selected) PocketColors.accentBg else PocketColors.surfaceInput,
-                                border = BorderStroke(if (selected) 1.5.dp else 1.dp, if (selected) PocketColors.accent else PocketColors.border)
-                            ) {
-                                Box(
-                                    modifier = Modifier.padding(vertical = 10.dp),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Text(
-                                        text = "$gb GB",
-                                        fontWeight = FontWeight.SemiBold,
-                                        color = if (selected) PocketColors.accentSoft else PocketColors.textPrimary
-                                    )
+                    Text("Write Method", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        LinuxWriteMethod.entries.forEach { m ->
+                            val selected = writeMethod == m; val blocked = m == LinuxWriteMethod.EXTRACTED_FAT32 && fat32Blocked
+                            Surface(modifier = Modifier.weight(1f).bounceClick(enabled = !blocked) { writeMethod = m }, shape = RoundedCornerShape(12.dp), color = if (selected) PocketColors.surfaceSubtle else PocketColors.surfaceInput, border = BorderStroke(if (selected) 1.dp else 0.5.dp, if (selected) PocketColors.accent else PocketColors.border)) {
+                                Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    Text(m.title, style = MaterialTheme.typography.labelMedium, color = if (blocked) PocketColors.textMuted else PocketColors.textPrimary)
+                                    Text(if (blocked) "Blocked (>4 GB file in ISO)" else m.subtitle, fontSize = 10.sp, color = PocketColors.textSecondary)
                                 }
                             }
                         }
                     }
                 }
-
-                OutlinedTextField(
-                    value = outputName,
-                    onValueChange = { outputName = it },
-                    label = { Text("Output Persistent USB Name") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = PocketColors.success,
-                        unfocusedBorderColor = PocketColors.border,
-                        focusedTextColor = PocketColors.textPrimary,
-                        unfocusedTextColor = PocketColors.textPrimary
-                    )
-                )
-
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    color = PocketColors.surfaceInput,
-                    border = BorderStroke(0.5.dp, PocketColors.border)
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { autoMount = !autoMount }
-                            .padding(horizontal = 14.dp, vertical = 11.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                            Text("Mount as Writable USB when done", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
-                            Text("Writable USB lets Linux save changes", fontSize = 11.sp, color = PocketColors.textSecondary)
+                AnimatedVisibility(visible = usbMode == LinuxUsbMode.WITH_PERSISTENCE) {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text("Persistence Partition Format", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                            LinuxPersistenceStyle.entries.forEach { s ->
+                                val selected = style == s
+                                Surface(modifier = Modifier.fillMaxWidth().bounceClick { style = s }, shape = RoundedCornerShape(11.dp), color = if (selected) PocketColors.accentBg else PocketColors.surfaceInput, border = BorderStroke(if (selected) 1.dp else 0.5.dp, if (selected) PocketColors.accent else PocketColors.border)) {
+                                    Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 9.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(s.title, style = MaterialTheme.typography.labelMedium, color = if (selected) PocketColors.accentSoft else PocketColors.textPrimary)
+                                            Text(s.subtitle, fontSize = 10.5.sp, color = PocketColors.textSecondary)
+                                        }
+                                        Text(s.volumeLabel, style = PocketColors.monoStyle, color = PocketColors.accentSoft)
+                                    }
+                                }
+                            }
                         }
-                        Spacer(modifier = Modifier.width(10.dp))
-                        PocketSwitch(checked = autoMount, onCheckedChange = { autoMount = it }, activeColor = PocketColors.success)
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text("Persistent Storage Size (ext4)", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                listOf(1, 2, 4, 8, 16).forEach { gb ->
+                                    val selected = persistGb == gb
+                                    Surface(modifier = Modifier.weight(1f).bounceClick { persistGb = gb }, shape = RoundedCornerShape(10.dp), color = if (selected) PocketColors.accentBg else PocketColors.surfaceInput, border = BorderStroke(if (selected) 1.25.dp else 0.75.dp, if (selected) PocketColors.accent else PocketColors.border)) {
+                                        Box(modifier = Modifier.padding(vertical = 9.dp), contentAlignment = Alignment.Center) { Text("${gb}G", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = if (selected) PocketColors.accentSoft else PocketColors.textPrimary) }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
-
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    color = if (lowSpace) PocketColors.dangerBg else PocketColors.accentBg,
-                    border = BorderStroke(1.dp, if (lowSpace) PocketColors.danger else PocketColors.border)
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Icon(
-                            imageVector = if (lowSpace) Icons.Rounded.WarningAmber else Icons.Rounded.Info,
-                            contentDescription = null,
-                            tint = if (lowSpace) PocketColors.danger else PocketColors.accentSoft,
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Text(
-                            text = "Needs ~${UsbGadgetEngine.formatBytes(estNeeded)} in ${UsbGadgetEngine.friendlyFolderName(defaultDir)} (${UsbGadgetEngine.formatBytes(freeSpace)} free). Select Persistent boot option in GRUB/Live menu.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = PocketColors.textPrimary
-                        )
+                OutlinedTextField(value = outputName, onValueChange = { outputName = it }, label = { Text("Output USB Image Name") }, singleLine = true, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp), colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = PocketColors.accent, unfocusedBorderColor = PocketColors.border, focusedTextColor = PocketColors.textPrimary, unfocusedTextColor = PocketColors.textPrimary))
+                Surface(shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
+                    Row(modifier = Modifier.fillMaxWidth().clickable { autoMount = !autoMount }.padding(horizontal = 13.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Auto-mount when finished", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                            Text("Mounts as Writable USB (RW) for persistence", fontSize = 11.sp, color = PocketColors.textSecondary)
+                        }
+                        PocketSwitch(checked = autoMount, onCheckedChange = { autoMount = it }, activeColor = PocketColors.accent)
                     }
                 }
-
-                Button(
-                    onClick = {
-                        onStartBuild(
-                            LinuxBuildConfig(
-                                isoFile = isoFile,
-                                outputDir = defaultDir,
-                                outputName = outputName.ifBlank { baseName },
-                                persistenceGb = persistGb,
-                                style = style,
-                                autoMountAfterBuild = autoMount
-                            )
-                        )
-                    },
-                    enabled = !lowSpace && outputName.isNotBlank(),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(PocketTokens.PrimaryButtonHeight),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = PocketColors.success,
-                        contentColor = PocketColors.onAccent
-                    )
-                ) {
-                    Text("Build Persistent USB", fontWeight = FontWeight.SemiBold)
+                if (lowSpace) {
+                    Surface(shape = RoundedCornerShape(10.dp), color = PocketColors.warningBg, border = BorderStroke(0.5.dp, PocketColors.warning)) {
+                        Row(modifier = Modifier.fillMaxWidth().padding(10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Rounded.WarningAmber, null, tint = PocketColors.warning, modifier = Modifier.size(16.dp))
+                            Text("Low storage: need ~${UsbGadgetEngine.formatBytes(estNeeded)}, have ${UsbGadgetEngine.formatBytes(freeSpace)}.", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
+                        }
+                    }
+                } else {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Icon(Icons.Rounded.Info, null, tint = PocketColors.textMuted, modifier = Modifier.size(14.dp))
+                        Text(if (writeMethod == LinuxWriteMethod.EXTRACTED_FAT32 && usbMode == LinuxUsbMode.WITH_PERSISTENCE) "Auto-injects persistence boot flag into GRUB/Syslinux." else "Estimated image size: ~${UsbGadgetEngine.formatBytes(estNeeded)}", fontSize = 11.sp, color = PocketColors.textSecondary)
+                    }
+                }
+                Button(onClick = { onStartBuild(LinuxBuildConfig(isoFile, defaultDir, outputName.trim().ifBlank { defaultOutName }, usbMode, writeMethod, PartitionScheme.MBR, persistGb, style, autoMount)) }, enabled = outputName.trim().isNotEmpty() && !lowSpace && !(writeMethod == LinuxWriteMethod.EXTRACTED_FAT32 && fat32Blocked), modifier = Modifier.fillMaxWidth().height(48.dp), shape = RoundedCornerShape(12.dp), colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)) {
+                    Text(if (usbMode == LinuxUsbMode.WITH_PERSISTENCE) "Build Persistent USB (.img)" else "Build Live USB (.img)", fontWeight = FontWeight.SemiBold)
                 }
             }
-
             Spacer(modifier = Modifier.height(22.dp))
         }
     }

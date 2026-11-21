@@ -12,6 +12,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.Date
 import java.util.Locale
 
@@ -200,6 +201,20 @@ data class ActionResult(
 )
 
 object UsbGadgetEngine {
+    private val ejectRequested = AtomicBoolean(false)
+    fun requestAbortWatchdog() { ejectRequested.set(true) }
+    fun clearAbortWatchdog() { ejectRequested.set(false) }
+
+    private fun runIndependentRootScript(script: String): String {
+        return runCatching {
+            val proc = ProcessBuilder("su", "-c", "sh").redirectErrorStream(true).start()
+            proc.outputStream.bufferedWriter(Charsets.UTF_8).use { w -> w.write(script); w.write("\nexit\n"); w.flush() }
+            val lines = proc.inputStream.bufferedReader(Charsets.UTF_8).readLines()
+            proc.waitFor()
+            lines.lastOrNull { it.startsWith("OK|") || it == "NONE" } ?: lines.lastOrNull().orEmpty()
+        }.getOrDefault("")
+    }
+
 
     private const val STATE_FILE = "/data/local/tmp/.pocketboot_prev_usb"
 
@@ -780,173 +795,68 @@ object UsbGadgetEngine {
      *    pulse (temporarily restoring sys.usb.configfs=1 + mtp so msm-dwc3 / usb_notify exits
      *    idle/charging-only state, then immediately re-locking configfs=0 and re-binding LUN 0 & LUN 1).
      */
-    fun watchdogTick(
-        keepAdb: Boolean,
-        allowHotPlugBounce: Boolean = false,
-        androidPluggedHint: Boolean = false
-    ): WatchdogTickResult {
+    fun watchdogTick(keepAdb: Boolean, allowHotPlugBounce: Boolean = false, androidPluggedHint: Boolean = false): WatchdogTickResult {
+        if (ejectRequested.get()) return WatchdogTickResult(hasMountedLun = false)
         return runCatching {
-            val adbRebind = if (keepAdb) {
-                """
-                if [ -d "${'$'}GADGET/functions/ffs.adb" ] && [ "${'$'}(getprop sys.usb.ffs.ready 2>/dev/null)" = "1" ]; then
-                    [ ! -e "${'$'}CFG/f2" ] && ln -s "${'$'}GADGET/functions/ffs.adb" "${'$'}CFG/f2" 2>/dev/null || true
-                fi
-                """.trimIndent()
-            } else ""
-            val bounceFlag = if (allowHotPlugBounce) "1" else "0"
-            val hintFlag = if (androidPluggedHint) "1" else "0"
-
+            val adbRebind = if (keepAdb) """if [ -d "${'$'}GADGET/functions/ffs.adb" ] && [ "${'$'}(getprop sys.usb.ffs.ready 2>/dev/null)" = "1" ]; then [ ! -e "${'$'}CFG/f2" ] && ln -s "${'$'}GADGET/functions/ffs.adb" "${'$'}CFG/f2" 2>/dev/null || true; fi""" else ""
+            val bounceFlag = if (allowHotPlugBounce) "1" else "0"; val hintFlag = if (androidPluggedHint) "1" else "0"
             val script = """
                 $DETECT_GADGET_SH
-                if [ -z "${'$'}GADGET" ] || [ -z "${'$'}CFG" ]; then
-                    echo "NONE"
-                    return 0
-                fi
-
+                if [ -z "${'$'}GADGET" ] || [ -z "${'$'}CFG" ]; then echo "NONE"; exit 0; fi
                 ACTIVE_FUNC=""
-                for existing in "${'$'}GADGET"/functions/mass_storage.*; do
-                    if [ -d "${'$'}existing/lun.0" ]; then
-                        ACTIVE_FUNC="${'$'}existing"
-                        break
-                    fi
-                done
-                if [ -z "${'$'}ACTIVE_FUNC" ]; then
-                    echo "NONE"
-                    return 0
-                fi
-
-                F0=${'$'}(cat "${'$'}ACTIVE_FUNC/lun.0/file" 2>/dev/null)
-                RO0=${'$'}(cat "${'$'}ACTIVE_FUNC/lun.0/ro" 2>/dev/null)
-                CD0=${'$'}(cat "${'$'}ACTIVE_FUNC/lun.0/cdrom" 2>/dev/null)
-                F1=${'$'}(cat "${'$'}ACTIVE_FUNC/lun.1/file" 2>/dev/null)
-                RO1=${'$'}(cat "${'$'}ACTIVE_FUNC/lun.1/ro" 2>/dev/null)
-                CD1=${'$'}(cat "${'$'}ACTIVE_FUNC/lun.1/cdrom" 2>/dev/null)
-                if [ -z "${'$'}F0" ] && [ -z "${'$'}F1" ]; then
-                    echo "NONE"
-                    return 0
-                fi
-
+                for existing in "${'$'}GADGET"/functions/mass_storage.*; do if [ -d "${'$'}existing/lun.0" ]; then ACTIVE_FUNC="${'$'}existing"; break; fi; done
+                if [ -z "${'$'}ACTIVE_FUNC" ]; then echo "NONE"; exit 0; fi
+                F0=${'$'}(cat "${'$'}ACTIVE_FUNC/lun.0/file" 2>/dev/null); RO0=${'$'}(cat "${'$'}ACTIVE_FUNC/lun.0/ro" 2>/dev/null); CD0=${'$'}(cat "${'$'}ACTIVE_FUNC/lun.0/cdrom" 2>/dev/null)
+                F1=${'$'}(cat "${'$'}ACTIVE_FUNC/lun.1/file" 2>/dev/null); RO1=${'$'}(cat "${'$'}ACTIVE_FUNC/lun.1/ro" 2>/dev/null); CD1=${'$'}(cat "${'$'}ACTIVE_FUNC/lun.1/cdrom" 2>/dev/null)
+                if [ -z "${'$'}F0" ] && [ -z "${'$'}F1" ]; then echo "NONE"; exit 0; fi
                 UDC=${'$'}(ls /sys/class/udc 2>/dev/null | grep -v '^dummy_udc' | head -n 1)
-                CUR_UDC=${'$'}(cat "${'$'}GADGET/UDC" 2>/dev/null)
-                STATE=""
+                CUR_UDC=${'$'}(cat "${'$'}GADGET/UDC" 2>/dev/null); STATE=""
                 [ -n "${'$'}UDC" ] && STATE=${'$'}(cat "/sys/class/udc/${'$'}UDC/state" 2>/dev/null)
-
-                # Detect USB VBUS online across Samsung (sec-battery/max77705), Qualcomm, Pixel, MediaTek.
-                # Only treat pure DCP wall bricks (exact USB_DCP / HVDCP without data) as charger-only;
-                # NEVER skip USB_PD / PD_DRP because modern PC USB-C ports advertise PD_DRP!
-                VBUS=$hintFlag
-                IS_WALL_BRICK=0
+                VBUS=$hintFlag; IS_WALL_BRICK=0
                 for ps in /sys/class/power_supply/*usb* /sys/class/power_supply/pc_port /sys/class/power_supply/otg /sys/class/power_supply/ac; do
                     [ -d "${'$'}ps" ] || continue
-                    ONL=${'$'}(cat "${'$'}ps/online" 2>/dev/null)
-                    PRES=${'$'}(cat "${'$'}ps/present" 2>/dev/null)
-                    PTYPE=${'$'}(cat "${'$'}ps/type" 2>/dev/null)
-                    REAL_TYPE=${'$'}(cat "${'$'}ps/real_type" 2>/dev/null)
+                    ONL=${'$'}(cat "${'$'}ps/online" 2>/dev/null); PRES=${'$'}(cat "${'$'}ps/present" 2>/dev/null); PTYPE=${'$'}(cat "${'$'}ps/type" 2>/dev/null); REAL_TYPE=${'$'}(cat "${'$'}ps/real_type" 2>/dev/null)
                     if [ "${'$'}ONL" = "1" ] || [ "${'$'}PRES" = "1" ]; then
                         VBUS=1
-                        case "${'$'}REAL_TYPE" in
-                            USB_DCP|DCP|HVDCP|HVDCP_3|AFC|PE) IS_WALL_BRICK=1 ;;
-                        esac
-                        case "${'$'}PTYPE" in
-                            USB_DCP|Mains) [ -z "${'$'}REAL_TYPE" ] && IS_WALL_BRICK=1 ;;
-                        esac
+                        case "${'$'}REAL_TYPE" in USB_DCP|DCP|HVDCP|HVDCP_3|AFC|PE) IS_WALL_BRICK=1 ;; esac
+                        case "${'$'}PTYPE" in USB_DCP|Mains) [ -z "${'$'}REAL_TYPE" ] && IS_WALL_BRICK=1 ;; esac
                     fi
                 done
-                if [ "${'$'}VBUS" = "0" ]; then
-                    BAT_ST=${'$'}(cat /sys/class/power_supply/battery/status 2>/dev/null)
-                    [ "${'$'}BAT_ST" = "Charging" ] && VBUS=1
-                fi
-
-                RECOVERED=0
-                BOUNCED=0
-
-                rebind_gadget_luns() {
-                    for p in /sys/bus/platform/devices/*dwc3*/power/control /sys/bus/platform/devices/*ssusb*/power/control /sys/bus/platform/devices/*mtu3*/power/control /sys/bus/platform/devices/*musb*/power/control /sys/class/udc/*/device/power/control; do
-                        [ -f "${'$'}p" ] && echo on > "${'$'}p" 2>/dev/null || true
-                    done
-                    echo "" > "${'$'}GADGET/UDC" 2>/dev/null
-                    rm -f "${'$'}CFG"/f* 2>/dev/null
-                    if [ -n "${'$'}F0" ]; then
-                        echo "" > "${'$'}ACTIVE_FUNC/lun.0/file" 2>/dev/null
-                        echo 1 > "${'$'}ACTIVE_FUNC/lun.0/removable" 2>/dev/null
-                        [ -n "${'$'}RO0" ] && echo "${'$'}RO0" > "${'$'}ACTIVE_FUNC/lun.0/ro" 2>/dev/null
-                        [ -n "${'$'}CD0" ] && echo "${'$'}CD0" > "${'$'}ACTIVE_FUNC/lun.0/cdrom" 2>/dev/null
-                        [ -f "${'$'}ACTIVE_FUNC/lun.0/nofua" ] && echo 1 > "${'$'}ACTIVE_FUNC/lun.0/nofua" 2>/dev/null
-                        echo "${'$'}F0" > "${'$'}ACTIVE_FUNC/lun.0/file" 2>/dev/null
-                    fi
-                    if [ -n "${'$'}F1" ] && [ -d "${'$'}ACTIVE_FUNC/lun.1" ]; then
-                        echo "" > "${'$'}ACTIVE_FUNC/lun.1/file" 2>/dev/null
-                        echo 1 > "${'$'}ACTIVE_FUNC/lun.1/removable" 2>/dev/null
-                        [ -n "${'$'}RO1" ] && echo "${'$'}RO1" > "${'$'}ACTIVE_FUNC/lun.1/ro" 2>/dev/null
-                        [ -n "${'$'}CD1" ] && echo "${'$'}CD1" > "${'$'}ACTIVE_FUNC/lun.1/cdrom" 2>/dev/null
-                        [ -f "${'$'}ACTIVE_FUNC/lun.1/nofua" ] && echo 1 > "${'$'}ACTIVE_FUNC/lun.1/nofua" 2>/dev/null
-                        echo "${'$'}F1" > "${'$'}ACTIVE_FUNC/lun.1/file" 2>/dev/null
-                    fi
-                    ln -s "${'$'}ACTIVE_FUNC" "${'$'}CFG/f1" 2>/dev/null || true
-                    $adbRebind
-                    if ! echo "${'$'}UDC" > "${'$'}GADGET/UDC" 2>/dev/null; then
-                        if [ -e "${'$'}CFG/f2" ]; then
-                            rm -f "${'$'}CFG/f2" 2>/dev/null || true
-                            echo "${'$'}UDC" > "${'$'}GADGET/UDC" 2>/dev/null
-                        fi
-                    fi
-                    if [ -f "/sys/class/udc/${'$'}UDC/soft_connect" ]; then
-                        echo disconnect > "/sys/class/udc/${'$'}UDC/soft_connect" 2>/dev/null || true
-                        sleep 0.15
-                        echo connect > "/sys/class/udc/${'$'}UDC/soft_connect" 2>/dev/null || true
-                    fi
+                if [ "${'$'}VBUS" = "0" ]; then [ "${'$'}(cat /sys/class/power_supply/battery/status 2>/dev/null)" = "Charging" ] && VBUS=1; fi
+                RECOVERED=0; BOUNCED=0
+                rebind_gadget_clean() {
+                    for p in /sys/bus/platform/devices/*dwc3*/power/control /sys/bus/platform/devices/*ssusb*/power/control /sys/bus/platform/devices/*mtu3*/power/control /sys/bus/platform/devices/*musb*/power/control /sys/class/udc/*/device/power/control; do [ -f "${'$'}p" ] && echo on > "${'$'}p" 2>/dev/null || true; done
+                    echo "" > "${'$'}GADGET/UDC" 2>/dev/null; rm -f "${'$'}CFG"/f* 2>/dev/null
+                    if [ -n "${'$'}F0" ]; then echo "" > "${'$'}ACTIVE_FUNC/lun.0/file" 2>/dev/null; echo 1 > "${'$'}ACTIVE_FUNC/lun.0/removable" 2>/dev/null; [ -n "${'$'}RO0" ] && echo "${'$'}RO0" > "${'$'}ACTIVE_FUNC/lun.0/ro" 2>/dev/null; [ -n "${'$'}CD0" ] && echo "${'$'}CD0" > "${'$'}ACTIVE_FUNC/lun.0/cdrom" 2>/dev/null; [ -f "${'$'}ACTIVE_FUNC/lun.0/nofua" ] && echo 1 > "${'$'}ACTIVE_FUNC/lun.0/nofua" 2>/dev/null; echo "${'$'}F0" > "${'$'}ACTIVE_FUNC/lun.0/file" 2>/dev/null; fi
+                    if [ -n "${'$'}F1" ] && [ -d "${'$'}ACTIVE_FUNC/lun.1" ]; then echo "" > "${'$'}ACTIVE_FUNC/lun.1/file" 2>/dev/null; echo 1 > "${'$'}ACTIVE_FUNC/lun.1/removable" 2>/dev/null; [ -n "${'$'}RO1" ] && echo "${'$'}RO1" > "${'$'}ACTIVE_FUNC/lun.1/ro" 2>/dev/null; [ -n "${'$'}CD1" ] && echo "${'$'}CD1" > "${'$'}ACTIVE_FUNC/lun.1/cdrom" 2>/dev/null; [ -f "${'$'}ACTIVE_FUNC/lun.1/nofua" ] && echo 1 > "${'$'}ACTIVE_FUNC/lun.1/nofua" 2>/dev/null; echo "${'$'}F1" > "${'$'}ACTIVE_FUNC/lun.1/file" 2>/dev/null; fi
+                    ln -s "${'$'}ACTIVE_FUNC" "${'$'}CFG/f1" 2>/dev/null || true; $adbRebind
+                    if ! echo "${'$'}UDC" > "${'$'}GADGET/UDC" 2>/dev/null; then if [ -e "${'$'}CFG/f2" ]; then rm -f "${'$'}CFG/f2" 2>/dev/null || true; echo "${'$'}UDC" > "${'$'}GADGET/UDC" 2>/dev/null; fi; fi
                 }
-
                 if [ -z "${'$'}CUR_UDC" ] && [ -n "${'$'}UDC" ]; then
-                    setprop sys.usb.configfs 0 2>/dev/null || true
-                    rebind_gadget_luns
-                    [ -n "${'$'}(cat "${'$'}GADGET/UDC" 2>/dev/null)" ] && RECOVERED=1
+                    setprop sys.usb.configfs 0 2>/dev/null || true; rebind_gadget_clean; [ -n "${'$'}(cat "${'$'}GADGET/UDC" 2>/dev/null)" ] && RECOVERED=1
                 elif [ "$bounceFlag" = "1" ] && [ -n "${'$'}UDC" ] && [ "${'$'}VBUS" = "1" ] && [ "${'$'}IS_WALL_BRICK" = "0" ] && [ "${'$'}STATE" != "configured" ]; then
-                    # Stage 1: Fast soft re-bind + soft_connect kick
-                    setprop sys.usb.configfs 0 2>/dev/null || true
-                    rebind_gadget_luns
-                    sleep 0.9
-                    STATE=${'$'}(cat "/sys/class/udc/${'$'}UDC/state" 2>/dev/null)
-                    if [ "${'$'}STATE" = "configured" ]; then
-                        BOUNCED=1
-                    else
-                        # Stage 2: Full USB PHY wake pulse (wakes Samsung/Qualcomm msm-dwc3 out of idle/charging-only state)
-                        echo "" > "${'$'}GADGET/UDC" 2>/dev/null
-                        rm -f "${'$'}CFG"/f* 2>/dev/null
-                        setprop sys.usb.configfs 1 2>/dev/null || true
-                        setprop sys.usb.config mtp 2>/dev/null || true
-                        sleep 1.1
-                        setprop sys.usb.config none 2>/dev/null || true
-                        sleep 0.7
-                        setprop sys.usb.configfs 0 2>/dev/null || true
-                        rebind_gadget_luns
-                        sleep 0.8
-                        STATE=${'$'}(cat "/sys/class/udc/${'$'}UDC/state" 2>/dev/null)
-                        BOUNCED=1
-                    fi
+                    echo "" > "${'$'}GADGET/UDC" 2>/dev/null; rm -f "${'$'}CFG"/f* 2>/dev/null
+                    for p in /sys/bus/platform/devices/*dwc3*/power/control /sys/bus/platform/devices/*ssusb*/power/control /sys/bus/platform/devices/*mtu3*/power/control /sys/bus/platform/devices/*musb*/power/control /sys/class/udc/*/device/power/control; do [ -f "${'$'}p" ] && echo auto > "${'$'}p" 2>/dev/null || true; done
+                    sleep 0.12
+                    WAKE_CFG=""; [ -f "$STATE_FILE" ] && WAKE_CFG=${'$'}(cat "$STATE_FILE" 2>/dev/null)
+                    if [ -z "${'$'}WAKE_CFG" ] || [ "${'$'}WAKE_CFG" = "none" ]; then WAKE_CFG=${'$'}(getprop persist.sys.usb.config 2>/dev/null); fi
+                    if [ -z "${'$'}WAKE_CFG" ] || [ "${'$'}WAKE_CFG" = "none" ]; then WAKE_CFG="mtp,adb"; fi
+                    setprop sys.usb.configfs 1 2>/dev/null || true; setprop sys.usb.config "${'$'}WAKE_CFG" 2>/dev/null || true; svc usb setFunctions mtp 2>/dev/null || true
+                    W=0; while [ "${'$'}W" -lt 20 ]; do sleep 0.12; UST=${'$'}(getprop sys.usb.state 2>/dev/null); UDC_ST=${'$'}(cat "/sys/class/udc/${'$'}UDC/state" 2>/dev/null); if [ "${'$'}UDC_ST" = "configured" ] || ([ -n "${'$'}UST" ] && [ "${'$'}UST" != "none" ]); then break; fi; W=${'$'}((W + 1)); done
+                    sleep 0.25; setprop sys.usb.config none 2>/dev/null || true
+                    W=0; while [ "${'$'}W" -lt 18 ]; do sleep 0.1; UST=${'$'}(getprop sys.usb.state 2>/dev/null); [ "${'$'}UST" = "none" ] || [ -z "${'$'}UST" ] && break; W=${'$'}((W + 1)); done
+                    setprop sys.usb.configfs 0 2>/dev/null || true; rebind_gadget_clean
+                    W=0; while [ "${'$'}W" -lt 10 ]; do sleep 0.12; STATE=${'$'}(cat "/sys/class/udc/${'$'}UDC/state" 2>/dev/null); [ "${'$'}STATE" = "configured" ] && break; W=${'$'}((W + 1)); done
+                    BOUNCED=1
                 fi
-
                 [ -n "${'$'}UDC" ] && [ -z "${'$'}STATE" ] && STATE=${'$'}(cat "/sys/class/udc/${'$'}UDC/state" 2>/dev/null)
-                PRIMARY=${'$'}{F0##*/}
-                [ -z "${'$'}PRIMARY" ] && PRIMARY=${'$'}{F1##*/}
+                PRIMARY=${'$'}{F0##*/}; [ -z "${'$'}PRIMARY" ] && PRIMARY=${'$'}{F1##*/}
                 echo "OK|${'$'}RECOVERED|${'$'}BOUNCED|${'$'}VBUS|${'$'}UDC|${'$'}STATE|${'$'}PRIMARY"
             """.trimIndent()
-
-            val wrapped = "pb_wd() {\n$script\n}\npb_wd"
-            val out = Shell.cmd(wrapped).exec().out.lastOrNull().orEmpty().trim()
-            if (!out.startsWith("OK|")) {
-                WatchdogTickResult(hasMountedLun = false)
-            } else {
+            val out = runIndependentRootScript(script).trim()
+            if (!out.startsWith("OK|")) WatchdogTickResult(hasMountedLun = false) else {
                 val parts = out.split("|")
-                WatchdogTickResult(
-                    hasMountedLun = true,
-                    recoveredUdc = parts.getOrNull(1) == "1",
-                    bouncedHotPlug = parts.getOrNull(2) == "1",
-                    vbusOnline = parts.getOrNull(3) == "1",
-                    udcName = parts.getOrNull(4).orEmpty(),
-                    linkState = parts.getOrNull(5).orEmpty(),
-                    primaryName = parts.getOrNull(6).orEmpty()
-                )
+                WatchdogTickResult(true, parts.getOrNull(1) == "1", parts.getOrNull(2) == "1", parts.getOrNull(3) == "1", parts.getOrNull(4).orEmpty(), parts.getOrNull(5).orEmpty(), parts.getOrNull(6).orEmpty())
             }
         }.getOrDefault(WatchdogTickResult(hasMountedLun = false))
     }
@@ -973,38 +883,23 @@ object UsbGadgetEngine {
     }
 
     suspend fun readUsbActivitySample(): UsbActivitySample = withContext(Dispatchers.IO) {
+        if (ejectRequested.get()) return@withContext UsbActivitySample()
         runCatching {
             val script = """
-                UDC=${'$'}(ls /sys/class/udc 2>/dev/null | grep -v '^dummy_udc' | head -n 1)
-                ST=""
-                SPD=""
-                if [ -n "${'$'}UDC" ]; then
-                    ST=${'$'}(cat "/sys/class/udc/${'$'}UDC/state" 2>/dev/null)
-                    SPD=${'$'}(cat "/sys/class/udc/${'$'}UDC/current_speed" 2>/dev/null)
-                fi
-                IO_BYTES=0
-                ACTIVE=0
-                for p in /proc/[0-9]*; do
-                    COMM=${'$'}(cat "${'$'}p/comm" 2>/dev/null)
-                    case "${'$'}COMM" in
-                        file-storage|f_mass_storage*)
-                            PSTATE=${'$'}(awk '/^State:/ {print ${'$'}2}' "${'$'}p/status" 2>/dev/null)
-                            if [ "${'$'}PSTATE" = "R" ] || [ "${'$'}PSTATE" = "D" ]; then ACTIVE=1; fi
-                            RB=${'$'}(awk '/^(rchar|read_bytes|wchar|write_bytes):/ {s+=${'$'}2} END {print s+0}' "${'$'}p/io" 2>/dev/null)
-                            IO_BYTES=${'$'}((IO_BYTES + RB))
-                            ;;
-                    esac
+                UDC=${'$'}(ls /sys/class/udc 2>/dev/null | grep -v '^dummy_udc' | head -n 1); ST=""; SPD=""
+                if [ -n "${'$'}UDC" ]; then ST=${'$'}(cat "/sys/class/udc/${'$'}UDC/state" 2>/dev/null); SPD=${'$'}(cat "/sys/class/udc/${'$'}UDC/current_speed" 2>/dev/null); fi
+                IO_BYTES=0; ACTIVE=0
+                PIDS=${'$'}(pidof file-storage 2>/dev/null || pgrep -f 'file-storage|f_mass_storage' 2>/dev/null || true)
+                for pid in ${'$'}PIDS; do
+                    [ -r "/proc/${'$'}pid/status" ] || continue
+                    PSTATE=${'$'}(awk '/^State:/ {print ${'$'}2; exit}' "/proc/${'$'}pid/status" 2>/dev/null)
+                    if [ "${'$'}PSTATE" = "R" ] || [ "${'$'}PSTATE" = "D" ]; then ACTIVE=1; fi
+                    if [ -r "/proc/${'$'}pid/io" ]; then RB=${'$'}(awk '/^(rchar|read_bytes|wchar|write_bytes):/ {s+=${'$'}2} END {print s+0}' "/proc/${'$'}pid/io" 2>/dev/null); IO_BYTES=${'$'}((IO_BYTES + RB)); fi
                 done
                 echo "${'$'}ST|${'$'}SPD|${'$'}IO_BYTES|${'$'}ACTIVE"
             """.trimIndent()
-            val out = Shell.cmd(script).exec().out.lastOrNull().orEmpty().trim()
-            val parts = out.split("|")
-            UsbActivitySample(
-                linkState = parts.getOrNull(0).orEmpty(),
-                speed = parts.getOrNull(1).orEmpty(),
-                ioBytesTotal = parts.getOrNull(2)?.toLongOrNull() ?: 0L,
-                kernelReadingActive = parts.getOrNull(3) == "1"
-            )
+            val parts = runIndependentRootScript(script).trim().split("|")
+            UsbActivitySample(parts.getOrNull(0).orEmpty(), parts.getOrNull(1).orEmpty(), parts.getOrNull(2)?.toLongOrNull() ?: 0L, parts.getOrNull(3) == "1")
         }.getOrDefault(UsbActivitySample())
     }
 
@@ -1014,6 +909,7 @@ object UsbGadgetEngine {
         settings: AppSettings,
         lunIndex: Int = 0
     ): ActionResult = withContext(Dispatchers.IO) {
+        clearAbortWatchdog()
         val ts = nowTs()
         val entries = mutableListOf<LogEntry>()
         return@withContext runCatching {
@@ -1094,7 +990,8 @@ object UsbGadgetEngine {
 
                     if [ "${'$'}(getprop sys.usb.configfs 2>/dev/null)" != "0" ]; then
                         setprop sys.usb.config none 2>/dev/null
-                        sleep 1
+                        W=0
+                        while [ "${'$'}W" -lt 12 ]; do sleep 0.1; UST=${'$'}(getprop sys.usb.state 2>/dev/null); [ "${'$'}UST" = "none" ] || [ -z "${'$'}UST" ] && break; W=${'$'}((W + 1)); done
                         setprop sys.usb.configfs 0 2>/dev/null
                         echo "LOG|usb|Locked ConfigFS against system USB daemon resets"
                     fi
@@ -1220,9 +1117,10 @@ object UsbGadgetEngine {
     }
 
     suspend fun unmountImage(lunIndex: Int? = null): ActionResult = withContext(Dispatchers.IO) {
+        if (lunIndex == null) requestAbortWatchdog()
         val ts = nowTs()
         val entries = mutableListOf<LogEntry>()
-        return@withContext runCatching {
+        return@withContext try { runCatching {
             val script = if (lunIndex != null) {
                 val otherLun = if (lunIndex == 0) 1 else 0
                 """
@@ -1274,7 +1172,7 @@ object UsbGadgetEngine {
                 for p in /sys/bus/platform/devices/*dwc3*/power/control /sys/bus/platform/devices/*ssusb*/power/control /sys/bus/platform/devices/*mtu3*/power/control /sys/bus/platform/devices/*musb*/power/control /sys/class/udc/*/device/power/control; do
                     [ -f "${'$'}p" ] && echo auto > "${'$'}p" 2>/dev/null || true
                 done
-                sleep 1
+                sleep 0.15
 
                 PREV_CFG=""
                 if [ -f "$STATE_FILE" ]; then
@@ -1314,6 +1212,8 @@ object UsbGadgetEngine {
         }.getOrElse { e ->
             entries.add(LogEntry(ts, "crash-guard", "Unmount exception: ${e.message}", true))
             ActionResult(false, "Unmount failed: ${e.message}", null, entries)
+        } } finally {
+            clearAbortWatchdog()
         }
     }
 

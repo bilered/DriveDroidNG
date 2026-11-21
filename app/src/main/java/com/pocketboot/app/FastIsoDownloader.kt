@@ -31,6 +31,9 @@ import java.io.File
 import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.zip.ZipInputStream
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.sync.Semaphore
@@ -55,7 +58,9 @@ data class DownloadCompletionEvent(
     val computedSha256: String?,
     val expectedSha256: String?,
     val checksumStatus: ChecksumVerifyStatus,
-    val autoMount: Boolean
+    val autoMount: Boolean,
+    val buildBenchmark: String? = null,
+    val bootVerifiedLabel: String? = null
 )
 
 data class PendingResumableDownload(
@@ -199,6 +204,12 @@ object FastIsoDownloader {
     private var cachedTargetMultiBootPath: String = ""
     private var cachedOnComplete: ((DownloadCompletionEvent) -> Unit)? = null
     private var cachedOnError: ((String) -> Unit)? = null
+    private var cachedOnLog: ((LogEntry) -> Unit)? = null
+    @Volatile private var cachedUserAgent: String = BROWSER_UA
+    private const val BROWSER_UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.4.0"
+    private const val WGET_UA = "Wget/1.21.4"
+    private const val CURL_UA = "curl/8.5.0"
+    private fun logDl(msg: String, isError: Boolean = false) { cachedOnLog?.invoke(LogEntry(SimpleDateFormat("HH:mm:ss", Locale.US).format(Date()), "download", msg, isError)) }
     private var cachedContext: Context? = null
 
     fun publishExternalCompletion(event: DownloadCompletionEvent) {
@@ -302,84 +313,106 @@ object FastIsoDownloader {
         }
     }
 
-    private fun openFollowingRedirects(urlStr: String, method: String, rangeHeader: String? = null): HttpURLConnection {
-        var current = urlStr
-        var redirects = 0
-        while (redirects < 10) {
-            val conn = (URL(current).openConnection() as HttpURLConnection).apply {
-                requestMethod = method
-                instanceFollowRedirects = false
-                connectTimeout = 15_000
-                readTimeout = 25_000
-                setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.3.2")
-                setRequestProperty("Accept", "*/*")
-                setRequestProperty("Accept-Encoding", "identity")
-                setRequestProperty("Connection", "keep-alive")
-                if (rangeHeader != null) {
-                    setRequestProperty("Range", rangeHeader)
-                }
-            }
-            val code = conn.responseCode
-            if (code in listOf(301, 302, 303, 307, 308)) {
-                val loc = conn.getHeaderField("Location")
-                conn.disconnect()
-                if (loc.isNullOrBlank()) throw IllegalStateException("Redirect without Location header")
-                current = URL(URL(current), loc).toString()
-                redirects++
-            } else {
-                return conn
-            }
-        }
-        throw IllegalStateException("Too many redirects")
+    private fun normalizeDownloadUrl(rawUrl: String): String {
+        val trimmed = rawUrl.trim(); val low = trimmed.lowercase()
+        if (low.contains("sourceforge.net/projects/") && low.contains("/files/") && !low.endsWith("/download")) return trimmed.trimEnd('/') + "/download"
+        if (low.contains("github.com/") && low.contains("/blob/")) return trimmed.replace("/blob/", "/raw/")
+        return trimmed
     }
-
-    private data class ProbeResult(
-        val finalUrl: String,
-        val totalBytes: Long,
-        val acceptsRanges: Boolean,
-        val isHtmlPage: Boolean
-    )
-
-    private fun probeServer(urlStr: String): ProbeResult {
-        runCatching {
-            val conn = openFollowingRedirects(urlStr, "HEAD")
+    private fun resolveDynamicApiUrl(rawUrl: String): Triple<String, String?, String?> {
+        val low = rawUrl.lowercase()
+        if (low.contains("api.pop-os.org/builds/")) {
+            logDl("Resolving latest Pop!_OS ISO from System76 API...")
+            val conn = openFollowingRedirects(rawUrl, "GET", userAgent = CURL_UA)
             try {
-                val code = conn.responseCode
-                val cType = conn.contentType.orEmpty().lowercase()
-                if (code in 200..299 && !cType.contains("text/html")) {
-                    val len = conn.contentLengthLong
-                    val acceptRanges = conn.getHeaderField("Accept-Ranges")?.equals("bytes", true) == true
-                    val finalUrl = conn.url.toString()
-                    if (len > 0L && acceptRanges) {
-                        return ProbeResult(finalUrl, len, true, false)
+                if (conn.responseCode in 200..299) {
+                    val obj = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
+                    val isoUrl = obj.optString("url", "").trim(); val sha = obj.optString("sha_sum", "").trim()
+                    if (isoUrl.startsWith("http")) { logDl("Pop!_OS resolved -> $isoUrl"); return Triple(isoUrl, sha.ifBlank { null }, isoUrl.substringAfterLast('/').substringBefore('?').ifBlank { null }) }
+                }
+            } finally { conn.disconnect() }
+        }
+        if (low.contains("tails.net/install/v2/tails/") && low.endsWith(".json")) {
+            logDl("Resolving latest Tails stable image from tails.net...")
+            val conn = openFollowingRedirects(rawUrl, "GET", userAgent = CURL_UA)
+            try {
+                if (conn.responseCode in 200..299) {
+                    val paths = JSONObject(conn.inputStream.bufferedReader().use { it.readText() }).optJSONArray("installations")?.optJSONObject(0)?.optJSONArray("installation-paths")
+                    if (paths != null) for (i in 0 until paths.length()) {
+                        val tfs = paths.optJSONObject(i)?.optJSONArray("target-files") ?: continue
+                        for (j in 0 until tfs.length()) {
+                            val tf = tfs.optJSONObject(j) ?: continue; val u = tf.optString("url", "").trim(); val sha = tf.optString("sha256", "").trim()
+                            if (u.endsWith(".img") || u.endsWith(".iso")) { logDl("Tails resolved -> $u"); return Triple(u, sha.ifBlank { null }, u.substringAfterLast('/').ifBlank { null }) }
+                        }
                     }
                 }
-            } finally {
-                conn.disconnect()
-            }
+            } finally { conn.disconnect() }
         }
-
-        val conn = openFollowingRedirects(urlStr, "GET", rangeHeader = "bytes=0-0")
-        try {
+        return Triple(rawUrl, null, null)
+    }
+    private fun prefersCliUserAgent(urlStr: String): Boolean { val low = urlStr.lowercase(); return low.contains("sourceforge.net") || low.contains("osdn.net") || low.contains("fosshub.com") }
+    private fun openFollowingRedirects(urlStr: String, method: String, rangeHeader: String? = null, userAgent: String = cachedUserAgent): HttpURLConnection {
+        var current = urlStr; var redirects = 0; val cookies = LinkedHashMap<String, String>()
+        while (redirects < 12) {
+            val conn = (URL(current).openConnection() as HttpURLConnection).apply {
+                requestMethod = method; instanceFollowRedirects = false; connectTimeout = 15_000; readTimeout = 25_000
+                setRequestProperty("User-Agent", userAgent); setRequestProperty("Accept", "*/*"); setRequestProperty("Accept-Encoding", "identity"); setRequestProperty("Connection", "keep-alive")
+                if (cookies.isNotEmpty()) setRequestProperty("Cookie", cookies.entries.joinToString("; ") { "${it.key}=${it.value}" })
+                if (rangeHeader != null) setRequestProperty("Range", rangeHeader)
+            }
             val code = conn.responseCode
-            val finalUrl = conn.url.toString()
-            val cType = conn.contentType.orEmpty().lowercase()
-            if (cType.contains("text/html")) {
-                return ProbeResult(finalUrl, -1L, false, true)
-            }
-            if (code == 206) {
-                val cr = conn.getHeaderField("Content-Range").orEmpty()
-                val total = cr.substringAfter('/', "").trim().toLongOrNull() ?: -1L
-                return ProbeResult(finalUrl, total, total > 0L, false)
-            }
-            if (code in 200..299) {
-                val len = conn.contentLengthLong
-                return ProbeResult(finalUrl, len, false, false)
-            }
-            throw IllegalStateException("Server returned HTTP $code")
-        } finally {
-            conn.disconnect()
+            conn.headerFields["Set-Cookie"]?.forEach { rc -> val pair = rc.substringBefore(';').trim(); val eq = pair.indexOf('='); if (eq > 0) cookies[pair.substring(0, eq).trim()] = pair.substring(eq + 1).trim() }
+            if (code in listOf(301, 302, 303, 307, 308)) { val loc = conn.getHeaderField("Location"); conn.disconnect(); if (loc.isNullOrBlank()) throw IllegalStateException("Redirect without Location header"); current = URL(URL(current), loc).toString(); redirects++ } else return conn
         }
+        throw IllegalStateException("Too many redirects (12+)")
+    }
+    private data class ProbeResult(val finalUrl: String, val totalBytes: Long, val acceptsRanges: Boolean, val isHtmlPage: Boolean, val httpCode: Int = 200, val contentType: String = "", val negotiatedUserAgent: String = BROWSER_UA)
+    private fun extractMirrorUrlFromHtml(baseUrl: String, html: String): String? {
+        Regex("""<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["'][^"']*url=([^"'\s>]+)""", RegexOption.IGNORE_CASE).find(html)?.groupValues?.getOrNull(1)?.let { raw ->
+            val clean = raw.replace("&amp;", "&").trim(); if (clean.startsWith("http") || clean.startsWith("/")) return runCatching { URL(URL(baseUrl), clean).toString() }.getOrNull()
+        }
+        return Regex("""href=["'](https?://[^"']+\.(?:iso|img|iso\.zip|img\.zip)(?:\?[^"']*)?)["']""", RegexOption.IGNORE_CASE).find(html)?.groupValues?.getOrNull(1)?.replace("&amp;", "&")
+    }
+    private fun probeWithUa(urlStr: String, ua: String): Pair<ProbeResult, String?> {
+        runCatching {
+            val conn = openFollowingRedirects(urlStr, "HEAD", userAgent = ua)
+            try {
+                val code = conn.responseCode; val cType = conn.contentType.orEmpty().lowercase()
+                if (code in 200..299 && !cType.contains("text/html")) {
+                    val len = conn.contentLengthLong; val acceptRanges = conn.getHeaderField("Accept-Ranges")?.equals("bytes", true) == true
+                    if (len > 0L && acceptRanges) return ProbeResult(conn.url.toString(), len, true, false, code, cType, ua) to null
+                }
+            } finally { conn.disconnect() }
+        }
+        val conn = openFollowingRedirects(urlStr, "GET", rangeHeader = "bytes=0-32767", userAgent = ua)
+        try {
+            val code = conn.responseCode; val finalUrl = conn.url.toString(); val cType = conn.contentType.orEmpty().lowercase()
+            if (cType.contains("text/html") || cType.contains("application/xhtml")) {
+                val snippet = runCatching { val buf = ByteArray(32_768); val n = conn.inputStream.read(buf); if (n > 0) String(buf, 0, n, Charsets.UTF_8) else "" }.getOrDefault("")
+                return ProbeResult(finalUrl, -1L, false, true, code, cType, ua) to extractMirrorUrlFromHtml(finalUrl, snippet)
+            }
+            if (code == 206) { val total = conn.getHeaderField("Content-Range").orEmpty().substringAfter('/', "").trim().toLongOrNull() ?: -1L; return ProbeResult(finalUrl, total, total > 0L, false, code, cType, ua) to null }
+            if (code in 200..299) return ProbeResult(finalUrl, conn.contentLengthLong, false, false, code, cType, ua) to null
+            throw IllegalStateException("Server returned HTTP $code ($finalUrl)")
+        } finally { conn.disconnect() }
+    }
+    private fun probeServer(urlStr: String): ProbeResult {
+        val uaOrder = if (prefersCliUserAgent(urlStr)) listOf(WGET_UA, CURL_UA, BROWSER_UA) else listOf(BROWSER_UA, WGET_UA, CURL_UA)
+        var lastProbe = ProbeResult(urlStr, -1L, false, true, 0, "unknown", uaOrder.first()); var extractedMirror: String? = null; var lastException: Exception? = null
+        for (ua in uaOrder) {
+            try {
+                val (res, mirror) = probeWithUa(urlStr, ua); lastProbe = res
+                if (mirror != null && extractedMirror == null) extractedMirror = mirror
+                if (!res.isHtmlPage) { if (ua != uaOrder.first()) logDl("Negotiated binary stream with UA=$ua -> ${res.finalUrl}"); return res }
+                logDl("Host returned HTML (${res.httpCode}, ${res.contentType}) with UA=$ua; trying fallback...")
+            } catch (e: Exception) { lastException = e; logDl("Probe attempt with UA=$ua failed: ${e.message}", isError = true) }
+        }
+        if (!extractedMirror.isNullOrBlank() && extractedMirror != urlStr) {
+            logDl("Found mirror redirect in HTML -> $extractedMirror")
+            runCatching { val (res, _) = probeWithUa(extractedMirror, WGET_UA); if (!res.isHtmlPage) return res }
+        }
+        if (lastProbe.httpCode == 0 && lastException != null) throw lastException
+        return lastProbe
     }
 
     fun start(
@@ -395,7 +428,8 @@ object FastIsoDownloader {
         autoMount: Boolean = true,
         autoVerifySha256: Boolean = true,
         onComplete: (DownloadCompletionEvent) -> Unit,
-        onError: (String) -> Unit
+        onError: (String) -> Unit,
+        onLog: (LogEntry) -> Unit = {}
     ) {
         cancel(deleteTemp = true)
         pausedFlag.set(false)
@@ -413,6 +447,8 @@ object FastIsoDownloader {
         cachedTargetMultiBootPath = targetMultiBootPath.trim()
         cachedOnComplete = onComplete
         cachedOnError = onError
+        cachedOnLog = onLog
+        cachedUserAgent = BROWSER_UA
 
         _state.value = TurboDownloadState(
             title = title,
@@ -428,15 +464,25 @@ object FastIsoDownloader {
 
         currentJob = scope.launch {
             try {
-                val probe = probeServer(url.trim())
+                val normalized = normalizeDownloadUrl(url)
+                logDl("Starting download: $title ($normalized)")
+                val (resolvedUrl, dynamicSha, dynamicName) = resolveDynamicApiUrl(normalized)
+                if (!dynamicSha.isNullOrBlank() && cachedExpectedSha256.isBlank()) cachedExpectedSha256 = dynamicSha.lowercase()
+                if (!dynamicName.isNullOrBlank() && (cleanName.startsWith("pop-os_latest", true) || cleanName.startsWith("tails-amd64-latest", true))) { _state.value = _state.value?.copy(fileName = dynamicName) }
+                val probe = probeServer(resolvedUrl)
                 if (probe.isHtmlPage) {
-                    throw IllegalStateException("Host returned a web page instead of a direct ISO stream. Use All Channels or Copy Link.")
+                    val isMsLink = resolvedUrl.contains("microsoft.com", true) || resolvedUrl.contains("software-static", true)
+                    val hint = if (isMsLink) "Use All Channels or Copy Link." else "Check Activity Log for the resolved URL or try another mirror."
+                    val msg = "Server returned a web page (HTTP ${probe.httpCode}, ${probe.contentType.ifBlank { "text/html" }}) instead of an ISO file. $hint"
+                    logDl("HTML rejection at ${probe.finalUrl} (HTTP ${probe.httpCode}, ${probe.contentType})", isError = true)
+                    throw IllegalStateException(msg)
                 }
+                cachedUserAgent = probe.negotiatedUserAgent
                 val total = if (probe.totalBytes > 0L) probe.totalBytes else approxBytes
                 val useThreads = if (probe.acceptsRanges && probe.totalBytes >= 4L * 1024L * 1024L) clampedThreads else 1
-
                 cachedFinalUrl = probe.finalUrl
                 cachedTotalBytes = probe.totalBytes
+                logDl("Resolved stream: ${probe.finalUrl} (${UsbGadgetEngine.formatBytes(total)}, range=${probe.acceptsRanges}, ${useThreads}x)")
 
                 val dlDir = stagingDir(context)
                 val tmpFile = File(dlDir, "$cleanName.part")
@@ -480,6 +526,7 @@ object FastIsoDownloader {
                 saveSidecarMeta()
                 _state.value = null
                 cachedContext?.let { TurboDownloadService.stop(it) }
+                logDl("Download failed: ${e.message ?: "Network error"}", isError = true)
                 onError("Download failed: ${e.message ?: "Network error"}")
             }
         }
@@ -716,8 +763,12 @@ object FastIsoDownloader {
         }
 
         runCatching { sidecarFile?.delete() }
-        stagingFile = null
-        sidecarFile = null
+        stagingFile = null; sidecarFile = null
+        var effectiveSavedPath = savedPath; var effectiveFileName = finalState.fileName
+        if (effectiveFileName.endsWith(".iso.zip", true) || effectiveFileName.endsWith(".img.zip", true)) {
+            _state.value = finalState.copy(statusText = "Extracting ISO from zip archive...")
+            extractImageFromZipArchive(ctx, effectiveSavedPath, targetDir)?.let { effectiveSavedPath = it; effectiveFileName = it.substringAfterLast('/'); logDl("Auto-extracted archive -> $effectiveFileName") }
+        }
 
         var computedHash: String? = null
         var checksumStatus = ChecksumVerifyStatus.NONE
@@ -730,7 +781,7 @@ object FastIsoDownloader {
             _state.value = verifyState
             NotificationHelper.updateDownloadProgress(ctx, verifyState)
 
-            computedHash = UsbGadgetEngine.computeSha256(savedPath)?.trim()?.lowercase()
+            computedHash = UsbGadgetEngine.computeSha256(effectiveSavedPath)?.trim()?.lowercase()
             checksumStatus = when {
                 computedHash == null -> ChecksumVerifyStatus.NONE
                 cachedExpectedSha256.isNotBlank() && computedHash.equals(cachedExpectedSha256, ignoreCase = true) ->
@@ -759,7 +810,7 @@ object FastIsoDownloader {
                 val addRes = VentoyImageBuilder.addIsoToVentoy(
                     context = ctx,
                     ventoyImgPath = mbPath,
-                    sourceIsoPath = savedPath,
+                    sourceIsoPath = effectiveSavedPath,
                     moveFile = true,
                     onProgress = { p ->
                         val st = _state.value?.copy(statusText = p.detail.ifBlank { p.stage })
@@ -774,8 +825,8 @@ object FastIsoDownloader {
 
         val completion = DownloadCompletionEvent(
             title = finalState.title,
-            fileName = finalState.fileName,
-            savedPath = savedPath,
+            fileName = effectiveFileName,
+            savedPath = effectiveSavedPath,
             injectedMultiBootPath = injectedMultiBoot,
             computedSha256 = computedHash,
             expectedSha256 = cachedExpectedSha256.ifBlank { null },
@@ -795,6 +846,30 @@ object FastIsoDownloader {
         NotificationHelper.showDownloadComplete(ctx, finalState.title, notifSub)
         cachedOnComplete?.invoke(completion)
     }
+
+    private fun extractImageFromZipArchive(context: Context, zipPath: String, targetDir: String): String? = runCatching {
+        val localZip = File(zipPath.replaceFirst("/data/media/0", "/storage/emulated/0"))
+        val stagedZip = File(context.cacheDir, "pb_extract_in.zip")
+        val qZip = "'${zipPath.replace("'", "'\\''")}'"
+        if (!localZip.canRead()) Shell.cmd("cp -f $qZip '${stagedZip.absolutePath.replace("'", "'\\''")}' 2>/dev/null").exec()
+        val srcFile = if (localZip.canRead()) localZip else stagedZip
+        if (!srcFile.exists()) return null
+        var extractedName: String? = null
+        val outTmp = File(context.cacheDir, "pb_extract_out.bin")
+        ZipInputStream(srcFile.inputStream().buffered()).use { zis ->
+            while (true) {
+                val entry = zis.nextEntry ?: break
+                if (!entry.isDirectory) {
+                    val ename = entry.name.substringAfterLast('/')
+                    if (ename.endsWith(".iso", true) || ename.endsWith(".img", true)) { extractedName = ename; outTmp.outputStream().buffered().use { zis.copyTo(it) }; break }
+                }
+            }
+        }
+        stagedZip.delete()
+        val finalName = extractedName ?: return null
+        val finalOutPath = "${targetDir.trimEnd('/')}/$finalName"
+        if (Shell.cmd("mv -f '${outTmp.absolutePath.replace("'", "'\\''")}' '${finalOutPath.replace("'", "'\\''")}' && rm -f $qZip").exec().isSuccess) { UsbGadgetEngine.fixUserStoragePermissions(context, finalOutPath, false); finalOutPath } else { outTmp.delete(); null }
+    }.getOrNull()
 
     private fun downloadChunkWithRetries(file: File, idx: Int, totalCounter: AtomicLong) {
         val end = chunkEnds[idx]

@@ -144,6 +144,7 @@ object PreFlightDiagnostics {
         val hasNtfs3g = File(libDir, "libntfs_3g.so").exists()
         val hasMsSys = File(libDir, "libms_sys.so").exists()
         val hasExfatBin = File(libDir, "libmkfs_exfat.so").exists()
+        val hasFatBin = File(libDir, "libmkfs_fat.so").exists()
         val hasNtfsResize = File(libDir, "libntfsresize.so").exists()
         val hasUefiAsset = runCatching { context.assets.open("uefi-ntfs.img").use { it.available() > 0 } }.getOrDefault(false)
 
@@ -165,7 +166,7 @@ object PreFlightDiagnostics {
             )
         )
 
-        val toolDetail = "Extractor=${if (has7z) "OK" else "NO"} • NTFS=${if (hasNtfs && hasNtfs3g) "OK" else "NO"} • Resize=${if (hasNtfsResize) "OK" else "NO"} • exFAT=${if (hasExfatBin) "OK" else "NO"} • MBR=${if (hasMsSys) "OK" else "NO"} • UEFI=${if (hasUefiAsset) "OK" else "NO"}"
+        val toolDetail = "Extractor=${if (has7z) "OK" else "NO"} • NTFS=${if (hasNtfs && hasNtfs3g) "OK" else "NO"} • Resize=${if (hasNtfsResize) "OK" else "NO"} • exFAT=${if (hasExfatBin) "OK" else "NO"} • FAT32=${if (hasFatBin) "OK" else "NO"} • MBR=${if (hasMsSys) "OK" else "NO"} • UEFI=${if (hasUefiAsset) "OK" else "NO"}"
         items.add(
             DiagCheckItem(
                 title = "Bundled Static ARM64 Tools",
@@ -225,7 +226,7 @@ object PreFlightDiagnostics {
 
     fun formatReport(items: List<DiagCheckItem>): String {
         val sb = StringBuilder()
-        sb.appendLine("PocketBoot v4.3.2 Pre-Flight Diagnostic Report")
+        sb.appendLine("PocketBoot v4.4.0 Pre-Flight Diagnostic Report")
         sb.appendLine("Device: ${Build.MANUFACTURER} ${Build.MODEL} (Android ${Build.VERSION.RELEASE}, API ${Build.VERSION.SDK_INT}, ABI ${Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"})")
         sb.appendLine("---")
         items.forEach { item ->

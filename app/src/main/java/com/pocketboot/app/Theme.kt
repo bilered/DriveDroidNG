@@ -154,10 +154,11 @@ fun buildPocketPalette(
     val accent = if (isDark) {
         if (baseAccent.luminance() < 0.22f) blend(baseAccent, Color.White, 0.28f) else baseAccent
     } else {
-        if (baseAccent.luminance() > 0.62f) blend(baseAccent, Color.Black, 0.42f) else baseAccent
+        if (baseAccent.luminance() > 0.56f) blend(baseAccent, Color.Black, 0.46f) else baseAccent
     }
 
-    val onAccent = if (accent.luminance() > 0.48f) Color(0xFF09090B) else Color.White
+    val onAccent = if (accent.luminance() > 0.45f) Color(0xFF09090B) else Color.White
+    val darkAccentSoft = if (accent.luminance() > 0.55f) blend(accent, Color.White, 0.14f) else blend(accent, Color.White, 0.34f)
 
     return when (surfaceMode) {
         SurfaceMode.LIGHT -> PocketPalette(
@@ -197,8 +198,8 @@ fun buildPocketPalette(
             surfaceInput = Color(0xFF0E121B),
             border = Color(0xFF263044),
             accent = accent,
-            accentSoft = blend(accent, Color.White, 0.34f),
-            accentBg = blend(accent, Color(0xFF0A0D13), 0.78f),
+            accentSoft = darkAccentSoft,
+            accentBg = blend(accent, Color(0xFF0A0D13), 0.84f),
             onAccent = onAccent,
             success = Color(0xFF10B981),
             successBg = Color(0xFF0B2B22),
@@ -226,8 +227,8 @@ fun buildPocketPalette(
             surfaceInput = Color(0xFF06080C),
             border = Color(0xFF202838),
             accent = accent,
-            accentSoft = blend(accent, Color.White, 0.34f),
-            accentBg = blend(accent, Color(0xFF000000), 0.80f),
+            accentSoft = darkAccentSoft,
+            accentBg = blend(accent, Color(0xFF000000), 0.85f),
             onAccent = onAccent,
             success = Color(0xFF10B981),
             successBg = Color(0xFF062119),

@@ -32,6 +32,7 @@ import androidx.compose.material.icons.rounded.BookmarkAdd
 import androidx.compose.material.icons.rounded.Build
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material.icons.rounded.ExpandMore
@@ -50,6 +51,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
@@ -93,25 +95,25 @@ data class WindowsEditionItem(
 )
 
 data class WindowsBuildConfig(
-    val isoFile: ImageFile,
-    val outputDir: String,
-    val outputName: String,
+    val isoFile: ImageFile, val outputDir: String, val outputName: String,
     val scheme: PartitionScheme = PartitionScheme.GPT,
-    val selectedEditionIndex: Int? = null,
-    val selectedEditionName: String? = null,
-    val bypassRequirements: Boolean = true,
-    val bypassMicrosoftAccount: Boolean = true,
-    val disableDataCollection: Boolean = true,
-    val disableBitLocker: Boolean = true,
-    val disableSponsoredApps: Boolean = false,
-    val classicContextMenu: Boolean = false,
-    val skipWifiSetup: Boolean = true,
-    val createLocalUser: Boolean = false,
-    val localUsername: String = "",
-    val localPassword: String = "",
-    val skipOobe: Boolean = false,
-    val extraDriversDir: String = "",
-    val autoMountAfterBuild: Boolean = true
+    val selectedEditionIndex: Int? = null, val selectedEditionName: String? = null,
+    val osKind: WindowsOsKind = WindowsOsKind.WIN11, val arch: String = "amd64",
+    val experience: WindowsExperienceConfig = WindowsExperienceConfig(),
+    val winUtil: WinUtilTweaksConfig = WinUtilTweaksConfig(),
+    val eiCfgUnlock: Boolean = false,
+    val bypassRequirements: Boolean = experience.bypassRequirements,
+    val bypassMicrosoftAccount: Boolean = experience.bypassMicrosoftAccount,
+    val disableDataCollection: Boolean = experience.disableDataCollection,
+    val disableBitLocker: Boolean = experience.disableBitLocker,
+    val disableSponsoredApps: Boolean = experience.disableSponsoredApps,
+    val classicContextMenu: Boolean = experience.classicContextMenu,
+    val skipWifiSetup: Boolean = experience.skipWifiSetup,
+    val createLocalUser: Boolean = experience.createLocalUser,
+    val localUsername: String = experience.localUsername,
+    val localPassword: String = experience.localPassword,
+    val skipOobe: Boolean = experience.skipOobe,
+    val extraDriversDir: String = "", val autoMountAfterBuild: Boolean = true
 )
 
 data class WindowsBuildProgress(
@@ -275,154 +277,10 @@ object WindowsImageBuilder {
         }
     }
 
-    fun generateAutounattendXml(config: WindowsBuildConfig): String {
-        val peCommands = mutableListOf<Pair<String, String>>()
-        if (config.bypassRequirements) {
-            peCommands.add("Bypass TPM Check" to """reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassTPMCheck /t REG_DWORD /d 1 /f""")
-            peCommands.add("Bypass Secure Boot Check" to """reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassSecureBootCheck /t REG_DWORD /d 1 /f""")
-            peCommands.add("Bypass RAM Check" to """reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassRAMCheck /t REG_DWORD /d 1 /f""")
-            peCommands.add("Bypass CPU Check" to """reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassCPUCheck /t REG_DWORD /d 1 /f""")
-            peCommands.add("Bypass Storage Check" to """reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassStorageCheck /t REG_DWORD /d 1 /f""")
-        }
-
-        val specCommands = mutableListOf<Pair<String, String>>()
-        if (config.bypassMicrosoftAccount) {
-            specCommands.add("Bypass Microsoft Account (OOBE)" to """reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE" /v BypassNRO /t REG_DWORD /d 1 /f""")
-        }
-        if (config.disableBitLocker) {
-            specCommands.add("Disable Automatic BitLocker" to """reg add "HKLM\SYSTEM\CurrentControlSet\Control\BitLocker" /v PreventDeviceEncryption /t REG_DWORD /d 1 /f""")
-        }
-        if (config.disableDataCollection) {
-            specCommands.add("Disable Telemetry" to """reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection" /v AllowTelemetry /t REG_DWORD /d 0 /f""")
-        }
-        if (config.disableSponsoredApps) {
-            specCommands.add("Disable Consumer Features" to """reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\CloudContent" /v DisableWindowsConsumerFeatures /t REG_DWORD /d 1 /f""")
-        }
-
-        val firstLogonCommands = mutableListOf<Pair<String, String>>()
-        if (config.disableSponsoredApps) {
-            firstLogonCommands.add("Disable Silent App Installs" to """reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" /v SilentInstalledAppsEnabled /t REG_DWORD /d 0 /f""")
-        }
-        if (config.classicContextMenu) {
-            firstLogonCommands.add("Restore Classic Context Menu" to """reg add "HKCU\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32" /f /ve""")
-        }
-
-        val sb = StringBuilder()
-        sb.appendLine("""<?xml version="1.0" encoding="utf-8"?>""")
-        sb.appendLine("""<unattend xmlns="urn:schemas-microsoft-com:unattend">""")
-
-        if (peCommands.isNotEmpty() || config.selectedEditionIndex != null) {
-            sb.appendLine("""  <settings pass="windowsPE">""")
-            sb.appendLine("""    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">""")
-            if (config.selectedEditionIndex != null) {
-                sb.appendLine("""      <ImageInstall>""")
-                sb.appendLine("""        <OSImage>""")
-                sb.appendLine("""          <InstallFrom>""")
-                sb.appendLine("""            <MetaData wcm:action="add">""")
-                sb.appendLine("""              <Key>/IMAGE/INDEX</Key>""")
-                sb.appendLine("""              <Value>${config.selectedEditionIndex}</Value>""")
-                sb.appendLine("""            </MetaData>""")
-                sb.appendLine("""          </InstallFrom>""")
-                sb.appendLine("""        </OSImage>""")
-                sb.appendLine("""      </ImageInstall>""")
-                sb.appendLine("""      <UserData>""")
-                sb.appendLine("""        <AcceptEula>true</AcceptEula>""")
-                sb.appendLine("""        <ProductKey>""")
-                sb.appendLine("""          <Key></Key>""")
-                sb.appendLine("""          <WillShowUI>Never</WillShowUI>""")
-                sb.appendLine("""        </ProductKey>""")
-                sb.appendLine("""      </UserData>""")
-            }
-            if (peCommands.isNotEmpty()) {
-                sb.appendLine("""      <RunSynchronous>""")
-                peCommands.forEachIndexed { idx, (desc, cmd) ->
-                    sb.appendLine("""        <RunSynchronousCommand wcm:action="add">""")
-                    sb.appendLine("""          <Order>${idx + 1}</Order>""")
-                    sb.appendLine("""          <Description>$desc</Description>""")
-                    sb.appendLine("""          <Path>$cmd</Path>""")
-                    sb.appendLine("""        </RunSynchronousCommand>""")
-                }
-                sb.appendLine("""      </RunSynchronous>""")
-            }
-            sb.appendLine("""    </component>""")
-            sb.appendLine("""  </settings>""")
-        }
-
-        if (specCommands.isNotEmpty()) {
-            sb.appendLine("""  <settings pass="specialize">""")
-            sb.appendLine("""    <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">""")
-            sb.appendLine("""      <RunSynchronous>""")
-            specCommands.forEachIndexed { idx, (desc, cmd) ->
-                sb.appendLine("""        <RunSynchronousCommand wcm:action="add">""")
-                sb.appendLine("""          <Order>${idx + 1}</Order>""")
-                sb.appendLine("""          <Description>$desc</Description>""")
-                sb.appendLine("""          <Path>$cmd</Path>""")
-                sb.appendLine("""        </RunSynchronousCommand>""")
-            }
-            sb.appendLine("""      </RunSynchronous>""")
-            sb.appendLine("""    </component>""")
-            sb.appendLine("""  </settings>""")
-        }
-
-        val cleanUser = if (config.createLocalUser) config.localUsername.trim().take(20) else ""
-        val needOobePass = config.disableDataCollection || config.bypassMicrosoftAccount ||
-            config.skipWifiSetup || config.skipOobe || cleanUser.isNotEmpty() || firstLogonCommands.isNotEmpty()
-
-        if (needOobePass) {
-            sb.appendLine("""  <settings pass="oobeSystem">""")
-            sb.appendLine("""    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">""")
-            sb.appendLine("""      <OOBE>""")
-            if (config.disableDataCollection || config.skipOobe) {
-                sb.appendLine("""        <HideEULAPage>true</HideEULAPage>""")
-                sb.appendLine("""        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>""")
-                sb.appendLine("""        <ProtectYourPC>3</ProtectYourPC>""")
-            }
-            if (config.bypassMicrosoftAccount || config.skipOobe) {
-                sb.appendLine("""        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>""")
-            }
-            if (config.skipWifiSetup || config.bypassMicrosoftAccount || config.skipOobe) {
-                sb.appendLine("""        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>""")
-            }
-            if (config.skipOobe) {
-                sb.appendLine("""        <SkipMachineOOBE>true</SkipMachineOOBE>""")
-                sb.appendLine("""        <SkipUserOOBE>true</SkipUserOOBE>""")
-            }
-            sb.appendLine("""      </OOBE>""")
-            if (cleanUser.isNotEmpty()) {
-                val safeUser = xmlEscape(cleanUser)
-                val safePass = xmlEscape(config.localPassword.take(32))
-                sb.appendLine("""      <UserAccounts>""")
-                sb.appendLine("""        <LocalAccounts>""")
-                sb.appendLine("""          <LocalAccount wcm:action="add">""")
-                sb.appendLine("""            <Name>$safeUser</Name>""")
-                sb.appendLine("""            <DisplayName>$safeUser</DisplayName>""")
-                sb.appendLine("""            <Group>Administrators</Group>""")
-                sb.appendLine("""            <Password>""")
-                sb.appendLine("""              <Value>$safePass</Value>""")
-                sb.appendLine("""              <PlainText>true</PlainText>""")
-                sb.appendLine("""            </Password>""")
-                sb.appendLine("""          </LocalAccount>""")
-                sb.appendLine("""        </LocalAccounts>""")
-                sb.appendLine("""      </UserAccounts>""")
-            }
-            if (firstLogonCommands.isNotEmpty()) {
-                sb.appendLine("""      <FirstLogonCommands>""")
-                firstLogonCommands.forEachIndexed { idx, (desc, cmd) ->
-                    sb.appendLine("""        <SynchronousCommand wcm:action="add">""")
-                    sb.appendLine("""          <Order>${idx + 1}</Order>""")
-                    sb.appendLine("""          <Description>$desc</Description>""")
-                    sb.appendLine("""          <CommandLine>$cmd</CommandLine>""")
-                    sb.appendLine("""        </SynchronousCommand>""")
-                }
-                sb.appendLine("""      </FirstLogonCommands>""")
-            }
-            sb.appendLine("""    </component>""")
-            sb.appendLine("""  </settings>""")
-        }
-
-        sb.appendLine("""</unattend>""")
-        return sb.toString()
-    }
+    fun generateAutounattendXml(config: WindowsBuildConfig): String = WindowsCustomizationEngine.generateAutounattendXml(
+        experience = config.experience, winUtil = config.winUtil, arch = config.arch,
+        selectedEditionIndex = config.selectedEditionIndex, hasSpecializeScript = config.experience.hasAnyActive() || config.winUtil.hasAnyActive(), hasOemUpdates = false
+    )
 
     private fun loadUefiNtfsImage(context: Context): ByteArray? {
         runCatching {
@@ -764,36 +622,38 @@ object WindowsImageBuilder {
             }
             entries.add(LogEntry(ts, "win-build", "Extracted Windows ISO contents into Partition 1"))
 
-            val anyBypass = config.bypassRequirements || config.bypassMicrosoftAccount ||
-                config.disableDataCollection || config.disableBitLocker ||
-                config.disableSponsoredApps || config.classicContextMenu ||
-                config.skipWifiSetup || (config.createLocalUser && config.localUsername.isNotBlank()) ||
-                config.skipOobe || config.selectedEditionIndex != null
+            val wimBin = findBundledBinary(context, "libwimlib_imagex.so", listOf("wimlib-imagex"))
+            val installWimCandidate = Shell.cmd("ls $TEMP_MNT/sources/install.wim $TEMP_MNT/sources/install.esd $TEMP_MNT/SOURCES/INSTALL.WIM $TEMP_MNT/SOURCES/INSTALL.ESD 2>/dev/null | head -n 1").exec().out.firstOrNull().orEmpty().trim()
+            if (wimBin != null && installWimCandidate.isNotBlank()) {
+                Shell.cmd(WindowsCustomizationEngine.applyWin7UefiFixSnippet(shellQuote(wimBin), shellQuote(installWimCandidate), TEMP_MNT)).exec()
+                    .out.filter { it.startsWith("LOG|") }.forEach { l -> val p = l.split("|", limit = 3); if (p.size == 3) entries.add(LogEntry(ts, p[1], p[2])) }
+            }
+            if (config.experience.useCa2023Bootloaders && wimBin != null && installWimCandidate.isNotBlank()) {
+                onProgress(WindowsBuildProgress("Applying CA 2023 bootloaders...", "Extracting bootmgfw_EX.efi", 0.83f, false))
+                Shell.cmd(WindowsCustomizationEngine.applyCa2023BootloadersSnippet(shellQuote(wimBin), shellQuote(installWimCandidate), TEMP_MNT)).exec()
+                    .out.filter { it.startsWith("LOG|") }.forEach { l -> val p = l.split("|", limit = 3); if (p.size == 3) entries.add(LogEntry(ts, p[1], p[2])) }
+            }
+            val anyBypass = config.experience.hasAnyActive() || config.winUtil.hasAnyActive() || config.selectedEditionIndex != null
             if (anyBypass) {
-                onProgress(WindowsBuildProgress("Applying Windows bypasses...", "Writing autounattend.xml", 0.85f, false))
-                val xml = generateAutounattendXml(config)
-                val tmpXml = File(context.cacheDir, "autounattend.xml")
-                tmpXml.writeText(xml, Charsets.UTF_8)
-                val qXml = shellQuote(tmpXml.absolutePath)
+                onProgress(WindowsBuildProgress("Applying Windows tweaks...", "Writing autounattend.xml & scripts", 0.85f, false))
+                val tmpXml = File(context.cacheDir, "autounattend.xml").apply { writeText(generateAutounattendXml(config), Charsets.UTF_8) }
                 val oemPanther = "$TEMP_MNT/sources/\$OEM\$/\$\$/Panther"
-                val qOemDir = shellQuote(oemPanther)
-                val qOemFile = shellQuote("$oemPanther/unattend.xml")
-                Shell.cmd(
-                    """
-                    cp $qXml $TEMP_MNT/autounattend.xml &&
-                    mkdir -p $qOemDir &&
-                    cp $qXml $qOemFile
-                    """.trimIndent()
-                ).exec()
-                tmpXml.delete()
-                if (config.selectedEditionIndex != null) {
-                    val tmpEi = File(context.cacheDir, "ei.cfg")
-                    tmpEi.writeText("[Channel]\r\n_Default\r\n[VL]\r\n0\r\n", Charsets.UTF_8)
-                    Shell.cmd("mkdir -p $TEMP_MNT/sources && cp ${shellQuote(tmpEi.absolutePath)} $TEMP_MNT/sources/ei.cfg").exec()
-                    tmpEi.delete()
-                    entries.add(LogEntry(ts, "win-build", "Preselected Windows edition #${config.selectedEditionIndex} (${config.selectedEditionName ?: ""}) + wrote sources/ei.cfg"))
-                }
-                entries.add(LogEntry(ts, "win-build", "Injected autounattend.xml (TPM=${config.bypassRequirements}, MSA=${config.bypassMicrosoftAccount}, Edition=${config.selectedEditionIndex ?: "ask"}, User=${if (config.createLocalUser) config.localUsername.ifBlank { "none" } else "none"})"))
+                val oemScripts = "$TEMP_MNT/sources/\$OEM\$/\$\$/Setup/Scripts"
+                val oemCustom = "$TEMP_MNT/sources/\$OEM\$/\$\$/Setup/Custom"
+                val tmpSpec = File(context.cacheDir, "PocketBoot_Specialize.cmd").apply { writeText(WindowsCustomizationEngine.buildSpecializeScript(config.experience, config.winUtil), Charsets.UTF_8) }
+                val customPath = config.experience.customPostInstallScriptPath.trim()
+                val customFileName = if (customPath.isNotBlank()) customPath.substringAfterLast('/') else ""
+                val tmpComp = File(context.cacheDir, "SetupComplete.cmd").apply { writeText(WindowsCustomizationEngine.buildSetupCompleteScript(false, customFileName.isNotBlank(), customFileName), Charsets.UTF_8) }
+                val customCopyCmd = if (customPath.isNotBlank()) "mkdir -p ${shellQuote(oemCustom)} && cp -f ${shellQuote(UsbGadgetEngine.resolveDirectPath(customPath))} ${shellQuote(oemCustom)}/ 2>/dev/null || true" else "true"
+                Shell.cmd("cp ${shellQuote(tmpXml.absolutePath)} $TEMP_MNT/autounattend.xml && mkdir -p ${shellQuote(oemPanther)} ${shellQuote(oemScripts)} && cp ${shellQuote(tmpXml.absolutePath)} ${shellQuote("$oemPanther/unattend.xml")} && cp ${shellQuote(tmpSpec.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_Specialize.cmd")} && cp ${shellQuote(tmpComp.absolutePath)} ${shellQuote("$oemScripts/SetupComplete.cmd")} && $customCopyCmd").exec()
+                tmpXml.delete(); tmpSpec.delete(); tmpComp.delete()
+                entries.add(LogEntry(ts, "win-build", "Injected autounattend.xml (${config.arch}, Exp=${config.experience.activeCount()}, WinUtil=${config.winUtil.activeCount()})"))
+            }
+            if (config.selectedEditionIndex != null || config.eiCfgUnlock) {
+                val tmpEi = File(context.cacheDir, "ei.cfg").apply { writeText(if (config.eiCfgUnlock && config.selectedEditionIndex == null) "[Channel]\r\nRetail\r\n" else "[Channel]\r\n_Default\r\n[VL]\r\n0\r\n", Charsets.UTF_8) }
+                Shell.cmd("mkdir -p $TEMP_MNT/sources && cp ${shellQuote(tmpEi.absolutePath)} $TEMP_MNT/sources/ei.cfg").exec()
+                tmpEi.delete()
+                entries.add(LogEntry(ts, "win-build", "Wrote sources/ei.cfg"))
             }
 
             if (config.extraDriversDir.isNotBlank()) {
@@ -899,776 +759,137 @@ object WindowsImageBuilder {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun WindowsBuilderSheet(
-    isoFile: ImageFile,
-    defaultDir: String,
-    presets: List<AutounattendPreset>,
-    building: Boolean,
-    progress: WindowsBuildProgress,
-    onDismiss: () -> Unit,
-    onCancelBuild: () -> Unit,
-    onSavePreset: (AutounattendPreset) -> Unit,
-    onDeletePreset: (String) -> Unit,
-    onStartBuild: (WindowsBuildConfig) -> Unit
+    isoFile: ImageFile, defaultDir: String, presets: List<AutounattendPreset>, building: Boolean, progress: WindowsBuildProgress,
+    onDismiss: () -> Unit, onCancelBuild: () -> Unit, onSavePreset: (AutounattendPreset) -> Unit, onDeletePreset: (String) -> Unit, onStartBuild: (WindowsBuildConfig) -> Unit
 ) {
     val context = LocalContext.current
-    val baseName = remember(isoFile.name) {
-        isoFile.name.substringBeforeLast('.').take(36) + "-USB.img"
-    }
+    val detectedOs = remember(isoFile.name) { WindowsCustomizationEngine.detectWindowsOsKind(isoFile.name) }
+    val detectedArch = remember(isoFile.name) { WindowsCustomizationEngine.detectProcessorArchitecture(isoFile.name) }
+    val defaultScheme = remember(detectedOs, detectedArch) { if (detectedOs == WindowsOsKind.WIN7 || detectedArch == "x86") PartitionScheme.MBR else PartitionScheme.GPT }
+    val baseName = remember(isoFile.name) { isoFile.name.substringBeforeLast('.').take(36) + "-USB.img" }
     var outputName by remember(isoFile.path) { mutableStateOf(baseName) }
-    var scheme by remember { mutableStateOf(PartitionScheme.GPT) }
-
-    // Multi-edition ISO detection & preselection
+    var scheme by remember(isoFile.path) { mutableStateOf(defaultScheme) }
     var editions by remember(isoFile.path) { mutableStateOf<List<WindowsEditionItem>>(emptyList()) }
     var inspectingEditions by remember(isoFile.path) { mutableStateOf(true) }
-    var selectedEdition by remember(isoFile.path) { mutableStateOf<WindowsEditionItem?>(null) }
-    var editionMenuExpanded by remember { mutableStateOf(false) }
-
-    // Collapsible Windows Experience Dropdown state & toggles
-    var experienceExpanded by remember { mutableStateOf(false) }
-    var bypassRequirements by remember { mutableStateOf(true) }
-    var bypassMsa by remember { mutableStateOf(true) }
-    var disablePrivacy by remember { mutableStateOf(true) }
-    var disableBitLocker by remember { mutableStateOf(true) }
-    var disableSponsoredApps by remember { mutableStateOf(false) }
-    var classicContextMenu by remember { mutableStateOf(false) }
-    var skipWifiSetup by remember { mutableStateOf(true) }
-    var skipOobe by remember { mutableStateOf(false) }
-    var createLocalUser by remember { mutableStateOf(false) }
-    var localUsername by remember { mutableStateOf("") }
-    var localPassword by remember { mutableStateOf("") }
+    var selectedEditionIndex by remember(isoFile.path) { mutableStateOf<Int?>(null) }
+    var experience by remember(isoFile.path) { mutableStateOf(WindowsExperienceConfig.defaultForOs(detectedOs)) }
+    var winUtil by remember(isoFile.path) { mutableStateOf(WinUtilTweaksConfig()) }
+    var eiCfgUnlock by remember(isoFile.path) { mutableStateOf(false) }
+    var extraDriversDir by remember(isoFile.path) { mutableStateOf("") }
+    var showDriversFolderPicker by remember { mutableStateOf(false) }
     var autoMount by remember { mutableStateOf(true) }
 
-    var extraDriversDir by remember { mutableStateOf("") }
-    var showDriversDirDialog by remember { mutableStateOf(false) }
-    var showSavePresetDialog by remember { mutableStateOf(false) }
-    var newPresetName by remember { mutableStateOf("") }
-
-    LaunchedEffect(isoFile.path) {
-        inspectingEditions = true
-        editions = WindowsImageBuilder.inspectWindowsEditions(context, isoFile.path)
-        inspectingEditions = false
-    }
-
-    val activeTweaksCount = listOf(
-        bypassRequirements, bypassMsa, disablePrivacy, disableBitLocker,
-        disableSponsoredApps, classicContextMenu, skipWifiSetup, skipOobe,
-        createLocalUser && localUsername.isNotBlank()
-    ).count { it }
-
-    val estNeeded = remember(isoFile.sizeBytes) {
-        val ov = (isoFile.sizeBytes / 8L).coerceAtLeast(384L * 1024L * 1024L)
-        isoFile.sizeBytes + ov + (4L * 1024L * 1024L)
-    }
+    LaunchedEffect(isoFile.path) { inspectingEditions = true; editions = WindowsImageBuilder.inspectWindowsEditions(context, isoFile.path); inspectingEditions = false }
+    val estNeeded = isoFile.sizeBytes + (512L * 1024L * 1024L)
     val freeSpace = remember(defaultDir) { UsbGadgetEngine.getFreeSpaceBytes(defaultDir) }
     val lowSpace = freeSpace in 1 until estNeeded
 
-    ModalBottomSheet(
-        onDismissRequest = { if (!building) onDismiss() },
-        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
-        containerColor = PocketColors.surfaceCard
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 20.dp)
-                .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(13.dp)
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(42.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(PocketColors.infoBlueBg),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(Icons.Rounded.Build, null, tint = PocketColors.infoBlue, modifier = Modifier.size(22.dp))
-                }
-                Column(modifier = Modifier.weight(1f)) {
-                    Text("Windows USB Builder", style = MaterialTheme.typography.titleLarge, color = PocketColors.textPrimary)
-                    Text(
-                        text = "${isoFile.name} · ${UsbGadgetEngine.formatBytes(isoFile.sizeBytes)}",
-                        style = PocketColors.monoStyle,
-                        color = PocketColors.textSecondary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-            }
-
+    ModalBottomSheet(onDismissRequest = { if (!building) onDismiss() }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), containerColor = PocketColors.surfaceCard) {
+        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(13.dp)) {
+            PocketSheetHeader(icon = Icons.Rounded.Window, tint = PocketColors.infoBlue, iconBg = PocketColors.infoBlueBg, title = "Windows USB Builder", subtitle = "${detectedOs.label} ($detectedArch) · ${UsbGadgetEngine.formatBytes(isoFile.sizeBytes)}", subtitleMono = true)
             if (building) {
-                Surface(
-                    shape = RoundedCornerShape(14.dp),
-                    color = PocketColors.surfaceInput,
-                    border = BorderStroke(1.dp, PocketColors.accent)
-                ) {
-                    Column(
-                        modifier = Modifier.fillMaxWidth().padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
+                Surface(shape = RoundedCornerShape(14.dp), color = PocketColors.surfaceInput, border = BorderStroke(1.dp, PocketColors.accent)) {
+                    Column(modifier = Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         Text(progress.stage, style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary)
-                        if (progress.detail.isNotBlank()) {
-                            Text(progress.detail, style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary)
-                        }
-                        if (progress.isIndeterminate) {
-                            LinearProgressIndicator(
-                                modifier = Modifier.fillMaxWidth().height(7.dp).clip(RoundedCornerShape(999.dp)),
-                                color = PocketColors.accent,
-                                trackColor = PocketColors.surfaceSubtle
-                            )
-                        } else {
-                            LinearProgressIndicator(
-                                progress = { progress.progress.coerceIn(0f, 1f) },
-                                modifier = Modifier.fillMaxWidth().height(7.dp).clip(RoundedCornerShape(999.dp)),
-                                color = PocketColors.accent,
-                                trackColor = PocketColors.surfaceSubtle
-                            )
-                        }
-                        Text(
-                            text = "Keep PocketBoot open while building. Extraction typically takes 2–5 minutes.",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = PocketColors.textMuted
-                        )
+                        if (progress.detail.isNotBlank()) Text(progress.detail, style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary)
+                        if (progress.isIndeterminate) LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(7.dp).clip(RoundedCornerShape(999.dp)), color = PocketColors.accent, trackColor = PocketColors.surfaceSubtle)
+                        else LinearProgressIndicator(progress = { progress.progress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth().height(7.dp).clip(RoundedCornerShape(999.dp)), color = PocketColors.accent, trackColor = PocketColors.surfaceSubtle)
                     }
                 }
-
-                OutlinedButton(
-                    onClick = onCancelBuild,
-                    modifier = Modifier.fillMaxWidth().height(48.dp),
-                    shape = RoundedCornerShape(12.dp),
-                    border = BorderStroke(1.dp, PocketColors.danger)
-                ) {
-                    Icon(Icons.Rounded.Close, null, tint = PocketColors.danger, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Cancel Build", color = PocketColors.danger, fontWeight = FontWeight.SemiBold)
+                OutlinedButton(onClick = onCancelBuild, modifier = Modifier.fillMaxWidth().height(48.dp), shape = RoundedCornerShape(12.dp), border = BorderStroke(1.dp, PocketColors.danger)) {
+                    Icon(Icons.Rounded.Close, null, tint = PocketColors.danger, modifier = Modifier.size(18.dp)); Spacer(modifier = Modifier.width(6.dp)); Text("Cancel Build", color = PocketColors.danger, fontWeight = FontWeight.SemiBold)
                 }
             } else {
-                // Saved Presets Bar
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("Custom Presets", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
-                        TextButton(
-                            onClick = { showSavePresetDialog = true },
-                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
-                        ) {
-                            Icon(Icons.Rounded.BookmarkAdd, null, tint = PocketColors.accentSoft, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Save Current", fontSize = 12.sp, color = PocketColors.accentSoft)
-                        }
-                    }
-
-                    if (presets.isEmpty()) {
-                        Text(
-                            text = "Save bypass and username profiles for 1-tap reuse.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = PocketColors.textMuted
-                        )
-                    } else {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            presets.forEach { preset ->
-                                Surface(
-                                    shape = RoundedCornerShape(10.dp),
-                                    color = PocketColors.surfaceInput,
-                                    border = BorderStroke(0.5.dp, PocketColors.border)
-                                ) {
-                                    Row(
-                                        modifier = Modifier
-                                            .clickable {
-                                                scheme = runCatching { PartitionScheme.valueOf(preset.schemeName) }.getOrDefault(PartitionScheme.GPT)
-                                                bypassRequirements = preset.bypassRequirements
-                                                bypassMsa = preset.bypassMicrosoftAccount
-                                                disablePrivacy = preset.disableDataCollection
-                                                disableBitLocker = preset.disableBitLocker
-                                                disableSponsoredApps = preset.disableSponsoredApps
-                                                classicContextMenu = preset.classicContextMenu
-                                                skipWifiSetup = preset.skipWifiSetup
-                                                createLocalUser = preset.createLocalUser
-                                                localUsername = preset.localUsername
-                                                skipOobe = preset.skipOobe
-                                            }
-                                            .padding(start = 10.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                    ) {
-                                        Text(preset.name, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = PocketColors.textPrimary)
-                                        Icon(
-                                            imageVector = Icons.Rounded.DeleteOutline,
-                                            contentDescription = "Delete preset",
-                                            tint = PocketColors.textMuted,
-                                            modifier = Modifier.size(16.dp).clickable { onDeletePreset(preset.name) }
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Partition Scheme Selector
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    PocketSectionHeader("Partition Scheme")
+                    Text("Partition Scheme", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         PartitionScheme.entries.forEach { s ->
                             val selected = scheme == s
-                            Surface(
-                                modifier = Modifier.weight(1f).bounceClick { scheme = s },
-                                shape = RoundedCornerShape(12.dp),
-                                color = if (selected) PocketColors.accentBg else PocketColors.surfaceInput,
-                                border = BorderStroke(if (selected) 1.5.dp else 0.5.dp, if (selected) PocketColors.accent else PocketColors.border)
-                            ) {
-                                Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Surface(modifier = Modifier.weight(1f).bounceClick { scheme = s }, shape = RoundedCornerShape(12.dp), color = if (selected) PocketColors.accentBg else PocketColors.surfaceInput, border = BorderStroke(if (selected) 1.5.dp else 0.75.dp, if (selected) PocketColors.accent else PocketColors.border)) {
+                                Column(modifier = Modifier.padding(11.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                     Text(s.label, style = MaterialTheme.typography.labelLarge, color = if (selected) PocketColors.accentSoft else PocketColors.textPrimary)
-                                    Text(
-                                        text = if (s == PartitionScheme.GPT) "NTFS + UEFI Boot (Win 11)" else "NTFS + Legacy BIOS MBR",
-                                        fontSize = 11.sp,
-                                        color = PocketColors.textSecondary
-                                    )
+                                    Text(s.subtitle, fontSize = 10.5.sp, color = PocketColors.textSecondary)
                                 }
                             }
                         }
                     }
                 }
-
-                // Multi-Edition Preselection Dropdown (auto-detected from install.wim / install.esd)
-                if (inspectingEditions || editions.size > 1) {
+                if (inspectingEditions) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = PocketColors.accent); Text("Inspecting Windows editions...", style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary)
+                    }
+                } else if (editions.size >= 2) {
                     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text("Windows Edition", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
-                            if (editions.size > 1) {
-                                Text("${editions.size} editions in ISO", style = PocketColors.monoStyle, color = PocketColors.accentSoft)
+                        Text("Pre-Select Edition (Optional)", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                        Row(modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Surface(modifier = Modifier.bounceClick { selectedEditionIndex = null }, shape = RoundedCornerShape(9.dp), color = if (selectedEditionIndex == null) PocketColors.accentBg else PocketColors.surfaceInput, border = BorderStroke(0.75.dp, if (selectedEditionIndex == null) PocketColors.accent else PocketColors.border)) {
+                                Text("Ask during Setup", modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp), style = MaterialTheme.typography.labelSmall, color = if (selectedEditionIndex == null) PocketColors.accentSoft else PocketColors.textSecondary)
                             }
-                        }
-                        Box(modifier = Modifier.fillMaxWidth()) {
-                            Surface(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable(enabled = !inspectingEditions && editions.size > 1) { editionMenuExpanded = true },
-                                shape = RoundedCornerShape(12.dp),
-                                color = PocketColors.surfaceInput,
-                                border = BorderStroke(0.75.dp, if (selectedEdition != null) PocketColors.accent else PocketColors.border)
-                            ) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 12.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                                ) {
-                                    if (inspectingEditions) {
-                                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = PocketColors.accent)
-                                        Text("Scanning ISO editions...", style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary)
-                                    } else {
-                                        Icon(Icons.Rounded.Window, null, tint = PocketColors.infoBlue, modifier = Modifier.size(18.dp))
-                                        Column(modifier = Modifier.weight(1f)) {
-                                            Text(
-                                                text = selectedEdition?.name ?: "Ask during Windows Setup (Default)",
-                                                style = MaterialTheme.typography.labelMedium,
-                                                color = PocketColors.textPrimary,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis
-                                            )
-                                            Text(
-                                                text = if (selectedEdition != null) "Preselected · Index #${selectedEdition!!.index} (skips edition screen)" else "Tap to preselect a specific edition",
-                                                fontSize = 11.sp,
-                                                color = PocketColors.textSecondary
-                                            )
-                                        }
-                                        Icon(Icons.Rounded.ExpandMore, null, tint = PocketColors.textSecondary, modifier = Modifier.size(18.dp))
-                                    }
-                                }
-                            }
-
-                            DropdownMenu(
-                                expanded = editionMenuExpanded,
-                                onDismissRequest = { editionMenuExpanded = false },
-                                modifier = Modifier.background(PocketColors.surfaceCard)
-                            ) {
-                                DropdownMenuItem(
-                                    text = {
-                                        Text(
-                                            "Ask during Windows Setup (Default)",
-                                            style = MaterialTheme.typography.labelMedium,
-                                            color = if (selectedEdition == null) PocketColors.accentSoft else PocketColors.textPrimary
-                                        )
-                                    },
-                                    leadingIcon = if (selectedEdition == null) {
-                                        { Icon(Icons.Rounded.Check, null, tint = PocketColors.accentSoft, modifier = Modifier.size(16.dp)) }
-                                    } else null,
-                                    onClick = {
-                                        selectedEdition = null
-                                        editionMenuExpanded = false
-                                    }
-                                )
-                                PocketHairlineDivider()
-                                editions.forEach { ed ->
-                                    val isSel = selectedEdition?.index == ed.index
-                                    DropdownMenuItem(
-                                        text = {
-                                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                                Text("#${ed.index}", style = PocketColors.monoStyle, color = PocketColors.textMuted)
-                                                Text(
-                                                    ed.name,
-                                                    style = MaterialTheme.typography.labelMedium,
-                                                    color = if (isSel) PocketColors.accentSoft else PocketColors.textPrimary
-                                                )
-                                            }
-                                        },
-                                        leadingIcon = if (isSel) {
-                                            { Icon(Icons.Rounded.Check, null, tint = PocketColors.accentSoft, modifier = Modifier.size(16.dp)) }
-                                        } else null,
-                                        onClick = {
-                                            selectedEdition = ed
-                                            editionMenuExpanded = false
-                                        }
-                                    )
+                            editions.forEach { ed ->
+                                val sel = selectedEditionIndex == ed.index
+                                Surface(modifier = Modifier.bounceClick { selectedEditionIndex = ed.index }, shape = RoundedCornerShape(9.dp), color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput, border = BorderStroke(0.75.dp, if (sel) PocketColors.accent else PocketColors.border)) {
+                                    Text(ed.name, modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp), style = MaterialTheme.typography.labelSmall, color = if (sel) PocketColors.accentSoft else PocketColors.textPrimary)
                                 }
                             }
                         }
                     }
                 }
-
-                // Collapsible Dropdown Menu for Windows Experience Bypasses & Local Admin User
-                Surface(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .animateContentSize(spring(stiffness = Spring.StiffnessMediumLow)),
-                    shape = RoundedCornerShape(14.dp),
-                    color = PocketColors.surfaceInput,
-                    border = BorderStroke(if (experienceExpanded) 1.dp else 0.75.dp, if (experienceExpanded) PocketColors.accent else PocketColors.border)
-                ) {
-                    Column {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .bounceClick { experienceExpanded = !experienceExpanded }
-                                .padding(horizontal = 14.dp, vertical = 13.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(34.dp)
-                                    .clip(RoundedCornerShape(9.dp))
-                                    .background(PocketColors.accentBg),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(Icons.Rounded.Tune, null, tint = PocketColors.accentSoft, modifier = Modifier.size(18.dp))
-                            }
-                            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
-                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    Text("Windows Experience & Bypasses", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
-                                    Surface(shape = RoundedCornerShape(6.dp), color = PocketColors.successBg) {
-                                        Text(
-                                            text = "$activeTweaksCount on",
-                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = PocketColors.success
-                                        )
-                                    }
-                                }
-                                Text(
-                                    text = if (experienceExpanded) "Tap to collapse options" else "TPM, MSA, BitLocker, Bloat, Classic Menu & Local Admin",
-                                    fontSize = 11.sp,
-                                    color = PocketColors.textSecondary,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                            Icon(
-                                imageVector = if (experienceExpanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
-                                contentDescription = "Toggle experience options",
-                                tint = PocketColors.textSecondary,
-                                modifier = Modifier.size(20.dp)
-                            )
-                        }
-
-                        AnimatedVisibility(
-                            visible = experienceExpanded,
-                            enter = fadeIn() + expandVertically(),
-                            exit = fadeOut() + shrinkVertically()
-                        ) {
-                            Column {
-                                PocketHairlineDivider()
-                                RufusToggleRow(
-                                    title = "Remove 4GB+ RAM, Secure Boot & TPM 2.0",
-                                    subtitle = "LabConfig hardware bypass",
-                                    checked = bypassRequirements,
-                                    onCheckedChange = { bypassRequirements = it }
-                                )
-                                PocketHairlineDivider()
-                                RufusToggleRow(
-                                    title = "Remove online Microsoft Account",
-                                    subtitle = "Offline local account (BypassNRO)",
-                                    checked = bypassMsa,
-                                    onCheckedChange = { bypassMsa = it }
-                                )
-                                PocketHairlineDivider()
-                                RufusToggleRow(
-                                    title = "Disable data collection & privacy prompts",
-                                    subtitle = "Skip telemetry & EULA prompts",
-                                    checked = disablePrivacy,
-                                    onCheckedChange = { disablePrivacy = it }
-                                )
-                                PocketHairlineDivider()
-                                RufusToggleRow(
-                                    title = "Disable automatic BitLocker encryption",
-                                    subtitle = "Prevent forced BitLocker",
-                                    checked = disableBitLocker,
-                                    onCheckedChange = { disableBitLocker = it }
-                                )
-                                PocketHairlineDivider()
-                                RufusToggleRow(
-                                    title = "Disable sponsored apps & consumer bloat",
-                                    subtitle = "Blocks auto-installed promo apps",
-                                    checked = disableSponsoredApps,
-                                    onCheckedChange = { disableSponsoredApps = it }
-                                )
-                                PocketHairlineDivider()
-                                RufusToggleRow(
-                                    title = "Restore classic right-click menu",
-                                    subtitle = "Full Windows 10 context menu on Win 11",
-                                    checked = classicContextMenu,
-                                    onCheckedChange = { classicContextMenu = it }
-                                )
-                                PocketHairlineDivider()
-                                RufusToggleRow(
-                                    title = "Skip Wi-Fi / Network setup in OOBE",
-                                    subtitle = "Stay offline during initial setup",
-                                    checked = skipWifiSetup,
-                                    onCheckedChange = { skipWifiSetup = it }
-                                )
-                                PocketHairlineDivider()
-                                RufusToggleRow(
-                                    title = "Skip OOBE setup screens",
-                                    subtitle = "Unattended boot to desktop",
-                                    checked = skipOobe,
-                                    onCheckedChange = { skipOobe = it }
-                                )
-                                PocketHairlineDivider()
-                                RufusToggleRow(
-                                    title = "Create Local Admin User",
-                                    subtitle = "Pre-create offline administrator account",
-                                    checked = createLocalUser,
-                                    onCheckedChange = { createLocalUser = it }
-                                )
-
-                                AnimatedVisibility(
-                                    visible = createLocalUser,
-                                    enter = fadeIn() + expandVertically(),
-                                    exit = fadeOut() + shrinkVertically()
-                                ) {
-                                    Column(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(start = 14.dp, end = 14.dp, bottom = 14.dp, top = 4.dp),
-                                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                                    ) {
-                                        OutlinedTextField(
-                                            value = localUsername,
-                                            onValueChange = { localUsername = it.filter { ch -> ch.isLetterOrDigit() || ch == '_' || ch == '-' || ch == ' ' }.take(20) },
-                                            label = { Text("Local Admin Username") },
-                                            placeholder = { Text("e.g. Admin") },
-                                            leadingIcon = { Icon(Icons.Rounded.Person, null, tint = PocketColors.accentSoft, modifier = Modifier.size(18.dp)) },
-                                            singleLine = true,
-                                            modifier = Modifier.fillMaxWidth(),
-                                            shape = RoundedCornerShape(10.dp),
-                                            colors = OutlinedTextFieldDefaults.colors(
-                                                focusedBorderColor = PocketColors.accent,
-                                                unfocusedBorderColor = PocketColors.border,
-                                                focusedTextColor = PocketColors.textPrimary,
-                                                unfocusedTextColor = PocketColors.textPrimary
-                                            )
-                                        )
-                                        OutlinedTextField(
-                                            value = localPassword,
-                                            onValueChange = { localPassword = it.take(32) },
-                                            label = { Text("Password (optional)") },
-                                            placeholder = { Text("Leave blank for no password") },
-                                            leadingIcon = { Icon(Icons.Rounded.Lock, null, tint = PocketColors.textMuted, modifier = Modifier.size(17.dp)) },
-                                            singleLine = true,
-                                            modifier = Modifier.fillMaxWidth(),
-                                            shape = RoundedCornerShape(10.dp),
-                                            colors = OutlinedTextFieldDefaults.colors(
-                                                focusedBorderColor = PocketColors.accent,
-                                                unfocusedBorderColor = PocketColors.border,
-                                                focusedTextColor = PocketColors.textPrimary,
-                                                unfocusedTextColor = PocketColors.textPrimary
-                                            )
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Optional Driver / Post-Install Apps Folder Injection
-                Surface(
-                    modifier = Modifier.fillMaxWidth().bounceClick { showDriversDirDialog = true },
-                    shape = RoundedCornerShape(12.dp),
-                    color = PocketColors.surfaceInput,
-                    border = BorderStroke(0.75.dp, if (extraDriversDir.isNotBlank()) PocketColors.accent else PocketColors.border)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 11.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Box(
-                            modifier = Modifier.size(34.dp).clip(RoundedCornerShape(9.dp)).background(PocketColors.infoBlueBg),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(Icons.Rounded.FolderCopy, null, tint = PocketColors.infoBlue, modifier = Modifier.size(18.dp))
-                        }
-                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
-                            Text("Include Driver / Apps Folder", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
-                            Text(
-                                text = if (extraDriversDir.isNotBlank()) {
-                                    "Copying into /Drivers: ${UsbGadgetEngine.friendlyFolderName(extraDriversDir)}"
-                                } else {
-                                    "Optional · inject NVMe, Wi-Fi drivers or setup apps into /Drivers"
-                                },
-                                fontSize = 11.sp,
-                                color = if (extraDriversDir.isNotBlank()) PocketColors.accentSoft else PocketColors.textSecondary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                        if (extraDriversDir.isNotBlank()) {
-                            Icon(
-                                imageVector = Icons.Rounded.Close,
-                                contentDescription = "Clear drivers folder",
-                                tint = PocketColors.textMuted,
-                                modifier = Modifier.size(18.dp).clickable { extraDriversDir = "" }
-                            )
-                        }
-                    }
-                }
-
-                // Output Image Name
-                OutlinedTextField(
-                    value = outputName,
-                    onValueChange = { outputName = it },
-                    label = { Text("Output USB Image Name") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = PocketColors.accent,
-                        unfocusedBorderColor = PocketColors.border,
-                        focusedTextColor = PocketColors.textPrimary,
-                        unfocusedTextColor = PocketColors.textPrimary
-                    )
-                )
-
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    color = PocketColors.surfaceInput,
-                    border = BorderStroke(0.5.dp, PocketColors.border)
-                ) {
-                    RufusToggleRow(
-                        title = "Mount USB image automatically when done",
-                        subtitle = "Auto-mount on LUN 0 when finished",
-                        checked = autoMount,
-                        onCheckedChange = { autoMount = it }
-                    )
-                }
-
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    color = if (lowSpace) PocketColors.dangerBg else PocketColors.accentBg,
-                    border = BorderStroke(0.5.dp, if (lowSpace) PocketColors.danger else PocketColors.border)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Icon(
-                            imageVector = if (lowSpace) Icons.Rounded.WarningAmber else Icons.Rounded.Info,
-                            contentDescription = null,
-                            tint = if (lowSpace) PocketColors.danger else PocketColors.accentSoft,
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Text(
-                            text = if (lowSpace) {
-                                "Not enough free space in ${UsbGadgetEngine.friendlyFolderName(defaultDir)}. Need ~${UsbGadgetEngine.formatBytes(estNeeded)}, have ${UsbGadgetEngine.formatBytes(freeSpace)}."
-                            } else {
-                                "Needs ~${UsbGadgetEngine.formatBytes(estNeeded)} in ${UsbGadgetEngine.friendlyFolderName(defaultDir)} (${UsbGadgetEngine.formatBytes(freeSpace)} free)."
-                            },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = PocketColors.textPrimary
-                        )
-                    }
-                }
-
-                Button(
-                    onClick = {
-                        onStartBuild(
-                            WindowsBuildConfig(
-                                isoFile = isoFile,
-                                outputDir = defaultDir,
-                                outputName = outputName.ifBlank { baseName },
-                                scheme = scheme,
-                                selectedEditionIndex = selectedEdition?.index,
-                                selectedEditionName = selectedEdition?.name,
-                                bypassRequirements = bypassRequirements,
-                                bypassMicrosoftAccount = bypassMsa,
-                                disableDataCollection = disablePrivacy,
-                                disableBitLocker = disableBitLocker,
-                                disableSponsoredApps = disableSponsoredApps,
-                                classicContextMenu = classicContextMenu,
-                                skipWifiSetup = skipWifiSetup,
-                                createLocalUser = createLocalUser,
-                                localUsername = localUsername.trim(),
-                                localPassword = localPassword,
-                                skipOobe = skipOobe,
-                                extraDriversDir = extraDriversDir.trim(),
-                                autoMountAfterBuild = autoMount
-                            )
-                        )
+                WindowsTwoPaneCustomizer(
+                    osKind = detectedOs, arch = detectedArch, experience = experience, winUtil = winUtil, presets = presets,
+                    showCa2023Option = true, showCustomScriptOption = true, defaultBrowseDir = defaultDir,
+                    onExperienceChange = { experience = it }, onWinUtilChange = { winUtil = it },
+                    onApplyPreset = { p ->
+                        scheme = runCatching { PartitionScheme.valueOf(p.schemeName) }.getOrDefault(scheme)
+                        experience = WindowsExperienceConfig(p.bypassRequirements, p.bypassMicrosoftAccount, p.disableDataCollection, p.disableBitLocker, p.qolImprovements, p.disableSponsoredApps, p.classicContextMenu, p.skipWifiSetup, p.createLocalUser, p.localUsername, "", p.skipOobe, p.useCa2023Bootloaders, p.applySkuSiPolicy)
+                        winUtil = WinUtilTweaksConfig.fromJsonString(p.winUtilJson)
                     },
-                    enabled = !lowSpace && outputName.isNotBlank() && (!createLocalUser || localUsername.trim().isNotEmpty()),
-                    modifier = Modifier.fillMaxWidth().height(PocketTokens.PrimaryButtonHeight),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)
-                ) {
-                    Text("Build Windows USB", fontWeight = FontWeight.SemiBold)
+                    onSavePreset = { n -> onSavePreset(AutounattendPreset(n, scheme.name, experience.bypassRequirements, experience.bypassMicrosoftAccount, experience.disableDataCollection, experience.disableBitLocker, experience.disableSponsoredApps, experience.classicContextMenu, experience.skipWifiSetup, experience.createLocalUser, experience.localUsername, experience.skipOobe, experience.qolImprovements, experience.useCa2023Bootloaders, experience.applySkuSiPolicy, winUtil.toJsonString())) },
+                    onDeletePreset = onDeletePreset
+                )
+                Surface(shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, if (eiCfgUnlock) PocketColors.accent.copy(alpha = 0.55f) else PocketColors.border)) {
+                    Row(modifier = Modifier.fillMaxWidth().clickable { eiCfgUnlock = !eiCfgUnlock }.padding(horizontal = 13.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Unlock All Editions (ei.cfg)", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                            Text("Lets you choose Pro/Edu even on OEM-keyed laptops", fontSize = 11.sp, color = PocketColors.textSecondary)
+                        }
+                        PocketSwitch(checked = eiCfgUnlock, onCheckedChange = { eiCfgUnlock = it }, activeColor = PocketColors.accent)
+                    }
+                }
+                Surface(modifier = Modifier.fillMaxWidth().bounceClick { showDriversFolderPicker = true }, shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.75.dp, if (extraDriversDir.isNotBlank()) PocketColors.accent else PocketColors.border)) {
+                    Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 11.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Icon(Icons.Rounded.FolderOpen, null, tint = PocketColors.accentSoft, modifier = Modifier.size(19.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Include Driver / Apps Folder (/Drivers)", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                            Text(if (extraDriversDir.isNotBlank()) extraDriversDir.replace("/data/media/0", "/sdcard") else "Tap to browse and select a folder (Intel RST, Wi-Fi, etc.)", fontSize = 11.sp, color = if (extraDriversDir.isNotBlank()) PocketColors.accentSoft else PocketColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                        if (extraDriversDir.isNotBlank()) { IconButton(onClick = { extraDriversDir = "" }, modifier = Modifier.size(28.dp)) { Icon(Icons.Rounded.Close, "Clear folder", tint = PocketColors.textMuted, modifier = Modifier.size(15.dp)) } }
+                        else Text("Browse", style = MaterialTheme.typography.labelSmall, color = PocketColors.accentSoft)
+                    }
+                }
+                OutlinedTextField(value = outputName, onValueChange = { outputName = it }, label = { Text("Output Bootable USB Name") }, singleLine = true, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp), colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = PocketColors.accent, unfocusedBorderColor = PocketColors.border, focusedTextColor = PocketColors.textPrimary, unfocusedTextColor = PocketColors.textPrimary))
+                Surface(shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
+                    Row(modifier = Modifier.fillMaxWidth().clickable { autoMount = !autoMount }.padding(horizontal = 13.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Auto-mount when finished", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                            Text("Mounts immediately as Read-Only USB", fontSize = 11.sp, color = PocketColors.textSecondary)
+                        }
+                        PocketSwitch(checked = autoMount, onCheckedChange = { autoMount = it }, activeColor = PocketColors.accent)
+                    }
+                }
+                if (lowSpace) {
+                    Surface(shape = RoundedCornerShape(10.dp), color = PocketColors.warningBg, border = BorderStroke(0.5.dp, PocketColors.warning)) {
+                        Row(modifier = Modifier.fillMaxWidth().padding(10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Rounded.WarningAmber, null, tint = PocketColors.warning, modifier = Modifier.size(16.dp))
+                            Text("Need ~${UsbGadgetEngine.formatBytes(estNeeded)}, have ${UsbGadgetEngine.formatBytes(freeSpace)} free.", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
+                        }
+                    }
+                }
+                Button(onClick = { onStartBuild(WindowsBuildConfig(isoFile, defaultDir, outputName.trim().ifBlank { baseName }, scheme, selectedEditionIndex, editions.firstOrNull { it.index == selectedEditionIndex }?.name, detectedOs, detectedArch, experience, winUtil, eiCfgUnlock, extraDriversDir = extraDriversDir, autoMountAfterBuild = autoMount)) }, enabled = outputName.trim().isNotEmpty() && !lowSpace, modifier = Modifier.fillMaxWidth().height(48.dp), shape = RoundedCornerShape(12.dp), colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)) {
+                    Text("Build Bootable Windows USB (.img)", fontWeight = FontWeight.SemiBold)
                 }
             }
-
             Spacer(modifier = Modifier.height(22.dp))
         }
     }
-
-    if (showDriversDirDialog) {
-        var draftDir by remember(extraDriversDir) { mutableStateOf(extraDriversDir.ifBlank { "/sdcard/Drivers" }) }
-        AlertDialog(
-            onDismissRequest = { showDriversDirDialog = false },
-            containerColor = PocketColors.surfaceCard,
-            title = { Text("Include Driver / Apps Folder", color = PocketColors.textPrimary) },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        "Files in this folder will be copied into /Drivers on your bootable Windows USB (ideal for Intel RST/NVMe storage or Wi-Fi drivers).",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = PocketColors.textSecondary
-                    )
-                    OutlinedTextField(
-                        value = draftDir,
-                        onValueChange = { draftDir = it },
-                        label = { Text("Folder path") },
-                        placeholder = { Text("/sdcard/Drivers") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        extraDriversDir = UsbGadgetEngine.resolveDirectPath(draftDir)
-                        showDriversDirDialog = false
-                    },
-                    enabled = draftDir.trim().isNotEmpty(),
-                    colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)
-                ) {
-                    Text("Set Folder", fontWeight = FontWeight.SemiBold)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showDriversDirDialog = false }) {
-                    Text("Cancel", color = PocketColors.textSecondary)
-                }
-            }
-        )
-    }
-
-    if (showSavePresetDialog) {
-        AlertDialog(
-            onDismissRequest = { showSavePresetDialog = false },
-            containerColor = PocketColors.surfaceCard,
-            title = { Text("Save Preset", color = PocketColors.textPrimary) },
-            text = {
-                OutlinedTextField(
-                    value = newPresetName,
-                    onValueChange = { newPresetName = it.take(28) },
-                    label = { Text("Preset Name") },
-                    placeholder = { Text("e.g., Win11 Clean Local") },
-                    singleLine = true
-                )
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        val clean = newPresetName.trim()
-                        if (clean.isNotEmpty()) {
-                            onSavePreset(
-                                AutounattendPreset(
-                                    name = clean,
-                                    schemeName = scheme.name,
-                                    bypassRequirements = bypassRequirements,
-                                    bypassMicrosoftAccount = bypassMsa,
-                                    disableDataCollection = disablePrivacy,
-                                    disableBitLocker = disableBitLocker,
-                                    disableSponsoredApps = disableSponsoredApps,
-                                    classicContextMenu = classicContextMenu,
-                                    skipWifiSetup = skipWifiSetup,
-                                    createLocalUser = createLocalUser,
-                                    localUsername = localUsername.trim(),
-                                    skipOobe = skipOobe
-                                )
-                            )
-                            newPresetName = ""
-                            showSavePresetDialog = false
-                        }
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)
-                ) {
-                    Text("Save", fontWeight = FontWeight.SemiBold)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showSavePresetDialog = false }) {
-                    Text("Cancel", color = PocketColors.textSecondary)
-                }
-            }
-        )
-    }
-}
-
-@Composable
-private fun RufusToggleRow(
-    title: String,
-    subtitle: String,
-    checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable { onCheckedChange(!checked) }
-            .padding(horizontal = 14.dp, vertical = 11.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            Text(title, style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
-            Text(subtitle, fontSize = 11.sp, color = PocketColors.textSecondary)
-        }
-        Spacer(modifier = Modifier.width(10.dp))
-        PocketSwitch(checked = checked, onCheckedChange = onCheckedChange, activeColor = PocketColors.success)
-    }
+    if (showDriversFolderPicker) RootFolderPickerSheet("Select Drivers / Apps Folder", "Files inside will be copied to /Drivers on the Windows USB", extraDriversDir.ifBlank { defaultDir }, { showDriversFolderPicker = false }) { extraDriversDir = it; showDriversFolderPicker = false }
 }

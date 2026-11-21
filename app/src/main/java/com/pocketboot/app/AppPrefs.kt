@@ -16,7 +16,11 @@ data class AutounattendPreset(
     val skipWifiSetup: Boolean = true,
     val createLocalUser: Boolean = false,
     val localUsername: String = "",
-    val skipOobe: Boolean = false
+    val skipOobe: Boolean = false,
+    val qolImprovements: Boolean = true,
+    val useCa2023Bootloaders: Boolean = false,
+    val applySkuSiPolicy: Boolean = false,
+    val winUtilJson: String = ""
 )
 
 data class AppSettings(
@@ -28,7 +32,7 @@ data class AppSettings(
     val autoPatchSelinux: Boolean = true,
     val surfaceMode: SurfaceMode = SurfaceMode.DARK,
     val useMonet: Boolean = false,
-    val accentHex: Long = 0xFF6366F1L,
+    val accentHex: Long = DEFAULT_ACCENT_HEX,
     val scanDirs: List<String> = listOf("/data/media/0/Download"),
     val pinnedFiles: List<String> = emptyList(),
     val hiddenFiles: List<String> = emptyList(),
@@ -37,10 +41,17 @@ data class AppSettings(
     val useDefaultDistroRepo: Boolean = true,
     val customRepoUrls: List<String> = emptyList(),
     val cachedDistrosJson: String = "",
+    val distrosCatalogVersion: Int = CURRENT_CATALOG_VERSION,
     val autounattendPresets: List<AutounattendPreset> = emptyList(),
     val downloadConnections: Int = 8,
     val autoVerifySha256: Boolean = true
-)
+) {
+    companion object {
+        const val DEFAULT_ACCENT_HEX = 0xFF15F5ABL
+        const val LEGACY_DEFAULT_ACCENT_HEX = 0xFF6366F1L
+        const val CURRENT_CATALOG_VERSION = 440
+    }
+}
 
 class AppPrefs(context: Context) {
     private val prefs = context.getSharedPreferences("pocketboot_prefs", Context.MODE_PRIVATE)
@@ -48,39 +59,22 @@ class AppPrefs(context: Context) {
     fun load(): AppSettings {
         val defaultDir = prefs.getString("default_dir", "/data/media/0/Download")
             ?.trim()?.ifBlank { "/data/media/0/Download" } ?: "/data/media/0/Download"
-
         val rawDirs = prefs.getString("scan_dirs", null)
-        val parsedDirs = if (rawDirs.isNullOrBlank()) {
-            listOf(defaultDir)
-        } else {
-            rawDirs.split("\n").map { it.trim() }.filter { it.isNotEmpty() }.distinct()
-        }
+        val parsedDirs = if (rawDirs.isNullOrBlank()) listOf(defaultDir) else rawDirs.split("\n").map { it.trim() }.filter { it.isNotEmpty() }.distinct()
         val scanDirs = (listOf(defaultDir) + parsedDirs.filter { it != defaultDir }).distinct()
-
-        val pinned = prefs.getString("pinned_files", "")
-            .orEmpty().split("\n").map { it.trim() }.filter { it.isNotEmpty() }.distinct()
-
-        val hidden = prefs.getString("hidden_files", "")
-            .orEmpty().split("\n").map { it.trim() }.filter { it.isNotEmpty() }.distinct()
-
-        val verified = prefs.getString("verified_iso_paths", "")
-            .orEmpty().split("\n").map { it.trim() }.filter { it.isNotEmpty() }.distinct()
-
-        val customRepos = prefs.getString("custom_repo_urls", "")
-            .orEmpty().split("\n").map { it.trim() }.filter { it.isNotEmpty() }.distinct()
-
+        val pinned = prefs.getString("pinned_files", "").orEmpty().split("\n").map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        val hidden = prefs.getString("hidden_files", "").orEmpty().split("\n").map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        val verified = prefs.getString("verified_iso_paths", "").orEmpty().split("\n").map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        val customRepos = prefs.getString("custom_repo_urls", "").orEmpty().split("\n").map { it.trim() }.filter { it.isNotEmpty() }.distinct()
         val modeMap = mutableMapOf<String, String>()
         prefs.getString("file_modes", "").orEmpty().split("\n").forEach { line ->
             val sep = line.lastIndexOf('|')
             if (sep > 0) {
                 val path = line.substring(0, sep).trim()
                 val modeName = line.substring(sep + 1).trim()
-                if (path.isNotEmpty() && modeName.isNotEmpty()) {
-                    modeMap[path] = modeName
-                }
+                if (path.isNotEmpty() && modeName.isNotEmpty()) modeMap[path] = modeName
             }
         }
-
         val presets = mutableListOf<AutounattendPreset>()
         val rawPresets = prefs.getString("autounattend_presets_json", "").orEmpty()
         if (rawPresets.isNotBlank()) {
@@ -104,16 +98,30 @@ class AppPrefs(context: Context) {
                                 skipWifiSetup = o.optBoolean("skipWifiSetup", true),
                                 createLocalUser = o.optBoolean("createLocalUser", user.isNotBlank()),
                                 localUsername = user,
-                                skipOobe = o.optBoolean("skipOobe", false)
+                                skipOobe = o.optBoolean("skipOobe", false),
+                                qolImprovements = o.optBoolean("qolImprovements", true),
+                                useCa2023Bootloaders = o.optBoolean("useCa2023Bootloaders", false),
+                                applySkuSiPolicy = o.optBoolean("applySkuSiPolicy", false),
+                                winUtilJson = o.optString("winUtilJson", "")
                             )
                         )
                     }
                 }
             }
         }
+        val surfaceMode = runCatching { SurfaceMode.valueOf(prefs.getString("surface_mode", SurfaceMode.DARK.name).orEmpty()) }.getOrDefault(SurfaceMode.DARK)
 
-        val modeStr = prefs.getString("surface_mode", SurfaceMode.DARK.name).orEmpty()
-        val surfaceMode = runCatching { SurfaceMode.valueOf(modeStr) }.getOrDefault(SurfaceMode.DARK)
+        var accentHex = prefs.getLong("accent_hex", AppSettings.DEFAULT_ACCENT_HEX)
+        if (!prefs.getBoolean("accent_migrated_v440", false)) {
+            if (accentHex == AppSettings.LEGACY_DEFAULT_ACCENT_HEX) accentHex = AppSettings.DEFAULT_ACCENT_HEX
+            prefs.edit().putLong("accent_hex", accentHex).putBoolean("accent_migrated_v440", true).apply()
+        }
+
+        val storedCatVer = prefs.getInt("distros_catalog_version", 0)
+        val cachedDistros = if (storedCatVer < AppSettings.CURRENT_CATALOG_VERSION) {
+            prefs.edit().remove("cached_distros_json").putInt("distros_catalog_version", AppSettings.CURRENT_CATALOG_VERSION).apply()
+            ""
+        } else prefs.getString("cached_distros_json", "").orEmpty()
 
         return AppSettings(
             hasCompletedSetup = prefs.getBoolean("setup_done", false),
@@ -124,7 +132,7 @@ class AppPrefs(context: Context) {
             autoPatchSelinux = prefs.getBoolean("auto_patch_selinux", true),
             surfaceMode = surfaceMode,
             useMonet = prefs.getBoolean("use_monet", false),
-            accentHex = prefs.getLong("accent_hex", 0xFF6366F1L),
+            accentHex = accentHex,
             scanDirs = scanDirs,
             pinnedFiles = pinned,
             hiddenFiles = hidden,
@@ -132,7 +140,8 @@ class AppPrefs(context: Context) {
             fileModes = modeMap,
             useDefaultDistroRepo = prefs.getBoolean("use_default_distro_repo", true),
             customRepoUrls = customRepos,
-            cachedDistrosJson = prefs.getString("cached_distros_json", "").orEmpty(),
+            cachedDistrosJson = cachedDistros,
+            distrosCatalogVersion = AppSettings.CURRENT_CATALOG_VERSION,
             autounattendPresets = presets,
             downloadConnections = prefs.getInt("dl_connections", 8).coerceIn(1, 16),
             autoVerifySha256 = prefs.getBoolean("auto_verify_sha256", true)
@@ -143,22 +152,17 @@ class AppPrefs(context: Context) {
         val serializedModes = settings.fileModes.entries.joinToString("\n") { "${it.key}|${it.value}" }
         val presetsArr = JSONArray()
         settings.autounattendPresets.forEach { p ->
-            presetsArr.put(
-                JSONObject().apply {
-                    put("name", p.name)
-                    put("schemeName", p.schemeName)
-                    put("bypassRequirements", p.bypassRequirements)
-                    put("bypassMicrosoftAccount", p.bypassMicrosoftAccount)
-                    put("disableDataCollection", p.disableDataCollection)
-                    put("disableBitLocker", p.disableBitLocker)
-                    put("disableSponsoredApps", p.disableSponsoredApps)
-                    put("classicContextMenu", p.classicContextMenu)
-                    put("skipWifiSetup", p.skipWifiSetup)
-                    put("createLocalUser", p.createLocalUser)
-                    put("localUsername", p.localUsername)
-                    put("skipOobe", p.skipOobe)
-                }
-            )
+            presetsArr.put(JSONObject().apply {
+                put("name", p.name); put("schemeName", p.schemeName)
+                put("bypassRequirements", p.bypassRequirements); put("bypassMicrosoftAccount", p.bypassMicrosoftAccount)
+                put("disableDataCollection", p.disableDataCollection); put("disableBitLocker", p.disableBitLocker)
+                put("disableSponsoredApps", p.disableSponsoredApps); put("classicContextMenu", p.classicContextMenu)
+                put("skipWifiSetup", p.skipWifiSetup); put("createLocalUser", p.createLocalUser)
+                put("localUsername", p.localUsername); put("skipOobe", p.skipOobe)
+                put("qolImprovements", p.qolImprovements); put("useCa2023Bootloaders", p.useCa2023Bootloaders)
+                put("applySkuSiPolicy", p.applySkuSiPolicy)
+                if (p.winUtilJson.isNotBlank()) put("winUtilJson", p.winUtilJson)
+            })
         }
         prefs.edit()
             .putBoolean("setup_done", settings.hasCompletedSetup)
@@ -170,6 +174,7 @@ class AppPrefs(context: Context) {
             .putString("surface_mode", settings.surfaceMode.name)
             .putBoolean("use_monet", settings.useMonet)
             .putLong("accent_hex", settings.accentHex)
+            .putBoolean("accent_migrated_v440", true)
             .putString("scan_dirs", settings.scanDirs.distinct().joinToString("\n"))
             .putString("pinned_files", settings.pinnedFiles.distinct().joinToString("\n"))
             .putString("hidden_files", settings.hiddenFiles.distinct().joinToString("\n"))
@@ -178,6 +183,7 @@ class AppPrefs(context: Context) {
             .putBoolean("use_default_distro_repo", settings.useDefaultDistroRepo)
             .putString("custom_repo_urls", settings.customRepoUrls.distinct().joinToString("\n"))
             .putString("cached_distros_json", settings.cachedDistrosJson)
+            .putInt("distros_catalog_version", AppSettings.CURRENT_CATALOG_VERSION)
             .putString("autounattend_presets_json", presetsArr.toString())
             .putInt("dl_connections", settings.downloadConnections.coerceIn(1, 16))
             .putBoolean("auto_verify_sha256", settings.autoVerifySha256)
@@ -188,129 +194,56 @@ class AppPrefs(context: Context) {
         fun exportBackupJson(settings: AppSettings): String {
             val presetsArr = JSONArray()
             settings.autounattendPresets.forEach { p ->
-                presetsArr.put(
-                    JSONObject().apply {
-                        put("name", p.name)
-                        put("schemeName", p.schemeName)
-                        put("bypassRequirements", p.bypassRequirements)
-                        put("bypassMicrosoftAccount", p.bypassMicrosoftAccount)
-                        put("disableDataCollection", p.disableDataCollection)
-                        put("disableBitLocker", p.disableBitLocker)
-                        put("disableSponsoredApps", p.disableSponsoredApps)
-                        put("classicContextMenu", p.classicContextMenu)
-                        put("skipWifiSetup", p.skipWifiSetup)
-                        put("createLocalUser", p.createLocalUser)
-                        put("localUsername", p.localUsername)
-                        put("skipOobe", p.skipOobe)
-                    }
-                )
+                presetsArr.put(JSONObject().apply {
+                    put("name", p.name); put("schemeName", p.schemeName)
+                    put("bypassRequirements", p.bypassRequirements); put("bypassMicrosoftAccount", p.bypassMicrosoftAccount)
+                    put("disableDataCollection", p.disableDataCollection); put("disableBitLocker", p.disableBitLocker)
+                    put("disableSponsoredApps", p.disableSponsoredApps); put("classicContextMenu", p.classicContextMenu)
+                    put("skipWifiSetup", p.skipWifiSetup); put("createLocalUser", p.createLocalUser)
+                    put("localUsername", p.localUsername); put("skipOobe", p.skipOobe)
+                    put("qolImprovements", p.qolImprovements); put("useCa2023Bootloaders", p.useCa2023Bootloaders)
+                    put("applySkuSiPolicy", p.applySkuSiPolicy)
+                    if (p.winUtilJson.isNotBlank()) put("winUtilJson", p.winUtilJson)
+                })
             }
             val modesObj = JSONObject()
             settings.fileModes.forEach { (k, v) -> modesObj.put(k, v) }
-
             return JSONObject().apply {
-                put("pocketbootBackupVersion", 1)
-                put("defaultDir", settings.defaultDir)
+                put("pocketbootBackupVersion", 2); put("defaultDir", settings.defaultDir)
                 put("favoriteQuickMountPath", settings.favoriteQuickMountPath)
-                put("keepAdbActive", settings.keepAdbActive)
-                put("autoPatchSelinux", settings.autoPatchSelinux)
-                put("surfaceMode", settings.surfaceMode.name)
-                put("useMonet", settings.useMonet)
-                put("accentHex", settings.accentHex)
-                put("scanDirs", JSONArray(settings.scanDirs))
-                put("useDefaultDistroRepo", settings.useDefaultDistroRepo)
-                put("customRepoUrls", JSONArray(settings.customRepoUrls))
-                put("downloadConnections", settings.downloadConnections)
-                put("autoVerifySha256", settings.autoVerifySha256)
-                put("fileModes", modesObj)
-                put("autounattendPresets", presetsArr)
+                put("keepAdbActive", settings.keepAdbActive); put("autoPatchSelinux", settings.autoPatchSelinux)
+                put("surfaceMode", settings.surfaceMode.name); put("useMonet", settings.useMonet)
+                put("accentHex", settings.accentHex); put("scanDirs", JSONArray(settings.scanDirs))
+                put("useDefaultDistroRepo", settings.useDefaultDistroRepo); put("customRepoUrls", JSONArray(settings.customRepoUrls))
+                put("downloadConnections", settings.downloadConnections); put("autoVerifySha256", settings.autoVerifySha256)
+                put("fileModes", modesObj); put("autounattendPresets", presetsArr)
             }.toString(2)
         }
 
-        fun importBackupJson(rawJson: String, current: AppSettings): AppSettings? {
-            return runCatching {
-                val obj = JSONObject(rawJson)
-                if (!obj.has("pocketbootBackupVersion")) return null
-
-                val defDir = obj.optString("defaultDir", current.defaultDir).ifBlank { current.defaultDir }
-                val dirsArr = obj.optJSONArray("scanDirs")
-                val parsedDirs = mutableListOf<String>()
-                if (dirsArr != null) {
-                    for (i in 0 until dirsArr.length()) {
-                        val s = dirsArr.optString(i, "").trim()
-                        if (s.isNotEmpty()) parsedDirs.add(s)
+        fun importBackupJson(rawJson: String, current: AppSettings): AppSettings? = runCatching {
+            val obj = JSONObject(rawJson)
+            if (!obj.has("pocketbootBackupVersion")) return null
+            val defDir = obj.optString("defaultDir", current.defaultDir).ifBlank { current.defaultDir }
+            val parsedDirs = mutableListOf<String>()
+            obj.optJSONArray("scanDirs")?.let { a -> for (i in 0 until a.length()) a.optString(i, "").trim().takeIf { it.isNotEmpty() }?.let { parsedDirs.add(it) } }
+            val scanDirs = (listOf(defDir) + parsedDirs.filter { it != defDir }).distinct()
+            val parsedRepos = mutableListOf<String>()
+            obj.optJSONArray("customRepoUrls")?.let { a -> for (i in 0 until a.length()) a.optString(i, "").trim().takeIf { it.isNotEmpty() }?.let { parsedRepos.add(it) } }
+            val modesMap = mutableMapOf<String, String>()
+            obj.optJSONObject("fileModes")?.let { m -> val keys = m.keys(); while (keys.hasNext()) { val k = keys.next(); val v = m.optString(k, "").trim(); if (k.isNotBlank() && v.isNotBlank()) modesMap[k] = v } }
+            val presets = mutableListOf<AutounattendPreset>()
+            obj.optJSONArray("autounattendPresets")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val name = o.optString("name", "").trim()
+                    if (name.isNotEmpty()) {
+                        val u = o.optString("localUsername", "")
+                        presets.add(AutounattendPreset(name, o.optString("schemeName", PartitionScheme.GPT.name), o.optBoolean("bypassRequirements", true), o.optBoolean("bypassMicrosoftAccount", true), o.optBoolean("disableDataCollection", true), o.optBoolean("disableBitLocker", true), o.optBoolean("disableSponsoredApps", false), o.optBoolean("classicContextMenu", false), o.optBoolean("skipWifiSetup", true), o.optBoolean("createLocalUser", u.isNotBlank()), u, o.optBoolean("skipOobe", false), o.optBoolean("qolImprovements", true), o.optBoolean("useCa2023Bootloaders", false), o.optBoolean("applySkuSiPolicy", false), o.optString("winUtilJson", "")))
                     }
                 }
-                val scanDirs = (listOf(defDir) + parsedDirs.filter { it != defDir }).distinct()
-
-                val reposArr = obj.optJSONArray("customRepoUrls")
-                val parsedRepos = mutableListOf<String>()
-                if (reposArr != null) {
-                    for (i in 0 until reposArr.length()) {
-                        val s = reposArr.optString(i, "").trim()
-                        if (s.isNotEmpty()) parsedRepos.add(s)
-                    }
-                }
-
-                val modesMap = mutableMapOf<String, String>()
-                obj.optJSONObject("fileModes")?.let { m ->
-                    val keys = m.keys()
-                    while (keys.hasNext()) {
-                        val k = keys.next()
-                        val v = m.optString(k, "").trim()
-                        if (k.isNotBlank() && v.isNotBlank()) modesMap[k] = v
-                    }
-                }
-
-                val presets = mutableListOf<AutounattendPreset>()
-                obj.optJSONArray("autounattendPresets")?.let { arr ->
-                    for (i in 0 until arr.length()) {
-                        val o = arr.optJSONObject(i) ?: continue
-                        val name = o.optString("name", "").trim()
-                        if (name.isNotEmpty()) {
-                            val u = o.optString("localUsername", "")
-                            presets.add(
-                                AutounattendPreset(
-                                    name = name,
-                                    schemeName = o.optString("schemeName", PartitionScheme.GPT.name),
-                                    bypassRequirements = o.optBoolean("bypassRequirements", true),
-                                    bypassMicrosoftAccount = o.optBoolean("bypassMicrosoftAccount", true),
-                                    disableDataCollection = o.optBoolean("disableDataCollection", true),
-                                    disableBitLocker = o.optBoolean("disableBitLocker", true),
-                                    disableSponsoredApps = o.optBoolean("disableSponsoredApps", false),
-                                    classicContextMenu = o.optBoolean("classicContextMenu", false),
-                                    skipWifiSetup = o.optBoolean("skipWifiSetup", true),
-                                    createLocalUser = o.optBoolean("createLocalUser", u.isNotBlank()),
-                                    localUsername = u,
-                                    skipOobe = o.optBoolean("skipOobe", false)
-                                )
-                            )
-                        }
-                    }
-                }
-
-                val surfMode = runCatching {
-                    SurfaceMode.valueOf(obj.optString("surfaceMode", current.surfaceMode.name))
-                }.getOrDefault(current.surfaceMode)
-
-                current.copy(
-                    hasCompletedSetup = true,
-                    defaultDir = defDir,
-                    favoriteQuickMountPath = obj.optString("favoriteQuickMountPath", current.favoriteQuickMountPath),
-                    keepAdbActive = obj.optBoolean("keepAdbActive", current.keepAdbActive),
-                    autoPatchSelinux = obj.optBoolean("autoPatchSelinux", current.autoPatchSelinux),
-                    surfaceMode = surfMode,
-                    useMonet = obj.optBoolean("useMonet", current.useMonet),
-                    accentHex = obj.optLong("accentHex", current.accentHex),
-                    scanDirs = scanDirs,
-                    useDefaultDistroRepo = obj.optBoolean("useDefaultDistroRepo", current.useDefaultDistroRepo),
-                    customRepoUrls = parsedRepos.distinct(),
-                    downloadConnections = obj.optInt("downloadConnections", current.downloadConnections).coerceIn(1, 16),
-                    autoVerifySha256 = obj.optBoolean("autoVerifySha256", current.autoVerifySha256),
-                    fileModes = modesMap,
-                    autounattendPresets = presets
-                )
-            }.getOrNull()
-        }
+            }
+            val surfMode = runCatching { SurfaceMode.valueOf(obj.optString("surfaceMode", current.surfaceMode.name)) }.getOrDefault(current.surfaceMode)
+            current.copy(hasCompletedSetup = true, defaultDir = defDir, favoriteQuickMountPath = obj.optString("favoriteQuickMountPath", current.favoriteQuickMountPath), keepAdbActive = obj.optBoolean("keepAdbActive", current.keepAdbActive), autoPatchSelinux = obj.optBoolean("autoPatchSelinux", current.autoPatchSelinux), surfaceMode = surfMode, useMonet = obj.optBoolean("useMonet", current.useMonet), accentHex = obj.optLong("accentHex", current.accentHex), scanDirs = scanDirs, useDefaultDistroRepo = obj.optBoolean("useDefaultDistroRepo", current.useDefaultDistroRepo), customRepoUrls = parsedRepos.distinct(), downloadConnections = obj.optInt("downloadConnections", current.downloadConnections).coerceIn(1, 16), autoVerifySha256 = obj.optBoolean("autoVerifySha256", current.autoVerifySha256), fileModes = modesMap, autounattendPresets = presets)
+        }.getOrNull()
     }
 }

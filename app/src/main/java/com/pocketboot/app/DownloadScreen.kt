@@ -1,5 +1,6 @@
 package com.pocketboot.app
 
+import java.util.Locale
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.net.Uri
@@ -155,169 +156,281 @@ data class CuratedIso(
 
 const val DISTROS_MANIFEST_URL = "https://raw.githubusercontent.com/bilered/DriveDroidNG/main/distros.json"
 
-val fallbackIsos = listOf(
+private val fallbackIsos: List<CuratedIso> = listOf(
     CuratedIso(
         title = "Ubuntu Desktop",
-        subtitle = "Popular Linux desktop installer for 64-bit PCs",
+        subtitle = "Most popular Linux desktop with full hardware support",
         category = "Linux",
-        sizeLabel = "5.8–6.0 GB",
-        approxBytes = 6_335_076_761L,
+        sizeLabel = "5.9 GB",
+        approxBytes = 6335076761L,
         fileName = "ubuntu-26.04.1-desktop-amd64.iso",
         url = "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-desktop-amd64.iso",
         versions = listOf(
-            DistroVersion("26.04.1 LTS (Latest · Linux 7.0 · Resolute)", "Aug 2026", "5.9 GB", 6_335_076_761L, "ubuntu-26.04.1-desktop-amd64.iso", "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-desktop-amd64.iso"),
-            DistroVersion("26.10 (Short-Term Interim Release)", "Oct 2026", "5.9 GB", 6_335_076_761L, "ubuntu-26.10-desktop-amd64.iso", "https://releases.ubuntu.com/26.10/ubuntu-26.10-desktop-amd64.iso"),
-            DistroVersion("24.04.5 LTS (Mature · GNOME 46 · Noble)", "Aug 2026", "5.8 GB", 6_227_702_579L, "ubuntu-24.04.5.1-desktop-amd64.iso", "https://releases.ubuntu.com/noble/ubuntu-24.04.5.1-desktop-amd64.iso"),
-            DistroVersion("22.04.5 LTS (Legacy Support · Jammy)", "Sep 2024", "4.7 GB", 5_046_586_572L, "ubuntu-22.04.5-desktop-amd64.iso", "https://releases.ubuntu.com/jammy/ubuntu-22.04.5-desktop-amd64.iso")
+            DistroVersion("26.04.1 LTS (Latest · Resolute)", "2026", "5.9 GB", 6335076761L, "ubuntu-26.04.1-desktop-amd64.iso", "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-desktop-amd64.iso", ""),
+            DistroVersion("24.04.5 LTS (Mature · Noble)", "2026", "5.8 GB", 6227702579L, "ubuntu-24.04.5.1-desktop-amd64.iso", "https://releases.ubuntu.com/noble/ubuntu-24.04.5.1-desktop-amd64.iso", ""),
+            DistroVersion("22.04.5 LTS (Legacy · Jammy)", "2024", "4.7 GB", 5046586572L, "ubuntu-22.04.5-desktop-amd64.iso", "https://releases.ubuntu.com/jammy/ubuntu-22.04.5-desktop-amd64.iso", "")
+        )
+    ),
+    CuratedIso(
+        title = "Pop!_OS",
+        subtitle = "System76 COSMIC desktop with Intel/AMD & NVIDIA editions",
+        category = "Linux",
+        sizeLabel = "2.8 GB",
+        approxBytes = 3006477107L,
+        fileName = "pop-os_latest_24.04_intel.iso",
+        url = "https://api.pop-os.org/builds/24.04/intel",
+        versions = listOf(
+            DistroVersion("24.04 LTS COSMIC (Intel / AMD · Live API)", "2026", "2.8 GB", 3006477107L, "pop-os_latest_24.04_intel.iso", "https://api.pop-os.org/builds/24.04/intel", ""),
+            DistroVersion("24.04 LTS COSMIC (NVIDIA · Live API)", "2026", "3.2 GB", 3435973836L, "pop-os_latest_24.04_nvidia.iso", "https://api.pop-os.org/builds/24.04/nvidia", ""),
+            DistroVersion("22.04 LTS GNOME (Intel / AMD · Live API)", "2025", "2.6 GB", 2791728742L, "pop-os_latest_22.04_intel.iso", "https://api.pop-os.org/builds/22.04/intel", ""),
+            DistroVersion("22.04 LTS GNOME (NVIDIA · Live API)", "2025", "3.0 GB", 3221225472L, "pop-os_latest_22.04_nvidia.iso", "https://api.pop-os.org/builds/22.04/nvidia", "")
         )
     ),
     CuratedIso(
         title = "Linux Mint",
-        subtitle = "Clean, familiar desktop Linux out of the box",
+        subtitle = "Familiar, fast desktop ideal for Windows switchers",
         category = "Linux",
-        sizeLabel = "2.8 GB",
-        approxBytes = 3_006_477_107L,
+        sizeLabel = "2.9 GB",
+        approxBytes = 3113851289L,
         fileName = "linuxmint-22.1-cinnamon-64bit.iso",
         url = "https://mirrors.edge.kernel.org/linuxmint/stable/22.1/linuxmint-22.1-cinnamon-64bit.iso",
         versions = listOf(
-            DistroVersion("22.1 Xia (Cinnamon · Recommended)", "Jan 2025", "2.8 GB", 3_006_477_107L, "linuxmint-22.1-cinnamon-64bit.iso", "https://mirrors.edge.kernel.org/linuxmint/stable/22.1/linuxmint-22.1-cinnamon-64bit.iso"),
-            DistroVersion("22.1 Xia (Xfce Lightweight)", "Jan 2025", "2.7 GB", 2_899_102_924L, "linuxmint-22.1-xfce-64bit.iso", "https://mirrors.edge.kernel.org/linuxmint/stable/22.1/linuxmint-22.1-xfce-64bit.iso"),
-            DistroVersion("22 Wilma (Cinnamon)", "Jul 2024", "2.8 GB", 3_006_477_107L, "linuxmint-22-cinnamon-64bit.iso", "https://mirrors.edge.kernel.org/linuxmint/stable/22/linuxmint-22-cinnamon-64bit.iso"),
-            DistroVersion("21.3 Virginia (Cinnamon)", "Jan 2024", "2.9 GB", 3_113_851_289L, "linuxmint-21.3-cinnamon-64bit.iso", "https://mirrors.edge.kernel.org/linuxmint/stable/21.3/linuxmint-21.3-cinnamon-64bit.iso")
+            DistroVersion("22.1 Xia (Cinnamon · Recommended)", "2025", "2.9 GB", 3113851289L, "linuxmint-22.1-cinnamon-64bit.iso", "https://mirrors.edge.kernel.org/linuxmint/stable/22.1/linuxmint-22.1-cinnamon-64bit.iso", ""),
+            DistroVersion("22.1 Xia (Xfce Lightweight)", "2025", "2.8 GB", 3006477107L, "linuxmint-22.1-xfce-64bit.iso", "https://mirrors.edge.kernel.org/linuxmint/stable/22.1/linuxmint-22.1-xfce-64bit.iso", ""),
+            DistroVersion("22 Wilma (Cinnamon)", "2024", "2.9 GB", 3113851289L, "linuxmint-22-cinnamon-64bit.iso", "https://mirrors.edge.kernel.org/linuxmint/stable/22/linuxmint-22-cinnamon-64bit.iso", "")
+        )
+    ),
+    CuratedIso(
+        title = "Debian",
+        subtitle = "Rock-solid universal Linux OS (Live GNOME, KDE & Netinst)",
+        category = "Linux",
+        sizeLabel = "3.6 GB",
+        approxBytes = 3865470566L,
+        fileName = "debian-live-13.7.0-amd64-gnome.iso",
+        url = "https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/debian-live-13.7.0-amd64-gnome.iso",
+        versions = listOf(
+            DistroVersion("13.7 Trixie Live (GNOME)", "2026", "3.6 GB", 3865470566L, "debian-live-13.7.0-amd64-gnome.iso", "https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/debian-live-13.7.0-amd64-gnome.iso", ""),
+            DistroVersion("13.7 Trixie Live (KDE Plasma)", "2026", "3.8 GB", 4080218931L, "debian-live-13.7.0-amd64-kde.iso", "https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/debian-live-13.7.0-amd64-kde.iso", ""),
+            DistroVersion("13.7 Trixie Netinst (Minimal)", "2026", "680 MB", 713031680L, "debian-13.7.0-amd64-netinst.iso", "https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-13.7.0-amd64-netinst.iso", "")
         )
     ),
     CuratedIso(
         title = "Fedora Workstation",
-        subtitle = "Cutting-edge GNOME desktop with newest Linux kernel",
+        subtitle = "Cutting-edge GNOME desktop backed by Red Hat",
         category = "Linux",
-        sizeLabel = "2.4–2.5 GB",
-        approxBytes = 2_684_354_560L,
+        sizeLabel = "2.4 GB",
+        approxBytes = 2576980377L,
         fileName = "Fedora-Workstation-Live-45-1.4.x86_64.iso",
         url = "https://download.fedoraproject.org/pub/fedora/linux/releases/45/Workstation/x86_64/iso/Fedora-Workstation-Live-45-1.4.x86_64.iso",
         versions = listOf(
-            DistroVersion("Fedora 45 Workstation (Latest)", "Oct 2026", "2.5 GB", 2_684_354_560L, "Fedora-Workstation-Live-45-1.4.x86_64.iso", "https://download.fedoraproject.org/pub/fedora/linux/releases/45/Workstation/x86_64/iso/Fedora-Workstation-Live-45-1.4.x86_64.iso"),
-            DistroVersion("Fedora 44 Workstation", "Apr 2026", "2.4 GB", 2_576_980_377L, "Fedora-Workstation-Live-44-1.7.x86_64.iso", "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Workstation/x86_64/iso/Fedora-Workstation-Live-44-1.7.x86_64.iso"),
-            DistroVersion("Fedora 43 Workstation", "Oct 2025", "2.3 GB", 2_469_606_195L, "Fedora-Workstation-Live-43-1.6.x86_64.iso", "https://download.fedoraproject.org/pub/fedora/linux/releases/43/Workstation/x86_64/iso/Fedora-Workstation-Live-43-1.6.x86_64.iso")
+            DistroVersion("Fedora 45 Workstation (Latest)", "2026", "2.4 GB", 2576980377L, "Fedora-Workstation-Live-45-1.4.x86_64.iso", "https://download.fedoraproject.org/pub/fedora/linux/releases/45/Workstation/x86_64/iso/Fedora-Workstation-Live-45-1.4.x86_64.iso", ""),
+            DistroVersion("Fedora 44 Workstation", "2026", "2.4 GB", 2576980377L, "Fedora-Workstation-Live-44-1.7.x86_64.iso", "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Workstation/x86_64/iso/Fedora-Workstation-Live-44-1.7.x86_64.iso", "")
         )
     ),
     CuratedIso(
         title = "Arch Linux",
-        subtitle = "Minimal rolling-release Linux installer for power users",
+        subtitle = "Minimalist rolling-release Linux with full DIY control",
         category = "Linux",
         sizeLabel = "1.2 GB",
-        approxBytes = 1_317_568_512L,
+        approxBytes = 1288490188L,
         fileName = "archlinux-x86_64.iso",
         url = "https://geo.mirror.pkgbuild.com/iso/latest/archlinux-x86_64.iso",
         versions = listOf(
-            DistroVersion("Latest Monthly Rolling (x86_64)", "Monthly", "1.2 GB", 1_317_568_512L, "archlinux-x86_64.iso", "https://geo.mirror.pkgbuild.com/iso/latest/archlinux-x86_64.iso")
+            DistroVersion("Latest Monthly Rolling (x86_64)", "2026", "1.2 GB", 1288490188L, "archlinux-x86_64.iso", "https://geo.mirror.pkgbuild.com/iso/latest/archlinux-x86_64.iso", "")
+        )
+    ),
+    CuratedIso(
+        title = "openSUSE Tumbleweed",
+        subtitle = "Reliable rolling release with YaST & Btrfs snapshots",
+        category = "Linux",
+        sizeLabel = "4.4 GB",
+        approxBytes = 4724464025L,
+        fileName = "openSUSE-Tumbleweed-DVD-x86_64-Current.iso",
+        url = "https://download.opensuse.org/tumbleweed/iso/openSUSE-Tumbleweed-DVD-x86_64-Current.iso",
+        versions = listOf(
+            DistroVersion("Tumbleweed DVD (Offline Installer)", "2026", "4.4 GB", 4724464025L, "openSUSE-Tumbleweed-DVD-x86_64-Current.iso", "https://download.opensuse.org/tumbleweed/iso/openSUSE-Tumbleweed-DVD-x86_64-Current.iso", ""),
+            DistroVersion("Tumbleweed GNOME Live", "2026", "1.1 GB", 1181116006L, "openSUSE-Tumbleweed-GNOME-Live-x86_64-Current.iso", "https://download.opensuse.org/tumbleweed/iso/openSUSE-Tumbleweed-GNOME-Live-x86_64-Current.iso", ""),
+            DistroVersion("Tumbleweed KDE Live", "2026", "1.1 GB", 1181116006L, "openSUSE-Tumbleweed-KDE-Live-x86_64-Current.iso", "https://download.opensuse.org/tumbleweed/iso/openSUSE-Tumbleweed-KDE-Live-x86_64-Current.iso", "")
+        )
+    ),
+    CuratedIso(
+        title = "NixOS",
+        subtitle = "Declarative, reproducible Linux distribution",
+        category = "Linux",
+        sizeLabel = "2.6 GB",
+        approxBytes = 2791728742L,
+        fileName = "latest-nixos-graphical-x86_64-linux.iso",
+        url = "https://channels.nixos.org/nixos-unstable/latest-nixos-graphical-x86_64-linux.iso",
+        versions = listOf(
+            DistroVersion("Graphical GNOME (Latest x86_64)", "2026", "2.6 GB", 2791728742L, "latest-nixos-graphical-x86_64-linux.iso", "https://channels.nixos.org/nixos-unstable/latest-nixos-graphical-x86_64-linux.iso", ""),
+            DistroVersion("Minimal CLI (Latest x86_64)", "2026", "1.1 GB", 1181116006L, "latest-nixos-minimal-x86_64-linux.iso", "https://channels.nixos.org/nixos-unstable/latest-nixos-minimal-x86_64-linux.iso", "")
+        )
+    ),
+    CuratedIso(
+        title = "Proxmox VE",
+        subtitle = "Enterprise open-source hypervisor (KVM + LXC + ZFS)",
+        category = "Server",
+        sizeLabel = "1.71 GB",
+        approxBytes = 1836098682L,
+        fileName = "proxmox-ve_9.2-1.iso",
+        url = "https://enterprise.proxmox.com/iso/proxmox-ve_9.2-1.iso",
+        versions = listOf(
+            DistroVersion("Proxmox VE 9.2-1 (x86_64 · Latest)", "2026", "1.71 GB", 1836098682L, "proxmox-ve_9.2-1.iso", "https://enterprise.proxmox.com/iso/proxmox-ve_9.2-1.iso", "4e88fe416df9b527624a175f24c9aa07c714d3332afb1ee3dbf3879573ef2c6c"),
+            DistroVersion("Proxmox VE 8.4-1 (Legacy Stable)", "2025", "1.57 GB", 1685774663L, "proxmox-ve_8.4-1.iso", "https://enterprise.proxmox.com/iso/proxmox-ve_8.4-1.iso", "d237d70ca48a9f6eb47f95fd4fd337722c3f69f8106393844d027d28c26523d8")
         )
     ),
     CuratedIso(
         title = "Ubuntu Server",
-        subtitle = "Headless LTS Linux server & homelab installer",
+        subtitle = "Headless LTS Linux server for homelabs & production",
         category = "Server",
-        sizeLabel = "3.8–3.9 GB",
-        approxBytes = 4_187_593_113L,
+        sizeLabel = "2.6 GB",
+        approxBytes = 2791728742L,
         fileName = "ubuntu-26.04.1-live-server-amd64.iso",
         url = "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso",
         versions = listOf(
-            DistroVersion("26.04.1 LTS Server (Latest · Resolute)", "Aug 2026", "3.9 GB", 4_187_593_113L, "ubuntu-26.04.1-live-server-amd64.iso", "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso"),
-            DistroVersion("24.04.5 LTS Server (Mature · Noble)", "Aug 2026", "3.8 GB", 4_080_218_931L, "ubuntu-24.04.5-live-server-amd64.iso", "https://releases.ubuntu.com/noble/ubuntu-24.04.5-live-server-amd64.iso"),
-            DistroVersion("22.04.5 LTS Server (Legacy · Jammy)", "Sep 2024", "2.0 GB", 2_147_483_648L, "ubuntu-22.04.5-live-server-amd64.iso", "https://releases.ubuntu.com/jammy/ubuntu-22.04.5-live-server-amd64.iso")
+            DistroVersion("26.04.1 LTS Server (Latest · Resolute)", "2026", "2.6 GB", 2791728742L, "ubuntu-26.04.1-live-server-amd64.iso", "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso", ""),
+            DistroVersion("24.04.5 LTS Server (Mature · Noble)", "2026", "2.6 GB", 2791728742L, "ubuntu-24.04.5-live-server-amd64.iso", "https://releases.ubuntu.com/noble/ubuntu-24.04.5-live-server-amd64.iso", "")
         )
     ),
     CuratedIso(
         title = "Alpine Linux",
-        subtitle = "Security-oriented, ultra-lean server & container OS",
+        subtitle = "Ultra-lightweight security-oriented musl Linux",
         category = "Server",
-        sizeLabel = "250 MB",
-        approxBytes = 262_144_000L,
+        sizeLabel = "240 MB",
+        approxBytes = 251658240L,
         fileName = "alpine-standard-3.24.4-x86_64.iso",
         url = "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-standard-3.24.4-x86_64.iso",
         versions = listOf(
-            DistroVersion("3.24.4 Standard (x86_64)", "Nov 2026", "250 MB", 262_144_000L, "alpine-standard-3.24.4-x86_64.iso", "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-standard-3.24.4-x86_64.iso"),
-            DistroVersion("3.24.4 Extended (Offline pkgs)", "Nov 2026", "960 MB", 1_006_632_960L, "alpine-extended-3.24.4-x86_64.iso", "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-extended-3.24.4-x86_64.iso"),
-            DistroVersion("3.23.3 Standard (x86_64)", "2026", "240 MB", 251_658_240L, "alpine-standard-3.23.3-x86_64.iso", "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/x86_64/alpine-standard-3.23.3-x86_64.iso")
+            DistroVersion("3.24.4 Standard (x86_64)", "2026", "240 MB", 251658240L, "alpine-standard-3.24.4-x86_64.iso", "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-standard-3.24.4-x86_64.iso", ""),
+            DistroVersion("3.24.4 Extended (Offline pkgs)", "2026", "860 MB", 901775360L, "alpine-extended-3.24.4-x86_64.iso", "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-extended-3.24.4-x86_64.iso", "")
         )
     ),
     CuratedIso(
         title = "Kali Linux",
-        subtitle = "Penetration testing & security auditing live/installer",
+        subtitle = "Penetration testing, forensics & security auditing suite",
         category = "Security",
-        sizeLabel = "4.5 GB",
-        approxBytes = 4_831_838_208L,
+        sizeLabel = "4.3 GB",
+        approxBytes = 4617089843L,
         fileName = "kali-linux-2026.3-live-amd64.iso",
         url = "https://cdimage.kali.org/kali-2026.3/kali-linux-2026.3-live-amd64.iso",
         versions = listOf(
-            DistroVersion("2026.3 Live (amd64 · Recommended)", "Oct 2026", "4.5 GB", 4_831_838_208L, "kali-linux-2026.3-live-amd64.iso", "https://cdimage.kali.org/kali-2026.3/kali-linux-2026.3-live-amd64.iso"),
-            DistroVersion("2026.3 Installer (amd64)", "Oct 2026", "4.2 GB", 4_509_715_660L, "kali-linux-2026.3-installer-amd64.iso", "https://cdimage.kali.org/kali-2026.3/kali-linux-2026.3-installer-amd64.iso"),
-            DistroVersion("2026.2 Live (amd64)", "Jun 2026", "4.4 GB", 4_724_464_025L, "kali-linux-2026.2-live-amd64.iso", "https://cdimage.kali.org/kali-2026.2/kali-linux-2026.2-live-amd64.iso")
+            DistroVersion("2026.3 Live (amd64 · Recommended)", "2026", "4.3 GB", 4617089843L, "kali-linux-2026.3-live-amd64.iso", "https://cdimage.kali.org/kali-2026.3/kali-linux-2026.3-live-amd64.iso", ""),
+            DistroVersion("2026.3 Installer (amd64)", "2026", "4.1 GB", 4402341478L, "kali-linux-2026.3-installer-amd64.iso", "https://cdimage.kali.org/kali-2026.3/kali-linux-2026.3-installer-amd64.iso", "")
         )
     ),
     CuratedIso(
-        title = "Rescuezilla",
-        subtitle = "Graphical disk cloning, backup & image restore",
-        category = "Rescue",
-        sizeLabel = "1.3 GB",
-        approxBytes = 1_395_864_371L,
-        fileName = "rescuezilla-2.6.2-64bit.resolute.iso",
-        url = "https://github.com/rescuezilla/rescuezilla/releases/download/2.6.2/rescuezilla-2.6.2-64bit.resolute.iso",
+        title = "Tails",
+        subtitle = "Amnesic privacy OS routing all traffic through Tor",
+        category = "Security",
+        sizeLabel = "1.5 GB",
+        approxBytes = 1610612736L,
+        fileName = "tails-amd64-latest.img",
+        url = "https://tails.net/install/v2/Tails/amd64/stable/latest.json",
         versions = listOf(
-            DistroVersion("2.6.2 (Ubuntu 26.04 Base · Newest Drivers)", "2026", "1.3 GB", 1_395_864_371L, "rescuezilla-2.6.2-64bit.resolute.iso", "https://github.com/rescuezilla/rescuezilla/releases/download/2.6.2/rescuezilla-2.6.2-64bit.resolute.iso"),
-            DistroVersion("2.5.1 (Ubuntu 24.04 Base · Mature)", "2024", "1.2 GB", 1_288_490_188L, "rescuezilla-2.5.1-64bit.noble.iso", "https://github.com/rescuezilla/rescuezilla/releases/download/2.5.1/rescuezilla-2.5.1-64bit.noble.iso")
-        )
-    ),
-    CuratedIso(
-        title = "SystemRescue",
-        subtitle = "Bootable PC repair, partition & data recovery kit",
-        category = "Rescue",
-        sizeLabel = "1.37 GB",
-        approxBytes = 1_434_451_968L,
-        fileName = "systemrescue-13.03-amd64.iso",
-        url = "https://fastly-cdn.system-rescue.org/releases/13.03/systemrescue-13.03-amd64.iso",
-        versions = listOf(
-            DistroVersion("13.03 (Latest amd64)", "2026", "1.37 GB", 1_434_451_968L, "systemrescue-13.03-amd64.iso", "https://fastly-cdn.system-rescue.org/releases/13.03/systemrescue-13.03-amd64.iso"),
-            DistroVersion("12.01 (amd64)", "2025", "1.2 GB", 1_288_490_188L, "systemrescue-12.01-amd64.iso", "https://fastly-cdn.system-rescue.org/releases/12.01/systemrescue-12.01-amd64.iso")
+            DistroVersion("Latest Stable USB Image (Live API)", "2026", "1.5 GB", 1610612736L, "tails-amd64-latest.img", "https://tails.net/install/v2/Tails/amd64/stable/latest.json", "")
         )
     ),
     CuratedIso(
         title = "GParted Live",
-        subtitle = "Resize, clone, and repair disk partitions safely",
+        subtitle = "Resize, move, and repair disk partitions graphically",
         category = "Rescue",
-        sizeLabel = "560 MB",
-        approxBytes = 587_202_560L,
+        sizeLabel = "645 MB",
+        approxBytes = 676331520L,
         fileName = "gparted-live-1.8.1-6-amd64.iso",
-        url = "https://downloads.sourceforge.net/gparted/gparted-live-1.8.1-6-amd64.iso",
+        url = "https://sourceforge.net/projects/gparted/files/gparted-live-stable/1.8.1-6/gparted-live-1.8.1-6-amd64.iso/download",
         versions = listOf(
-            DistroVersion("1.8.1-6 (amd64 · Latest)", "2026", "560 MB", 587_202_560L, "gparted-live-1.8.1-6-amd64.iso", "https://downloads.sourceforge.net/gparted/gparted-live-1.8.1-6-amd64.iso"),
-            DistroVersion("1.7.0-8 (amd64)", "2025", "540 MB", 566_231_040L, "gparted-live-1.7.0-8-amd64.iso", "https://downloads.sourceforge.net/gparted/gparted-live-1.7.0-8-amd64.iso")
+            DistroVersion("1.8.1-6 (amd64 · Latest)", "2026", "645 MB", 676331520L, "gparted-live-1.8.1-6-amd64.iso", "https://sourceforge.net/projects/gparted/files/gparted-live-stable/1.8.1-6/gparted-live-1.8.1-6-amd64.iso/download", "d789c38779f0d6f7026c12f44c2c52a04f66e28a1aea7d51f3045ad1bbf28411"),
+            DistroVersion("1.7.0-8 (amd64 · Legacy)", "2025", "560 MB", 587202560L, "gparted-live-1.7.0-8-amd64.iso", "https://sourceforge.net/projects/gparted/files/gparted-live-stable/1.7.0-8/gparted-live-1.7.0-8-amd64.iso/download", "")
+        )
+    ),
+    CuratedIso(
+        title = "Clonezilla Live",
+        subtitle = "Bare-metal disk & partition cloning and imaging tool",
+        category = "Rescue",
+        sizeLabel = "460 MB",
+        approxBytes = 482344960L,
+        fileName = "clonezilla-live-3.3.3-37-amd64.iso",
+        url = "https://sourceforge.net/projects/clonezilla/files/clonezilla_live_stable/3.3.3-37/clonezilla-live-3.3.3-37-amd64.iso/download",
+        versions = listOf(
+            DistroVersion("3.3.3-37 Stable (Debian amd64)", "2026", "460 MB", 482344960L, "clonezilla-live-3.3.3-37-amd64.iso", "https://sourceforge.net/projects/clonezilla/files/clonezilla_live_stable/3.3.3-37/clonezilla-live-3.3.3-37-amd64.iso/download", "")
+        )
+    ),
+    CuratedIso(
+        title = "Rescuezilla",
+        subtitle = "Graphical disk backup & restore (Clonezilla compatible)",
+        category = "Rescue",
+        sizeLabel = "1.3 GB",
+        approxBytes = 1395864371L,
+        fileName = "rescuezilla-2.6.2-64bit.resolute.iso",
+        url = "https://github.com/rescuezilla/rescuezilla/releases/download/2.6.2/rescuezilla-2.6.2-64bit.resolute.iso",
+        versions = listOf(
+            DistroVersion("2.6.2 (Ubuntu 26.04 Base)", "2026", "1.3 GB", 1395864371L, "rescuezilla-2.6.2-64bit.resolute.iso", "https://github.com/rescuezilla/rescuezilla/releases/download/2.6.2/rescuezilla-2.6.2-64bit.resolute.iso", ""),
+            DistroVersion("2.5.1 (Ubuntu 24.04 Base)", "2024", "1.2 GB", 1288490188L, "rescuezilla-2.5.1-64bit.noble.iso", "https://github.com/rescuezilla/rescuezilla/releases/download/2.5.1/rescuezilla-2.5.1-64bit.noble.iso", "")
+        )
+    ),
+    CuratedIso(
+        title = "SystemRescue",
+        subtitle = "Arch-based rescue toolkit for unbootable PCs & filesystems",
+        category = "Rescue",
+        sizeLabel = "1.2 GB",
+        approxBytes = 1288490188L,
+        fileName = "systemrescue-13.03-amd64.iso",
+        url = "https://fastly-cdn.system-rescue.org/releases/13.03/systemrescue-13.03-amd64.iso",
+        versions = listOf(
+            DistroVersion("13.03 (Latest amd64)", "2026", "1.2 GB", 1288490188L, "systemrescue-13.03-amd64.iso", "https://fastly-cdn.system-rescue.org/releases/13.03/systemrescue-13.03-amd64.iso", ""),
+            DistroVersion("12.01 (amd64)", "2025", "1.2 GB", 1288490188L, "systemrescue-12.01-amd64.iso", "https://fastly-cdn.system-rescue.org/releases/12.01/systemrescue-12.01-amd64.iso", "")
+        )
+    ),
+    CuratedIso(
+        title = "ShredOS (Nwipe)",
+        subtitle = "Secure drive eraser with NVMe/SSD Hardware Sanitize",
+        category = "Rescue",
+        sizeLabel = "355 MB",
+        approxBytes = 372244480L,
+        fileName = "shredos-2025.11_32_x86-64_v0.43.1_20261010.img",
+        url = "https://github.com/PartialVolume/shredos.x86_64/releases/download/v2025.11_32_x86-64_v0.43.1/shredos-2025.11_32_x86-64_v0.43.1_20261010.img",
+        versions = listOf(
+            DistroVersion("v0.43.1 USB Image (.img · x86_64)", "2026", "355 MB", 372244480L, "shredos-2025.11_32_x86-64_v0.43.1_20261010.img", "https://github.com/PartialVolume/shredos.x86_64/releases/download/v2025.11_32_x86-64_v0.43.1/shredos-2025.11_32_x86-64_v0.43.1_20261010.img", "c856cfb91ebd525e23caffc284d84764e9d9b5427ee1925783773642e3d50ae4"),
+            DistroVersion("v0.43.1 Optical ISO (.iso · x86_64)", "2026", "342 MB", 358612992L, "shredos-2025.11_32_x86-64_v0.43.1_20261010.iso", "https://github.com/PartialVolume/shredos.x86_64/releases/download/v2025.11_32_x86-64_v0.43.1/shredos-2025.11_32_x86-64_v0.43.1_20261010.iso", "d0ffb8d7b346289db93094dbf1d2a64692b7f7cb179cc1ca76b74fdffbac1414")
+        )
+    ),
+    CuratedIso(
+        title = "Memtest86+",
+        subtitle = "Open-source RAM diagnostic tool (auto-extracts .iso)",
+        category = "Rescue",
+        sizeLabel = "6 MB",
+        approxBytes = 6291456L,
+        fileName = "mt86plus_9.00_x86_64.iso.zip",
+        url = "https://www.memtest.org/download/v9.00/mt86plus_9.00_x86_64.iso.zip",
+        versions = listOf(
+            DistroVersion("v9.00 (x86_64 · UEFI & BIOS)", "2026", "6 MB", 6291456L, "mt86plus_9.00_x86_64.iso.zip", "https://www.memtest.org/download/v9.00/mt86plus_9.00_x86_64.iso.zip", ""),
+            DistroVersion("v9.00 (ARM64 · UEFI)", "2026", "5 MB", 5242880L, "mt86plus_9.00_arm64.iso.zip", "https://www.memtest.org/download/v9.00/mt86plus_9.00_arm64.iso.zip", "")
         )
     ),
     CuratedIso(
         title = "netboot.xyz",
-        subtitle = "Tiny 2 MB network boot menu for dozens of OSes",
+        subtitle = "Network-boot 70+ OS installers & rescue tools over iPXE",
         category = "Lightweight",
-        sizeLabel = "2 MB",
-        approxBytes = 2_500_000L,
+        sizeLabel = "3 MB",
+        approxBytes = 3145728L,
         fileName = "netboot.xyz.iso",
         url = "https://boot.netboot.xyz/ipxe/netboot.xyz.iso",
         versions = listOf(
-            DistroVersion("Latest x86_64 iPXE ISO", "Rolling", "2 MB", 2_500_000L, "netboot.xyz.iso", "https://boot.netboot.xyz/ipxe/netboot.xyz.iso"),
-            DistroVersion("Latest ARM64 iPXE ISO", "Rolling", "2 MB", 2_500_000L, "netboot.xyz-arm64.iso", "https://boot.netboot.xyz/ipxe/netboot.xyz-arm64.iso")
+            DistroVersion("Latest x86_64 iPXE ISO", "2026", "3 MB", 3145728L, "netboot.xyz.iso", "https://boot.netboot.xyz/ipxe/netboot.xyz.iso", ""),
+            DistroVersion("Latest ARM64 iPXE ISO", "2026", "3 MB", 3145728L, "netboot.xyz-arm64.iso", "https://boot.netboot.xyz/ipxe/netboot.xyz-arm64.iso", "")
         )
     ),
     CuratedIso(
         title = "Tiny Core Linux",
-        subtitle = "Ultra-small live Linux desktop for quick boot tests",
+        subtitle = "Ultra-tiny desktop Linux that runs entirely in RAM",
         category = "Lightweight",
         sizeLabel = "23 MB",
-        approxBytes = 24_000_000L,
+        approxBytes = 24117248L,
         fileName = "TinyCore-current.iso",
         url = "https://distro.ibiblio.org/tinycorelinux/15.x/x86/release/TinyCore-current.iso",
         versions = listOf(
-            DistroVersion("15.x TinyCore (GUI · 23 MB)", "Current", "23 MB", 24_000_000L, "TinyCore-current.iso", "https://distro.ibiblio.org/tinycorelinux/15.x/x86/release/TinyCore-current.iso"),
-            DistroVersion("15.x CorePlus (Wi-Fi + Tools)", "Current", "248 MB", 260_046_848L, "CorePlus-current.iso", "https://distro.ibiblio.org/tinycorelinux/15.x/x86/release/CorePlus-current.iso"),
-            DistroVersion("15.x Core (CLI Only)", "Current", "17 MB", 17_825_792L, "Core-current.iso", "https://distro.ibiblio.org/tinycorelinux/15.x/x86/release/Core-current.iso")
+            DistroVersion("15.x TinyCore (GUI · 23 MB)", "2025", "23 MB", 24117248L, "TinyCore-current.iso", "https://distro.ibiblio.org/tinycorelinux/15.x/x86/release/TinyCore-current.iso", ""),
+            DistroVersion("15.x CorePlus (Wi-Fi + Tools · 248 MB)", "2025", "248 MB", 260046848L, "CorePlus-current.iso", "https://distro.ibiblio.org/tinycorelinux/15.x/x86/release/CorePlus-current.iso", "")
         )
     )
 )
@@ -510,8 +623,10 @@ fun DownloadScreen(
     val scope = rememberCoroutineScope()
     val defaultDir = settings.defaultDir
     val turboState by FastIsoDownloader.state.collectAsState()
-    val winBuildState by WindowsBuildEngine.jobState.collectAsState()
+    val winDlState by WindowsBuildEngine.downloadState.collectAsState()
+    val winConvState by WindowsBuildEngine.conversionState.collectAsState()
     val lastCompletion by FastIsoDownloader.lastCompletion.collectAsState()
+    var showBuildMonitorSheet by remember { mutableStateOf(false) }
 
     val activeMultiBootTarget = remember(settings.downloadTargetMultiBootPath, multiBootDrives) {
         val target = settings.downloadTargetMultiBootPath
@@ -522,7 +637,7 @@ fun DownloadScreen(
 
     var pendingResumables by remember { mutableStateOf<List<PendingResumableDownload>>(emptyList()) }
     var pendingWinBuilds by remember { mutableStateOf<List<PendingWindowsBuild>>(emptyList()) }
-    LaunchedEffect(turboState, winBuildState, settings.defaultDir) {
+    LaunchedEffect(turboState, winDlState, winConvState, settings.defaultDir) {
         pendingResumables = FastIsoDownloader.scanPendingResumableDownloads(context)
         pendingWinBuilds = WindowsBuildEngine.scanPendingBuilds(context, settings.scanDirs + settings.defaultDir)
     }
@@ -549,7 +664,7 @@ fun DownloadScreen(
     var selectedCategory by remember { mutableStateOf("All") }
     var autoMount by remember { mutableStateOf(true) }
 
-    val anyDownloadActive = turboState != null || winBuildState != null
+    val anyDownloadActive = turboState != null || winDlState != null
     val freeBytes = remember(defaultDir, turboState) { UsbGadgetEngine.getFreeSpaceBytes(defaultDir) }
 
     val activeRepoUrls = remember(settings.useDefaultDistroRepo, settings.customRepoUrls) {
@@ -632,7 +747,8 @@ fun DownloadScreen(
                     pendingResumables = FastIsoDownloader.scanPendingResumableDownloads(context)
                     onMessage(err, true)
                 }
-            }
+            },
+            onLog = { entry -> scope.launch { onAppendLog(entry) } }
         )
         val destLabel = if (activeMultiBootTarget != null) " → ${activeMultiBootTarget.name}" else ""
         onMessage("Started Turbo (${settings.downloadConnections}x): $cleanName$destLabel", false)
@@ -936,12 +1052,12 @@ fun DownloadScreen(
         }
 
         AnimatedVisibility(
-            visible = pendingWinBuilds.isNotEmpty() && winBuildState == null,
+            visible = pendingWinBuilds.isNotEmpty() && winDlState == null,
             enter = fadeIn() + expandVertically(),
             exit = fadeOut() + shrinkVertically()
         ) {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                PocketSectionHeader("Unfinished Windows Builds · Resumable", trailing = "${pendingWinBuilds.size}")
+                PocketSectionHeader("Unfinished & Cached Windows Builds", trailing = "${pendingWinBuilds.size}")
                 pendingWinBuilds.forEach { pb ->
                     Surface(
                         shape = RoundedCornerShape(PocketTokens.CardRadius),
@@ -981,7 +1097,7 @@ fun DownloadScreen(
                                 shape = RoundedCornerShape(PocketTokens.CompactButtonRadius),
                                 colors = ButtonDefaults.buttonColors(containerColor = PocketColors.infoBlue, contentColor = Color.White)
                             ) {
-                                Text("Resume", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
+                                Text(if (pb.isCachedReady) "Rebuild" else "Resume", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
                             }
                             IconButton(
                                 onClick = {
@@ -1000,7 +1116,7 @@ fun DownloadScreen(
         }
 
         AnimatedVisibility(
-            visible = lastCompletion != null && turboState == null && winBuildState == null,
+            visible = lastCompletion != null && turboState == null && winDlState == null,
             enter = fadeIn() + expandVertically(),
             exit = fadeOut() + shrinkVertically()
         ) {
@@ -1048,7 +1164,19 @@ fun DownloadScreen(
                                 )
                                 Text(done.fileName, style = PocketColors.monoStyle, color = PocketColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             }
-                            if (!done.computedSha256.isNullOrBlank()) {
+                            if (!done.bootVerifiedLabel.isNullOrBlank() || !done.buildBenchmark.isNullOrBlank()) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                if (!done.bootVerifiedLabel.isNullOrBlank()) {
+                                    Surface(shape = RoundedCornerShape(6.dp), color = PocketColors.successBg) {
+                                        Text(done.bootVerifiedLabel, modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = PocketColors.success)
+                                    }
+                                }
+                                if (!done.buildBenchmark.isNullOrBlank()) {
+                                    Text(done.buildBenchmark, style = PocketColors.monoStyle, color = PocketColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                                }
+                            }
+                        }
+                        if (!done.computedSha256.isNullOrBlank()) {
                                 IconButton(
                                     onClick = {
                                         val cm = context.getSystemService(ClipboardManager::class.java)
@@ -1209,126 +1337,81 @@ fun DownloadScreen(
             }
         }
 
-        // Active Windows Channel Build Card
+        // Dedicated ISO / USB Builder Pipeline Card (independent of Turbo Downloader — tap for full live telemetry)
         AnimatedVisibility(
-            visible = winBuildState != null,
+            visible = winConvState != null,
             enter = fadeIn(tween(220)) + expandVertically(spring(stiffness = Spring.StiffnessMediumLow)),
             exit = fadeOut(tween(180)) + shrinkVertically()
         ) {
-            winBuildState?.let { job ->
+            winConvState?.let { conv ->
+                val pctStr = String.format(Locale.US, "%.1f%%", (conv.overallProgress * 100f).coerceIn(0f, 100f))
                 Surface(
-                    shape = RoundedCornerShape(16.dp),
-                    color = PocketColors.surfaceCard,
-                    border = BorderStroke(1.5.dp, PocketColors.infoBlue)
+                    modifier = Modifier.fillMaxWidth().bounceClick { showBuildMonitorSheet = true },
+                    shape = RoundedCornerShape(16.dp), color = PocketColors.surfaceCard, border = BorderStroke(1.5.dp, PocketColors.accent)
                 ) {
                     Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(
-                                Brush.verticalGradient(
-                                    colors = listOf(PocketColors.infoBlueBg.copy(alpha = 0.55f), PocketColors.surfaceCard)
-                                )
-                            )
-                            .padding(14.dp),
+                        modifier = Modifier.fillMaxWidth().background(Brush.verticalGradient(listOf(PocketColors.accentBg.copy(alpha = 0.55f), PocketColors.surfaceCard))).padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(9.dp)
+                    ) {
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Surface(shape = RoundedCornerShape(5.dp), color = PocketColors.accentBg) { Text("BUILD", modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, color = PocketColors.accentSoft) }
+                                    Text(conv.title, style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                                    if (conv.queuedCount > 0) Surface(shape = RoundedCornerShape(5.dp), color = PocketColors.infoBlueBg) { Text("+${conv.queuedCount} queued", modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, color = PocketColors.infoBlue) }
+                                }
+                                Text(conv.stageLabel, style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                            Text("Tap for details ›", style = MaterialTheme.typography.labelSmall, color = PocketColors.accentSoft)
+                        }
+                        LinearProgressIndicator(progress = { conv.overallProgress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(999.dp)), color = PocketColors.accent, trackColor = PocketColors.surfaceSubtle)
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("$pctStr · ${formatDurationShort(conv.elapsedSeconds)}${if (conv.etaSeconds > 0L) " · ETA ${FastIsoDownloader.formatEta(conv.etaSeconds)}" else ""}", style = PocketColors.monoStyle, color = PocketColors.accentSoft)
+                            Text(if (conv.diskSpeedBytesPerSec >= 1024L) FastIsoDownloader.formatSpeed(conv.diskSpeedBytesPerSec) else conv.activeBinary, style = PocketColors.monoStyle, color = PocketColors.success)
+                        }
+                    }
+                }
+            }
+        }
+
+        // Active Windows Package Downloader Card (frees up immediately once packages finish!)
+        AnimatedVisibility(
+            visible = winDlState != null,
+            enter = fadeIn(tween(220)) + expandVertically(spring(stiffness = Spring.StiffnessMediumLow)),
+            exit = fadeOut(tween(180)) + shrinkVertically()
+        ) {
+            winDlState?.let { job ->
+                Surface(shape = RoundedCornerShape(16.dp), color = PocketColors.surfaceCard, border = BorderStroke(1.5.dp, PocketColors.infoBlue)) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth().background(Brush.verticalGradient(listOf(PocketColors.infoBlueBg.copy(alpha = 0.55f), PocketColors.surfaceCard))).padding(14.dp),
                         verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                     Text(job.title, style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
-                                    Surface(
-                                        shape = RoundedCornerShape(5.dp),
-                                        color = when {
-                                            job.isPaused -> PocketColors.warningBg
-                                            job.isConverting -> PocketColors.successBg
-                                            else -> PocketColors.warningBg
-                                        }
-                                    ) {
-                                        Text(
-                                            text = when {
-                                                job.isPaused -> "PAUSED"
-                                                job.isConverting -> "BUILD"
-                                                else -> "⚡ ${job.activeThreads}x"
-                                            },
-                                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = when {
-                                                job.isPaused -> PocketColors.warning
-                                                job.isConverting -> PocketColors.success
-                                                else -> PocketColors.warning
-                                            }
-                                        )
-                                    }
+                                    Surface(shape = RoundedCornerShape(5.dp), color = PocketColors.warningBg) { Text(if (job.isPaused) "PAUSED" else "⚡ ${job.activeThreads}x", modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, color = PocketColors.warning) }
                                 }
                                 Text(job.stage, style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             }
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                if (!job.isConverting) {
-                                    IconButton(
-                                        onClick = {
-                                            if (job.isPaused) WindowsBuildEngine.resumeBuild()
-                                            else WindowsBuildEngine.pauseBuild()
-                                        },
-                                        modifier = Modifier.size(34.dp)
-                                    ) {
-                                        Icon(
-                                            imageVector = if (job.isPaused) Icons.Rounded.PlayArrow else Icons.Rounded.Pause,
-                                            contentDescription = if (job.isPaused) "Resume build" else "Pause build",
-                                            tint = PocketColors.accentSoft,
-                                            modifier = Modifier.size(19.dp)
-                                        )
-                                    }
+                                IconButton(onClick = { if (job.isPaused) WindowsBuildEngine.resumeDownload() else WindowsBuildEngine.pauseDownload() }, modifier = Modifier.size(34.dp)) {
+                                    Icon(if (job.isPaused) Icons.Rounded.PlayArrow else Icons.Rounded.Pause, null, tint = PocketColors.accentSoft, modifier = Modifier.size(19.dp))
                                 }
-                                IconButton(
-                                    onClick = { showCancelWinBuildDialog = true },
-                                    modifier = Modifier.size(34.dp)
-                                ) {
+                                IconButton(onClick = { showCancelWinBuildDialog = true }, modifier = Modifier.size(34.dp)) {
                                     Icon(Icons.Rounded.Close, "Cancel", tint = PocketColors.danger, modifier = Modifier.size(18.dp))
                                 }
                             }
                         }
-
-                        LinearProgressIndicator(
-                            progress = { job.progress.coerceIn(0f, 1f) },
-                            modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(999.dp)),
-                            color = if (job.isConverting) PocketColors.success else PocketColors.infoBlue,
-                            trackColor = PocketColors.surfaceSubtle
-                        )
+                        LinearProgressIndicator(progress = { job.progress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(999.dp)), color = PocketColors.infoBlue, trackColor = PocketColors.surfaceSubtle)
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text(
-                                text = "${(job.progress * 100).toInt()}% · ${job.detail}",
-                                style = PocketColors.monoStyle,
-                                color = if (job.isConverting) PocketColors.success else PocketColors.infoBlue,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f)
-                            )
+                            Text("${(job.progress * 100).toInt()}% · ${job.detail}", style = PocketColors.monoStyle, color = PocketColors.infoBlue, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
                             Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = when {
-                                    job.isPaused -> "Paused · Resumable"
-                                    job.isConverting -> "Assembling"
-                                    else -> "${FastIsoDownloader.formatSpeed(job.speedBytesPerSec)} · ${FastIsoDownloader.formatEta(job.etaSeconds)}"
-                                },
-                                style = PocketColors.monoStyle,
-                                color = if (job.isPaused) PocketColors.warning else PocketColors.success,
-                                maxLines = 1
-                            )
+                            Text(if (job.isPaused) "Paused · Resumable" else "${FastIsoDownloader.formatSpeed(job.speedBytesPerSec)} · ${FastIsoDownloader.formatEta(job.etaSeconds)}", style = PocketColors.monoStyle, color = if (job.isPaused) PocketColors.warning else PocketColors.success, maxLines = 1)
                         }
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                             Text("Auto-mount when finished", style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary)
-                            PocketSwitch(
-                                checked = job.autoMount,
-                                onCheckedChange = { WindowsBuildEngine.updateAutoMount(it) }
-                            )
+                            PocketSwitch(checked = job.autoMount, onCheckedChange = { WindowsBuildEngine.updateDownloadAutoMount(it) })
                         }
                     }
                 }
@@ -1635,6 +1718,17 @@ fun DownloadScreen(
             multiBootDrives = multiBootDrives,
             activeMultiBootTarget = activeMultiBootTarget,
             turboConnections = settings.downloadConnections,
+            presets = settings.autounattendPresets,
+            onSavePreset = { preset ->
+                val updatedPresets = (settings.autounattendPresets.filterNot { it.name.equals(preset.name, true) } + preset)
+                onUpdateSettings(settings.copy(autounattendPresets = updatedPresets))
+                onMessage("Saved preset \"${preset.name}\".", false)
+            },
+            onDeletePreset = { presetName ->
+                val updatedPresets = settings.autounattendPresets.filterNot { it.name == presetName }
+                onUpdateSettings(settings.copy(autounattendPresets = updatedPresets))
+                onMessage("Deleted preset \"$presetName\".", false)
+            },
             onDismiss = { selectedWindowsFamily = null },
             onStartDirectDownload = { title, url, fileName, sha ->
                 startTurboDownload(title, url, fileName, expectedSha256 = sha)
@@ -1847,6 +1941,18 @@ fun DownloadScreen(
         )
     }
 
+    if (showBuildMonitorSheet && winConvState != null) {
+        WindowsBuildMonitorSheet(
+            state = winConvState!!,
+            onDismiss = { showBuildMonitorSheet = false },
+            onToggleAutoMount = { WindowsBuildEngine.updateConversionAutoMount(it) },
+            onCancelBuild = {
+                WindowsBuildEngine.cancelConversion()
+                onMessage("Cancelled active ISO/USB build.", false)
+            }
+        )
+    }
+
     if (showCancelWinBuildDialog) {
         AlertDialog(
             onDismissRequest = { showCancelWinBuildDialog = false },
@@ -1863,7 +1969,7 @@ fun DownloadScreen(
                 Button(
                     onClick = {
                         showCancelWinBuildDialog = false
-                        WindowsBuildEngine.cancelBuild(discardTemp = true)
+                        WindowsBuildEngine.cancelDownload(discardTemp = true)
                         onMessage("Cancelled build and cleaned temporary files.", false)
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = PocketColors.danger, contentColor = Color.White)
@@ -1875,7 +1981,7 @@ fun DownloadScreen(
                 TextButton(
                     onClick = {
                         showCancelWinBuildDialog = false
-                        WindowsBuildEngine.cancelBuild(discardTemp = false)
+                        WindowsBuildEngine.cancelDownload(discardTemp = false)
                         onMessage("Cancelled build (verified packages kept for 24h resume).", false)
                     }
                 ) {

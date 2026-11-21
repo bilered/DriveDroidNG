@@ -3,6 +3,12 @@ package com.pocketboot.app
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.widget.Toast
+import android.net.Uri
+import android.provider.DocumentsContract
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material.icons.rounded.CreateNewFolder
+import androidx.compose.material.icons.rounded.Code
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -870,5 +876,175 @@ private fun BrowserInfoRow(label: String, value: String) {
     Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
         Text(label, style = MaterialTheme.typography.labelSmall, color = PocketColors.textMuted)
         Text(value, style = PocketColors.monoStyle, color = PocketColors.textPrimary)
+    }
+}
+
+
+private fun resolveTreeUriToPath(uri: Uri): String? = runCatching {
+    val parts = DocumentsContract.getTreeDocumentId(uri).split(":", limit = 2)
+    if (parts.size == 2) {
+        val vol = parts[0]; val rel = parts[1].trim('/')
+        if (vol.equals("primary", true)) { if (rel.isEmpty()) "/data/media/0" else "/data/media/0/$rel" }
+        else { if (rel.isEmpty()) "/storage/$vol" else "/storage/$vol/$rel" }
+    } else null
+}.getOrNull()
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun RootFolderPickerSheet(
+    title: String = "Select Folder",
+    subtitle: String = "Browse storage and tap Select This Folder",
+    initialDir: String = "/data/media/0",
+    onDismiss: () -> Unit,
+    onSelectFolder: (String) -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val startPath = remember(initialDir) { val r = UsbGadgetEngine.resolveDirectPath(initialDir).trimEnd('/'); if (r.startsWith("/data/media/0") || r.startsWith("/storage/")) r else "/data/media/0" }
+    var currentDir by remember(startPath) { mutableStateOf(startPath) }
+    var entries by remember { mutableStateOf<List<BrowserEntry>>(emptyList()) }
+    var loading by remember { mutableStateOf(true) }
+    var reloadNonce by remember { mutableIntStateOf(0) }
+    var showNewFolderDialog by remember { mutableStateOf(false) }
+    var newFolderName by remember { mutableStateOf("") }
+    val systemTreeLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            val resolved = resolveTreeUriToPath(uri)
+            if (!resolved.isNullOrBlank()) onSelectFolder(UsbGadgetEngine.resolveDirectPath(resolved))
+            else Toast.makeText(context, "Could not resolve folder path.", Toast.LENGTH_SHORT).show()
+        }
+    }
+    LaunchedEffect(currentDir, reloadNonce) { loading = true; entries = UsbGadgetEngine.listDirectory(currentDir); loading = false }
+    val folders = remember(entries) { entries.filter { it.isDirectory }.sortedBy { it.name.lowercase() } }
+    val filesCount = remember(entries) { entries.count { !it.isDirectory } }
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), containerColor = PocketColors.surfaceCard) {
+        Column(modifier = Modifier.fillMaxWidth().fillMaxHeight(0.84f).padding(horizontal = 18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Box(modifier = Modifier.size(38.dp).clip(RoundedCornerShape(10.dp)).background(PocketColors.accentBg), contentAlignment = Alignment.Center) { Icon(Icons.Rounded.FolderOpen, null, tint = PocketColors.accentSoft, modifier = Modifier.size(20.dp)) }
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(title, style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary)
+                    Text(subtitle, style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                IconButton(onClick = { showNewFolderDialog = true }) { Icon(Icons.Rounded.CreateNewFolder, "New Folder", tint = PocketColors.accentSoft, modifier = Modifier.size(20.dp)) }
+                TextButton(onClick = { runCatching { systemTreeLauncher.launch(null) } }, contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp)) { Text("System", fontSize = 11.5.sp, color = PocketColors.accentSoft) }
+            }
+            Row(modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf("Internal" to "/data/media/0", "Download" to "/data/media/0/Download", "Drivers" to "/data/media/0/Drivers", "PocketBoot" to "/data/media/0/PocketBoot").forEach { (lbl, path) ->
+                    val active = currentDir.trimEnd('/') == path
+                    Surface(modifier = Modifier.bounceClick { currentDir = path }, shape = RoundedCornerShape(8.dp), color = if (active) PocketColors.accentBg else PocketColors.surfaceInput, border = BorderStroke(0.75.dp, if (active) PocketColors.accent else PocketColors.border)) {
+                        Text(lbl, modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp), style = MaterialTheme.typography.labelSmall, color = if (active) PocketColors.accentSoft else PocketColors.textSecondary)
+                    }
+                }
+            }
+            Surface(shape = RoundedCornerShape(10.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
+                Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 11.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text(currentDir.replace("/data/media/0", "/sdcard"), style = PocketColors.monoStyle, color = PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                    Text("${folders.size} folders · $filesCount files", style = MaterialTheme.typography.labelSmall, color = PocketColors.textMuted)
+                }
+            }
+            Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                if (loading) Box(modifier = Modifier.fillMaxWidth().padding(32.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator(modifier = Modifier.size(26.dp), strokeWidth = 2.5.dp, color = PocketColors.accent) }
+                else LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    val canGoUp = currentDir.trimEnd('/') != "/data/media/0" && currentDir.trimEnd('/') != "/storage" && currentDir.count { it == '/' } > 1
+                    if (canGoUp) {
+                        item("parent_dir") {
+                            Surface(modifier = Modifier.fillMaxWidth().clickable { val p = currentDir.trimEnd('/').substringBeforeLast('/').ifBlank { "/data/media/0" }; currentDir = if (p == "/data/media" || p == "/data") "/data/media/0" else p }, shape = RoundedCornerShape(10.dp), color = PocketColors.surfaceSubtle, border = BorderStroke(0.5.dp, PocketColors.border)) {
+                                Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                    Icon(Icons.AutoMirrored.Rounded.ArrowBack, null, tint = PocketColors.accentSoft, modifier = Modifier.size(18.dp)); Text(".. (Parent Folder)", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                                }
+                            }
+                        }
+                    }
+                    if (folders.isEmpty()) {
+                        item("empty_subfolders") {
+                            Surface(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(10.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
+                                Text(if (filesCount > 0) "$filesCount file(s) inside this folder. Tap \"Select This Folder\" below." else "No subfolders here. Tap \"Select This Folder\" or create a new folder.", modifier = Modifier.padding(14.dp), style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary)
+                            }
+                        }
+                    }
+                    items(folders, key = { it.path }) { folder ->
+                        Surface(modifier = Modifier.fillMaxWidth().clickable { currentDir = folder.path }, shape = RoundedCornerShape(10.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
+                            Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                Icon(Icons.Rounded.Folder, null, tint = PocketColors.accentSoft, modifier = Modifier.size(20.dp))
+                                Text(folder.name, style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                                Icon(Icons.Rounded.ChevronRight, null, tint = PocketColors.textMuted, modifier = Modifier.size(18.dp))
+                            }
+                        }
+                    }
+                }
+            }
+            Row(modifier = Modifier.fillMaxWidth().padding(bottom = 18.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = onDismiss, modifier = Modifier.weight(0.8f).height(48.dp), shape = RoundedCornerShape(12.dp), border = BorderStroke(0.75.dp, PocketColors.border)) { Text("Cancel", color = PocketColors.textSecondary) }
+                Button(onClick = { onSelectFolder(UsbGadgetEngine.resolveDirectPath(currentDir)) }, modifier = Modifier.weight(1.4f).height(48.dp), shape = RoundedCornerShape(12.dp), colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)) {
+                    Icon(Icons.Rounded.CheckCircle, null, modifier = Modifier.size(18.dp)); Spacer(modifier = Modifier.width(6.dp)); Text("Select This Folder", fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+    }
+    if (showNewFolderDialog) {
+        AlertDialog(
+            onDismissRequest = { showNewFolderDialog = false }, containerColor = PocketColors.surfaceCard,
+            title = { Text("Create New Folder", color = PocketColors.textPrimary) },
+            text = { OutlinedTextField(value = newFolderName, onValueChange = { newFolderName = it.replace("/", "") }, label = { Text("Folder name") }, placeholder = { Text("e.g., Drivers") }, singleLine = true, modifier = Modifier.fillMaxWidth()) },
+            confirmButton = { Button(onClick = { val c = newFolderName.trim(); if (c.isNotEmpty()) { val t = "${currentDir.trimEnd('/')}/$c"; showNewFolderDialog = false; newFolderName = ""; scope.launch { UsbGadgetEngine.ensureDirectoryExists(t, context); currentDir = t; reloadNonce++ } } }, enabled = newFolderName.trim().isNotEmpty(), colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)) { Text("Create", fontWeight = FontWeight.SemiBold) } },
+            dismissButton = { TextButton(onClick = { showNewFolderDialog = false }) { Text("Cancel", color = PocketColors.textSecondary) } }
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun RootSingleFilePickerSheet(
+    title: String = "Select Custom Script",
+    subtitle: String = "Choose a .cmd, .bat, or .ps1 file to run after Windows setup",
+    allowedExtensions: Set<String> = setOf("cmd", "bat", "ps1"),
+    initialDir: String = "/data/media/0/Download",
+    onDismiss: () -> Unit,
+    onSelectFile: (String) -> Unit
+) {
+    val startPath = remember(initialDir) { val r = UsbGadgetEngine.resolveDirectPath(initialDir).trimEnd('/'); if (r.startsWith("/data/media/0") || r.startsWith("/storage/")) r else "/data/media/0" }
+    var currentDir by remember(startPath) { mutableStateOf(startPath) }
+    var entries by remember { mutableStateOf<List<BrowserEntry>>(emptyList()) }
+    var loading by remember { mutableStateOf(true) }
+    LaunchedEffect(currentDir) { loading = true; entries = UsbGadgetEngine.listDirectory(currentDir); loading = false }
+    val visibleEntries = remember(entries, allowedExtensions) {
+        val dirs = entries.filter { it.isDirectory }.sortedBy { it.name.lowercase() }
+        val files = entries.filter { !it.isDirectory }.filter { f -> allowedExtensions.isEmpty() || f.name.substringAfterLast('.', "").lowercase() in allowedExtensions }.sortedBy { it.name.lowercase() }
+        dirs + files
+    }
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), containerColor = PocketColors.surfaceCard) {
+        Column(modifier = Modifier.fillMaxWidth().fillMaxHeight(0.80f).padding(horizontal = 18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            PocketSheetHeader(icon = Icons.Rounded.Code, tint = PocketColors.accentSoft, iconBg = PocketColors.accentBg, title = title, subtitle = subtitle)
+            Surface(shape = RoundedCornerShape(10.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
+                Text(currentDir.replace("/data/media/0", "/sdcard"), modifier = Modifier.fillMaxWidth().padding(horizontal = 11.dp, vertical = 8.dp), style = PocketColors.monoStyle, color = PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                if (loading) Box(modifier = Modifier.fillMaxWidth().padding(32.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator(modifier = Modifier.size(26.dp), strokeWidth = 2.5.dp, color = PocketColors.accent) }
+                else LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    val canGoUp = currentDir.trimEnd('/') != "/data/media/0" && currentDir.count { it == '/' } > 1
+                    if (canGoUp) {
+                        item("parent_up") {
+                            Surface(modifier = Modifier.fillMaxWidth().clickable { val p = currentDir.trimEnd('/').substringBeforeLast('/').ifBlank { "/data/media/0" }; currentDir = if (p == "/data/media" || p == "/data") "/data/media/0" else p }, shape = RoundedCornerShape(10.dp), color = PocketColors.surfaceSubtle, border = BorderStroke(0.5.dp, PocketColors.border)) {
+                                Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                    Icon(Icons.AutoMirrored.Rounded.ArrowBack, null, tint = PocketColors.accentSoft, modifier = Modifier.size(18.dp)); Text(".. (Parent Folder)", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                                }
+                            }
+                        }
+                    }
+                    items(visibleEntries, key = { it.path }) { item ->
+                        Surface(modifier = Modifier.fillMaxWidth().clickable { if (item.isDirectory) currentDir = item.path else onSelectFile(UsbGadgetEngine.resolveDirectPath(item.path)) }, shape = RoundedCornerShape(10.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, if (!item.isDirectory) PocketColors.accent.copy(alpha = 0.5f) else PocketColors.border)) {
+                            Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                Icon(if (item.isDirectory) Icons.Rounded.Folder else Icons.Rounded.Code, null, tint = if (item.isDirectory) PocketColors.textSecondary else PocketColors.accentSoft, modifier = Modifier.size(19.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(item.name, style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    if (!item.isDirectory) Text(UsbGadgetEngine.formatBytes(item.sizeBytes), style = PocketColors.monoStyle, color = PocketColors.textMuted)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            OutlinedButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth().padding(bottom = 18.dp).height(46.dp), shape = RoundedCornerShape(12.dp), border = BorderStroke(0.75.dp, PocketColors.border)) { Text("Cancel", color = PocketColors.textSecondary) }
+        }
     }
 }

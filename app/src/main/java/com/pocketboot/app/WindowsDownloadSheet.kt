@@ -40,6 +40,13 @@ import androidx.compose.material.icons.rounded.CheckBox
 import androidx.compose.material.icons.rounded.CheckBoxOutlineBlank
 import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.ExpandLess
+import androidx.compose.material.icons.rounded.FolderOpen
+import androidx.compose.material.icons.rounded.SystemUpdateAlt
+import androidx.compose.material.icons.rounded.ListAlt
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.material.icons.rounded.CloudDownload
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.Download
@@ -107,6 +114,9 @@ fun WindowsDownloadSheet(
     multiBootDrives: List<ImageFile>,
     activeMultiBootTarget: ImageFile?,
     turboConnections: Int,
+    presets: List<AutounattendPreset> = emptyList(),
+    onSavePreset: (AutounattendPreset) -> Unit = {},
+    onDeletePreset: (String) -> Unit = {},
     onDismiss: () -> Unit,
     onStartDirectDownload: (title: String, url: String, fileName: String, expectedSha256: String) -> Unit,
     onStartChannelBuild: (WindowsChannelBuildConfig) -> Unit
@@ -166,22 +176,30 @@ fun WindowsDownloadSheet(
     var buildEditions by remember(family.id) { mutableStateOf<List<WinBuildEditionOption>>(emptyList()) }
     var buildEdLoading by remember(family.id) { mutableStateOf(false) }
     val selectedBuildEditions = remember(family.id) { mutableStateListOf<String>() }
-    var manifestEstimate by remember(family.id) { mutableStateOf<WinManifestEstimate?>(null) }
+    var detailedManifest by remember(family.id) { mutableStateOf<WinDetailedManifest?>(null) }
     var estimateLoading by remember(family.id) { mutableStateOf(false) }
+    var showUpdatesInspector by remember { mutableStateOf(false) }
+    var showFullFilesInspector by remember { mutableStateOf(false) }
 
+    var downloadMethod by remember { mutableStateOf(WinDownloadMethod.DOWNLOAD_AND_BUILD) }
     var buildCompression by remember { mutableStateOf(WinIsoCompression.WIM) }
     var buildOutputMode by remember(activeMultiBootTarget?.path) {
-        mutableStateOf(
-            if (activeMultiBootTarget != null) WinBuildOutputMode.DIRECT_MULTIBOOT else WinBuildOutputMode.STANDARD_ISO
-        )
+        mutableStateOf(if (activeMultiBootTarget != null) WinBuildOutputMode.DIRECT_MULTIBOOT else WinBuildOutputMode.STANDARD_ISO)
     }
     var customOutputName by remember { mutableStateOf("") }
 
-    // Direct Bootable USB Bypasses & Drivers Folder
-    var usbBypassReq by remember { mutableStateOf(true) }
-    var usbBypassMsa by remember { mutableStateOf(true) }
-    var usbDisableTelemetry by remember { mutableStateOf(true) }
-    var usbDisableBitLocker by remember { mutableStateOf(true) }
+    var includeUpdates by remember { mutableStateOf(false) }
+    var includeStoreApps by remember { mutableStateOf(false) }
+    var integrateNetFx3 by remember { mutableStateOf(false) }
+    var runComponentCleanup by remember { mutableStateOf(false) }
+    var skipWinRe by remember { mutableStateOf(false) }
+    var eiCfgUnlock by remember { mutableStateOf(false) }
+    var keepPackagesAfterBuild by remember { mutableStateOf(false) }
+    var convOptionsExpanded by remember { mutableStateOf(true) }
+
+    var usbScheme by remember { mutableStateOf(PartitionScheme.GPT) }
+    var experience by remember { mutableStateOf(WindowsExperienceConfig()) }
+    var winUtil by remember { mutableStateOf(WinUtilTweaksConfig()) }
     var usbExtraDriversDir by remember { mutableStateOf("") }
     var showUsbDriversDialog by remember { mutableStateOf(false) }
 
@@ -276,7 +294,10 @@ fun WindowsDownloadSheet(
     LaunchedEffect(selectedBuild?.uuid) {
         val b = selectedBuild ?: return@LaunchedEffect
         buildLangLoading = true
-        manifestEstimate = null
+        detailedManifest = null
+        val detOs = WindowsCustomizationEngine.detectWindowsOsKind(b.title)
+        experience = WindowsExperienceConfig.defaultForOs(detOs)
+        usbScheme = if (detOs == WindowsOsKind.WIN7 || b.arch.equals("x86", true)) PartitionScheme.MBR else PartitionScheme.GPT
         buildLangs = WindowsBuildEngine.fetchLanguages(b.uuid)
         selectedBuildLang = buildLangs.firstOrNull { it.code.equals("en-us", true) } ?: buildLangs.firstOrNull()
         buildLangLoading = false
@@ -309,10 +330,10 @@ fun WindowsDownloadSheet(
         )
         if (selectedBuildEditions.isNotEmpty()) {
             estimateLoading = true
-            manifestEstimate = WindowsBuildEngine.fetchManifestEstimate(b.uuid, l.code, selectedBuildEditions.toList())
+            detailedManifest = WindowsBuildEngine.fetchDetailedManifest(b.uuid, l.code, selectedBuildEditions.toList())
             estimateLoading = false
         } else {
-            manifestEstimate = null
+            detailedManifest = null
         }
     }
 
@@ -454,7 +475,7 @@ fun WindowsDownloadSheet(
                     // Unified Architecture Picker (Release -> Architecture -> Language for BOTH Win 11 & Win 10)
                     selectedDirectGroup?.let { grp ->
                         val hasWin11Pair = grp.x64Release != null && grp.arm64Release != null
-                        val isWin10Dual = grp.osFamily == "win10"
+                        val isWin10Dual = grp.osFamily == "win10" || grp.osFamily == "win81"
                         if (hasWin11Pair || isWin10Dual) {
                             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                 PocketSectionHeader("Architecture")
@@ -517,7 +538,7 @@ fun WindowsDownloadSheet(
                                     Icon(Icons.Rounded.Tag, null, tint = PocketColors.infoBlue, modifier = Modifier.size(18.dp))
                                     Column {
                                         Text("EDITION ID", fontSize = 10.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.7.sp, color = PocketColors.textMuted)
-                                        val badgeArch = if (rel.osFamily == "win10") directWin10Arch else if (rel.isArm64Only) "ARM64" else "x64"
+                                        val badgeArch = if (rel.osFamily == "win10" || rel.osFamily == "win81") directWin10Arch else if (rel.isArm64Only) "ARM64" else "x64"
                                         Text("#${rel.editionId} · $badgeArch", style = PocketColors.monoStyle, color = PocketColors.textPrimary)
                                     }
                                 }
@@ -923,11 +944,17 @@ fun WindowsDownloadSheet(
                 } else {
                     // STEP 2: CONFIGURE SELECTED BUILD
                     val b = selectedBuild!!
-                    val minNeededBytes = if (buildOutputMode == WinBuildOutputMode.DIRECT_NTFS_USB) {
-                        10L * 1024L * 1024L * 1024L
-                    } else {
-                        12L * 1024L * 1024L * 1024L
+                    val selDlBytes = when (downloadMethod) {
+                        WinDownloadMethod.DOWNLOAD_UPDATES_ONLY -> detailedManifest?.updateBytes ?: 0L
+                        else -> (detailedManifest?.baseBytes ?: 3_500_000_000L) +
+                            (if (includeUpdates) detailedManifest?.updateBytes ?: 0L else 0L) +
+                            (if (includeStoreApps) detailedManifest?.appBytes ?: 0L else 0L) +
+                            (if (integrateNetFx3) detailedManifest?.netFx3Bytes ?: 0L else 0L)
                     }
+                    val estBuildOutBytes = if (downloadMethod == WinDownloadMethod.DOWNLOAD_AND_BUILD) {
+                        selDlBytes + (if (skipWinRe) 0L else 520L * 1024L * 1024L) + 512L * 1024L * 1024L
+                    } else 256L * 1024L * 1024L
+                    val minNeededBytes = selDlBytes + estBuildOutBytes
                     val lowSpace = freeBytes in 1L until minNeededBytes
                     val lowBattery = batteryPct < 25 && !isCharging
 
@@ -1054,231 +1081,169 @@ fun WindowsDownloadSheet(
                         }
                     }
 
-                    // Estimated Download Size & Package Count Pill
-                    Surface(
-                        shape = RoundedCornerShape(11.dp),
-                        color = PocketColors.infoBlueBg.copy(alpha = 0.55f),
-                        border = BorderStroke(0.5.dp, PocketColors.infoBlue.copy(alpha = 0.6f))
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 9.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Icon(Icons.Rounded.CloudDownload, null, tint = PocketColors.infoBlue, modifier = Modifier.size(17.dp))
-                            Text(
-                                text = when {
-                                    estimateLoading -> "Calculating package download size..."
-                                    manifestEstimate != null -> "Est. Download: ${UsbGadgetEngine.formatBytes(manifestEstimate!!.totalBytes)} (${manifestEstimate!!.fileCount} verified packages · Resumable)"
-                                    else -> "Packages are SHA-1 verified & resumable if interrupted"
-                                },
-                                style = PocketColors.monoStyle,
-                                color = PocketColors.textPrimary
-                            )
-                        }
-                    }
-
-                    // Compression Selector
                     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        PocketSectionHeader("Converter Compression")
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            WinIsoCompression.entries.forEach { comp ->
-                                val isSel = buildCompression == comp
-                                Surface(
-                                    modifier = Modifier.weight(1f).bounceClick { buildCompression = comp },
-                                    shape = RoundedCornerShape(11.dp),
-                                    color = if (isSel) PocketColors.accentBg else PocketColors.surfaceInput,
-                                    border = BorderStroke(if (isSel) 1.5.dp else 0.5.dp, if (isSel) PocketColors.accent else PocketColors.border)
-                                ) {
-                                    Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                            Text(comp.label, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold, color = if (isSel) PocketColors.accentSoft else PocketColors.textPrimary)
-                                            if (comp.recommended) {
-                                                Surface(shape = RoundedCornerShape(4.dp), color = PocketColors.successBg) {
-                                                    Text("Rec", modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp), fontSize = 9.sp, fontWeight = FontWeight.SemiBold, color = PocketColors.success)
-                                                }
-                                            }
-                                        }
-                                        Text(comp.subtitle, fontSize = 10.5.sp, color = PocketColors.textSecondary)
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Output Target Selector
-                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        PocketSectionHeader("Output Target")
-                        val modes = buildList {
-                            add(WinBuildOutputMode.STANDARD_ISO)
-                            if (multiBootDrives.isNotEmpty()) add(WinBuildOutputMode.DIRECT_MULTIBOOT)
-                            add(WinBuildOutputMode.DIRECT_NTFS_USB)
-                        }
-                        modes.forEach { mode ->
-                            val isSel = buildOutputMode == mode
-                            Surface(
-                                modifier = Modifier.fillMaxWidth().bounceClick { buildOutputMode = mode },
-                                shape = RoundedCornerShape(11.dp),
-                                color = if (isSel) PocketColors.accentBg else PocketColors.surfaceInput,
-                                border = BorderStroke(if (isSel) 1.5.dp else 0.5.dp, if (isSel) PocketColors.accent else PocketColors.border)
-                            ) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                            Text(mode.label, style = MaterialTheme.typography.labelLarge, color = if (isSel) PocketColors.accentSoft else PocketColors.textPrimary)
-                                            if (mode.recommended) {
-                                                Surface(shape = RoundedCornerShape(5.dp), color = PocketColors.successBg) {
-                                                    Text("Recommended", modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, color = PocketColors.success)
-                                                }
-                                            }
-                                        }
-                                        Text(mode.subtitle, fontSize = 11.sp, color = PocketColors.textSecondary)
-                                    }
-                                    if (isSel) {
-                                        Icon(Icons.Rounded.Check, null, tint = PocketColors.accentSoft, modifier = Modifier.size(18.dp))
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Direct Bootable USB Bypasses & Optional Drivers Folder (when DIRECT_NTFS_USB is selected)
-                    AnimatedVisibility(
-                        visible = buildOutputMode == WinBuildOutputMode.DIRECT_NTFS_USB,
-                        enter = fadeIn() + expandVertically(),
-                        exit = fadeOut() + shrinkVertically()
-                    ) {
-                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            PocketSectionHeader("Direct USB Setup Options")
-                            Surface(
-                                shape = RoundedCornerShape(12.dp),
-                                color = PocketColors.surfaceInput,
-                                border = BorderStroke(0.5.dp, PocketColors.border)
-                            ) {
-                                Column {
-                                    DirectUsbOptionRow("Bypass TPM 2.0, Secure Boot & 4 GB RAM", usbBypassReq) { usbBypassReq = it }
-                                    PocketHairlineDivider()
-                                    DirectUsbOptionRow("Bypass Online Microsoft Account (NRO)", usbBypassMsa) { usbBypassMsa = it }
-                                    PocketHairlineDivider()
-                                    DirectUsbOptionRow("Disable Telemetry & Privacy Prompts", usbDisableTelemetry) { usbDisableTelemetry = it }
-                                    PocketHairlineDivider()
-                                    DirectUsbOptionRow("Disable Automatic BitLocker Encryption", usbDisableBitLocker) { usbDisableBitLocker = it }
-                                }
-                            }
-
-                            Surface(
-                                modifier = Modifier.fillMaxWidth().bounceClick { showUsbDriversDialog = true },
-                                shape = RoundedCornerShape(11.dp),
-                                color = PocketColors.surfaceInput,
-                                border = BorderStroke(0.75.dp, if (usbExtraDriversDir.isNotBlank()) PocketColors.accent else PocketColors.border)
-                            ) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                                ) {
-                                    Icon(Icons.Rounded.FolderCopy, null, tint = PocketColors.infoBlue, modifier = Modifier.size(18.dp))
+                        PocketSectionHeader("Download Method")
+                        WinDownloadMethod.entries.forEach { method ->
+                            val isSel = downloadMethod == method
+                            val disabled = method == WinDownloadMethod.DOWNLOAD_UPDATES_ONLY && detailedManifest?.hasUpdates == false
+                            Surface(modifier = Modifier.fillMaxWidth().bounceClick(enabled = !disabled) { downloadMethod = method }, shape = RoundedCornerShape(11.dp), color = if (isSel) PocketColors.accentBg else PocketColors.surfaceInput, border = BorderStroke(if (isSel) 1.25.dp else 0.5.dp, if (isSel) PocketColors.accent else PocketColors.border)) {
+                                Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
                                     Column(modifier = Modifier.weight(1f)) {
-                                        Text("Include Driver / Apps Folder", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
-                                        Text(
-                                            text = if (usbExtraDriversDir.isNotBlank()) "Copying to /Drivers: ${UsbGadgetEngine.friendlyFolderName(usbExtraDriversDir)}" else "Optional · copy NVMe / Wi-Fi drivers into /Drivers",
-                                            fontSize = 11.sp,
-                                            color = if (usbExtraDriversDir.isNotBlank()) PocketColors.accentSoft else PocketColors.textSecondary,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
+                                        Text(method.label, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold, color = if (disabled) PocketColors.textMuted else if (isSel) PocketColors.accentSoft else PocketColors.textPrimary)
+                                        Text(if (disabled) "No additional updates in this build" else method.subtitle, fontSize = 10.5.sp, color = PocketColors.textSecondary)
                                     }
-                                    if (usbExtraDriversDir.isNotBlank()) {
-                                        Icon(Icons.Rounded.Close, "Clear", tint = PocketColors.textMuted, modifier = Modifier.size(17.dp).clickable { usbExtraDriversDir = "" })
+                                    if (isSel) Icon(Icons.Rounded.Check, null, tint = PocketColors.accentSoft, modifier = Modifier.size(17.dp))
+                                }
+                            }
+                        }
+                    }
+
+                    Surface(shape = RoundedCornerShape(12.dp), color = PocketColors.infoBlueBg.copy(alpha = 0.45f), border = BorderStroke(0.75.dp, PocketColors.infoBlue.copy(alpha = 0.6f))) {
+                        Column(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Icon(Icons.Rounded.SystemUpdateAlt, null, tint = PocketColors.infoBlue, modifier = Modifier.size(18.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    val dm = detailedManifest
+                                    Text(when { estimateLoading -> "Inspecting package manifest..."; dm != null -> "Base OS: ${UsbGadgetEngine.formatBytes(dm.baseBytes)} (${dm.baseFiles.size} files)"; else -> "Packages are SHA-1 verified & resumable" }, style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                                    if (dm != null) {
+                                        val updTxt = if (dm.hasUpdates) "${dm.updateFiles.size} additional updates (+${UsbGadgetEngine.formatBytes(dm.updateBytes)})" else "No additional updates"
+                                        val appTxt = if (dm.hasApps) " · ${dm.appFiles.size} Store apps (+${UsbGadgetEngine.formatBytes(dm.appBytes)})" else ""
+                                        Text("$updTxt$appTxt", fontSize = 11.sp, color = PocketColors.textSecondary)
+                                    }
+                                }
+                            }
+                            if (detailedManifest != null) {
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                                    if (detailedManifest!!.hasUpdates) {
+                                        OutlinedButton(onClick = { showUpdatesInspector = true }, modifier = Modifier.weight(1f).height(36.dp), shape = RoundedCornerShape(9.dp), contentPadding = PaddingValues(horizontal = 8.dp), border = BorderStroke(0.75.dp, PocketColors.infoBlue.copy(alpha = 0.7f))) {
+                                            Text("Updates List (${detailedManifest!!.updateFiles.size})", fontSize = 11.sp, color = PocketColors.textPrimary, maxLines = 1)
+                                        }
+                                    }
+                                    OutlinedButton(onClick = { showFullFilesInspector = true }, modifier = Modifier.weight(1f).height(36.dp), shape = RoundedCornerShape(9.dp), contentPadding = PaddingValues(horizontal = 8.dp), border = BorderStroke(0.75.dp, PocketColors.border)) {
+                                        Icon(Icons.Rounded.ListAlt, null, tint = PocketColors.accentSoft, modifier = Modifier.size(14.dp)); Spacer(modifier = Modifier.width(4.dp)); Text("All Files (${detailedManifest!!.allFiles.size})", fontSize = 11.sp, color = PocketColors.textPrimary, maxLines = 1)
                                     }
                                 }
                             }
                         }
                     }
 
-                    // Editable Output Filename Preview
-                    OutlinedTextField(
-                        value = customOutputName,
-                        onValueChange = { customOutputName = it },
-                        label = { Text("Output Filename") },
-                        leadingIcon = { Icon(Icons.Rounded.Tune, null, tint = PocketColors.accentSoft, modifier = Modifier.size(17.dp)) },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(12.dp),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = PocketColors.accent,
-                            unfocusedBorderColor = PocketColors.border,
-                            focusedContainerColor = PocketColors.surfaceInput,
-                            unfocusedContainerColor = PocketColors.surfaceInput
+                    if (downloadMethod != WinDownloadMethod.DOWNLOAD_UPDATES_ONLY) {
+                        val detOs = remember(b.title) { WindowsCustomizationEngine.detectWindowsOsKind(b.title) }
+                        Surface(shape = RoundedCornerShape(14.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.75.dp, PocketColors.border)) {
+                            Column(modifier = Modifier.fillMaxWidth()) {
+                                Row(modifier = Modifier.fillMaxWidth().clickable { convOptionsExpanded = !convOptionsExpanded }.padding(horizontal = 13.dp, vertical = 11.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text("Conversion & Integration Options", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                                        Text("100% on-phone · Unplug-safe at first Windows restart", fontSize = 10.5.sp, color = PocketColors.textSecondary)
+                                    }
+                                    Icon(if (convOptionsExpanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore, null, tint = PocketColors.textSecondary, modifier = Modifier.size(19.dp))
+                                }
+                                AnimatedVisibility(visible = convOptionsExpanded) {
+                                    Column(modifier = Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                        PocketHairlineDivider()
+                                        if (detailedManifest?.hasUpdates != false) {
+                                            val updSz = detailedManifest?.updateBytes?.takeIf { it > 0L }?.let { " (+${UsbGadgetEngine.formatBytes(it)})" }.orEmpty()
+                                            DirectUsbOptionRow("Include additional updates$updSz", includeUpdates) { includeUpdates = it }; PocketHairlineDivider()
+                                        }
+                                        if (detailedManifest?.hasApps == true) {
+                                            DirectUsbOptionRow("Include Inbox Store Apps (+${UsbGadgetEngine.formatBytes(detailedManifest!!.appBytes)})", includeStoreApps) { includeStoreApps = it }; PocketHairlineDivider()
+                                        }
+                                        if (detailedManifest?.hasNetFx3 == true) {
+                                            DirectUsbOptionRow("Integrate .NET Framework 3.5 (Offline)", integrateNetFx3) { integrateNetFx3 = it }; PocketHairlineDivider()
+                                        }
+                                        if (downloadMethod == WinDownloadMethod.DOWNLOAD_AND_BUILD) {
+                                            DirectUsbOptionRow("Run component cleanup (/ResetBase)", runComponentCleanup) { runComponentCleanup = it }; PocketHairlineDivider()
+                                            DirectUsbOptionRow("Use solid (ESD) compression${if (!detOs.supportsEsd) " (N/A Win 7/8)" else ""}", buildCompression == WinIsoCompression.ESD && detOs.supportsEsd) { if (detOs.supportsEsd) buildCompression = if (it) WinIsoCompression.ESD else WinIsoCompression.WIM }; PocketHairlineDivider()
+                                            DirectUsbOptionRow("Skip WinRE Recovery (~480 MB smaller)", skipWinRe) { skipWinRe = it }; PocketHairlineDivider()
+                                            DirectUsbOptionRow("Unlock all editions (ei.cfg)", eiCfgUnlock) { eiCfgUnlock = it }; PocketHairlineDivider()
+                                            DirectUsbOptionRow("Keep base UUP packages after build", keepPackagesAfterBuild) { keepPackagesAfterBuild = it }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (downloadMethod == WinDownloadMethod.DOWNLOAD_AND_BUILD) {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            PocketSectionHeader("Output Target")
+                            val modes = buildList { add(WinBuildOutputMode.STANDARD_ISO); if (multiBootDrives.isNotEmpty()) add(WinBuildOutputMode.DIRECT_MULTIBOOT); add(WinBuildOutputMode.DIRECT_NTFS_USB) }
+                            modes.forEach { mode ->
+                                val isSel = buildOutputMode == mode
+                                Surface(modifier = Modifier.fillMaxWidth().bounceClick { buildOutputMode = mode }, shape = RoundedCornerShape(11.dp), color = if (isSel) PocketColors.accentBg else PocketColors.surfaceInput, border = BorderStroke(if (isSel) 1.5.dp else 0.5.dp, if (isSel) PocketColors.accent else PocketColors.border)) {
+                                    Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                                Text(mode.label, style = MaterialTheme.typography.labelLarge, color = if (isSel) PocketColors.accentSoft else PocketColors.textPrimary)
+                                                if (mode.recommended) Surface(shape = RoundedCornerShape(5.dp), color = PocketColors.successBg) { Text("Rec", modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, color = PocketColors.success) }
+                                            }
+                                            Text(mode.subtitle, fontSize = 11.sp, color = PocketColors.textSecondary)
+                                        }
+                                        if (isSel) Icon(Icons.Rounded.Check, null, tint = PocketColors.accentSoft, modifier = Modifier.size(18.dp))
+                                    }
+                                }
+                            }
+                        }
+
+                        AnimatedVisibility(visible = buildOutputMode == WinBuildOutputMode.DIRECT_NTFS_USB) {
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                PocketSectionHeader("USB Partition Scheme & Drivers")
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    PartitionScheme.entries.forEach { s ->
+                                        val sel = usbScheme == s
+                                        Surface(modifier = Modifier.weight(1f).bounceClick { usbScheme = s }, shape = RoundedCornerShape(11.dp), color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput, border = BorderStroke(if (sel) 1.25.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)) {
+                                            Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                                Text(s.label, style = MaterialTheme.typography.labelMedium, color = if (sel) PocketColors.accentSoft else PocketColors.textPrimary)
+                                                Text(s.subtitle, fontSize = 10.sp, color = PocketColors.textSecondary)
+                                            }
+                                        }
+                                    }
+                                }
+                                Surface(modifier = Modifier.fillMaxWidth().bounceClick { showUsbDriversDialog = true }, shape = RoundedCornerShape(11.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.75.dp, if (usbExtraDriversDir.isNotBlank()) PocketColors.accent else PocketColors.border)) {
+                                    Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                        Icon(Icons.Rounded.FolderOpen, null, tint = PocketColors.accentSoft, modifier = Modifier.size(18.dp))
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text("Include Driver / Apps Folder (/Drivers)", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                                            Text(if (usbExtraDriversDir.isNotBlank()) usbExtraDriversDir.replace("/data/media/0", "/sdcard") else "Tap to browse folder (Intel RST, Wi-Fi, etc.)", fontSize = 11.sp, color = if (usbExtraDriversDir.isNotBlank()) PocketColors.accentSoft else PocketColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        }
+                                        if (usbExtraDriversDir.isNotBlank()) Icon(Icons.Rounded.Close, "Clear", tint = PocketColors.textMuted, modifier = Modifier.size(17.dp).clickable { usbExtraDriversDir = "" })
+                                        else Text("Browse", style = MaterialTheme.typography.labelSmall, color = PocketColors.accentSoft)
+                                    }
+                                }
+                            }
+                        }
+
+                        val detOsKind = remember(b.title) { WindowsCustomizationEngine.detectWindowsOsKind(b.title) }
+                        WindowsTwoPaneCustomizer(
+                            osKind = detOsKind, arch = b.arch, experience = experience, winUtil = winUtil, presets = presets,
+                            showCa2023Option = true, showCustomScriptOption = true, defaultBrowseDir = targetDir,
+                            onExperienceChange = { experience = it }, onWinUtilChange = { winUtil = it },
+                            onApplyPreset = { p ->
+                                usbScheme = runCatching { PartitionScheme.valueOf(p.schemeName) }.getOrDefault(usbScheme)
+                                experience = WindowsExperienceConfig(p.bypassRequirements, p.bypassMicrosoftAccount, p.disableDataCollection, p.disableBitLocker, p.qolImprovements, p.disableSponsoredApps, p.classicContextMenu, p.skipWifiSetup, p.createLocalUser, p.localUsername, "", p.skipOobe, p.useCa2023Bootloaders, p.applySkuSiPolicy)
+                                winUtil = WinUtilTweaksConfig.fromJsonString(p.winUtilJson)
+                            },
+                            onSavePreset = { n -> onSavePreset(AutounattendPreset(n, usbScheme.name, experience.bypassRequirements, experience.bypassMicrosoftAccount, experience.disableDataCollection, experience.disableBitLocker, experience.disableSponsoredApps, experience.classicContextMenu, experience.skipWifiSetup, experience.createLocalUser, experience.localUsername, experience.skipOobe, experience.qolImprovements, experience.useCa2023Bootloaders, experience.applySkuSiPolicy, winUtil.toJsonString())) },
+                            onDeletePreset = onDeletePreset
                         )
+                    }
+
+                    OutlinedTextField(
+                        value = customOutputName, onValueChange = { customOutputName = it },
+                        label = { Text(if (downloadMethod == WinDownloadMethod.DOWNLOAD_AND_BUILD) "Output Filename" else "Output Folder Name") },
+                        leadingIcon = { Icon(Icons.Rounded.Tune, null, tint = PocketColors.accentSoft, modifier = Modifier.size(17.dp)) },
+                        singleLine = true, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp),
+                        colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = PocketColors.accent, unfocusedBorderColor = PocketColors.border, focusedContainerColor = PocketColors.surfaceInput, unfocusedContainerColor = PocketColors.surfaceInput)
                     )
 
-                    // Pre-Build Storage & Battery Check Strip
-                    Surface(
-                        shape = RoundedCornerShape(11.dp),
-                        color = when {
-                            lowSpace -> PocketColors.dangerBg
-                            lowBattery -> PocketColors.warningBg
-                            else -> PocketColors.surfaceInput
-                        },
-                        border = BorderStroke(
-                            0.5.dp,
-                            when {
-                                lowSpace -> PocketColors.danger
-                                lowBattery -> PocketColors.warning
-                                else -> PocketColors.border
+                    val freeAfter = (freeBytes - minNeededBytes).coerceAtLeast(0L)
+                    Surface(shape = RoundedCornerShape(11.dp), color = when { lowSpace -> PocketColors.dangerBg; lowBattery -> PocketColors.warningBg; else -> PocketColors.surfaceInput }, border = BorderStroke(0.5.dp, when { lowSpace -> PocketColors.danger; lowBattery -> PocketColors.warning; else -> PocketColors.border })) {
+                        Column(modifier = Modifier.fillMaxWidth().padding(11.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Icon(when { lowSpace -> Icons.Rounded.WarningAmber; lowBattery -> Icons.Rounded.BatteryAlert; else -> Icons.Rounded.Info }, null, tint = when { lowSpace -> PocketColors.danger; lowBattery -> PocketColors.warning; else -> PocketColors.accentSoft }, modifier = Modifier.size(16.dp))
+                                Text(when { lowSpace -> "Need ~${UsbGadgetEngine.formatBytes(minNeededBytes)}, only ${UsbGadgetEngine.formatBytes(freeBytes)} free"; lowBattery -> "Battery at $batteryPct% · plug in charger for long builds"; else -> "DL ${UsbGadgetEngine.formatBytes(selDlBytes)} · Peak ${UsbGadgetEngine.formatBytes(minNeededBytes)} · Free After ~${UsbGadgetEngine.formatBytes(freeAfter)}" }, style = PocketColors.monoStyle, color = PocketColors.textPrimary)
                             }
-                        )
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(11.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Icon(
-                                imageVector = when {
-                                    lowSpace -> Icons.Rounded.WarningAmber
-                                    lowBattery -> Icons.Rounded.BatteryAlert
-                                    else -> Icons.Rounded.Info
-                                },
-                                contentDescription = null,
-                                tint = when {
-                                    lowSpace -> PocketColors.danger
-                                    lowBattery -> PocketColors.warning
-                                    else -> PocketColors.accentSoft
-                                },
-                                modifier = Modifier.size(17.dp)
-                            )
-                            Text(
-                                text = when {
-                                    lowSpace -> "Need ~${UsbGadgetEngine.formatBytes(minNeededBytes)} temp space in ${UsbGadgetEngine.friendlyFolderName(targetDir)} (only ${UsbGadgetEngine.formatBytes(freeBytes)} free)."
-                                    lowBattery -> "Battery is at $batteryPct%. Plug in a charger before starting long ISO assembly."
-                                    else -> "Temp workspace: ${UsbGadgetEngine.friendlyFolderName(targetDir)}/.pocketboot_tmp · ${UsbGadgetEngine.formatBytes(freeBytes)} free"
-                                },
-                                style = MaterialTheme.typography.bodySmall,
-                                color = PocketColors.textPrimary
-                            )
-                        }
-                    }
-
-                    if ((buildOutputMode != WinBuildOutputMode.DIRECT_NTFS_USB && !buildTools.canConvertIso) ||
-                        (buildOutputMode == WinBuildOutputMode.DIRECT_NTFS_USB && !buildTools.canBuildDirectUsb)
-                    ) {
-                        Surface(
-                            shape = RoundedCornerShape(11.dp),
-                            color = PocketColors.warningBg,
-                            border = BorderStroke(0.5.dp, PocketColors.warning)
-                        ) {
-                            Text(
-                                "Note: On-phone Windows ISO build binaries (cabextract/wimlib/chntpw/xorriso) were not detected. Check Pre-Flight Diagnostics.",
-                                modifier = Modifier.padding(11.dp),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = PocketColors.textPrimary
-                            )
+                            if (freeBytes > 0L) LinearProgressIndicator(progress = { (minNeededBytes.toFloat() / freeBytes.toFloat()).coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth().height(5.dp).clip(RoundedCornerShape(999.dp)), color = if (lowSpace) PocketColors.danger else PocketColors.accent, trackColor = PocketColors.surfaceSubtle)
                         }
                     }
 
@@ -1286,21 +1251,11 @@ fun WindowsDownloadSheet(
                         OutlinedButton(
                             onClick = {
                                 val langCode = selectedBuildLang?.code ?: "en-us"
-                                val webUrl = WindowsBuildEngine.buildExternalPageLink(b, langCode)
-                                val cm = context.getSystemService(ClipboardManager::class.java)
-                                cm?.setPrimaryClip(ClipData.newPlainText("Windows Build Link", webUrl))
-                                Toast.makeText(context, "Copied build link for external download managers.", Toast.LENGTH_SHORT).show()
+                                context.getSystemService(ClipboardManager::class.java)?.setPrimaryClip(ClipData.newPlainText("Windows Build Link", WindowsBuildEngine.buildExternalPageLink(b, langCode)))
+                                Toast.makeText(context, "Copied build link.", Toast.LENGTH_SHORT).show()
                             },
-                            modifier = Modifier.weight(0.95f).height(48.dp),
-                            shape = RoundedCornerShape(12.dp),
-                            contentPadding = PaddingValues(horizontal = 10.dp),
-                            border = BorderStroke(0.75.dp, PocketColors.border)
-                        ) {
-                            Icon(Icons.Rounded.ContentCopy, null, tint = PocketColors.accentSoft, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(5.dp))
-                            Text("Copy Link", fontSize = 12.5.sp, color = PocketColors.textPrimary)
-                        }
-
+                            modifier = Modifier.weight(0.9f).height(48.dp), shape = RoundedCornerShape(12.dp), contentPadding = PaddingValues(horizontal = 10.dp), border = BorderStroke(0.75.dp, PocketColors.border)
+                        ) { Icon(Icons.Rounded.ContentCopy, null, tint = PocketColors.accentSoft, modifier = Modifier.size(16.dp)); Spacer(modifier = Modifier.width(5.dp)); Text("Copy Link", fontSize = 12.5.sp, color = PocketColors.textPrimary) }
                         Button(
                             onClick = {
                                 val lang = selectedBuildLang ?: return@Button
@@ -1310,32 +1265,19 @@ fun WindowsDownloadSheet(
                                 onDismiss()
                                 onStartChannelBuild(
                                     WindowsChannelBuildConfig(
-                                        build = b,
-                                        lang = lang,
-                                        editions = chosenEds,
-                                        compression = buildCompression,
-                                        outputMode = buildOutputMode,
-                                        targetDir = targetDir,
-                                        customOutputName = customOutputName.trim(),
-                                        targetMultiBootPath = mbPath,
-                                        connections = turboConnections,
-                                        autoMount = true,
-                                        bypassRequirements = usbBypassReq,
-                                        bypassMicrosoftAccount = usbBypassMsa,
-                                        disableDataCollection = usbDisableTelemetry,
-                                        disableBitLocker = usbDisableBitLocker,
-                                        extraDriversDir = usbExtraDriversDir.trim()
+                                        build = b, lang = lang, editions = chosenEds, compression = buildCompression, outputMode = buildOutputMode, downloadMethod = downloadMethod,
+                                        targetDir = targetDir, customOutputName = customOutputName.trim(), targetMultiBootPath = mbPath, connections = turboConnections, autoMount = true,
+                                        includeUpdates = includeUpdates, includeStoreApps = includeStoreApps, integrateNetFx3 = integrateNetFx3, runComponentCleanup = runComponentCleanup,
+                                        skipWinRe = skipWinRe, eiCfgUnlock = eiCfgUnlock, keepPackagesAfterBuild = keepPackagesAfterBuild, scheme = usbScheme, experience = experience, winUtil = winUtil, extraDriversDir = usbExtraDriversDir.trim()
                                     )
                                 )
                             },
                             enabled = !lowSpace && selectedBuildLang != null && selectedBuildEditions.isNotEmpty() && customOutputName.isNotBlank(),
-                            modifier = Modifier.weight(1.35f).height(48.dp),
-                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.weight(1.4f).height(48.dp), shape = RoundedCornerShape(12.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)
                         ) {
-                            Icon(Icons.Rounded.Build, null, modifier = Modifier.size(17.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Download & Build", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                            Icon(Icons.Rounded.Build, null, modifier = Modifier.size(17.dp)); Spacer(modifier = Modifier.width(6.dp))
+                            Text(when (downloadMethod) { WinDownloadMethod.DOWNLOAD_AND_BUILD -> "Download & Build"; WinDownloadMethod.DOWNLOAD_PACKAGE_SET -> "Download Packages"; WinDownloadMethod.DOWNLOAD_UPDATES_ONLY -> "Download Updates" }, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
                         }
                     }
                 }
@@ -1346,46 +1288,41 @@ fun WindowsDownloadSheet(
     }
 
     if (showUsbDriversDialog) {
-        var draftDir by remember(usbExtraDriversDir) { mutableStateOf(usbExtraDriversDir.ifBlank { "/sdcard/Drivers" }) }
-        AlertDialog(
-            onDismissRequest = { showUsbDriversDialog = false },
-            containerColor = PocketColors.surfaceCard,
-            title = { Text("Include Driver / Apps Folder", color = PocketColors.textPrimary) },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        "Files from this folder will be copied into /Drivers on the Direct Bootable USB image.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = PocketColors.textSecondary
-                    )
-                    OutlinedTextField(
-                        value = draftDir,
-                        onValueChange = { draftDir = it },
-                        label = { Text("Folder path") },
-                        placeholder = { Text("/sdcard/Drivers") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        usbExtraDriversDir = UsbGadgetEngine.resolveDirectPath(draftDir)
-                        showUsbDriversDialog = false
-                    },
-                    enabled = draftDir.trim().isNotEmpty(),
-                    colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)
-                ) {
-                    Text("Set Folder", fontWeight = FontWeight.SemiBold)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showUsbDriversDialog = false }) {
-                    Text("Cancel", color = PocketColors.textSecondary)
+        RootFolderPickerSheet("Select Drivers / Apps Folder", "Files inside will be copied into /Drivers on the Direct USB", usbExtraDriversDir.ifBlank { targetDir }, { showUsbDriversDialog = false }) { usbExtraDriversDir = it; showUsbDriversDialog = false }
+    }
+    if (showUpdatesInspector && detailedManifest != null) {
+        WinManifestInspectorSheet("Additional Updates (${detailedManifest!!.updateFiles.size})", "Total: ${UsbGadgetEngine.formatBytes(detailedManifest!!.updateBytes)} · Embedded unplug-safe via \$OEM\$", detailedManifest!!.updateFiles) { showUpdatesInspector = false }
+    }
+    if (showFullFilesInspector && detailedManifest != null) {
+        WinManifestInspectorSheet("Full Build File List (${detailedManifest!!.allFiles.size})", "Total manifest: ${UsbGadgetEngine.formatBytes(detailedManifest!!.allFiles.sumOf { it.sizeBytes })}", detailedManifest!!.allFiles) { showFullFilesInspector = false }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun WinManifestInspectorSheet(title: String, subtitle: String, files: List<WinPackageFileEntry>, onDismiss: () -> Unit) {
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), containerColor = PocketColors.surfaceCard) {
+        Column(modifier = Modifier.fillMaxWidth().fillMaxHeight(0.82f).padding(horizontal = 18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            PocketSheetHeader(icon = Icons.Rounded.ListAlt, tint = PocketColors.infoBlue, iconBg = PocketColors.infoBlueBg, title = title, subtitle = subtitle)
+            LazyColumn(modifier = Modifier.weight(1f).fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                items(files, key = { it.name }) { f ->
+                    Surface(shape = RoundedCornerShape(10.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
+                        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 11.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                Text(f.name, style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Surface(shape = RoundedCornerShape(5.dp), color = PocketColors.accentBg) { Text(f.kind.badge, modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp), fontSize = 9.5.sp, color = PocketColors.accentSoft) }
+                            }
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text("SHA-1: ${f.sha1.take(18)}...", style = PocketColors.monoStyle, fontSize = 10.sp, color = PocketColors.textMuted)
+                                Text(UsbGadgetEngine.formatBytes(f.sizeBytes), style = PocketColors.monoStyle, fontSize = 10.5.sp, color = PocketColors.accentSoft)
+                            }
+                        }
+                    }
                 }
             }
-        )
+            OutlinedButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth().padding(bottom = 18.dp).height(46.dp), shape = RoundedCornerShape(12.dp), border = BorderStroke(0.75.dp, PocketColors.border)) { Text("Close", color = PocketColors.textPrimary) }
+        }
     }
 }
 

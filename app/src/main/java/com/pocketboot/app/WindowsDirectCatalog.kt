@@ -51,6 +51,15 @@ enum class WindowsCatalogFamily(
         supportsDirectRetail = true,
         defaultBuilderFamily = WinFamilyFilter.WIN10
     ),
+    WIN81(
+        id = "win81",
+        title = "Windows 8.1",
+        subtitle = "Official Microsoft Retail ISO (x64 & x86)",
+        badgeLabel = "Direct ISO",
+        sizeHint = "~3.6–4.3 GB",
+        supportsDirectRetail = true,
+        defaultBuilderFamily = WinFamilyFilter.WIN10
+    ),
     ALL_BUILDS(
         id = "all_builds",
         title = "Windows Builds & Server",
@@ -122,7 +131,8 @@ object WindowsDirectCatalog {
         DirectWindowsRelease("win11", "25H2 (Build 26200)", "Windows 11 Home/Pro/Edu (ARM64)", 3263, isArm64Only = true),
         DirectWindowsRelease("win11", "24H2 (Build 26100)", "Windows 11 Home/Pro/Edu", 3113, isArm64Only = false),
         DirectWindowsRelease("win11", "24H2 (Build 26100)", "Windows 11 Home/Pro/Edu (ARM64)", 3131, isArm64Only = true),
-        DirectWindowsRelease("win10", "22H2 v1 (Build 19045)", "Windows 10 Home/Pro/Edu", 2618, isArm64Only = false)
+        DirectWindowsRelease("win10", "22H2 v1 (Build 19045)", "Windows 10 Home/Pro/Edu", 2618, isArm64Only = false),
+        DirectWindowsRelease("win81", "8.1 Update 3 (Build 9600)", "Windows 8.1 Core/Pro", 52, isArm64Only = false)
     )
 
     private fun ensureCookieManager() {
@@ -163,7 +173,7 @@ object WindowsDirectCatalog {
 
     suspend fun fetchReleases(family: WindowsCatalogFamily, forceRefresh: Boolean = false): List<DirectWindowsRelease> =
         withContext(Dispatchers.IO) {
-            val famKey = if (family == WindowsCatalogFamily.WIN11) "win11" else "win10"
+            val famKey = when (family) { WindowsCatalogFamily.WIN11 -> "win11"; WindowsCatalogFamily.WIN81 -> "win81"; else -> "win10" }
             if (!forceRefresh) {
                 releasesCache[famKey]?.takeIf { it.isNotEmpty() }?.let { return@withContext it }
             }
@@ -251,13 +261,14 @@ object WindowsDirectCatalog {
 
         val osWin11Regex = Regex("""@\(\s*"Windows\s+11"\s*,""", RegexOption.IGNORE_CASE)
         val osWin10Regex = Regex("""@\(\s*"Windows\s+10"\s*,""", RegexOption.IGNORE_CASE)
-        val osOtherRegex = Regex("""@\(\s*"(?:Windows\s+8|Windows\s+7|UEFI\s+Shell)[^"]*"\s*,""", RegexOption.IGNORE_CASE)
+        val osWin81Regex = Regex("""@\(\s*"Windows\s+8\.1"\s*,""", RegexOption.IGNORE_CASE)
+        val osOtherRegex = Regex("""@\(\s*"(?:Windows\s+7|UEFI\s+Shell)[^"]*"\s*,""", RegexOption.IGNORE_CASE)
 
         val releaseRegex = Regex("""@\(\s*"([^"]*(?:2[0-9]H[12]|v\d|Build\s+\d+)[^"]*)"\s*,""", RegexOption.IGNORE_CASE)
         // Tuple form: @("Windows 11 Home/Pro/Edu", @(3813, 3816))
         val tupleEditionRegex = Regex("""@\(\s*"([^"]+)"\s*,\s*@\(\s*(\d{3,5})\s*(?:,\s*(\d{3,5}))?\s*\)\s*\)""")
         // Single form: @("Windows 10 Home/Pro/Edu", 2618)
-        val singleEditionRegex = Regex("""@\(\s*"([^"]+)"\s*,\s*(\d{3,5})\s*\)""")
+        val singleEditionRegex = Regex("""@\(\s*"([^"]+)"\s*,\s*(\d{1,5})\s*\)""")
 
         body.lineSequence().forEach { rawLine ->
             val line = rawLine.trim()
@@ -270,6 +281,11 @@ object WindowsDirectCatalog {
             }
             if (osWin10Regex.containsMatchIn(line)) {
                 currentOs = "win10"
+                currentRelease = ""
+                return@forEach
+            }
+            if (osWin81Regex.containsMatchIn(line)) {
+                currentOs = "win81"
                 currentRelease = ""
                 return@forEach
             }
@@ -346,7 +362,7 @@ object WindowsDirectCatalog {
     }
 
     private fun initializeSession(sessionId: String, osFamily: String) {
-        val pageSlug = if (osFamily == "win11") "windows11" else "windows10ISO"
+        val pageSlug = when (osFamily) { "win11" -> "windows11"; "win81" -> "windows8ISO"; else -> "windows10ISO" }
         val pageUrl = "https://www.microsoft.com/en-us/software-download/$pageSlug"
 
         runCatching { httpGet(pageUrl) }
@@ -386,7 +402,7 @@ object WindowsDirectCatalog {
         suspendCancellableCoroutine { cont ->
             val mainHandler = Handler(Looper.getMainLooper())
             mainHandler.post {
-                val pageSlug = if (osFamily == "win11") "windows11" else "windows10ISO"
+                val pageSlug = when (osFamily) { "win11" -> "windows11"; "win81" -> "windows8ISO"; else -> "windows10ISO" }
                 val originUrl = "https://www.microsoft.com/en-us/software-download/$pageSlug"
                 var finished = false
                 var wv: WebView? = null
@@ -545,7 +561,7 @@ object WindowsDirectCatalog {
         }
 
         val sessionId = UUID.randomUUID().toString()
-        val pageSlug = if (release.osFamily == "win11") "windows11" else "windows10ISO"
+        val pageSlug = when (release.osFamily) { "win11" -> "windows11"; "win81" -> "windows8ISO"; else -> "windows10ISO" }
         val referer = "https://www.microsoft.com/en-us/software-download/$pageSlug"
         val apiUrl = "https://www.microsoft.com/software-download-connector/api/getskuinformationbyproductedition" +
             "?profile=$profileId&productEditionId=${release.editionId}" +
@@ -587,7 +603,7 @@ object WindowsDirectCatalog {
         sessionId: String,
         skuId: String
     ): DirectApiResult<List<DirectIsoLink>> = withContext(Dispatchers.IO) {
-        val pageSlug = if (release.osFamily == "win11") "windows11" else "windows10ISO"
+        val pageSlug = when (release.osFamily) { "win11" -> "windows11"; "win81" -> "windows8ISO"; else -> "windows10ISO" }
         val referer = "https://www.microsoft.com/en-us/software-download/$pageSlug"
         val apiUrl = "https://www.microsoft.com/software-download-connector/api/GetProductDownloadLinksBySku" +
             "?profile=$profileId&productEditionId=undefined&SKU=$skuId" +

@@ -41,12 +41,21 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <service
+            android:name=".IsoBuilderService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
         <receiver
             android:name=".DisconnectReceiver"
             android:exported="false" />
 
         <receiver
             android:name=".TurboDownloadActionReceiver"
+            android:exported="false" />
+
+        <receiver
+            android:name=".IsoBuilderActionReceiver"
             android:exported="false" />
 
         <service

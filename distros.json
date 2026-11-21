@@ -1,42 +1,35 @@
 {
-  "version": 4,
+  "version": 440,
+  "updated": "2026-11-22",
   "distros": [
     {
       "title": "Ubuntu Desktop",
-      "subtitle": "Popular Linux desktop installer for 64-bit PCs",
+      "subtitle": "Most popular Linux desktop with full hardware support",
       "category": "Linux",
-      "sizeLabel": "5.8\u20136.0 GB",
-      "approxBytes": 6442450944,
+      "sizeLabel": "5.9 GB",
+      "approxBytes": 6335076761,
       "fileName": "ubuntu-26.04.1-desktop-amd64.iso",
       "url": "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-desktop-amd64.iso",
       "versions": [
         {
-          "label": "26.04.1 LTS (Latest \u00b7 Linux 7.0 \u00b7 Resolute)",
-          "date": "Aug 2026",
+          "label": "26.04.1 LTS (Latest \u00b7 Resolute)",
+          "releaseYear": "2026",
           "sizeLabel": "5.9 GB",
           "approxBytes": 6335076761,
           "fileName": "ubuntu-26.04.1-desktop-amd64.iso",
           "url": "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-desktop-amd64.iso"
         },
         {
-          "label": "26.10 (Short-Term Interim Release)",
-          "date": "Oct 2026",
-          "sizeLabel": "5.9 GB",
-          "approxBytes": 6335076761,
-          "fileName": "ubuntu-26.10-desktop-amd64.iso",
-          "url": "https://releases.ubuntu.com/26.10/ubuntu-26.10-desktop-amd64.iso"
-        },
-        {
-          "label": "24.04.5 LTS (Mature \u00b7 GNOME 46 \u00b7 Noble)",
-          "date": "Aug 2026",
+          "label": "24.04.5 LTS (Mature \u00b7 Noble)",
+          "releaseYear": "2026",
           "sizeLabel": "5.8 GB",
           "approxBytes": 6227702579,
           "fileName": "ubuntu-24.04.5.1-desktop-amd64.iso",
           "url": "https://releases.ubuntu.com/noble/ubuntu-24.04.5.1-desktop-amd64.iso"
         },
         {
-          "label": "22.04.5 LTS (Legacy Support \u00b7 Jammy)",
-          "date": "Sep 2024",
+          "label": "22.04.5 LTS (Legacy \u00b7 Jammy)",
+          "releaseYear": "2024",
           "sizeLabel": "4.7 GB",
           "approxBytes": 5046586572,
           "fileName": "ubuntu-22.04.5-desktop-amd64.iso",
@@ -45,51 +38,121 @@
       ]
     },
     {
-      "title": "Linux Mint",
-      "subtitle": "Clean, familiar desktop Linux out of the box",
+      "title": "Pop!_OS",
+      "subtitle": "System76 COSMIC desktop with Intel/AMD & NVIDIA editions",
       "category": "Linux",
       "sizeLabel": "2.8 GB",
       "approxBytes": 3006477107,
+      "fileName": "pop-os_latest_24.04_intel.iso",
+      "url": "https://api.pop-os.org/builds/24.04/intel",
+      "versions": [
+        {
+          "label": "24.04 LTS COSMIC (Intel / AMD \u00b7 Live API)",
+          "releaseYear": "2026",
+          "sizeLabel": "2.8 GB",
+          "approxBytes": 3006477107,
+          "fileName": "pop-os_latest_24.04_intel.iso",
+          "url": "https://api.pop-os.org/builds/24.04/intel"
+        },
+        {
+          "label": "24.04 LTS COSMIC (NVIDIA \u00b7 Live API)",
+          "releaseYear": "2026",
+          "sizeLabel": "3.2 GB",
+          "approxBytes": 3435973836,
+          "fileName": "pop-os_latest_24.04_nvidia.iso",
+          "url": "https://api.pop-os.org/builds/24.04/nvidia"
+        },
+        {
+          "label": "22.04 LTS GNOME (Intel / AMD \u00b7 Live API)",
+          "releaseYear": "2025",
+          "sizeLabel": "2.6 GB",
+          "approxBytes": 2791728742,
+          "fileName": "pop-os_latest_22.04_intel.iso",
+          "url": "https://api.pop-os.org/builds/22.04/intel"
+        },
+        {
+          "label": "22.04 LTS GNOME (NVIDIA \u00b7 Live API)",
+          "releaseYear": "2025",
+          "sizeLabel": "3.0 GB",
+          "approxBytes": 3221225472,
+          "fileName": "pop-os_latest_22.04_nvidia.iso",
+          "url": "https://api.pop-os.org/builds/22.04/nvidia"
+        }
+      ]
+    },
+    {
+      "title": "Linux Mint",
+      "subtitle": "Familiar, fast desktop ideal for Windows switchers",
+      "category": "Linux",
+      "sizeLabel": "2.9 GB",
+      "approxBytes": 3113851289,
       "fileName": "linuxmint-22.1-cinnamon-64bit.iso",
       "url": "https://mirrors.edge.kernel.org/linuxmint/stable/22.1/linuxmint-22.1-cinnamon-64bit.iso",
       "versions": [
         {
           "label": "22.1 Xia (Cinnamon \u00b7 Recommended)",
-          "date": "Jan 2025",
-          "sizeLabel": "2.8 GB",
-          "approxBytes": 3006477107,
+          "releaseYear": "2025",
+          "sizeLabel": "2.9 GB",
+          "approxBytes": 3113851289,
           "fileName": "linuxmint-22.1-cinnamon-64bit.iso",
           "url": "https://mirrors.edge.kernel.org/linuxmint/stable/22.1/linuxmint-22.1-cinnamon-64bit.iso"
         },
         {
           "label": "22.1 Xia (Xfce Lightweight)",
-          "date": "Jan 2025",
-          "sizeLabel": "2.7 GB",
-          "approxBytes": 2899102924,
+          "releaseYear": "2025",
+          "sizeLabel": "2.8 GB",
+          "approxBytes": 3006477107,
           "fileName": "linuxmint-22.1-xfce-64bit.iso",
           "url": "https://mirrors.edge.kernel.org/linuxmint/stable/22.1/linuxmint-22.1-xfce-64bit.iso"
         },
         {
           "label": "22 Wilma (Cinnamon)",
-          "date": "Jul 2024",
-          "sizeLabel": "2.8 GB",
-          "approxBytes": 3006477107,
-          "fileName": "linuxmint-22-cinnamon-64bit.iso",
-          "url": "https://mirrors.edge.kernel.org/linuxmint/stable/22/linuxmint-22-cinnamon-64bit.iso"
-        },
-        {
-          "label": "21.3 Virginia (Cinnamon)",
-          "date": "Jan 2024",
+          "releaseYear": "2024",
           "sizeLabel": "2.9 GB",
           "approxBytes": 3113851289,
-          "fileName": "linuxmint-21.3-cinnamon-64bit.iso",
-          "url": "https://mirrors.edge.kernel.org/linuxmint/stable/21.3/linuxmint-21.3-cinnamon-64bit.iso"
+          "fileName": "linuxmint-22-cinnamon-64bit.iso",
+          "url": "https://mirrors.edge.kernel.org/linuxmint/stable/22/linuxmint-22-cinnamon-64bit.iso"
+        }
+      ]
+    },
+    {
+      "title": "Debian",
+      "subtitle": "Rock-solid universal Linux OS (Live GNOME, KDE & Netinst)",
+      "category": "Linux",
+      "sizeLabel": "3.6 GB",
+      "approxBytes": 3865470566,
+      "fileName": "debian-live-13.7.0-amd64-gnome.iso",
+      "url": "https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/debian-live-13.7.0-amd64-gnome.iso",
+      "versions": [
+        {
+          "label": "13.7 Trixie Live (GNOME)",
+          "releaseYear": "2026",
+          "sizeLabel": "3.6 GB",
+          "approxBytes": 3865470566,
+          "fileName": "debian-live-13.7.0-amd64-gnome.iso",
+          "url": "https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/debian-live-13.7.0-amd64-gnome.iso"
+        },
+        {
+          "label": "13.7 Trixie Live (KDE Plasma)",
+          "releaseYear": "2026",
+          "sizeLabel": "3.8 GB",
+          "approxBytes": 4080218931,
+          "fileName": "debian-live-13.7.0-amd64-kde.iso",
+          "url": "https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/debian-live-13.7.0-amd64-kde.iso"
+        },
+        {
+          "label": "13.7 Trixie Netinst (Minimal)",
+          "releaseYear": "2026",
+          "sizeLabel": "680 MB",
+          "approxBytes": 713031680,
+          "fileName": "debian-13.7.0-amd64-netinst.iso",
+          "url": "https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-13.7.0-amd64-netinst.iso"
         }
       ]
     },
     {
       "title": "Fedora Workstation",
-      "subtitle": "Cutting-edge GNOME desktop with newest Linux kernel",
+      "subtitle": "Cutting-edge GNOME desktop backed by Red Hat",
       "category": "Linux",
       "sizeLabel": "2.4 GB",
       "approxBytes": 2576980377,
@@ -98,157 +161,282 @@
       "versions": [
         {
           "label": "Fedora 45 Workstation (Latest)",
-          "date": "Oct 2026",
-          "sizeLabel": "2.5 GB",
-          "approxBytes": 2684354560,
+          "releaseYear": "2026",
+          "sizeLabel": "2.4 GB",
+          "approxBytes": 2576980377,
           "fileName": "Fedora-Workstation-Live-45-1.4.x86_64.iso",
           "url": "https://download.fedoraproject.org/pub/fedora/linux/releases/45/Workstation/x86_64/iso/Fedora-Workstation-Live-45-1.4.x86_64.iso"
         },
         {
           "label": "Fedora 44 Workstation",
-          "date": "Apr 2026",
+          "releaseYear": "2026",
           "sizeLabel": "2.4 GB",
           "approxBytes": 2576980377,
           "fileName": "Fedora-Workstation-Live-44-1.7.x86_64.iso",
           "url": "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Workstation/x86_64/iso/Fedora-Workstation-Live-44-1.7.x86_64.iso"
-        },
-        {
-          "label": "Fedora 43 Workstation",
-          "date": "Oct 2025",
-          "sizeLabel": "2.3 GB",
-          "approxBytes": 2469606195,
-          "fileName": "Fedora-Workstation-Live-43-1.6.x86_64.iso",
-          "url": "https://download.fedoraproject.org/pub/fedora/linux/releases/43/Workstation/x86_64/iso/Fedora-Workstation-Live-43-1.6.x86_64.iso"
         }
       ]
     },
     {
       "title": "Arch Linux",
-      "subtitle": "Minimal rolling-release Linux installer for power users",
+      "subtitle": "Minimalist rolling-release Linux with full DIY control",
       "category": "Linux",
       "sizeLabel": "1.2 GB",
-      "approxBytes": 1317568512,
+      "approxBytes": 1288490188,
       "fileName": "archlinux-x86_64.iso",
       "url": "https://geo.mirror.pkgbuild.com/iso/latest/archlinux-x86_64.iso",
       "versions": [
         {
           "label": "Latest Monthly Rolling (x86_64)",
-          "date": "Monthly",
+          "releaseYear": "2026",
           "sizeLabel": "1.2 GB",
-          "approxBytes": 1317568512,
+          "approxBytes": 1288490188,
           "fileName": "archlinux-x86_64.iso",
           "url": "https://geo.mirror.pkgbuild.com/iso/latest/archlinux-x86_64.iso"
         }
       ]
     },
     {
-      "title": "Ubuntu Server",
-      "subtitle": "Headless LTS Linux server & homelab installer",
+      "title": "openSUSE Tumbleweed",
+      "subtitle": "Reliable rolling release with YaST & Btrfs snapshots",
+      "category": "Linux",
+      "sizeLabel": "4.4 GB",
+      "approxBytes": 4724464025,
+      "fileName": "openSUSE-Tumbleweed-DVD-x86_64-Current.iso",
+      "url": "https://download.opensuse.org/tumbleweed/iso/openSUSE-Tumbleweed-DVD-x86_64-Current.iso",
+      "versions": [
+        {
+          "label": "Tumbleweed DVD (Offline Installer)",
+          "releaseYear": "2026",
+          "sizeLabel": "4.4 GB",
+          "approxBytes": 4724464025,
+          "fileName": "openSUSE-Tumbleweed-DVD-x86_64-Current.iso",
+          "url": "https://download.opensuse.org/tumbleweed/iso/openSUSE-Tumbleweed-DVD-x86_64-Current.iso"
+        },
+        {
+          "label": "Tumbleweed GNOME Live",
+          "releaseYear": "2026",
+          "sizeLabel": "1.1 GB",
+          "approxBytes": 1181116006,
+          "fileName": "openSUSE-Tumbleweed-GNOME-Live-x86_64-Current.iso",
+          "url": "https://download.opensuse.org/tumbleweed/iso/openSUSE-Tumbleweed-GNOME-Live-x86_64-Current.iso"
+        },
+        {
+          "label": "Tumbleweed KDE Live",
+          "releaseYear": "2026",
+          "sizeLabel": "1.1 GB",
+          "approxBytes": 1181116006,
+          "fileName": "openSUSE-Tumbleweed-KDE-Live-x86_64-Current.iso",
+          "url": "https://download.opensuse.org/tumbleweed/iso/openSUSE-Tumbleweed-KDE-Live-x86_64-Current.iso"
+        }
+      ]
+    },
+    {
+      "title": "NixOS",
+      "subtitle": "Declarative, reproducible Linux distribution",
+      "category": "Linux",
+      "sizeLabel": "2.6 GB",
+      "approxBytes": 2791728742,
+      "fileName": "latest-nixos-graphical-x86_64-linux.iso",
+      "url": "https://channels.nixos.org/nixos-unstable/latest-nixos-graphical-x86_64-linux.iso",
+      "versions": [
+        {
+          "label": "Graphical GNOME (Latest x86_64)",
+          "releaseYear": "2026",
+          "sizeLabel": "2.6 GB",
+          "approxBytes": 2791728742,
+          "fileName": "latest-nixos-graphical-x86_64-linux.iso",
+          "url": "https://channels.nixos.org/nixos-unstable/latest-nixos-graphical-x86_64-linux.iso"
+        },
+        {
+          "label": "Minimal CLI (Latest x86_64)",
+          "releaseYear": "2026",
+          "sizeLabel": "1.1 GB",
+          "approxBytes": 1181116006,
+          "fileName": "latest-nixos-minimal-x86_64-linux.iso",
+          "url": "https://channels.nixos.org/nixos-unstable/latest-nixos-minimal-x86_64-linux.iso"
+        }
+      ]
+    },
+    {
+      "title": "Proxmox VE",
+      "subtitle": "Enterprise open-source hypervisor (KVM + LXC + ZFS)",
       "category": "Server",
-      "sizeLabel": "3.8 GB",
-      "approxBytes": 4080218931,
+      "sizeLabel": "1.71 GB",
+      "approxBytes": 1836098682,
+      "fileName": "proxmox-ve_9.2-1.iso",
+      "url": "https://enterprise.proxmox.com/iso/proxmox-ve_9.2-1.iso",
+      "versions": [
+        {
+          "label": "Proxmox VE 9.2-1 (x86_64 \u00b7 Latest)",
+          "releaseYear": "2026",
+          "sizeLabel": "1.71 GB",
+          "approxBytes": 1836098682,
+          "fileName": "proxmox-ve_9.2-1.iso",
+          "url": "https://enterprise.proxmox.com/iso/proxmox-ve_9.2-1.iso",
+          "sha256": "4e88fe416df9b527624a175f24c9aa07c714d3332afb1ee3dbf3879573ef2c6c"
+        },
+        {
+          "label": "Proxmox VE 8.4-1 (Legacy Stable)",
+          "releaseYear": "2025",
+          "sizeLabel": "1.57 GB",
+          "approxBytes": 1685774663,
+          "fileName": "proxmox-ve_8.4-1.iso",
+          "url": "https://enterprise.proxmox.com/iso/proxmox-ve_8.4-1.iso",
+          "sha256": "d237d70ca48a9f6eb47f95fd4fd337722c3f69f8106393844d027d28c26523d8"
+        }
+      ]
+    },
+    {
+      "title": "Ubuntu Server",
+      "subtitle": "Headless LTS Linux server for homelabs & production",
+      "category": "Server",
+      "sizeLabel": "2.6 GB",
+      "approxBytes": 2791728742,
       "fileName": "ubuntu-26.04.1-live-server-amd64.iso",
       "url": "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso",
       "versions": [
         {
           "label": "26.04.1 LTS Server (Latest \u00b7 Resolute)",
-          "date": "Aug 2026",
-          "sizeLabel": "3.9 GB",
-          "approxBytes": 4187593113,
+          "releaseYear": "2026",
+          "sizeLabel": "2.6 GB",
+          "approxBytes": 2791728742,
           "fileName": "ubuntu-26.04.1-live-server-amd64.iso",
           "url": "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso"
         },
         {
           "label": "24.04.5 LTS Server (Mature \u00b7 Noble)",
-          "date": "Aug 2026",
-          "sizeLabel": "3.8 GB",
-          "approxBytes": 4080218931,
+          "releaseYear": "2026",
+          "sizeLabel": "2.6 GB",
+          "approxBytes": 2791728742,
           "fileName": "ubuntu-24.04.5-live-server-amd64.iso",
           "url": "https://releases.ubuntu.com/noble/ubuntu-24.04.5-live-server-amd64.iso"
-        },
-        {
-          "label": "22.04.5 LTS Server (Legacy \u00b7 Jammy)",
-          "date": "Sep 2024",
-          "sizeLabel": "2.0 GB",
-          "approxBytes": 2147483648,
-          "fileName": "ubuntu-22.04.5-live-server-amd64.iso",
-          "url": "https://releases.ubuntu.com/jammy/ubuntu-22.04.5-live-server-amd64.iso"
         }
       ]
     },
     {
       "title": "Alpine Linux",
-      "subtitle": "Security-oriented, ultra-lean server & container OS",
+      "subtitle": "Ultra-lightweight security-oriented musl Linux",
       "category": "Server",
-      "sizeLabel": "250 MB",
-      "approxBytes": 262144000,
+      "sizeLabel": "240 MB",
+      "approxBytes": 251658240,
       "fileName": "alpine-standard-3.24.4-x86_64.iso",
       "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-standard-3.24.4-x86_64.iso",
       "versions": [
         {
           "label": "3.24.4 Standard (x86_64)",
-          "date": "Nov 2026",
-          "sizeLabel": "250 MB",
-          "approxBytes": 262144000,
+          "releaseYear": "2026",
+          "sizeLabel": "240 MB",
+          "approxBytes": 251658240,
           "fileName": "alpine-standard-3.24.4-x86_64.iso",
           "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-standard-3.24.4-x86_64.iso"
         },
         {
           "label": "3.24.4 Extended (Offline pkgs)",
-          "date": "Nov 2026",
-          "sizeLabel": "960 MB",
-          "approxBytes": 1006632960,
+          "releaseYear": "2026",
+          "sizeLabel": "860 MB",
+          "approxBytes": 901775360,
           "fileName": "alpine-extended-3.24.4-x86_64.iso",
           "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-extended-3.24.4-x86_64.iso"
-        },
-        {
-          "label": "3.23.3 Standard (x86_64)",
-          "date": "2026",
-          "sizeLabel": "240 MB",
-          "approxBytes": 251658240,
-          "fileName": "alpine-standard-3.23.3-x86_64.iso",
-          "url": "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/x86_64/alpine-standard-3.23.3-x86_64.iso"
         }
       ]
     },
     {
       "title": "Kali Linux",
-      "subtitle": "Penetration testing & security auditing live/installer",
+      "subtitle": "Penetration testing, forensics & security auditing suite",
       "category": "Security",
-      "sizeLabel": "4.5 GB",
-      "approxBytes": 4831838208,
+      "sizeLabel": "4.3 GB",
+      "approxBytes": 4617089843,
       "fileName": "kali-linux-2026.3-live-amd64.iso",
       "url": "https://cdimage.kali.org/kali-2026.3/kali-linux-2026.3-live-amd64.iso",
       "versions": [
         {
           "label": "2026.3 Live (amd64 \u00b7 Recommended)",
-          "date": "Oct 2026",
-          "sizeLabel": "4.5 GB",
-          "approxBytes": 4831838208,
+          "releaseYear": "2026",
+          "sizeLabel": "4.3 GB",
+          "approxBytes": 4617089843,
           "fileName": "kali-linux-2026.3-live-amd64.iso",
           "url": "https://cdimage.kali.org/kali-2026.3/kali-linux-2026.3-live-amd64.iso"
         },
         {
           "label": "2026.3 Installer (amd64)",
-          "date": "Oct 2026",
-          "sizeLabel": "4.2 GB",
-          "approxBytes": 4509715660,
+          "releaseYear": "2026",
+          "sizeLabel": "4.1 GB",
+          "approxBytes": 4402341478,
           "fileName": "kali-linux-2026.3-installer-amd64.iso",
           "url": "https://cdimage.kali.org/kali-2026.3/kali-linux-2026.3-installer-amd64.iso"
+        }
+      ]
+    },
+    {
+      "title": "Tails",
+      "subtitle": "Amnesic privacy OS routing all traffic through Tor",
+      "category": "Security",
+      "sizeLabel": "1.5 GB",
+      "approxBytes": 1610612736,
+      "fileName": "tails-amd64-latest.img",
+      "url": "https://tails.net/install/v2/Tails/amd64/stable/latest.json",
+      "versions": [
+        {
+          "label": "Latest Stable USB Image (Live API)",
+          "releaseYear": "2026",
+          "sizeLabel": "1.5 GB",
+          "approxBytes": 1610612736,
+          "fileName": "tails-amd64-latest.img",
+          "url": "https://tails.net/install/v2/Tails/amd64/stable/latest.json"
+        }
+      ]
+    },
+    {
+      "title": "GParted Live",
+      "subtitle": "Resize, move, and repair disk partitions graphically",
+      "category": "Rescue",
+      "sizeLabel": "645 MB",
+      "approxBytes": 676331520,
+      "fileName": "gparted-live-1.8.1-6-amd64.iso",
+      "url": "https://sourceforge.net/projects/gparted/files/gparted-live-stable/1.8.1-6/gparted-live-1.8.1-6-amd64.iso/download",
+      "versions": [
+        {
+          "label": "1.8.1-6 (amd64 \u00b7 Latest)",
+          "releaseYear": "2026",
+          "sizeLabel": "645 MB",
+          "approxBytes": 676331520,
+          "fileName": "gparted-live-1.8.1-6-amd64.iso",
+          "url": "https://sourceforge.net/projects/gparted/files/gparted-live-stable/1.8.1-6/gparted-live-1.8.1-6-amd64.iso/download",
+          "sha256": "d789c38779f0d6f7026c12f44c2c52a04f66e28a1aea7d51f3045ad1bbf28411"
         },
         {
-          "label": "2026.2 Live (amd64)",
-          "date": "Jun 2026",
-          "sizeLabel": "4.4 GB",
-          "approxBytes": 4724464025,
-          "fileName": "kali-linux-2026.2-live-amd64.iso",
-          "url": "https://cdimage.kali.org/kali-2026.2/kali-linux-2026.2-live-amd64.iso"
+          "label": "1.7.0-8 (amd64 \u00b7 Legacy)",
+          "releaseYear": "2025",
+          "sizeLabel": "560 MB",
+          "approxBytes": 587202560,
+          "fileName": "gparted-live-1.7.0-8-amd64.iso",
+          "url": "https://sourceforge.net/projects/gparted/files/gparted-live-stable/1.7.0-8/gparted-live-1.7.0-8-amd64.iso/download"
+        }
+      ]
+    },
+    {
+      "title": "Clonezilla Live",
+      "subtitle": "Bare-metal disk & partition cloning and imaging tool",
+      "category": "Rescue",
+      "sizeLabel": "460 MB",
+      "approxBytes": 482344960,
+      "fileName": "clonezilla-live-3.3.3-37-amd64.iso",
+      "url": "https://sourceforge.net/projects/clonezilla/files/clonezilla_live_stable/3.3.3-37/clonezilla-live-3.3.3-37-amd64.iso/download",
+      "versions": [
+        {
+          "label": "3.3.3-37 Stable (Debian amd64)",
+          "releaseYear": "2026",
+          "sizeLabel": "460 MB",
+          "approxBytes": 482344960,
+          "fileName": "clonezilla-live-3.3.3-37-amd64.iso",
+          "url": "https://sourceforge.net/projects/clonezilla/files/clonezilla_live_stable/3.3.3-37/clonezilla-live-3.3.3-37-amd64.iso/download"
         }
       ]
     },
     {
       "title": "Rescuezilla",
-      "subtitle": "Graphical disk cloning, backup & image restore",
+      "subtitle": "Graphical disk backup & restore (Clonezilla compatible)",
       "category": "Rescue",
       "sizeLabel": "1.3 GB",
       "approxBytes": 1395864371,
@@ -256,16 +444,16 @@
       "url": "https://github.com/rescuezilla/rescuezilla/releases/download/2.6.2/rescuezilla-2.6.2-64bit.resolute.iso",
       "versions": [
         {
-          "label": "2.6.2 (Ubuntu 26.04 Base \u00b7 Newest Drivers)",
-          "date": "2026",
+          "label": "2.6.2 (Ubuntu 26.04 Base)",
+          "releaseYear": "2026",
           "sizeLabel": "1.3 GB",
           "approxBytes": 1395864371,
           "fileName": "rescuezilla-2.6.2-64bit.resolute.iso",
           "url": "https://github.com/rescuezilla/rescuezilla/releases/download/2.6.2/rescuezilla-2.6.2-64bit.resolute.iso"
         },
         {
-          "label": "2.5.1 (Ubuntu 24.04 Base \u00b7 Mature)",
-          "date": "2024",
+          "label": "2.5.1 (Ubuntu 24.04 Base)",
+          "releaseYear": "2024",
           "sizeLabel": "1.2 GB",
           "approxBytes": 1288490188,
           "fileName": "rescuezilla-2.5.1-64bit.noble.iso",
@@ -275,24 +463,24 @@
     },
     {
       "title": "SystemRescue",
-      "subtitle": "Bootable PC repair, partition & data recovery kit",
+      "subtitle": "Arch-based rescue toolkit for unbootable PCs & filesystems",
       "category": "Rescue",
-      "sizeLabel": "1.37 GB",
-      "approxBytes": 1434451968,
+      "sizeLabel": "1.2 GB",
+      "approxBytes": 1288490188,
       "fileName": "systemrescue-13.03-amd64.iso",
       "url": "https://fastly-cdn.system-rescue.org/releases/13.03/systemrescue-13.03-amd64.iso",
       "versions": [
         {
           "label": "13.03 (Latest amd64)",
-          "date": "2026",
-          "sizeLabel": "1.37 GB",
-          "approxBytes": 1434451968,
+          "releaseYear": "2026",
+          "sizeLabel": "1.2 GB",
+          "approxBytes": 1288490188,
           "fileName": "systemrescue-13.03-amd64.iso",
           "url": "https://fastly-cdn.system-rescue.org/releases/13.03/systemrescue-13.03-amd64.iso"
         },
         {
           "label": "12.01 (amd64)",
-          "date": "2025",
+          "releaseYear": "2025",
           "sizeLabel": "1.2 GB",
           "approxBytes": 1288490188,
           "fileName": "systemrescue-12.01-amd64.iso",
@@ -301,54 +489,83 @@
       ]
     },
     {
-      "title": "GParted Live",
-      "subtitle": "Resize, clone, and repair disk partitions safely",
+      "title": "ShredOS (Nwipe)",
+      "subtitle": "Secure drive eraser with NVMe/SSD Hardware Sanitize",
       "category": "Rescue",
-      "sizeLabel": "560 MB",
-      "approxBytes": 587202560,
-      "fileName": "gparted-live-1.8.1-6-amd64.iso",
-      "url": "https://downloads.sourceforge.net/gparted/gparted-live-1.8.1-6-amd64.iso",
+      "sizeLabel": "355 MB",
+      "approxBytes": 372244480,
+      "fileName": "shredos-2025.11_32_x86-64_v0.43.1_20261010.img",
+      "url": "https://github.com/PartialVolume/shredos.x86_64/releases/download/v2025.11_32_x86-64_v0.43.1/shredos-2025.11_32_x86-64_v0.43.1_20261010.img",
       "versions": [
         {
-          "label": "1.8.1-6 (amd64 \u00b7 Latest)",
-          "date": "2026",
-          "sizeLabel": "560 MB",
-          "approxBytes": 587202560,
-          "fileName": "gparted-live-1.8.1-6-amd64.iso",
-          "url": "https://downloads.sourceforge.net/gparted/gparted-live-1.8.1-6-amd64.iso"
+          "label": "v0.43.1 USB Image (.img \u00b7 x86_64)",
+          "releaseYear": "2026",
+          "sizeLabel": "355 MB",
+          "approxBytes": 372244480,
+          "fileName": "shredos-2025.11_32_x86-64_v0.43.1_20261010.img",
+          "url": "https://github.com/PartialVolume/shredos.x86_64/releases/download/v2025.11_32_x86-64_v0.43.1/shredos-2025.11_32_x86-64_v0.43.1_20261010.img",
+          "sha256": "c856cfb91ebd525e23caffc284d84764e9d9b5427ee1925783773642e3d50ae4"
         },
         {
-          "label": "1.7.0-8 (amd64)",
-          "date": "2025",
-          "sizeLabel": "540 MB",
-          "approxBytes": 566231040,
-          "fileName": "gparted-live-1.7.0-8-amd64.iso",
-          "url": "https://downloads.sourceforge.net/gparted/gparted-live-1.7.0-8-amd64.iso"
+          "label": "v0.43.1 Optical ISO (.iso \u00b7 x86_64)",
+          "releaseYear": "2026",
+          "sizeLabel": "342 MB",
+          "approxBytes": 358612992,
+          "fileName": "shredos-2025.11_32_x86-64_v0.43.1_20261010.iso",
+          "url": "https://github.com/PartialVolume/shredos.x86_64/releases/download/v2025.11_32_x86-64_v0.43.1/shredos-2025.11_32_x86-64_v0.43.1_20261010.iso",
+          "sha256": "d0ffb8d7b346289db93094dbf1d2a64692b7f7cb179cc1ca76b74fdffbac1414"
+        }
+      ]
+    },
+    {
+      "title": "Memtest86+",
+      "subtitle": "Open-source RAM diagnostic tool (auto-extracts .iso)",
+      "category": "Rescue",
+      "sizeLabel": "6 MB",
+      "approxBytes": 6291456,
+      "fileName": "mt86plus_9.00_x86_64.iso.zip",
+      "url": "https://www.memtest.org/download/v9.00/mt86plus_9.00_x86_64.iso.zip",
+      "versions": [
+        {
+          "label": "v9.00 (x86_64 \u00b7 UEFI & BIOS)",
+          "releaseYear": "2026",
+          "sizeLabel": "6 MB",
+          "approxBytes": 6291456,
+          "fileName": "mt86plus_9.00_x86_64.iso.zip",
+          "url": "https://www.memtest.org/download/v9.00/mt86plus_9.00_x86_64.iso.zip"
+        },
+        {
+          "label": "v9.00 (ARM64 \u00b7 UEFI)",
+          "releaseYear": "2026",
+          "sizeLabel": "5 MB",
+          "approxBytes": 5242880,
+          "fileName": "mt86plus_9.00_arm64.iso.zip",
+          "url": "https://www.memtest.org/download/v9.00/mt86plus_9.00_arm64.iso.zip"
         }
       ]
     },
     {
       "title": "netboot.xyz",
-      "subtitle": "Tiny 2 MB network boot menu for dozens of OSes",
+      "subtitle": "Network-boot 70+ OS installers & rescue tools over iPXE",
       "category": "Lightweight",
-      "sizeLabel": "2 MB",
-      "approxBytes": 2500000,
+      "sizeLabel": "3 MB",
+      "approxBytes": 3145728,
       "fileName": "netboot.xyz.iso",
       "url": "https://boot.netboot.xyz/ipxe/netboot.xyz.iso",
       "versions": [
         {
           "label": "Latest x86_64 iPXE ISO",
-          "date": "Rolling",
-          "sizeLabel": "2 MB",
-          "approxBytes": 2500000,
+          "releaseYear": "2026",
+          "sizeLabel": "3 MB",
+          "approxBytes": 3145728,
           "fileName": "netboot.xyz.iso",
           "url": "https://boot.netboot.xyz/ipxe/netboot.xyz.iso"
         },
         {
           "label": "Latest ARM64 iPXE ISO",
-          "date": "Rolling",
-          "sizeLabel": "2 MB",
-          "approxBytes": 2500000,
+          "releaseYear": "2026",
+          "sizeLabel": "3 MB",
+          "approxBytes": 3145728,
           "fileName": "netboot.xyz-arm64.iso",
           "url": "https://boot.netboot.xyz/ipxe/netboot.xyz-arm64.iso"
         }
@@ -356,36 +573,28 @@
     },
     {
       "title": "Tiny Core Linux",
-      "subtitle": "Ultra-small live Linux desktop for quick boot tests",
+      "subtitle": "Ultra-tiny desktop Linux that runs entirely in RAM",
       "category": "Lightweight",
       "sizeLabel": "23 MB",
-      "approxBytes": 24000000,
+      "approxBytes": 24117248,
       "fileName": "TinyCore-current.iso",
       "url": "https://distro.ibiblio.org/tinycorelinux/15.x/x86/release/TinyCore-current.iso",
       "versions": [
         {
           "label": "15.x TinyCore (GUI \u00b7 23 MB)",
-          "date": "Current",
+          "releaseYear": "2025",
           "sizeLabel": "23 MB",
-          "approxBytes": 24000000,
+          "approxBytes": 24117248,
           "fileName": "TinyCore-current.iso",
           "url": "https://distro.ibiblio.org/tinycorelinux/15.x/x86/release/TinyCore-current.iso"
         },
         {
           "label": "15.x CorePlus (Wi-Fi + Tools \u00b7 248 MB)",
-          "date": "Current",
+          "releaseYear": "2025",
           "sizeLabel": "248 MB",
           "approxBytes": 260046848,
           "fileName": "CorePlus-current.iso",
           "url": "https://distro.ibiblio.org/tinycorelinux/15.x/x86/release/CorePlus-current.iso"
-        },
-        {
-          "label": "15.x Core (CLI Only \u00b7 17 MB)",
-          "date": "Current",
-          "sizeLabel": "17 MB",
-          "approxBytes": 17825792,
-          "fileName": "Core-current.iso",
-          "url": "https://distro.ibiblio.org/tinycorelinux/15.x/x86/release/Core-current.iso"
         }
       ]
     }

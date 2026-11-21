@@ -244,7 +244,7 @@ class UsbKeepAliveService : Service() {
             val msg = if (configured) {
                 "USB-C cable plugged in · auto-connected to PC"
             } else {
-                "Woke USB controller on cable attach"
+                "USB cable attached · tap Reconnect if PC did not detect"
             }
             LinkWatchdogTracker.recordRecovery(msg, countAsRecovery = false)
         }
@@ -288,9 +288,7 @@ class UsbKeepAliveService : Service() {
             runCatching { unregisterReceiver(usbAttachReceiver) }
             receiverRegistered = false
         }
-        scope.launch {
-            runCatching { UsbGadgetEngine.setUsbPowerControl(alwaysOn = false) }
-        }
+        // Power control restored directly by unmountImage()
         releaseWakeLock()
         LinkWatchdogTracker.setActive(false)
         scope.cancel()

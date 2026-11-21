@@ -10,17 +10,12 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -32,248 +27,194 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 enum class WinFamilyFilter(val label: String, val shortTag: String) {
-    WIN11("Windows 11", "Win11"),
-    WIN10("Windows 10", "Win10"),
-    SERVER("Windows Server", "Server")
+    WIN11("Windows 11", "Win11"), WIN10("Windows 10", "Win10"), SERVER("Windows Server", "Server")
 }
 
 enum class WinFeatureVersion(
-    val family: WinFamilyFilter,
-    val label: String,
-    val searchTerms: List<String>,
-    val buildPrefixes: List<String>,
-    val recommended: Boolean = false
+    val family: WinFamilyFilter, val label: String, val searchTerms: List<String>, val buildPrefixes: List<String>, val recommended: Boolean = false
 ) {
     W11_26H2(WinFamilyFilter.WIN11, "26H2", listOf("Windows 11 26H2", "26300", "26320"), listOf("26300", "26320", "26340"), recommended = true),
     W11_26H1(WinFamilyFilter.WIN11, "26H1", listOf("Windows 11 26H1", "28000", "28020"), listOf("28000", "28020", "28120")),
     W11_25H2(WinFamilyFilter.WIN11, "25H2", listOf("Windows 11 25H2", "26200"), listOf("26200")),
     W11_24H2(WinFamilyFilter.WIN11, "24H2", listOf("Windows 11 24H2", "26100"), listOf("26100")),
     W11_23H2(WinFamilyFilter.WIN11, "23H2", listOf("Windows 11 23H2", "22631"), listOf("22631", "22635")),
+    W11_22H2(WinFamilyFilter.WIN11, "22H2", listOf("Windows 11 22H2", "22621"), listOf("22621")),
+    W11_21H2(WinFamilyFilter.WIN11, "21H2", listOf("Windows 11 21H2", "22000"), listOf("22000")),
     W11_INSIDER(WinFamilyFilter.WIN11, "Insider", listOf("Windows 11 Insider", "Canary"), listOf("29", "27", "26340", "28120")),
-
     W10_22H2(WinFamilyFilter.WIN10, "22H2", listOf("Windows 10 22H2", "19045"), listOf("19045"), recommended = true),
     W10_21H2(WinFamilyFilter.WIN10, "21H2 / LTSC", listOf("Windows 10 21H2", "19044"), listOf("19044")),
-
+    W10_21H1(WinFamilyFilter.WIN10, "21H1 / 20H2", listOf("Windows 10 21H1", "19043", "19042"), listOf("19043", "19042")),
+    W10_1909(WinFamilyFilter.WIN10, "1909 / 1809", listOf("Windows 10 1909", "18363", "17763"), listOf("18363", "17763")),
     SRV_2025(WinFamilyFilter.SERVER, "2025", listOf("Windows Server 2025", "Server 26100"), listOf("26100", "26300", "28000"), recommended = true),
     SRV_2022(WinFamilyFilter.SERVER, "2022", listOf("Windows Server 2022", "20348"), listOf("20348")),
-    SRV_2019(WinFamilyFilter.SERVER, "2019", listOf("Windows Server 2019", "17763"), listOf("17763"));
-
-    companion object {
-        fun forFamily(family: WinFamilyFilter): List<WinFeatureVersion> =
-            entries.filter { it.family == family }
-    }
+    SRV_2019(WinFamilyFilter.SERVER, "2019", listOf("Windows Server 2019", "17763"), listOf("17763")),
+    SRV_2016(WinFamilyFilter.SERVER, "2016 / vNext", listOf("Windows Server", "26040", "14393"), listOf("26040", "14393"));
+    companion object { fun forFamily(family: WinFamilyFilter): List<WinFeatureVersion> = entries.filter { it.family == family } }
 }
 
 enum class WinBuildTier(val sectionTitle: String, val badgeLabel: String) {
-    STABLE("Stable (General Availability)", "Stable"),
-    PREVIEW("Preview (Release / Cumulative Preview)", "Preview"),
-    INSIDER("Other / Insider Builds", "Insider")
+    RECOMMENDED("Recommended · Stable & Latest", "Stable"),
+    PREVIEW("Release Preview & Beta", "Preview"),
+    INSIDER("Dev & Canary Insider", "Insider")
 }
 
 data class GroupedWindowsBuilds(
-    val stable: List<WindowsChannelBuild> = emptyList(),
+    val recommended: List<WindowsChannelBuild> = emptyList(),
     val preview: List<WindowsChannelBuild> = emptyList(),
     val insider: List<WindowsChannelBuild> = emptyList()
 ) {
-    val totalCount: Int get() = stable.size + preview.size + insider.size
-    val isEmpty: Boolean get() = totalCount == 0
+    val isEmpty: Boolean get() = recommended.isEmpty() && preview.isEmpty() && insider.isEmpty()
+    val totalCount: Int get() = recommended.size + preview.size + insider.size
 }
 
-enum class WinIsoCompression(
-    val label: String,
-    val subtitle: String,
-    val ext: String,
-    val wimlibArg: String,
-    val recommended: Boolean = false
-) {
-    WIM(
-        label = "WIM · Fast",
-        subtitle = "~2–4 min · low RAM usage",
-        ext = "wim",
-        wimlibArg = "--compress=maximum",
-        recommended = true
-    ),
-    ESD(
-        label = "ESD · Compact",
-        subtitle = "~5–8 min · smallest ISO",
-        ext = "esd",
-        wimlibArg = "--compress=LZMS --solid --threads=2",
-        recommended = false
-    )
+enum class WinDownloadMethod(val label: String, val subtitle: String) {
+    DOWNLOAD_AND_BUILD("Download & Build ISO / USB", "Downloads via Turbo then builds in separate Builder queue"),
+    DOWNLOAD_PACKAGE_SET("Download UUP Package Set Only", "Saves raw SHA-1 verified .esd/.cab folder"),
+    DOWNLOAD_UPDATES_ONLY("Download Additional Updates Only", "Saves only .msu / KB*.cab / .NET update files")
 }
 
-enum class WinBuildOutputMode(
-    val label: String,
-    val subtitle: String,
-    val recommended: Boolean = false
-) {
-    STANDARD_ISO(
-        label = "Bootable ISO (.iso)",
-        subtitle = "Standard UEFI + Legacy BIOS installer",
-        recommended = true
-    ),
-    DIRECT_MULTIBOOT(
-        label = "Add to Multi-Boot (.img)",
-        subtitle = "Builds .iso and moves directly into Multi-Boot"
-    ),
-    DIRECT_NTFS_USB(
-        label = "Direct Bootable USB (.img)",
-        subtitle = "Skips ISO packing · faster & saves ~5 GB temp space"
-    )
+enum class WinIsoCompression(val label: String, val subtitle: String, val ext: String, val wimlibArg: String, val recommended: Boolean = false) {
+    WIM("WIM · Fast", "~2–4 min · low RAM usage", "wim", "--compress=maximum", recommended = true),
+    ESD("ESD · Solid Compact", "~5–9 min · smallest ISO (LZMS solid)", "esd", "--compress=LZMS --solid --threads=2", recommended = false)
+}
+
+enum class WinBuildOutputMode(val label: String, val subtitle: String, val recommended: Boolean = false) {
+    STANDARD_ISO("Bootable ISO (.iso)", "Standard UEFI + Legacy BIOS installer", recommended = true),
+    DIRECT_MULTIBOOT("Add to Multi-Boot (.img)", "Moves finished ISO into your Multi-Boot drive"),
+    DIRECT_NTFS_USB("Direct Bootable USB (.img)", "GPT/MBR NTFS + full Experience, WinUtil & Drivers")
 }
 
 data class WindowsChannelBuild(
-    val uuid: String,
-    val title: String,
-    val build: String,
-    val arch: String,
-    val createdEpoch: Long,
-    val tier: WinBuildTier = WinBuildTier.STABLE,
-    val channelBadge: String = "Stable"
+    val uuid: String, val title: String, val build: String, val arch: String,
+    val createdEpoch: Long, val tier: WinBuildTier = WinBuildTier.RECOMMENDED, val channelBadge: String = "Stable"
 ) {
-    val archDisplay: String
-        get() = when (arch.lowercase()) {
-            "amd64" -> "x64"
-            "arm64" -> "ARM64"
-            "x86" -> "x86"
-            else -> arch.uppercase()
-        }
-
-    val dateDisplay: String
-        get() = if (createdEpoch > 0L) {
-            SimpleDateFormat("dd MMM yyyy", Locale.US).format(Date(createdEpoch * 1000L))
-        } else "Recent"
+    val archDisplay: String get() = when (arch.lowercase()) { "amd64" -> "x64"; "arm64" -> "ARM64"; "x86" -> "x86"; else -> arch.uppercase() }
+    val createdDateLabel: String get() = if (createdEpoch > 0L) runCatching { SimpleDateFormat("MMM d, yyyy", Locale.US).format(Date(createdEpoch * 1000L)) }.getOrDefault("") else ""
+    val dateDisplay: String get() = createdDateLabel
 }
 
-data class WinBuildLangOption(
-    val code: String,
-    val displayName: String
-)
+data class WinBuildLangOption(val code: String, val displayName: String)
+data class WinBuildEditionOption(val code: String, val displayName: String)
+enum class WinPackageKind(val badge: String) { BASE_OS("Base OS"), UPDATE("Update"), STORE_APP("Store App"), NETFX3(".NET 3.5") }
+data class WinPackageFileEntry(val name: String, val url: String, val sizeBytes: Long, val sha1: String, val kind: WinPackageKind = WinPackageKind.BASE_OS)
+data class WinManifestEstimate(val fileCount: Int, val totalBytes: Long)
 
-data class WinBuildEditionOption(
-    val code: String,
-    val displayName: String
-)
-
-data class WinPackageFileEntry(
-    val name: String,
-    val url: String,
-    val sizeBytes: Long,
-    val sha1: String
-)
-
-data class WinManifestEstimate(
-    val fileCount: Int,
-    val totalBytes: Long
-)
+data class WinDetailedManifest(
+    val baseFiles: List<WinPackageFileEntry> = emptyList(),
+    val updateFiles: List<WinPackageFileEntry> = emptyList(),
+    val appFiles: List<WinPackageFileEntry> = emptyList(),
+    val netFx3Files: List<WinPackageFileEntry> = emptyList(),
+    val allFiles: List<WinPackageFileEntry> = emptyList()
+) {
+    val baseBytes: Long get() = baseFiles.sumOf { it.sizeBytes }
+    val updateBytes: Long get() = updateFiles.sumOf { it.sizeBytes }
+    val appBytes: Long get() = appFiles.sumOf { it.sizeBytes }
+    val netFx3Bytes: Long get() = netFx3Files.sumOf { it.sizeBytes }
+    val hasUpdates: Boolean get() = updateFiles.isNotEmpty()
+    val hasApps: Boolean get() = appFiles.isNotEmpty()
+    val hasNetFx3: Boolean get() = netFx3Files.isNotEmpty()
+}
 
 data class WindowsChannelBuildConfig(
-    val build: WindowsChannelBuild,
-    val lang: WinBuildLangOption,
-    val editions: List<WinBuildEditionOption>,
-    val compression: WinIsoCompression,
-    val outputMode: WinBuildOutputMode,
-    val targetDir: String,
-    val customOutputName: String = "",
-    val targetMultiBootPath: String = "",
-    val connections: Int = 8,
-    val autoMount: Boolean = true,
-    val bypassRequirements: Boolean = true,
-    val bypassMicrosoftAccount: Boolean = true,
-    val disableDataCollection: Boolean = true,
-    val disableBitLocker: Boolean = true,
+    val build: WindowsChannelBuild, val lang: WinBuildLangOption, val editions: List<WinBuildEditionOption>,
+    val compression: WinIsoCompression = WinIsoCompression.WIM,
+    val outputMode: WinBuildOutputMode = WinBuildOutputMode.STANDARD_ISO,
+    val downloadMethod: WinDownloadMethod = WinDownloadMethod.DOWNLOAD_AND_BUILD,
+    val targetDir: String, val customOutputName: String = "", val targetMultiBootPath: String = "",
+    val connections: Int = 8, val autoMount: Boolean = true,
+    val includeUpdates: Boolean = false, val includeStoreApps: Boolean = false,
+    val integrateNetFx3: Boolean = false, val runComponentCleanup: Boolean = false,
+    val skipWinRe: Boolean = false, val eiCfgUnlock: Boolean = false, val keepPackagesAfterBuild: Boolean = false,
+    val scheme: PartitionScheme = PartitionScheme.GPT,
+    val experience: WindowsExperienceConfig = WindowsExperienceConfig(),
+    val winUtil: WinUtilTweaksConfig = WinUtilTweaksConfig(),
+    val bypassRequirements: Boolean = experience.bypassRequirements,
+    val bypassMicrosoftAccount: Boolean = experience.bypassMicrosoftAccount,
+    val disableDataCollection: Boolean = experience.disableDataCollection,
+    val disableBitLocker: Boolean = experience.disableBitLocker,
     val extraDriversDir: String = ""
 )
 
 data class PendingWindowsBuild(
-    val workRootPath: String,
-    val workPrefix: String,
-    val title: String,
-    val outputName: String,
-    val cachedBytes: Long,
-    val totalBytes: Long,
-    val config: WindowsChannelBuildConfig
+    val workRootPath: String, val workPrefix: String, val title: String, val outputName: String,
+    val cachedBytes: Long, val totalBytes: Long, val isCachedReady: Boolean = false, val config: WindowsChannelBuildConfig
 ) {
-    val progress: Float
-        get() = if (totalBytes > 0L) (cachedBytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f) else 0f
+    val progress: Float get() = if (totalBytes > 0L) (cachedBytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f) else 0f
 }
 
 data class WindowsBuildJobState(
-    val title: String,
-    val stage: String,
-    val detail: String,
-    val progress: Float = 0f,
-    val downloadedBytes: Long = 0L,
-    val totalBytes: Long = 0L,
-    val speedBytesPerSec: Long = 0L,
-    val etaSeconds: Long = -1L,
-    val activeThreads: Int = 8,
-    val filesDone: Int = 0,
-    val filesTotal: Int = 0,
-    val isConverting: Boolean = false,
-    val isPaused: Boolean = false,
-    val autoMount: Boolean = true,
-    val workDirPath: String = ""
+    val title: String, val stage: String, val detail: String, val progress: Float = 0f,
+    val downloadedBytes: Long = 0L, val totalBytes: Long = 0L, val speedBytesPerSec: Long = 0L,
+    val etaSeconds: Long = -1L, val activeThreads: Int = 8, val filesDone: Int = 0, val filesTotal: Int = 0,
+    val isConverting: Boolean = false, val isPaused: Boolean = false, val autoMount: Boolean = true, val workDirPath: String = ""
 )
 
-data class WindowsBuildToolsStatus(
-    val cabextract: String?,
-    val wimlib: String?,
-    val chntpw: String?,
-    val xorriso: String?
-) {
+data class WindowsConversionJobState(
+    val title: String, val outputFileName: String, val outputMode: WinBuildOutputMode,
+    val currentStep: Int = 1, val stageLabel: String = "Preparing build...", val detailText: String = "",
+    val overallProgress: Float = 0f, val diskSpeedBytesPerSec: Long = 0L, val elapsedSeconds: Long = 0L,
+    val etaSeconds: Long = -1L, val currentOutputBytes: Long = 0L, val freeSpaceBytes: Long = 0L,
+    val activeBinary: String = "", val batteryPct: Int = 100, val stepDurationsSec: Map<Int, Long> = emptyMap(),
+    val consoleTail: List<String> = emptyList(), val queuedCount: Int = 0, val queuedTitles: List<String> = emptyList(),
+    val autoMount: Boolean = true, val workDirPath: String = ""
+)
+
+data class WindowsBuildToolsStatus(val cabextract: String?, val wimlib: String?, val chntpw: String?, val xorriso: String?) {
     val canConvertIso: Boolean get() = cabextract != null && wimlib != null && chntpw != null && xorriso != null
     val canBuildDirectUsb: Boolean get() = cabextract != null && wimlib != null && chntpw != null
 }
 
-object WindowsBuildEngine {
+private data class QueuedConversionJob(
+    val context: Context, val config: WindowsChannelBuildConfig, val workRootPath: String, val workPrefix: String,
+    val jobTitle: String, val totalDownloadBytes: Long, val hasUpdates: Boolean, val hasApps: Boolean, val hasNetFx3: Boolean,
+    val onComplete: (DownloadCompletionEvent) -> Unit, val onError: (String) -> Unit, val onLog: (LogEntry) -> Unit
+)
 
+object WindowsBuildEngine {
     private const val API_BASE = "https://api.uupdump.net"
-    private const val UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.3.2"
+    private const val UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.4.0"
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val _jobState = MutableStateFlow<WindowsBuildJobState?>(null)
-    val jobState: StateFlow<WindowsBuildJobState?> = _jobState.asStateFlow()
+    private val _downloadState = MutableStateFlow<WindowsBuildJobState?>(null)
+    val downloadState: StateFlow<WindowsBuildJobState?> = _downloadState.asStateFlow()
+
+    private val _conversionState = MutableStateFlow<WindowsConversionJobState?>(null)
+    val conversionState: StateFlow<WindowsConversionJobState?> = _conversionState.asStateFlow()
 
     private val langsCache = ConcurrentHashMap<String, List<WinBuildLangOption>>()
     private val editionsCache = ConcurrentHashMap<String, List<WinBuildEditionOption>>()
-    private val manifestEstimateCache = ConcurrentHashMap<String, WinManifestEstimate>()
+    private val detailedManifestCache = ConcurrentHashMap<String, WinDetailedManifest>()
 
-    private var activeJob: Job? = null
-    private val cancelledFlag = AtomicBoolean(false)
-    private val pausedFlag = AtomicBoolean(false)
-    @Volatile private var autoMountLive: Boolean = true
-    private var cachedContext: Context? = null
-    private var activeConfig: WindowsChannelBuildConfig? = null
-    private var activeOnComplete: ((DownloadCompletionEvent) -> Unit)? = null
-    private var activeOnError: ((String) -> Unit)? = null
+    private var activeDownloadJob: Job? = null
+    private val dlCancelledFlag = AtomicBoolean(false)
+    private val dlPausedFlag = AtomicBoolean(false)
+    @Volatile private var dlAutoMountLive: Boolean = true
+    private var dlContext: Context? = null
+    private var dlConfig: WindowsChannelBuildConfig? = null
+    private var dlOnComplete: ((DownloadCompletionEvent) -> Unit)? = null
+    private var dlOnError: ((String) -> Unit)? = null
+    private var dlOnLog: ((LogEntry) -> Unit)? = null
     private var activeOnLog: ((LogEntry) -> Unit)? = null
-    private var activeWorkRootPath: String = ""
-    private var activeWorkPrefix: String = ""
+    private var dlWorkRootPath: String = ""
+    private var dlWorkPrefix: String = ""
+
+    private val conversionQueue = ConcurrentLinkedQueue<QueuedConversionJob>()
+    private var activeConversionJob: Job? = null
+    private val convCancelledFlag = AtomicBoolean(false)
+    @Volatile private var convAutoMountLive: Boolean = true
+    private var convContext: Context? = null
+    private var convOnLog: ((LogEntry) -> Unit)? = null
 
     private val JUNK_TITLE_PATTERNS = listOf(
-        "critical oobe",
-        "dynamic update",
-        "safe os",
-        "setup dynamic",
-        ".net framework",
-        "microsoft edge",
-        "security intelligence",
-        "defender",
-        "windows update stack",
-        "servicing stack",
-        "language pack",
-        "feature on demand",
-        "out-of-band",
-        "recovery update",
-        "compatibility update",
-        "windows configuration update",
-        "malicious software"
+        "critical oobe", "dynamic update", "safe os", "setup dynamic",
+        ".net framework", "microsoft edge", "security intelligence", "defender",
+        "windows update stack", "servicing stack", "language pack", "feature on demand", "hotpatch"
     )
 
     private fun nowTs(): String = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
@@ -541,306 +482,216 @@ object WindowsBuildEngine {
     private fun isSkippableNonEditionCab(fileName: String): Boolean {
         val low = fileName.lowercase()
         if (!low.endsWith(".cab")) return false
-        return low.contains("windows10.0-kb") ||
-            low.contains("windows11.0-kb") ||
-            low.startsWith("ssu-") ||
-            low.contains("-ssu-") ||
-            low.contains("desktopdeployment") ||
-            low.contains("aggregatedmetadata") ||
-            low.contains("baseless") ||
-            low.contains("safeos") ||
-            low.contains("dynamicupdate")
+        return low.contains("windows10.0-kb") || low.contains("windows11.0-kb") ||
+            low.startsWith("ssu-") || low.contains("-ssu-") ||
+            low.contains("desktopdeployment") || low.contains("aggregatedmetadata") ||
+            low.contains("baseless") || low.contains("safeos") ||
+            low.contains("dynamicupdate") || low.contains("netfx3-ondemand")
     }
 
-    private fun filterCorePackageFiles(all: List<WinPackageFileEntry>): List<WinPackageFileEntry> =
-        all.filter { f ->
-            val low = f.name.lowercase()
-            low.endsWith(".esd") || (low.endsWith(".cab") && !isSkippableNonEditionCab(low))
-        }.ifEmpty { all }
-
-    suspend fun fetchManifestEstimate(
-        updateId: String,
-        langCode: String,
-        editionCodes: List<String>
-    ): WinManifestEstimate? = withContext(Dispatchers.IO) {
-        val edParam = editionCodes.sorted().joinToString(";") { it.lowercase() }
-        val key = "$updateId|$langCode|$edParam"
-        manifestEstimateCache[key]?.let { return@withContext it }
-
-        val url = "$API_BASE/get.php?id=${URLEncoder.encode(updateId, "UTF-8")}" +
-            "&lang=${URLEncoder.encode(langCode, "UTF-8")}" +
-            "&edition=${URLEncoder.encode(edParam, "UTF-8")}&noLinks=1"
-        val root = fetchJsonWithRetry(url) ?: return@withContext null
-        val filesObj = root.optJSONObject("response")?.optJSONObject("files") ?: return@withContext null
-
-        val list = mutableListOf<WinPackageFileEntry>()
-        val keys = filesObj.keys()
-        while (keys.hasNext()) {
-            val fileName = keys.next()
-            val f = filesObj.optJSONObject(fileName) ?: continue
-            val size = f.optString("size", "0").toLongOrNull() ?: f.optLong("size", 0L)
-            val sha1 = f.optString("sha1", "").trim()
-            list.add(WinPackageFileEntry(name = fileName, url = "", sizeBytes = size, sha1 = sha1))
+    private fun classifyPackageFile(fileName: String): WinPackageKind {
+        val low = fileName.lowercase()
+        return when {
+            low.contains("netfx3-ondemand") && low.endsWith(".cab") -> WinPackageKind.NETFX3
+            low.endsWith(".msu") || (low.endsWith(".cab") && isSkippableNonEditionCab(low)) -> WinPackageKind.UPDATE
+            low.endsWith(".msixbundle") || low.endsWith(".appxbundle") || low.endsWith(".msix") || low.endsWith(".appx") ||
+                (low.endsWith(".xml") && (low.contains("license") || low.contains("app"))) -> WinPackageKind.STORE_APP
+            else -> WinPackageKind.BASE_OS
         }
-        val core = filterCorePackageFiles(list)
-        if (core.isEmpty()) return@withContext null
-        val est = WinManifestEstimate(fileCount = core.size, totalBytes = core.sumOf { it.sizeBytes.coerceAtLeast(0L) })
-        manifestEstimateCache[key] = est
-        est
     }
 
-    suspend fun fetchFileManifest(
-        updateId: String,
-        langCode: String,
-        editionCodes: List<String>
-    ): List<WinPackageFileEntry> = withContext(Dispatchers.IO) {
-        val edParam = editionCodes.joinToString(";") { it.lowercase() }
-        val url = "$API_BASE/get.php?id=${URLEncoder.encode(updateId, "UTF-8")}" +
-            "&lang=${URLEncoder.encode(langCode, "UTF-8")}" +
-            "&edition=${URLEncoder.encode(edParam, "UTF-8")}&noLinks=0"
-        val root = fetchJsonWithRetry(url) ?: return@withContext emptyList()
-        val filesObj = root.optJSONObject("response")?.optJSONObject("files") ?: return@withContext emptyList()
-
-        val out = mutableListOf<WinPackageFileEntry>()
+    private fun parseDetailedManifest(root: JSONObject, requireUrl: Boolean): WinDetailedManifest {
+        val filesObj = root.optJSONObject("response")?.optJSONObject("files") ?: return WinDetailedManifest()
+        val base = mutableListOf<WinPackageFileEntry>(); val updates = mutableListOf<WinPackageFileEntry>()
+        val apps = mutableListOf<WinPackageFileEntry>(); val netfx = mutableListOf<WinPackageFileEntry>()
+        val all = mutableListOf<WinPackageFileEntry>()
         val keys = filesObj.keys()
         while (keys.hasNext()) {
-            val fileName = keys.next()
-            val f = filesObj.optJSONObject(fileName) ?: continue
-            val fUrl = f.optString("url", "").trim()
-            val size = f.optString("size", "0").toLongOrNull() ?: f.optLong("size", 0L)
-            val sha1 = f.optString("sha1", "").trim()
-            if (fUrl.startsWith("http", true)) {
-                out.add(WinPackageFileEntry(name = fileName, url = fUrl, sizeBytes = size, sha1 = sha1))
+            val name = keys.next(); val item = filesObj.optJSONObject(name) ?: continue
+            val url = item.optString("url", "")
+            if (requireUrl && url.isBlank()) continue
+            val size = item.optString("size", "0").toLongOrNull() ?: item.optLong("size", 0L)
+            val sha1 = item.optString("sha1", "").lowercase()
+            val kind = classifyPackageFile(name)
+            val entry = WinPackageFileEntry(name, url, size, sha1, kind)
+            all.add(entry)
+            when (kind) {
+                WinPackageKind.BASE_OS -> if (name.lowercase().endsWith(".esd") || name.lowercase().endsWith(".cab")) base.add(entry)
+                WinPackageKind.UPDATE -> updates.add(entry)
+                WinPackageKind.STORE_APP -> apps.add(entry)
+                WinPackageKind.NETFX3 -> netfx.add(entry)
             }
         }
-        out.sortedByDescending { it.sizeBytes }
+        return WinDetailedManifest(base.sortedBy { it.name.lowercase() }, updates.sortedBy { it.name.lowercase() }, apps.sortedBy { it.name.lowercase() }, netfx.sortedBy { it.name.lowercase() }, all.sortedBy { it.name.lowercase() })
+    }
+
+    suspend fun fetchDetailedManifest(updateId: String, langCode: String, editionCodes: List<String>): WinDetailedManifest? = withContext(Dispatchers.IO) {
+        val edParam = editionCodes.sorted().joinToString(";") { it.lowercase() }
+        val key = "$updateId|$langCode|$edParam"
+        detailedManifestCache[key]?.let { return@withContext it }
+        val url = "$API_BASE/get.php?id=${URLEncoder.encode(updateId, "UTF-8")}&lang=${URLEncoder.encode(langCode, "UTF-8")}&edition=${URLEncoder.encode(edParam, "UTF-8")}&noLinks=1"
+        val root = fetchJsonWithRetry(url) ?: return@withContext null
+        val parsed = parseDetailedManifest(root, false)
+        if (parsed.allFiles.isEmpty()) return@withContext null
+        detailedManifestCache[key] = parsed
+        parsed
+    }
+
+    suspend fun fetchManifestEstimate(updateId: String, langCode: String, editionCodes: List<String>): WinManifestEstimate? =
+        fetchDetailedManifest(updateId, langCode, editionCodes)?.let { WinManifestEstimate(it.baseFiles.size, it.baseBytes) }
+
+    suspend fun fetchFullDownloadManifest(updateId: String, langCode: String, editionCodes: List<String>): WinDetailedManifest = withContext(Dispatchers.IO) {
+        val edParam = editionCodes.joinToString(";") { it.lowercase() }
+        val url = "$API_BASE/get.php?id=${URLEncoder.encode(updateId, "UTF-8")}&lang=${URLEncoder.encode(langCode, "UTF-8")}&edition=${URLEncoder.encode(edParam, "UTF-8")}"
+        val root = fetchJsonWithRetry(url) ?: return@withContext WinDetailedManifest()
+        parseDetailedManifest(root, true)
     }
 
     fun buildExternalPageLink(build: WindowsChannelBuild, langCode: String): String =
-        "https://uupdump.net/selectlang.php?id=${URLEncoder.encode(build.uuid, "UTF-8")}&pack=${URLEncoder.encode(langCode, "UTF-8")}"
+        "https://uupdump.net/selectlang.php?id=${URLEncoder.encode(build.uuid, "UTF-8")}"
 
-    private fun saveBuildJobJson(context: Context, workRootPath: String, config: WindowsChannelBuildConfig, totalBytes: Long) {
+    private fun saveBuildJobJson(context: Context, workRootPath: String, config: WindowsChannelBuildConfig, totalBytes: Long, isCachedReady: Boolean = false) {
         runCatching {
-            val edArr = JSONArray()
-            config.editions.forEach { ed ->
-                edArr.put(JSONObject().put("code", ed.code).put("displayName", ed.displayName))
-            }
             val obj = JSONObject().apply {
-                put("uuid", config.build.uuid)
-                put("title", config.build.title)
-                put("build", config.build.build)
-                put("arch", config.build.arch)
-                put("createdEpoch", config.build.createdEpoch)
-                put("langCode", config.lang.code)
-                put("langName", config.lang.displayName)
-                put("editions", edArr)
-                put("compression", config.compression.name)
-                put("outputMode", config.outputMode.name)
-                put("targetDir", config.targetDir)
-                put("customOutputName", config.customOutputName)
-                put("targetMultiBootPath", config.targetMultiBootPath)
-                put("connections", config.connections)
-                put("autoMount", autoMountLive)
-                put("bypassRequirements", config.bypassRequirements)
-                put("bypassMicrosoftAccount", config.bypassMicrosoftAccount)
-                put("disableDataCollection", config.disableDataCollection)
-                put("disableBitLocker", config.disableBitLocker)
+                put("uuid", config.build.uuid); put("title", config.build.title); put("build", config.build.build)
+                put("arch", config.build.arch); put("createdEpoch", config.build.createdEpoch)
+                put("langCode", config.lang.code); put("langName", config.lang.displayName)
+                put("editions", JSONArray().apply { config.editions.forEach { put(JSONObject().put("code", it.code).put("name", it.displayName)) } })
+                put("compression", config.compression.name); put("outputMode", config.outputMode.name); put("downloadMethod", config.downloadMethod.name)
+                put("targetDir", config.targetDir); put("customOutputName", config.customOutputName); put("targetMultiBootPath", config.targetMultiBootPath)
+                put("connections", config.connections); put("autoMount", config.autoMount)
+                put("includeUpdates", config.includeUpdates); put("includeStoreApps", config.includeStoreApps)
+                put("integrateNetFx3", config.integrateNetFx3); put("runComponentCleanup", config.runComponentCleanup)
+                put("skipWinRe", config.skipWinRe); put("eiCfgUnlock", config.eiCfgUnlock); put("keepPackagesAfterBuild", config.keepPackagesAfterBuild)
+                put("scheme", config.scheme.name); put("bypassReq", config.experience.bypassRequirements); put("bypassMsa", config.experience.bypassMicrosoftAccount)
+                put("disableTelemetry", config.experience.disableDataCollection); put("disableBitLocker", config.experience.disableBitLocker)
+                put("qol", config.experience.qolImprovements)
+                put("disableSponsoredApps", config.experience.disableSponsoredApps)
+                put("classicContextMenu", config.experience.classicContextMenu)
+                put("skipWifiSetup", config.experience.skipWifiSetup)
+                put("createLocalUser", config.experience.createLocalUser)
+                put("localUsername", config.experience.localUsername)
+                put("skipOobe", config.experience.skipOobe)
+                put("useCa2023Bootloaders", config.experience.useCa2023Bootloaders)
+                put("applySkuSiPolicy", config.experience.applySkuSiPolicy)
+                put("customPostInstallScriptPath", config.experience.customPostInstallScriptPath)
                 put("extraDriversDir", config.extraDriversDir)
-                put("totalBytes", totalBytes)
+                put("winUtilJson", config.winUtil.toJsonString()); put("totalBytes", totalBytes); put("isCachedReady", isCachedReady)
             }
-            val tmpFile = File(context.cacheDir, "pb_build_job_${System.nanoTime()}.json")
-            tmpFile.writeText(obj.toString(), Charsets.UTF_8)
-            Shell.cmd("mv -f ${shellQuote(tmpFile.absolutePath)} ${shellQuote("$workRootPath/build_job.json")} 2>/dev/null").exec()
-            tmpFile.delete()
+            val tmp = File(context.applicationContext.cacheDir, "pb_build_meta.json").apply { writeText(obj.toString(), Charsets.UTF_8) }
+            Shell.cmd("mkdir -p ${shellQuote(workRootPath)} && cp -f ${shellQuote(tmp.absolutePath)} ${shellQuote("$workRootPath/pb_build.json")}").exec()
+            tmp.delete()
         }
     }
 
-    suspend fun scanPendingBuilds(context: Context, scanDirs: List<String>): List<PendingWindowsBuild> =
-        withContext(Dispatchers.IO) {
-            val activePath = activeWorkRootPath
-            val out = mutableListOf<PendingWindowsBuild>()
-            val seenPaths = mutableSetOf<String>()
-
-            val rootsToScan = scanDirs.map { UsbGadgetEngine.resolveDirectPath(it).trimEnd('/') + "/.pocketboot_tmp" } +
-                listOf("/data/local/tmp")
-
-            for (parent in rootsToScan.distinct()) {
-                val qParent = shellQuote(parent)
-                val jobFiles = Shell.cmd(
-                    "[ -d $qParent ] && find $qParent -maxdepth 2 -type f -name 'build_job.json' 2>/dev/null || true"
-                ).exec().out.map { it.trim() }.filter { it.isNotEmpty() }
-
-                for (jf in jobFiles) {
-                    val workRoot = jf.substringBeforeLast('/')
-                    if (workRoot == activePath && _jobState.value != null) continue
-                    if (!seenPaths.add(workRoot)) continue
-                    val raw = Shell.cmd("cat ${shellQuote(jf)} 2>/dev/null").exec().out.joinToString("\n")
-                    if (raw.isBlank()) continue
-                    runCatching {
-                        val o = JSONObject(raw)
-                        val edArr = o.optJSONArray("editions") ?: JSONArray()
-                        val eds = mutableListOf<WinBuildEditionOption>()
-                        for (i in 0 until edArr.length()) {
-                            val eo = edArr.optJSONObject(i) ?: continue
-                            val c = eo.optString("code", "").trim()
-                            if (c.isNotEmpty()) eds.add(WinBuildEditionOption(c, eo.optString("displayName", c)))
-                        }
-                        if (eds.isEmpty()) return@runCatching
-                        val b = WindowsChannelBuild(
-                            uuid = o.optString("uuid"),
-                            title = o.optString("title"),
-                            build = o.optString("build"),
-                            arch = o.optString("arch", "amd64"),
-                            createdEpoch = o.optLong("createdEpoch", 0L)
-                        )
-                        if (b.uuid.isBlank()) return@runCatching
-                        val cfg = WindowsChannelBuildConfig(
-                            build = b,
-                            lang = WinBuildLangOption(o.optString("langCode", "en-us"), o.optString("langName", "English")),
-                            editions = eds,
-                            compression = runCatching { WinIsoCompression.valueOf(o.optString("compression")) }.getOrDefault(WinIsoCompression.WIM),
-                            outputMode = runCatching { WinBuildOutputMode.valueOf(o.optString("outputMode")) }.getOrDefault(WinBuildOutputMode.STANDARD_ISO),
-                            targetDir = o.optString("targetDir", "/data/media/0/Download"),
-                            customOutputName = o.optString("customOutputName", ""),
-                            targetMultiBootPath = o.optString("targetMultiBootPath", ""),
-                            connections = o.optInt("connections", 8),
-                            autoMount = o.optBoolean("autoMount", true),
-                            bypassRequirements = o.optBoolean("bypassRequirements", true),
-                            bypassMicrosoftAccount = o.optBoolean("bypassMicrosoftAccount", true),
-                            disableDataCollection = o.optBoolean("disableDataCollection", true),
-                            disableBitLocker = o.optBoolean("disableBitLocker", true),
-                            extraDriversDir = o.optString("extraDriversDir", "")
-                        )
-                        val workPrefix = workRoot.substringAfterLast('/')
-                        val pkgBytes = Shell.cmd(
-                            "[ -d ${shellQuote("$workRoot/PKGS")} ] && du -sb ${shellQuote("$workRoot/PKGS")} 2>/dev/null | awk '{print \$1}' || echo 0"
-                        ).exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
-                        val stageDir = stageCacheDir(context, workPrefix)
-                        val partBytes = stageDir.listFiles()?.filter { it.name.endsWith(".part") }?.sumOf { f ->
-                            val meta = File(f.absolutePath + ".pbmeta")
-                            if (meta.exists()) {
-                                runCatching {
-                                    val mo = JSONObject(meta.readText(Charsets.UTF_8))
-                                    val sliceCnt = mo.optInt("sliceCount", 0)
-                                    val doneArr = mo.optJSONArray("doneSlices")
-                                    val tot = mo.optLong("totalBytes", 0L)
-                                    if (sliceCnt > 0 && doneArr != null && tot > 0L) {
-                                        (tot * doneArr.length().toLong()) / sliceCnt.toLong()
-                                    } else {
-                                        val sA = mo.optJSONArray("chunkStarts")
-                                        val cA = mo.optJSONArray("chunkCursors")
-                                        if (sA != null && cA != null) {
-                                            (0 until minOf(sA.length(), cA.length())).sumOf { i ->
-                                                (cA.optLong(i) - sA.optLong(i)).coerceAtLeast(0L)
-                                            }
-                                        } else 0L
-                                    }
-                                }.getOrDefault(0L)
-                            } else f.length()
-                        } ?: 0L
-
-                        out.add(
-                            PendingWindowsBuild(
-                                workRootPath = workRoot,
-                                workPrefix = workPrefix,
-                                title = "Win ${b.build} (${b.archDisplay} · ${cfg.lang.code})",
-                                outputName = cfg.customOutputName.ifBlank { "Windows_${b.build}.iso" },
-                                cachedBytes = pkgBytes + partBytes,
-                                totalBytes = o.optLong("totalBytes", 0L),
-                                config = cfg
-                            )
-                        )
+    suspend fun scanPendingBuilds(context: Context, scanDirs: List<String>): List<PendingWindowsBuild> = withContext(Dispatchers.IO) {
+        val results = mutableListOf<PendingWindowsBuild>()
+        val activeDl = dlWorkRootPath; val activeConv = _conversionState.value?.workDirPath.orEmpty()
+        scanDirs.map { UsbGadgetEngine.resolveDirectPath(it).trimEnd('/') }.distinct().forEach { baseDir ->
+            val found = Shell.cmd("ls -d ${shellQuote("$baseDir/.pocketboot_tmp")}/pb_uup_*/pb_build.json 2>/dev/null || true").exec().out
+            found.forEach { metaPath ->
+                val cleanMeta = metaPath.trim()
+                if (cleanMeta.isBlank()) return@forEach
+                val workRoot = cleanMeta.substringBeforeLast('/')
+                if (workRoot == activeDl || workRoot == activeConv) return@forEach
+                val raw = Shell.cmd("cat ${shellQuote(cleanMeta)} 2>/dev/null").exec().out.joinToString("\n")
+                if (raw.isBlank()) return@forEach
+                runCatching {
+                    val o = JSONObject(raw)
+                    val edArr = o.optJSONArray("editions") ?: JSONArray()
+                    val eds = mutableListOf<WinBuildEditionOption>()
+                    for (i in 0 until edArr.length()) { val eo = edArr.optJSONObject(i) ?: continue; eds.add(WinBuildEditionOption(eo.optString("code"), eo.optString("name"))) }
+                    if (eds.isEmpty()) return@runCatching
+                    val bld = WindowsChannelBuild(o.optString("uuid"), o.optString("title", "Windows"), o.optString("build", ""), o.optString("arch", "amd64"), o.optLong("createdEpoch", 0L))
+                    val lang = WinBuildLangOption(o.optString("langCode", "en-us"), o.optString("langName", "English (United States)"))
+                    val comp = runCatching { WinIsoCompression.valueOf(o.optString("compression", "WIM")) }.getOrDefault(WinIsoCompression.WIM)
+                    val mode = runCatching { WinBuildOutputMode.valueOf(o.optString("outputMode", "STANDARD_ISO")) }.getOrDefault(WinBuildOutputMode.STANDARD_ISO)
+                    val method = runCatching { WinDownloadMethod.valueOf(o.optString("downloadMethod", "DOWNLOAD_AND_BUILD")) }.getOrDefault(WinDownloadMethod.DOWNLOAD_AND_BUILD)
+                    val scheme = runCatching { PartitionScheme.valueOf(o.optString("scheme", "GPT")) }.getOrDefault(PartitionScheme.GPT)
+                    val exp = WindowsExperienceConfig(
+                        bypassRequirements = o.optBoolean("bypassReq", true),
+                        bypassMicrosoftAccount = o.optBoolean("bypassMsa", true),
+                        disableDataCollection = o.optBoolean("disableTelemetry", true),
+                        disableBitLocker = o.optBoolean("disableBitLocker", true),
+                        qolImprovements = o.optBoolean("qol", true),
+                        disableSponsoredApps = o.optBoolean("disableSponsoredApps", false),
+                        classicContextMenu = o.optBoolean("classicContextMenu", false),
+                        skipWifiSetup = o.optBoolean("skipWifiSetup", true),
+                        createLocalUser = o.optBoolean("createLocalUser", false),
+                        localUsername = o.optString("localUsername", ""),
+                        skipOobe = o.optBoolean("skipOobe", false),
+                        useCa2023Bootloaders = o.optBoolean("useCa2023Bootloaders", false),
+                        applySkuSiPolicy = o.optBoolean("applySkuSiPolicy", false),
+                        customPostInstallScriptPath = o.optString("customPostInstallScriptPath", "")
+                    )
+                    val cfg = WindowsChannelBuildConfig(bld, lang, eds, comp, mode, method, o.optString("targetDir", baseDir), o.optString("customOutputName", ""), o.optString("targetMultiBootPath", ""), o.optInt("connections", 8), o.optBoolean("autoMount", true), o.optBoolean("includeUpdates", false), o.optBoolean("includeStoreApps", false), o.optBoolean("integrateNetFx3", false), o.optBoolean("runComponentCleanup", false), o.optBoolean("skipWinRe", false), o.optBoolean("eiCfgUnlock", false), o.optBoolean("keepPackagesAfterBuild", false), scheme, exp, WinUtilTweaksConfig.fromJsonString(o.optString("winUtilJson", "")), extraDriversDir = o.optString("extraDriversDir", ""))
+                    val workPrefix = workRoot.substringAfterLast('/')
+                    val pkgBytes = Shell.cmd("du -sb ${shellQuote("$workRoot/PKGS")} 2>/dev/null | awk '{print \$1}'").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                    val stageBytes = stageCacheDir(context, workPrefix).walkTopDown().filter { it.isFile && it.name.endsWith(".part") }.sumOf { it.length() }
+                    val totalBytes = o.optLong("totalBytes", 0L).coerceAtLeast(pkgBytes)
+                    if (pkgBytes > 0L || stageBytes > 0L) {
+                        results.add(PendingWindowsBuild(workRoot, workPrefix, "Win ${bld.build} (${bld.archDisplay})", cfg.customOutputName.ifBlank { "Win_${bld.build}_${bld.archDisplay}_${lang.code}${if (mode == WinBuildOutputMode.DIRECT_NTFS_USB) "_USB.img" else ".iso"}" }, (pkgBytes + stageBytes).coerceAtMost(totalBytes.coerceAtLeast(pkgBytes + stageBytes)), totalBytes, o.optBoolean("isCachedReady", false), cfg))
                     }
                 }
             }
-            out.sortedByDescending { it.cachedBytes }
         }
+        results.distinctBy { it.workRootPath }
+    }
 
     fun discardPendingBuild(context: Context, pending: PendingWindowsBuild) {
-        scope.launch {
-            UsbGadgetEngine.cleanupTempWorkDir(pending.workRootPath)
-            runCatching { stageCacheDir(context, pending.workPrefix).deleteRecursively() }
-        }
+        scope.launch { UsbGadgetEngine.cleanupTempWorkDir(pending.workRootPath); runCatching { stageCacheDir(context, pending.workPrefix).deleteRecursively() } }
     }
 
     private fun pruneOldWorkDirs(targetDir: String, keepPrefix: String) {
-        val resolvedDefault = UsbGadgetEngine.resolveDirectPath(targetDir).trimEnd('/')
-        val parentTmp = "$resolvedDefault/.pocketboot_tmp"
-        val qParent = shellQuote(parentTmp)
-        val qKeep = shellQuote(keepPrefix)
-        Shell.cmd(
-            "if [ -d $qParent ]; then find $qParent -mindepth 1 -maxdepth 1 -type d -name 'winbuild_*' ! -name $qKeep -mmin +1440 -exec rm -rf {} + 2>/dev/null || true; fi"
-        ).exec()
+        val tmpRoot = "${UsbGadgetEngine.resolveDirectPath(targetDir).trimEnd('/')}/.pocketboot_tmp"
+        val activeConv = _conversionState.value?.workDirPath?.substringAfterLast('/').orEmpty()
+        Shell.cmd("if [ -d ${shellQuote(tmpRoot)} ]; then for d in ${shellQuote(tmpRoot)}/pb_uup_*; do [ -d \"\$d\" ] || continue; bn=\$(basename \"\$d\"); if [ \"\$bn\" != ${shellQuote(keepPrefix)} ] && [ \"\$bn\" != ${shellQuote(activeConv)} ]; then if ! grep -q '\"isCachedReady\":true' \"\$d/pb_build.json\" 2>/dev/null; then rm -rf \"\$d\" 2>/dev/null || true; fi; fi; done; fi").exec()
     }
 
-    fun updateAutoMount(value: Boolean) {
-        autoMountLive = value
-        _jobState.value = _jobState.value?.copy(autoMount = value)
+    fun updateDownloadAutoMount(value: Boolean) { dlAutoMountLive = value; _downloadState.value = _downloadState.value?.copy(autoMount = value) }
+    fun updateConversionAutoMount(value: Boolean) { convAutoMountLive = value; _conversionState.value = _conversionState.value?.copy(autoMount = value) }
+
+    fun pauseDownload() {
+        val cur = _downloadState.value ?: return
+        if (cur.isPaused) return
+        dlPausedFlag.set(true); activeDownloadJob?.cancel()
+        val pausedState = cur.copy(isPaused = true, speedBytesPerSec = 0L, etaSeconds = -1L, stage = "Paused · Tap Resume anytime")
+        _downloadState.value = pausedState
+        dlContext?.let { ctx -> NotificationHelper.updateDownloadProgress(ctx, TurboDownloadState(pausedState.title, pausedState.stage, "", dlConfig?.targetDir.orEmpty(), "", pausedState.downloadedBytes, pausedState.totalBytes, 0L, -1L, 0, true, true, false, false, "Paused")) }
+        emitLog("win-dl", "Paused Windows package download (${UsbGadgetEngine.formatBytes(cur.downloadedBytes)} cached)")
     }
 
-    fun pauseBuild() {
-        val cur = _jobState.value ?: return
-        if (cur.isConverting || cur.isPaused) return
-        pausedFlag.set(true)
-        activeJob?.cancel()
-        activeJob = null
-        val pausedState = cur.copy(
-            isPaused = true,
-            speedBytesPerSec = 0L,
-            etaSeconds = -1L,
-            stage = "Paused (${cur.filesDone}/${cur.filesTotal} packages verified)",
-            detail = "Byte-level checkpoints saved · Tap Resume anytime"
-        )
-        _jobState.value = pausedState
-        cachedContext?.let { ctx ->
-            NotificationHelper.updateDownloadProgress(
-                ctx,
-                TurboDownloadState(
-                    title = pausedState.title,
-                    fileName = pausedState.stage,
-                    url = "",
-                    targetDir = activeConfig?.targetDir.orEmpty(),
-                    downloadedBytes = pausedState.downloadedBytes,
-                    totalBytes = pausedState.totalBytes,
-                    supportsRange = true,
-                    isPaused = true,
-                    statusText = pausedState.detail
-                )
-            )
-        }
+    fun resumeDownload() {
+        val ctx = dlContext ?: return; val cfg = dlConfig ?: return; val oc = dlOnComplete ?: return; val oe = dlOnError ?: return; val ol = dlOnLog ?: return
+        startBuild(ctx, cfg, oc, oe, ol)
     }
 
-    fun resumeBuild() {
-        val ctx = cachedContext ?: return
-        val cfg = activeConfig ?: return
-        val onDone = activeOnComplete ?: return
-        val onErr = activeOnError ?: return
-        val onLog = activeOnLog
-        val cur = _jobState.value
-        if (cur != null && !cur.isPaused) return
-        startBuild(ctx, cfg.copy(autoMount = autoMountLive), onDone, onErr, onLog ?: {})
-    }
-
-    fun cancelBuild(discardTemp: Boolean = true) {
-        cancelledFlag.set(true)
-        pausedFlag.set(false)
-        activeJob?.cancel()
-        activeJob = null
-        val pathToClean = activeWorkRootPath
-        val prefixToClean = activeWorkPrefix
-        _jobState.value = null
-        cachedContext?.let { ctx ->
+    fun cancelDownload(discardTemp: Boolean = true) {
+        dlCancelledFlag.set(true); dlPausedFlag.set(false); activeDownloadJob?.cancel()
+        val workPath = dlWorkRootPath; val prefix = dlWorkPrefix
+        _downloadState.value = null; dlWorkRootPath = ""; dlWorkPrefix = ""
+        dlContext?.let { ctx ->
             TurboDownloadService.stop(ctx)
-            if (discardTemp && prefixToClean.isNotBlank()) {
-                runCatching { stageCacheDir(ctx, prefixToClean).deleteRecursively() }
+            if (discardTemp) {
+                if (workPath.isNotBlank()) UsbGadgetEngine.cleanupTempWorkDir(workPath)
+                if (prefix.isNotBlank()) runCatching { stageCacheDir(ctx, prefix).deleteRecursively() }
             }
         }
-        if (discardTemp && pathToClean.isNotBlank()) {
-            scope.launch { UsbGadgetEngine.cleanupTempWorkDir(pathToClean) }
-            activeWorkRootPath = ""
-            activeWorkPrefix = ""
-        }
     }
+
+    fun cancelConversion() {
+        convCancelledFlag.set(true); conversionQueue.clear(); activeConversionJob?.cancel()
+        val curWork = _conversionState.value?.workDirPath.orEmpty()
+        _conversionState.value = null
+        convContext?.let { IsoBuilderService.stop(it) }
+        scope.launch {
+            Shell.cmd("pkill -f 'libwimlib_imagex|libxorriso|libcabextract' 2>/dev/null || true; rm -rf /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive /data/local/tmp/pb_wim_prog.log /data/local/tmp/pb_ca2023 /data/local/tmp/pb_win7_efi 2>/dev/null || true").exec()
+            if (curWork.isNotBlank()) Shell.cmd("rm -rf ${shellQuote("$curWork/ISODIR")} ${shellQuote("$curWork/TMP")} 2>/dev/null || true").exec()
+        }
+        emitConvLog("win-build", "Cancelled active ISO/USB build and cleared scratch files.", true)
+    }
+
+    private fun emitConvLog(tag: String, msg: String, isError: Boolean = false) { convOnLog?.invoke(LogEntry(nowTs(), tag, msg, isError)) }
 
     private fun batchVerifyExistingPackages(
         pkgDirPath: String,
@@ -886,773 +737,513 @@ object WindowsBuildEngine {
         return verified
     }
 
-    fun startBuild(
-        context: Context,
-        config: WindowsChannelBuildConfig,
-        onComplete: (DownloadCompletionEvent) -> Unit,
-        onError: (String) -> Unit,
-        onLog: (LogEntry) -> Unit = {}
-    ) {
-        activeJob?.cancel()
-        activeJob = null
-        cancelledFlag.set(false)
-        pausedFlag.set(false)
-        autoMountLive = config.autoMount
-
+    fun startBuild(context: Context, config: WindowsChannelBuildConfig, onComplete: (DownloadCompletionEvent) -> Unit, onError: (String) -> Unit, onLog: (LogEntry) -> Unit) {
+        cancelDownload(discardTemp = false)
+        dlCancelledFlag.set(false); dlPausedFlag.set(false); dlAutoMountLive = config.autoMount
         val appCtx = context.applicationContext
-        cachedContext = appCtx
-        activeConfig = config
-        activeOnComplete = onComplete
-        activeOnError = onError
-        activeOnLog = onLog
+        dlContext = appCtx; dlConfig = config; dlOnComplete = onComplete; dlOnError = onError; dlOnLog = onLog; activeOnLog = onLog
 
-        val tools = inspectTools(appCtx)
-        val needIsoTools = config.outputMode != WinBuildOutputMode.DIRECT_NTFS_USB
-        if (needIsoTools && !tools.canConvertIso) {
-            val msg = "Windows ISO build tools missing in APK. Check Pre-Flight Diagnostics."
-            emitLog("win-iso", msg, true)
-            onError(msg)
-            return
-        }
-        if (!needIsoTools && !tools.canBuildDirectUsb) {
-            val msg = "Windows build tools (cabextract/wimlib/chntpw) missing in APK."
-            emitLog("win-iso", msg, true)
-            onError(msg)
-            return
-        }
-
-        val minNeededBytes = if (config.outputMode == WinBuildOutputMode.DIRECT_NTFS_USB) {
-            10L * 1024L * 1024L * 1024L
-        } else {
-            12L * 1024L * 1024L * 1024L
-        }
-        val freeBytes = UsbGadgetEngine.getFreeSpaceBytes(config.targetDir)
-        if (freeBytes in 1L until minNeededBytes) {
-            val msg = "Need at least ${UsbGadgetEngine.formatBytes(minNeededBytes)} free in ${UsbGadgetEngine.friendlyFolderName(config.targetDir)} (have ${UsbGadgetEngine.formatBytes(freeBytes)})."
-            emitLog("win-iso", msg, true)
-            onError(msg)
-            return
-        }
-
+        val jobTitle = "Win ${config.build.build} (${config.build.archDisplay})"
         val maxConns = config.connections.coerceIn(1, 16)
-        val jobTitle = "Win ${config.build.build} (${config.build.archDisplay} · ${config.lang.code})"
-        _jobState.value = WindowsBuildJobState(
-            title = jobTitle,
-            stage = "Fetching package manifest...",
-            detail = "Preparing ${config.editions.size} edition(s)",
-            progress = 0.02f,
-            activeThreads = maxConns,
-            autoMount = autoMountLive
-        )
+        _downloadState.value = WindowsBuildJobState(jobTitle, "Fetching package list...", config.build.title, 0.01f, activeThreads = maxConns, autoMount = dlAutoMountLive)
         TurboDownloadService.start(appCtx)
-        emitLog("win-iso", "Starting $jobTitle (${config.outputMode.label}, ${config.compression.label}, Turbo ${maxConns}x)")
 
-        activeJob = scope.launch {
-            val workPrefix = "winbuild_${config.build.uuid.take(8)}_${config.lang.code}"
-            pruneOldWorkDirs(config.targetDir, keepPrefix = workPrefix)
-            val workRootPath = UsbGadgetEngine.createSafeTempWorkDir(
-                context = appCtx,
-                defaultDir = config.targetDir,
-                prefix = workPrefix
-            )
-            activeWorkRootPath = workRootPath
-            activeWorkPrefix = workPrefix
-
-            val pkgDir = File(workRootPath, "PKGS")
-            val isoDir = File(workRootPath, "ISODIR")
-            val tmpDir = File(workRootPath, "TMP")
-            val appStageDir = stageCacheDir(appCtx, workPrefix)
+        activeDownloadJob = scope.launch {
+            val shortUuid = config.build.uuid.take(8).replace(Regex("[^A-Za-z0-9]"), "")
+            val edHash = config.editions.map { it.code.lowercase() }.sorted().joinToString("_").hashCode().toUInt().toString(16).take(6)
+            val workPrefix = "pb_uup_${config.build.build.replace(".", "_")}_${shortUuid}_${config.lang.code.lowercase()}_$edHash"
+            val workRootPath = UsbGadgetEngine.createSafeTempWorkDir(appCtx, config.targetDir, workPrefix)
+            dlWorkRootPath = workRootPath; dlWorkPrefix = workPrefix
+            val pkgDir = File(workRootPath, "PKGS"); val appStageDir = stageCacheDir(appCtx, workPrefix)
 
             try {
-                val manifest = fetchFileManifest(
-                    updateId = config.build.uuid,
-                    langCode = config.lang.code,
-                    editionCodes = config.editions.map { it.code }
-                )
-                if (manifest.isEmpty()) {
-                    throw IllegalStateException("Package server returned an empty file manifest. Try another build or language.")
+                if (config.downloadMethod == WinDownloadMethod.DOWNLOAD_AND_BUILD) {
+                    val tools = inspectTools(appCtx)
+                    if (config.outputMode == WinBuildOutputMode.DIRECT_NTFS_USB && !tools.canBuildDirectUsb) throw IllegalStateException("Bundled build tools missing. Reinstall the latest APK.")
+                    if (config.outputMode != WinBuildOutputMode.DIRECT_NTFS_USB && !tools.canConvertIso) throw IllegalStateException("Bundled ISO build tools (cabextract/wimlib/chntpw/xorriso) missing.")
                 }
+                pruneOldWorkDirs(config.targetDir, workPrefix)
+                Shell.cmd("mkdir -p ${shellQuote(pkgDir.absolutePath)}").exec()
 
-                val coreFiles = filterCorePackageFiles(manifest)
-                val totalBytes = coreFiles.sumOf { it.sizeBytes.coerceAtLeast(0L) }
-                Shell.cmd(
-                    "mkdir -p ${shellQuote(pkgDir.absolutePath)} ${shellQuote(isoDir.absolutePath)} ${shellQuote(tmpDir.absolutePath)} && " +
-                        "chmod -R 0777 ${shellQuote(workRootPath)}"
-                ).exec()
-                saveBuildJobJson(appCtx, workRootPath, config, totalBytes)
+                val manifest = fetchFullDownloadManifest(config.build.uuid, config.lang.code, config.editions.map { it.code })
+                if (manifest.allFiles.isEmpty()) throw IllegalStateException("Could not load package list from server.")
 
-                val alreadyVerified = batchVerifyExistingPackages(pkgDir.absolutePath, coreFiles)
-                val initialDoneBytes = coreFiles.filter { it.name in alreadyVerified }.sumOf { it.sizeBytes.coerceAtLeast(0L) }
-                val downloadedCounter = AtomicLong(initialDoneBytes)
+                val targetFiles = when (config.downloadMethod) {
+                    WinDownloadMethod.DOWNLOAD_UPDATES_ONLY -> manifest.updateFiles
+                    else -> buildList {
+                        addAll(manifest.baseFiles)
+                        if (config.includeUpdates) addAll(manifest.updateFiles)
+                        if (config.includeStoreApps) addAll(manifest.appFiles)
+                        if (config.integrateNetFx3) addAll(manifest.netFx3Files)
+                    }
+                }.distinctBy { it.name }
+                if (targetFiles.isEmpty()) throw IllegalStateException("No downloadable packages matched the selected options.")
+
+                val totalBytes = targetFiles.sumOf { it.sizeBytes }.coerceAtLeast(1L)
+                val freeNow = UsbGadgetEngine.getFreeSpaceBytes(config.targetDir)
+                val estExtraBuildBytes = if (config.downloadMethod == WinDownloadMethod.DOWNLOAD_AND_BUILD) (totalBytes + (if (config.skipWinRe) 0L else 520L * 1024L * 1024L) + 600L * 1024L * 1024L) else 256L * 1024L * 1024L
+                val existingPkgBytes = Shell.cmd("du -sb ${shellQuote(pkgDir.absolutePath)} 2>/dev/null | awk '{print \$1}'").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                val neededFree = ((totalBytes - existingPkgBytes).coerceAtLeast(0L)) + estExtraBuildBytes
+                if (freeNow > 0L && freeNow < neededFree) throw IllegalStateException("Not enough free space. Need ~${UsbGadgetEngine.formatBytes(neededFree)}, have ${UsbGadgetEngine.formatBytes(freeNow)} free.")
+
+                saveBuildJobJson(appCtx, workRootPath, config, totalBytes, false)
+                emitLog("win-dl", "Found ${targetFiles.size} package(s) (${UsbGadgetEngine.formatBytes(totalBytes)}) · Method=${config.downloadMethod.name}")
+
+                _downloadState.value = WindowsBuildJobState(jobTitle, "Checking cached packages...", "Verifying SHA-1 hashes", 0.03f, 0L, totalBytes, activeThreads = maxConns, filesTotal = targetFiles.size, autoMount = dlAutoMountLive, workDirPath = workRootPath)
+                val alreadyVerified = batchVerifyExistingPackages(appCtx, pkgDir, targetFiles)
+                val cachedBytes = targetFiles.filter { it.name in alreadyVerified }.sumOf { it.sizeBytes }
                 val filesDoneCounter = AtomicInteger(alreadyVerified.size)
+                val downloadedCounter = AtomicLong(cachedBytes)
                 val liveThreadsCounter = AtomicInteger(0)
-                val effectiveMaxConns = AtomicInteger(maxConns)
-
-                if (alreadyVerified.isNotEmpty()) {
-                    emitLog("win-iso", "Resumed ${alreadyVerified.size}/${coreFiles.size} verified packages (${UsbGadgetEngine.formatBytes(initialDoneBytes)})")
-                }
+                if (alreadyVerified.isNotEmpty()) emitLog("win-dl", "Resumed ${alreadyVerified.size}/${targetFiles.size} verified packages (${UsbGadgetEngine.formatBytes(cachedBytes)})")
 
                 val meterJob = launch {
-                    var prevBytes = downloadedCounter.get()
-                    var prevTime = System.currentTimeMillis()
-                    var smoothedSpeed = 0.0
-                    var ticks = 0
-                    while (isActive && !cancelledFlag.get() && !pausedFlag.get()) {
-                        delay(450L)
-                        ticks++
-                        val now = System.currentTimeMillis()
-                        val cur = downloadedCounter.get().coerceIn(0L, totalBytes.coerceAtLeast(1L))
-                        val dt = (now - prevTime).coerceAtLeast(1L)
-                        val instant = ((cur - prevBytes).coerceAtLeast(0L) * 1000.0) / dt.toDouble()
-                        smoothedSpeed = if (smoothedSpeed == 0.0) instant else (smoothedSpeed * 0.65 + instant * 0.35)
-                        prevBytes = cur
-                        prevTime = now
-
-                        val spd = smoothedSpeed.toLong()
-                        val rem = (totalBytes - cur).coerceAtLeast(0L)
-                        val eta = if (spd > 1024L && totalBytes > 0L) rem / spd else -1L
-                        val frac = if (totalBytes > 0L) (cur.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f) else 0f
-                        val shownThreads = liveThreadsCounter.get().coerceAtLeast(1).coerceAtMost(effectiveMaxConns.get())
-
-                        val st = WindowsBuildJobState(
-                            title = jobTitle,
-                            stage = "Downloading packages (${filesDoneCounter.get()}/${coreFiles.size})...",
-                            detail = "${UsbGadgetEngine.formatBytes(cur)} / ${UsbGadgetEngine.formatBytes(totalBytes)}",
-                            progress = 0.04f + frac * 0.50f,
-                            downloadedBytes = cur,
-                            totalBytes = totalBytes,
-                            speedBytesPerSec = spd,
-                            etaSeconds = eta,
-                            activeThreads = shownThreads,
-                            filesDone = filesDoneCounter.get(),
-                            filesTotal = coreFiles.size,
-                            isConverting = false,
-                            isPaused = false,
-                            autoMount = autoMountLive,
-                            workDirPath = workRootPath
-                        )
-                        _jobState.value = st
-                        if (ticks % 2 == 0) {
-                            NotificationHelper.updateDownloadProgress(
-                                appCtx,
-                                TurboDownloadState(
-                                    title = st.title,
-                                    fileName = st.stage,
-                                    url = "",
-                                    targetDir = config.targetDir,
-                                    downloadedBytes = cur,
-                                    totalBytes = totalBytes,
-                                    speedBytesPerSec = spd,
-                                    etaSeconds = eta,
-                                    activeThreads = shownThreads,
-                                    supportsRange = true,
-                                    statusText = st.detail
-                                )
-                            )
-                        }
+                    var prevBytes = downloadedCounter.get(); var prevMs = System.currentTimeMillis(); var smoothSpeed = 0L
+                    while (isActive && !dlPausedFlag.get() && !dlCancelledFlag.get()) {
+                        delay(500L)
+                        val nowMs = System.currentTimeMillis(); val cur = downloadedCounter.get(); val dt = (nowMs - prevMs).coerceAtLeast(1L)
+                        val inst = ((cur - prevBytes).coerceAtLeast(0L) * 1000L) / dt
+                        smoothSpeed = if (smoothSpeed == 0L) inst else ((smoothSpeed * 6 + inst * 4) / 10)
+                        prevBytes = cur; prevMs = nowMs
+                        val eta = if (smoothSpeed > 0L && totalBytes > cur) (totalBytes - cur) / smoothSpeed else -1L
+                        val shownThreads = liveThreadsCounter.get().coerceAtLeast(1)
+                        val st = WindowsBuildJobState(jobTitle, "Downloading (${filesDoneCounter.get()}/${targetFiles.size} files)", "${UsbGadgetEngine.formatBytes(cur)} / ${UsbGadgetEngine.formatBytes(totalBytes)} · ${FastIsoDownloader.formatSpeed(smoothSpeed)}", (cur.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f), cur, totalBytes, smoothSpeed, eta, shownThreads, filesDoneCounter.get(), targetFiles.size, false, false, dlAutoMountLive, workRootPath)
+                        _downloadState.value = st
+                        NotificationHelper.updateDownloadProgress(appCtx, TurboDownloadState(st.title, st.stage, "", config.targetDir, "", cur, totalBytes, smoothSpeed, eta, shownThreads, true, false, false, false, st.detail))
                     }
                 }
-
                 try {
-                    val pending = coreFiles.filter { it.name !in alreadyVerified }
-                    val batchItems = pending.map { entry ->
+                    val batchItems = targetFiles.filter { it.name !in alreadyVerified }.map { entry ->
                         val safeName = entry.name.replace(Regex("[^A-Za-z0-9._-]"), "_")
-                        FastIsoDownloader.TurboBatchItem(
-                            id = entry.name,
-                            url = entry.url,
-                            partFile = File(appStageDir, "$safeName.part"),
-                            metaFile = File(appStageDir, "$safeName.part.pbmeta"),
-                            expectedSize = entry.sizeBytes,
-                            expectedSha1 = entry.sha1
-                        )
+                        FastIsoDownloader.TurboBatchItem(entry.name, entry.url, File(appStageDir, "$safeName.part"), File(appStageDir, "$safeName.part.pbmeta"), entry.sizeBytes, entry.sha1)
                     }
-                    FastIsoDownloader.downloadBatchTurbo(
-                        items = batchItems,
-                        connections = maxConns,
-                        pausedFlag = pausedFlag,
-                        cancelledFlag = cancelledFlag,
-                        totalCounter = downloadedCounter,
-                        activeStreamsOut = liveThreadsCounter,
-                        onFileVerified = { doneItem ->
-                            val destPath = "${pkgDir.absolutePath}/${doneItem.id}"
-                            val mvRes = Shell.cmd("mv -f ${shellQuote(doneItem.partFile.absolutePath)} ${shellQuote(destPath)} 2>&1").exec()
-                            if (!mvRes.isSuccess) {
-                                throw IllegalStateException("Move failed for ${doneItem.id}: ${mvRes.out.joinToString(" ")}")
-                            }
-                            filesDoneCounter.incrementAndGet()
-                        }
-                    )
-                } finally {
-                    meterJob.cancel()
-                }
+                    FastIsoDownloader.downloadBatchTurbo(batchItems, maxConns, dlPausedFlag, dlCancelledFlag, downloadedCounter, liveThreadsCounter) { doneItem ->
+                        val mvRes = Shell.cmd("mv -f ${shellQuote(doneItem.partFile.absolutePath)} ${shellQuote("${pkgDir.absolutePath}/${doneItem.id}")} 2>&1").exec()
+                        if (!mvRes.isSuccess) throw IllegalStateException("Move failed for ${doneItem.id}")
+                        filesDoneCounter.incrementAndGet()
+                    }
+                } finally { meterJob.cancel() }
 
-                if (pausedFlag.get() || cancelledFlag.get()) return@launch
+                if (dlPausedFlag.get() || dlCancelledFlag.get()) return@launch
                 runCatching { appStageDir.deleteRecursively() }
-                emitLog("win-iso", "Downloaded & SHA-1 verified all ${coreFiles.size} packages")
+                emitLog("win-dl", "Downloaded & SHA-1 verified all ${targetFiles.size} packages")
 
-                fun updateConv(stage: String, detail: String, pct: Float) {
-                    val st = WindowsBuildJobState(
-                        title = jobTitle,
-                        stage = stage,
-                        detail = detail,
-                        progress = pct,
-                        downloadedBytes = totalBytes,
-                        totalBytes = totalBytes,
-                        speedBytesPerSec = 0L,
-                        etaSeconds = -1L,
-                        activeThreads = maxConns,
-                        filesDone = coreFiles.size,
-                        filesTotal = coreFiles.size,
-                        isConverting = true,
-                        isPaused = false,
-                        autoMount = autoMountLive,
-                        workDirPath = workRootPath
-                    )
-                    _jobState.value = st
-                    NotificationHelper.updateDownloadProgress(
-                        appCtx,
-                        TurboDownloadState(
-                            title = st.title,
-                            fileName = stage,
-                            url = "",
-                            targetDir = config.targetDir,
-                            downloadedBytes = (pct * 100).toLong(),
-                            totalBytes = 100L,
-                            supportsRange = false,
-                            statusText = detail
-                        )
-                    )
+                dlWorkRootPath = ""; dlWorkPrefix = ""; _downloadState.value = null; TurboDownloadService.stop(appCtx)
+
+                if (config.downloadMethod != WinDownloadMethod.DOWNLOAD_AND_BUILD) {
+                    val folderSuffix = if (config.downloadMethod == WinDownloadMethod.DOWNLOAD_UPDATES_ONLY) "Updates" else "UUP_Packages"
+                    val cleanFolder = config.customOutputName.trim().substringBeforeLast('.').replace(Regex("[^A-Za-z0-9._-]"), "_").ifBlank { "Windows_${config.build.build}_${config.build.archDisplay}_$folderSuffix" }
+                    val destFolder = "${UsbGadgetEngine.resolveDirectPath(config.targetDir).trimEnd('/')}/$cleanFolder"
+                    Shell.cmd("mkdir -p ${shellQuote(destFolder)} && mv -f ${shellQuote(pkgDir.absolutePath)}/* ${shellQuote(destFolder)}/ 2>&1").exec()
+                    UsbGadgetEngine.fixUserStoragePermissions(appCtx, destFolder, isDir = true)
+                    UsbGadgetEngine.cleanupTempWorkDir(workRootPath)
+                    val completion = DownloadCompletionEvent(jobTitle, cleanFolder, destFolder, null, null, null, ChecksumVerifyStatus.NONE, false, "${targetFiles.size} verified files · ${UsbGadgetEngine.formatBytes(totalBytes)}")
+                    FastIsoDownloader.publishExternalCompletion(completion)
+                    NotificationHelper.showDownloadComplete(appCtx, jobTitle, "Saved ${targetFiles.size} files to $cleanFolder/")
+                    onComplete(completion)
+                    return@launch
                 }
 
-                val qCab = shellQuote(tools.cabextract!!)
-                val qWim = shellQuote(tools.wimlib!!)
-                val qChntpw = shellQuote(tools.chntpw!!)
-                val qPkg = shellQuote(pkgDir.absolutePath)
-                val qIsoDir = shellQuote(isoDir.absolutePath)
-                val qTmp = shellQuote(tmpDir.absolutePath)
-                val pathHeader = """
-                    PKG=$qPkg
-                    ISODIR=$qIsoDir
-                    TMP=$qTmp
-                    export TMPDIR="${'$'}TMP" HOME="${'$'}TMP"
-                """.trimIndent()
-
-                // Pre-flight check bundled binaries in an isolated child shell
-                val toolCheckRes = runIsolatedRootScript(
-                    appCtx,
-                    "toolcheck",
-                    """
-                    set -e
-                    $pathHeader
-                    rm -rf "${'$'}ISODIR" "${'$'}TMP" /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive
-                    mkdir -p "${'$'}ISODIR" "${'$'}TMP"
-                    $qCab --version >/dev/null
-                    $qWim --version >/dev/null
-                    """.trimIndent()
-                )
-                if (!toolCheckRes.isSuccess) {
-                    val err = (toolCheckRes.out + toolCheckRes.err).filter { it.isNotBlank() }.takeLast(5).joinToString(" | ").take(280)
-                    emitLog("win-iso", "Build tool check failed (code ${toolCheckRes.code}): $err", true)
-                    throw IllegalStateException("Build tool check failed: ${err.ifBlank { "exit code ${toolCheckRes.code}" }}")
-                }
-
-                // STEP 1/4: Convert genuine edition/language CABs -> uncompressed reference ESDs on native Linux storage
-                val allCabPaths = runIsolatedRootScript(
-                    appCtx,
-                    "listcabs",
-                    """
-                    $pathHeader
-                    for c in "${'$'}PKG"/*.cab "${'$'}PKG"/*.CAB; do
-                        [ -f "${'$'}c" ] && echo "${'$'}c"
-                    done
-                    """.trimIndent()
-                ).out.map { it.trim() }.filter { it.startsWith("/") && it.lowercase().endsWith(".cab") }
-                val editionCabs = allCabPaths.filter { !isSkippableNonEditionCab(it.substringAfterLast('/')) }
-
-                if (editionCabs.isEmpty()) {
-                    emitLog("win-iso", "Step 1/4: No edition .cab packages to convert (pure ESD build)")
-                } else {
-                    emitLog("win-iso", "Step 1/4: Converting ${editionCabs.size} edition .cab package(s) (skipped ${allCabPaths.size - editionCabs.size} non-edition CABs)")
-                }
-
-                var convertedCabs = 0
-                editionCabs.forEachIndexed { idx, cabPath ->
-                    if (cancelledFlag.get()) return@launch
-                    val cabName = cabPath.substringAfterLast('/')
-                    val pct = 0.55f + (idx.toFloat() / editionCabs.size.coerceAtLeast(1).toFloat()) * 0.07f
-                    updateConv(
-                        "Step 1/4 · Converting CAB ${idx + 1}/${editionCabs.size}...",
-                        cabName,
-                        pct
-                    )
-                    val qOneCab = shellQuote(cabPath)
-                    val qBn = shellQuote(cabName)
-                    val oneCabRes = runIsolatedRootScript(
-                        appCtx,
-                        "cab",
-                        """
-                        set -e
-                        $pathHeader
-                        BN=$qBn
-                        EXTDIR="/data/local/tmp/pb_uup_ext"
-                        rm -rf "${'$'}EXTDIR"
-                        mkdir -p "${'$'}EXTDIR"
-                        set +e
-                        $qCab -q -d "${'$'}EXTDIR" $qOneCab
-                        CAB_RC=${'$'}?
-                        set -e
-                        if [ -z "${'$'}(ls -A "${'$'}EXTDIR" 2>/dev/null)" ]; then
-                            echo "PB_SKIP_NON_MSCF (rc=${'$'}CAB_RC)"
-                            rm -rf "${'$'}EXTDIR"
-                            exit 0
-                        fi
-                        $qWim capture "${'$'}EXTDIR" "${'$'}TMP/${'$'}BN.esd" "Edition Package" "Edition Package" --compress=none --no-acls --norpfix
-                        rm -rf "${'$'}EXTDIR"
-                        """.trimIndent()
-                    )
-                    val joinedOut = (oneCabRes.out + oneCabRes.err).joinToString(" ")
-                    if (!oneCabRes.isSuccess) {
-                        val err = (oneCabRes.out + oneCabRes.err).filter { it.isNotBlank() }.takeLast(5).joinToString(" | ").take(280)
-                        emitLog("win-iso", "CAB convert failed on $cabName (code ${oneCabRes.code}): $err", true)
-                        throw IllegalStateException("CAB convert failed ($cabName): ${err.ifBlank { "exit code ${oneCabRes.code}" }}")
-                    }
-                    if (joinedOut.contains("PB_SKIP_NON_MSCF")) {
-                        emitLog("win-iso", "Skipped non-MSCF cabinet: $cabName")
-                    } else if (!joinedOut.contains("PB_SKIP_EMPTY")) {
-                        convertedCabs++
-                    }
-                }
-                emitLog("win-iso", "Step 1/4 complete: converted $convertedCabs CAB reference ESD(s)")
-
-                // STEP 2/4: Detect edition metadata ESDs & assemble dual-index boot.wim (exact UUPdump convert.sh flow)
-                updateConv("Step 2/4 · Building boot.wim...", "Inspecting editions & applying WinPE layout", 0.63f)
-                val metaListRes = runIsolatedRootScript(
-                    appCtx,
-                    "meta",
-                    """
-                    $pathHeader
-                    for f in "${'$'}PKG"/*.esd "${'$'}PKG"/*.ESD; do
-                        [ -f "${'$'}f" ] || continue
-                        cnt=${'$'}($qWim info "${'$'}f" 2>/dev/null | grep -c '^Index:' || true)
-                        if [ "${'$'}cnt" -ge 3 ]; then
-                            echo "${'$'}f"
-                        fi
-                    done
-                    """.trimIndent()
-                )
-                val metaList = metaListRes.out.map { it.trim() }.filter { it.startsWith("/") && it.lowercase().endsWith(".esd") }
-
-                if (metaList.isEmpty()) {
-                    throw IllegalStateException("No Windows edition metadata ESD (3+ indexes) found in downloaded packages.")
-                }
-                val firstMeta = shellQuote(metaList.first())
-
-                val bootWimRes = runIsolatedRootScript(
-                    appCtx,
-                    "bootwim",
-                    """
-                    set -e
-                    $pathHeader
-                    $qWim apply $firstMeta 1 "${'$'}ISODIR" --no-acls --no-attributes
-                    mkdir -p "${'$'}ISODIR/sources"
-                    $qWim export $firstMeta 2 "${'$'}TMP/winre.wim" --compress=maximum --boot
-                    cp -f "${'$'}TMP/winre.wim" "${'$'}ISODIR/sources/boot.wim"
-                    $qWim info "${'$'}ISODIR/sources/boot.wim" 1 "Microsoft Windows PE" "Microsoft Windows PE"
-                    $qWim info "${'$'}ISODIR/sources/boot.wim" 1 --image-property FLAGS=9
-
-                    # Exact UUPdump WinPE SOFTWARE hive patch on native Linux storage
-                    HIVEDIR="/data/local/tmp/pb_uup_hive"
-                    rm -rf "${'$'}HIVEDIR"
-                    mkdir -p "${'$'}HIVEDIR"
-                    $qWim extract "${'$'}ISODIR/sources/boot.wim" 1 "/Windows/System32/config/SOFTWARE" --dest-dir="${'$'}HIVEDIR" --no-acls --no-attributes >/dev/null 2>&1 || \
-                      $qWim extract "${'$'}ISODIR/sources/boot.wim" 1 "/windows/system32/config/software" --dest-dir="${'$'}HIVEDIR" --no-acls --no-attributes >/dev/null 2>&1 || true
-                    HIVE_FILE=${'$'}(find "${'$'}HIVEDIR" -maxdepth 1 -type f -iname 'software' | head -n 1)
-                    if [ -n "${'$'}HIVE_FILE" ]; then
-                        set +e
-                        printf 'cd Microsoft\\Windows NT\\CurrentVersion\nnv 1 SystemRoot\ned SystemRoot\nX:\\${'$'}Windows.~bt\\Windows\ncd WinPE\nnv 1 InstRoot\ned InstRoot\nX:\\${'$'}Windows.~bt\nq\n' | $qChntpw -C -e "${'$'}HIVE_FILE"
-                        REG_RC=${'$'}?
-                        set -e
-                        if [ "${'$'}REG_RC" != "0" ] && [ "${'$'}REG_RC" != "2" ]; then
-                            echo "Warning: reged exited with ${'$'}REG_RC"
-                        fi
-                        $qWim update "${'$'}ISODIR/sources/boot.wim" 1 --command="add '${'$'}HIVE_FILE' /Windows/System32/config/SOFTWARE"
-                    fi
-                    rm -rf "${'$'}HIVEDIR"
-
-                    BG_FILE=""
-                    for bg in "${'$'}ISODIR/sources/background_cli.bmp" "${'$'}ISODIR/sources/background_svr.bmp" "${'$'}ISODIR/sources/background_cli.png"; do
-                        [ -f "${'$'}bg" ] && BG_FILE="${'$'}bg" && break
-                    done
-                    if [ -n "${'$'}BG_FILE" ]; then
-                        $qWim update "${'$'}ISODIR/sources/boot.wim" 1 --command="add '${'$'}BG_FILE' /Windows/system32/winre.jpg" || true
-                    fi
-                    $qWim update "${'$'}ISODIR/sources/boot.wim" 1 --command="delete --force /Windows/System32/winpeshl.ini" || true
-
-                    # Index 2: Microsoft Windows Setup
-                    $qWim export "${'$'}TMP/winre.wim" 1 "${'$'}ISODIR/sources/boot.wim" "Microsoft Windows Setup" "Microsoft Windows Setup"
-                    $qWim info "${'$'}ISODIR/sources/boot.wim" 2 --image-property FLAGS=2
-                    $qWim info "${'$'}ISODIR/sources/boot.wim" 2 --boot
-                    $qWim extract $firstMeta 3 "/Windows/System32/xmllite.dll" --dest-dir="${'$'}ISODIR/sources" --no-acls --no-attributes >/dev/null 2>&1 || true
-
-                    UPD_TXT="/data/local/tmp/pb_boot_update.txt"
-                    : > "${'$'}UPD_TXT"
-                    echo "delete --force /Windows/System32/winpeshl.ini" >> "${'$'}UPD_TXT"
-                    if [ -f "${'$'}ISODIR/setup.exe" ]; then
-                        echo "add '${'$'}ISODIR/setup.exe' /setup.exe" >> "${'$'}UPD_TXT"
-                    fi
-                    if [ -n "${'$'}BG_FILE" ]; then
-                        echo "add '${'$'}BG_FILE' /sources/background.bmp" >> "${'$'}UPD_TXT"
-                        echo "add '${'$'}BG_FILE' /Windows/system32/winre.jpg" >> "${'$'}UPD_TXT"
-                    fi
-                    for sf in "${'$'}ISODIR"/sources/*; do
-                        [ -e "${'$'}sf" ] || continue
-                        sbn=${'$'}(basename "${'$'}sf")
-                        case "${'$'}sbn" in
-                            boot.wim|install.wim|install.esd|sxs|SXS|uup|UUP) continue ;;
-                        esac
-                        echo "add '${'$'}sf' '/sources/${'$'}sbn'" >> "${'$'}UPD_TXT"
-                    done
-                    $qWim update "${'$'}ISODIR/sources/boot.wim" 2 < "${'$'}UPD_TXT"
-                    $qWim optimize "${'$'}ISODIR/sources/boot.wim"
-                    rm -f "${'$'}ISODIR/sources/xmllite.dll" "${'$'}TMP/winre.wim" "${'$'}UPD_TXT"
-                    """.trimIndent()
-                )
-                if (!bootWimRes.isSuccess) {
-                    val err = (bootWimRes.out + bootWimRes.err).filter { it.isNotBlank() }.takeLast(5).joinToString(" | ").take(280)
-                    emitLog("win-iso", "boot.wim assembly failed (code ${bootWimRes.code}): $err", true)
-                    throw IllegalStateException("boot.wim assembly failed: ${err.ifBlank { "exit code ${bootWimRes.code}" }}")
-                }
-                emitLog("win-iso", "Step 2/4 complete: Assembled boot.wim (WinPE + Setup)")
-
-                // STEP 3/4: Export Windows editions into install.wim / install.esd with live percentage polling
-                val installPath = "${isoDir.absolutePath}/sources/install.${config.compression.ext}"
-                val qInstallFile = shellQuote(installPath)
-                val wimProgLog = "/data/local/tmp/pb_wim_prog.log"
-                val qProgLog = shellQuote(wimProgLog)
-
-                metaList.forEachIndexed { idx, metaPath ->
-                    if (cancelledFlag.get()) return@launch
-                    val sliceBase = 0.68f + (idx.toFloat() / metaList.size.toFloat()) * 0.20f
-                    val sliceSpan = 0.20f / metaList.size.toFloat()
-                    updateConv(
-                        "Step 3/4 · Compressing install.${config.compression.ext} (${idx + 1}/${metaList.size})...",
-                        "${config.compression.label} · 0%",
-                        sliceBase
-                    )
-
-                    val wimPollJob = launch {
-                        val pctRegex = Regex("""(\d{1,3})%""")
-                        while (isActive && !cancelledFlag.get()) {
-                            delay(800L)
-                            val tail = Shell.cmd("tail -c 256 $qProgLog 2>/dev/null || true").exec().out.joinToString(" ")
-                            val lastPct = pctRegex.findAll(tail).lastOrNull()?.groupValues?.get(1)?.toIntOrNull()
-                            if (lastPct != null && lastPct in 0..100) {
-                                updateConv(
-                                    "Step 3/4 · Compressing install.${config.compression.ext} (${idx + 1}/${metaList.size})...",
-                                    "${config.compression.label} · $lastPct%",
-                                    sliceBase + (lastPct / 100f) * sliceSpan
-                                )
-                            }
-                        }
-                    }
-
-                    val qMeta = shellQuote(metaPath)
-                    val expRes = runIsolatedRootScript(
-                        appCtx,
-                        "wimexp",
-                        """
-                        set -e
-                        $pathHeader
-                        : > $qProgLog
-                        ED_NAME=${'$'}($qWim info $qMeta 3 2>/dev/null | sed -n 's/^Display Name:[[:space:]]*//p; s/^Name:[[:space:]]*//p' | head -n 1)
-                        [ -z "${'$'}ED_NAME" ] && ED_NAME="Windows ${config.build.build}"
-                        set --
-                        for ref in "${'$'}PKG"/*.esd "${'$'}PKG"/*.ESD "${'$'}TMP"/*.esd; do
-                            [ -f "${'$'}ref" ] && set -- "${'$'}@" --ref="${'$'}ref"
-                        done
-                        $qWim export $qMeta 3 $qInstallFile "${'$'}ED_NAME" ${config.compression.wimlibArg} "${'$'}@" > $qProgLog 2>&1
-                        """.trimIndent()
-                    )
-                    wimPollJob.cancel()
-                    if (!expRes.isSuccess) {
-                        val err = Shell.cmd("tail -n 6 $qProgLog 2>/dev/null || true").exec().out
-                            .filter { it.isNotBlank() }.joinToString(" | ").take(280)
-                        Shell.cmd("rm -f $qProgLog 2>/dev/null || true").exec()
-                        emitLog("win-iso", "install.${config.compression.ext} export failed: $err", true)
-                        throw IllegalStateException("install.${config.compression.ext} export failed: ${err.ifBlank { "exit code ${expRes.code}" }}")
-                    }
-                    Shell.cmd("rm -f $qProgLog 2>/dev/null || true").exec()
-                }
-                runIsolatedRootScript(appCtx, "wimopt", "$pathHeader\n$qWim optimize $qInstallFile >/dev/null 2>&1 || true")
-                Shell.cmd("rm -rf $qPkg $qTmp /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive").exec()
-                emitLog("win-iso", "Step 3/4 complete: Built install.${config.compression.ext} (${metaList.size} edition(s))")
-
-                val safeTargetDir = UsbGadgetEngine.resolveDirectPath(config.targetDir).trimEnd('/')
-                val defaultSlug = "Windows_${config.build.build}_${config.build.archDisplay}_${config.lang.code}"
-                    .replace(Regex("[^A-Za-z0-9._-]"), "_")
-                val cleanCustom = config.customOutputName.trim()
-                    .replace(Regex("[^A-Za-z0-9._ -]"), "_")
-                    .trim()
-
-                var finalOutputPath = ""
-                var finalFileName = ""
-                var injectedMbPath: String? = null
-
-                if (config.outputMode == WinBuildOutputMode.DIRECT_NTFS_USB) {
-                    updateConv("Step 4/4 · Building Direct Bootable USB...", "Formatting GPT NTFS + UEFI Boot & Bypasses", 0.90f)
-                    finalFileName = if (cleanCustom.isNotEmpty()) {
-                        if (cleanCustom.endsWith(".img", true)) cleanCustom else "$cleanCustom.img"
-                    } else {
-                        "${defaultSlug}_USB.img"
-                    }
-                    finalOutputPath = "$safeTargetDir/$finalFileName"
-                    val usbErr = buildDirectNtfsUsbFromDir(appCtx, isoDir.absolutePath, finalOutputPath, config)
-                    if (usbErr != null) {
-                        emitLog("win-iso", "Direct USB build failed: $usbErr", true)
-                        throw IllegalStateException(usbErr)
-                    }
-                } else {
-                    val qXor = shellQuote(tools.xorriso!!)
-                    finalFileName = if (cleanCustom.isNotEmpty()) {
-                        if (cleanCustom.endsWith(".iso", true)) cleanCustom else "$cleanCustom.iso"
-                    } else {
-                        "$defaultSlug.iso"
-                    }
-                    finalOutputPath = "$safeTargetDir/$finalFileName"
-                    val qOutIso = shellQuote(finalOutputPath)
-                    val volId = "WIN_${config.build.build.substringBefore('.')}".take(28).uppercase()
-
-                    val estIsoBytes = Shell.cmd("du -sb $qIsoDir 2>/dev/null | awk '{print \$1}'").exec()
-                        .out.firstOrNull()?.trim()?.toLongOrNull()?.coerceAtLeast(1L) ?: (5L * 1024L * 1024L * 1024L)
-                    updateConv("Step 4/4 · Packing bootable ISO...", finalFileName, 0.90f)
-
-                    val isoPollJob = launch {
-                        while (isActive && !cancelledFlag.get()) {
-                            delay(700L)
-                            val curSz = Shell.cmd("stat -c '%s' $qOutIso 2>/dev/null || echo 0")
-                                .exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
-                            if (curSz > 0L) {
-                                val f = (curSz.toFloat() / estIsoBytes.toFloat()).coerceIn(0f, 1f)
-                                updateConv(
-                                    "Step 4/4 · Packing bootable ISO...",
-                                    "${UsbGadgetEngine.formatBytes(curSz)} / ~${UsbGadgetEngine.formatBytes(estIsoBytes)}",
-                                    0.90f + f * 0.06f
-                                )
-                            }
-                        }
-                    }
-
-                    val xorRes = runIsolatedRootScript(
-                        appCtx,
-                        "xorriso",
-                        """
-                        set -e
-                        $pathHeader
-                        mkdir -p ${shellQuote(safeTargetDir)}
-                        rm -f $qOutIso
-                        EFI_BOOT=""
-                        if [ -f "${'$'}ISODIR/efi/microsoft/boot/efisys.bin" ]; then
-                            EFI_BOOT="efi/microsoft/boot/efisys.bin"
-                        elif [ -f "${'$'}ISODIR/EFI/Microsoft/Boot/efisys.bin" ]; then
-                            EFI_BOOT="EFI/Microsoft/Boot/efisys.bin"
-                        fi
-                        BIOS_BOOT=""
-                        if [ -f "${'$'}ISODIR/boot/etfsboot.com" ]; then
-                            BIOS_BOOT="boot/etfsboot.com"
-                        fi
-
-                        if [ -n "${'$'}BIOS_BOOT" ] && [ -n "${'$'}EFI_BOOT" ]; then
-                            $qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -volid "$volId" -udf \
-                              -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -boot-info-table \
-                              -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot \
-                              -o $qOutIso "${'$'}ISODIR"
-                        elif [ -n "${'$'}EFI_BOOT" ]; then
-                            $qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -volid "$volId" -udf \
-                              -e "${'$'}EFI_BOOT" -no-emul-boot \
-                              -o $qOutIso "${'$'}ISODIR"
-                        else
-                            $qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -volid "$volId" -udf \
-                              -o $qOutIso "${'$'}ISODIR"
-                        fi
-                        """.trimIndent()
-                    )
-                    isoPollJob.cancel()
-                    if (!xorRes.isSuccess) {
-                        val err = (xorRes.out + xorRes.err).filter { it.isNotBlank() }.takeLast(5).joinToString(" | ").take(280)
-                        emitLog("win-iso", "ISO packing failed (code ${xorRes.code}): $err", true)
-                        throw IllegalStateException("ISO packing failed: ${err.ifBlank { "exit code ${xorRes.code}" }}")
-                    }
-
-                    UsbGadgetEngine.fixUserStoragePermissions(appCtx, safeTargetDir, isDir = true)
-                    UsbGadgetEngine.fixUserStoragePermissions(appCtx, finalOutputPath, isDir = false)
-
-                    if (config.outputMode == WinBuildOutputMode.DIRECT_MULTIBOOT && config.targetMultiBootPath.isNotBlank()) {
-                        val mbPath = UsbGadgetEngine.resolveDirectPath(config.targetMultiBootPath)
-                        updateConv("Moving ISO into Multi-Boot...", mbPath.substringAfterLast('/'), 0.97f)
-                        val addRes = VentoyImageBuilder.addIsoToVentoy(
-                            context = appCtx,
-                            ventoyImgPath = mbPath,
-                            sourceIsoPath = finalOutputPath,
-                            moveFile = true,
-                            onProgress = { p -> updateConv("Moving into Multi-Boot...", p.detail.ifBlank { p.stage }, 0.98f) }
-                        )
-                        if (addRes.success) {
-                            injectedMbPath = mbPath
-                        }
-                    }
-                }
-
-                UsbGadgetEngine.cleanupTempWorkDir(workRootPath)
-                runCatching { appStageDir.deleteRecursively() }
-                activeWorkRootPath = ""
-                activeWorkPrefix = ""
-                _jobState.value = null
-                TurboDownloadService.stop(appCtx)
-
-                emitLog("win-iso", "Completed build: $finalFileName")
-                val completion = DownloadCompletionEvent(
-                    title = jobTitle,
-                    fileName = finalFileName,
-                    savedPath = finalOutputPath,
-                    injectedMultiBootPath = injectedMbPath,
-                    computedSha256 = null,
-                    expectedSha256 = null,
-                    checksumStatus = ChecksumVerifyStatus.NONE,
-                    autoMount = autoMountLive
-                )
-                FastIsoDownloader.publishExternalCompletion(completion)
-                NotificationHelper.showDownloadComplete(appCtx, jobTitle, "Built $finalFileName")
-                onComplete(completion)
+                enqueueConversion(QueuedConversionJob(appCtx, config.copy(autoMount = dlAutoMountLive), workRootPath, workPrefix, jobTitle, totalBytes, config.includeUpdates && manifest.hasUpdates, config.includeStoreApps && manifest.hasApps, config.integrateNetFx3 && manifest.hasNetFx3, onComplete, onError, onLog))
             } catch (_: CancellationException) {
-                if (!pausedFlag.get()) {
-                    _jobState.value = null
-                    TurboDownloadService.stop(appCtx)
-                }
+                if (!dlPausedFlag.get()) { _downloadState.value = null; TurboDownloadService.stop(appCtx) }
             } catch (e: Exception) {
-                Shell.cmd("rm -rf ${shellQuote(isoDir.absolutePath)} ${shellQuote(tmpDir.absolutePath)} 2>/dev/null || true").exec()
-                _jobState.value = null
-                TurboDownloadService.stop(appCtx)
-                val msg = "Windows build failed: ${e.message ?: "Unexpected error"}"
-                emitLog("win-iso", msg, true)
-                onError(msg)
+                _downloadState.value = null; TurboDownloadService.stop(appCtx)
+                val msg = "Windows download failed: ${e.message ?: "Unexpected error"}"
+                emitLog("win-dl", msg, true); onError(msg)
             }
         }
     }
 
-    private fun buildDirectNtfsUsbFromDir(
-        context: Context,
-        isoDirPath: String,
-        outImgPath: String,
-        config: WindowsChannelBuildConfig
-    ): String? {
-        val ntfsFormatter = WindowsImageBuilder.findBundledBinary(context, "libmkfs_ntfs.so", listOf("mkfs.ntfs", "mkntfs"))
-            ?: return "Bundled mkfs.ntfs not found."
-        val ntfs3g = WindowsImageBuilder.findBundledBinary(context, "libntfs_3g.so", listOf("ntfs-3g"))
-        val uefiBytes = runCatching { context.assets.open("uefi-ntfs.img").use { it.readBytes() } }.getOrNull()
-            ?: return "Missing uefi-ntfs.img asset."
+    private fun enqueueConversion(job: QueuedConversionJob) {
+        conversionQueue.add(job)
+        val queued = conversionQueue.toList()
+        _conversionState.value = _conversionState.value?.copy(queuedCount = queued.size, queuedTitles = queued.map { it.jobTitle })
+        if (activeConversionJob == null || activeConversionJob?.isActive != true) startNextConversion()
+    }
 
-        val qSrcDir = shellQuote(isoDirPath)
-        val qOut = shellQuote(outImgPath)
-        val dirBytes = Shell.cmd("du -sb $qSrcDir 2>/dev/null | awk '{print \$1}'").exec()
-            .out.firstOrNull()?.trim()?.toLongOrNull() ?: (6L * 1024L * 1024L * 1024L)
+    private fun startNextConversion() {
+        val next = conversionQueue.poll()
+        if (next == null) { _conversionState.value = null; convContext?.let { IsoBuilderService.stop(it) }; return }
+        convCancelledFlag.set(false); convAutoMountLive = next.config.autoMount; convContext = next.context; convOnLog = next.onLog
+        IsoBuilderService.start(next.context)
+        activeConversionJob = scope.launch {
+            try { executeConversionJob(next) } finally {
+                if (convCancelledFlag.get()) { _conversionState.value = null; IsoBuilderService.stop(next.context) }
+                else startNextConversion()
+            }
+        }
+    }
+
+    private suspend fun executeConversionJob(job: QueuedConversionJob) {
+        val appCtx = job.context; val config = job.config; val workRootPath = job.workRootPath
+        val pkgDir = File(workRootPath, "PKGS"); val isoDir = File(workRootPath, "ISODIR"); val tmpDir = File(workRootPath, "TMP")
+        val safeTargetDir = UsbGadgetEngine.resolveDirectPath(config.targetDir).trimEnd('/')
+        val defaultSlug = "Windows_${config.build.build}_${config.build.archDisplay}_${config.lang.code}".replace(Regex("[^A-Za-z0-9._-]"), "_")
+        val cleanCustom = config.customOutputName.trim().replace(Regex("[^A-Za-z0-9._ -]"), "_").trim()
+        val finalFileName = if (config.outputMode == WinBuildOutputMode.DIRECT_NTFS_USB) {
+            if (cleanCustom.isNotEmpty()) { if (cleanCustom.endsWith(".img", true)) cleanCustom else "$cleanCustom.img" } else "${defaultSlug}_USB.img"
+        } else {
+            if (cleanCustom.isNotEmpty()) { if (cleanCustom.endsWith(".iso", true)) cleanCustom else "$cleanCustom.iso" } else "$defaultSlug.iso"
+        }
+        val finalOutputPath = "$safeTargetDir/$finalFileName"
+
+        val startMs = System.currentTimeMillis(); var currentStep = 1; var stepStartMs = startMs
+        val stepDurations = mutableMapOf<Int, Long>(); val consoleLines = mutableListOf<String>()
+        var lastMeasuredOutputBytes = 0L; var lastMeasuredMs = startMs; var smoothDiskSpeed = 0L; var activeBin = "init"
+
+        fun addConsole(line: String) { val c = line.trim(); if (c.isNotEmpty()) { consoleLines.add(c.take(120)); if (consoleLines.size > 20) consoleLines.removeAt(0) } }
+        fun advanceStep(newStep: Int, binName: String) {
+            val now = System.currentTimeMillis()
+            if (newStep > currentStep) { stepDurations[currentStep] = ((now - stepStartMs) / 1000L).coerceAtLeast(1L); stepStartMs = now; currentStep = newStep }
+            activeBin = binName
+        }
+        fun publishConv(stage: String, detail: String, pct: Float, outBytes: Long = lastMeasuredOutputBytes) {
+            val now = System.currentTimeMillis(); val elapsedSec = ((now - startMs) / 1000L).coerceAtLeast(1L); val dt = (now - lastMeasuredMs).coerceAtLeast(1L)
+            if (outBytes > lastMeasuredOutputBytes && dt >= 300L) {
+                val inst = ((outBytes - lastMeasuredOutputBytes) * 1000L) / dt
+                smoothDiskSpeed = if (smoothDiskSpeed == 0L) inst else ((smoothDiskSpeed * 6 + inst * 4) / 10)
+                lastMeasuredOutputBytes = outBytes; lastMeasuredMs = now
+            }
+            val clampedPct = pct.coerceIn(0f, 1f)
+            val etaSec = if (clampedPct >= 0.04f && clampedPct < 0.99f) ((elapsedSec.toFloat() / clampedPct) * (1f - clampedPct)).toLong() else -1L
+            val (batPct, _) = readBatteryPercent(appCtx)
+            val queued = conversionQueue.toList()
+            val st = WindowsConversionJobState(job.jobTitle, finalFileName, config.outputMode, currentStep, stage, detail, clampedPct, smoothDiskSpeed, elapsedSec, etaSec, outBytes, UsbGadgetEngine.getFreeSpaceBytes(config.targetDir), activeBin, batPct, stepDurations.toMap(), consoleLines.toList(), queued.size, queued.map { it.jobTitle }, convAutoMountLive, workRootPath)
+            _conversionState.value = st
+            NotificationHelper.updateIsoBuilderProgress(appCtx, st)
+        }
+
+        try {
+            val tools = inspectTools(appCtx)
+            val qCab = shellQuote(tools.cabextract!!); val qWim = shellQuote(tools.wimlib!!); val qChntpw = shellQuote(tools.chntpw!!)
+            val qPkg = shellQuote(pkgDir.absolutePath); val qIsoDir = shellQuote(isoDir.absolutePath); val qTmp = shellQuote(tmpDir.absolutePath)
+            val pathHeader = "PKG=$qPkg\nISODIR=$qIsoDir\nTMP=$qTmp\nexport TMPDIR=\"\$TMP\" HOME=\"\$TMP\""
+
+            publishConv("Step 1/4 · Checking build tools...", "Verifying native ARM64 binaries", 0.02f)
+            if (!runIsolatedRootScript(appCtx, "toolcheck", "set -e\n$pathHeader\nrm -rf \"\$ISODIR\" \"\$TMP\" /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive\nmkdir -p \"\$ISODIR\" \"\$TMP\"\n$qCab --version >/dev/null\n$qWim --version >/dev/null").isSuccess) {
+                throw IllegalStateException("Build tool check failed")
+            }
+
+            advanceStep(1, "cabextract")
+            val allCabPaths = runIsolatedRootScript(appCtx, "listcabs", "$pathHeader\nfor c in \"\$PKG\"/*.cab \"\$PKG\"/*.CAB; do [ -f \"\$c\" ] && echo \"\$c\"; done").out.map { it.trim() }.filter { it.startsWith("/") && it.lowercase().endsWith(".cab") }
+            val editionCabs = allCabPaths.filter { !isSkippableNonEditionCab(it.substringAfterLast('/')) }
+            addConsole("Step 1/4: ${editionCabs.size} edition CAB(s) (${allCabPaths.size - editionCabs.size} non-edition skipped)")
+            editionCabs.forEachIndexed { idx, cabPath ->
+                if (convCancelledFlag.get()) return
+                val cabName = cabPath.substringAfterLast('/')
+                publishConv("Step 1/4 · Converting CAB ${idx + 1}/${editionCabs.size}...", cabName, 0.03f + (idx.toFloat() / editionCabs.size.coerceAtLeast(1).toFloat()) * 0.14f)
+                val oneCabRes = runIsolatedRootScript(appCtx, "cab", "set -e\n$pathHeader\nBN=${shellQuote(cabName)}\nEXTDIR=\"/data/local/tmp/pb_uup_ext\"\nrm -rf \"\$EXTDIR\" && mkdir -p \"\$EXTDIR\"\nset +e\n$qCab -q -d \"\$EXTDIR\" ${shellQuote(cabPath)}\nset -e\nif [ -z \"\$(ls -A \"\$EXTDIR\" 2>/dev/null)\" ]; then rm -rf \"\$EXTDIR\"; exit 0; fi\n$qWim capture \"\$EXTDIR\" \"\$TMP/\$BN.esd\" \"Edition Package\" \"Edition Package\" --compress=none --no-acls --norpfix\nrm -rf \"\$EXTDIR\"")
+                if (!oneCabRes.isSuccess) throw IllegalStateException("CAB convert failed ($cabName)")
+                addConsole("Converted $cabName")
+            }
+
+            advanceStep(2, "wimlib-imagex")
+            publishConv("Step 2/4 · Building boot.wim & WinRE...", "Applying WinPE & patching SOFTWARE hive", 0.20f)
+            val metaList = runIsolatedRootScript(appCtx, "meta", "$pathHeader\nfor f in \"\$PKG\"/*.esd \"\$PKG\"/*.ESD; do [ -f \"\$f\" ] || continue; cnt=\$($qWim info \"\$f\" 2>/dev/null | grep -c '^Index:' || true); [ \"\$cnt\" -ge 3 ] && echo \"\$f\"; done").out.map { it.trim() }.filter { it.startsWith("/") && it.lowercase().endsWith(".esd") }
+            if (metaList.isEmpty()) throw IllegalStateException("No Windows edition metadata ESD (3+ indexes) found.")
+            val firstMeta = shellQuote(metaList.first())
+
+            val bootWimRes = runIsolatedRootScript(appCtx, "bootwim", """
+                set -e
+                $pathHeader
+                $qWim apply $firstMeta 1 "${'$'}ISODIR" --no-acls --no-attributes
+                mkdir -p "${'$'}ISODIR/sources"
+                $qWim export $firstMeta 2 "${'$'}TMP/winre.wim" --compress=maximum --boot
+                cp -f "${'$'}TMP/winre.wim" "${'$'}ISODIR/sources/boot.wim"
+                $qWim info "${'$'}ISODIR/sources/boot.wim" 1 "Microsoft Windows PE" "Microsoft Windows PE"
+                $qWim info "${'$'}ISODIR/sources/boot.wim" 1 --image-property FLAGS=9
+                HIVEDIR="/data/local/tmp/pb_uup_hive"
+                rm -rf "${'$'}HIVEDIR" && mkdir -p "${'$'}HIVEDIR"
+                $qWim extract "${'$'}ISODIR/sources/boot.wim" 1 "/Windows/System32/config/SOFTWARE" --dest-dir="${'$'}HIVEDIR" --no-acls --no-attributes >/dev/null 2>&1 || \
+                  $qWim extract "${'$'}ISODIR/sources/boot.wim" 1 "/windows/system32/config/software" --dest-dir="${'$'}HIVEDIR" --no-acls --no-attributes >/dev/null 2>&1 || true
+                HIVE_FILE=${'$'}(find "${'$'}HIVEDIR" -maxdepth 1 -type f -iname 'software' | head -n 1)
+                if [ -n "${'$'}HIVE_FILE" ]; then
+                    set +e
+                    printf 'cd Microsoft\\Windows NT\\CurrentVersion\nnv 1 SystemRoot\ned SystemRoot\nX:\\${'$'}Windows.~bt\\Windows\ncd WinPE\nnv 1 InstRoot\ned InstRoot\nX:\\${'$'}Windows.~bt\nq\n' | $qChntpw -C -e "${'$'}HIVE_FILE"
+                    set -e
+                    $qWim update "${'$'}ISODIR/sources/boot.wim" 1 --command="add '${'$'}HIVE_FILE' /Windows/System32/config/SOFTWARE"
+                fi
+                rm -rf "${'$'}HIVEDIR"
+                BG_FILE=""
+                for bg in "${'$'}ISODIR/sources/background_cli.bmp" "${'$'}ISODIR/sources/background_svr.bmp" "${'$'}ISODIR/sources/background_cli.png"; do [ -f "${'$'}bg" ] && BG_FILE="${'$'}bg" && break; done
+                [ -n "${'$'}BG_FILE" ] && ($qWim update "${'$'}ISODIR/sources/boot.wim" 1 --command="add '${'$'}BG_FILE' /Windows/system32/winre.jpg" || true)
+                $qWim update "${'$'}ISODIR/sources/boot.wim" 1 --command="delete --force /Windows/System32/winpeshl.ini" || true
+                $qWim export "${'$'}TMP/winre.wim" 1 "${'$'}ISODIR/sources/boot.wim" "Microsoft Windows Setup" "Microsoft Windows Setup"
+                $qWim info "${'$'}ISODIR/sources/boot.wim" 2 --image-property FLAGS=2
+                $qWim info "${'$'}ISODIR/sources/boot.wim" 2 --boot
+                $qWim extract $firstMeta 3 "/Windows/System32/xmllite.dll" --dest-dir="${'$'}ISODIR/sources" --no-acls --no-attributes >/dev/null 2>&1 || true
+                UPD_TXT="/data/local/tmp/pb_boot_update.txt"; : > "${'$'}UPD_TXT"
+                echo "delete --force /Windows/System32/winpeshl.ini" >> "${'$'}UPD_TXT"
+                [ -f "${'$'}ISODIR/setup.exe" ] && echo "add '${'$'}ISODIR/setup.exe' /setup.exe" >> "${'$'}UPD_TXT"
+                [ -n "${'$'}BG_FILE" ] && echo "add '${'$'}BG_FILE' /sources/background.bmp" >> "${'$'}UPD_TXT" && echo "add '${'$'}BG_FILE' /Windows/system32/winre.jpg" >> "${'$'}UPD_TXT"
+                for sf in "${'$'}ISODIR"/sources/*; do
+                    [ -e "${'$'}sf" ] || continue; sbn=${'$'}(basename "${'$'}sf")
+                    case "${'$'}sbn" in boot.wim|install.wim|install.esd|sxs|SXS|uup|UUP) continue ;; esac
+                    echo "add '${'$'}sf' '/sources/${'$'}sbn'" >> "${'$'}UPD_TXT"
+                done
+                $qWim update "${'$'}ISODIR/sources/boot.wim" 2 < "${'$'}UPD_TXT"
+                $qWim optimize "${'$'}ISODIR/sources/boot.wim"
+                rm -f "${'$'}ISODIR/sources/xmllite.dll" "${'$'}UPD_TXT"
+            """.trimIndent())
+            if (!bootWimRes.isSuccess) throw IllegalStateException("boot.wim assembly failed: ${(bootWimRes.out + bootWimRes.err).takeLast(4).joinToString(" ").take(240)}")
+            addConsole("Step 2/4 complete: boot.wim assembled + winre.wim kept")
+
+            advanceStep(3, "wimlib-imagex")
+            val detectedOs = WindowsCustomizationEngine.detectWindowsOsKind(config.build.title)
+            val effectiveComp = if (!detectedOs.supportsEsd) WinIsoCompression.WIM else config.compression
+            val useTwoStageSolidEsd = effectiveComp == WinIsoCompression.ESD && !config.skipWinRe
+            val stageWimPath = if (useTwoStageSolidEsd) "${tmpDir.absolutePath}/install_stage.wim" else "${isoDir.absolutePath}/sources/install.${effectiveComp.ext}"
+            val finalInstallPath = "${isoDir.absolutePath}/sources/install.${effectiveComp.ext}"
+            val qStageWim = shellQuote(stageWimPath); val qFinalInstall = shellQuote(finalInstallPath)
+            val wimProgLog = "/data/local/tmp/pb_wim_prog.log"; val qProgLog = shellQuote(wimProgLog)
+            val exportArg = if (useTwoStageSolidEsd) "--compress=LZX:50" else effectiveComp.wimlibArg
+
+            metaList.forEachIndexed { idx, metaPath ->
+                if (convCancelledFlag.get()) return
+                val spanTotal = if (useTwoStageSolidEsd) 0.30f else 0.48f
+                val sliceBase = 0.28f + (idx.toFloat() / metaList.size.toFloat()) * spanTotal
+                val sliceSpan = spanTotal / metaList.size.toFloat()
+                publishConv("Step 3/4 · Exporting edition ${idx + 1}/${metaList.size}...", "${effectiveComp.label} · 0%", sliceBase)
+                val wimPollJob = launch {
+                    val pctRegex = Regex("""(\d{1,3})%""")
+                    while (isActive && !convCancelledFlag.get()) {
+                        delay(700L)
+                        val tailLines = Shell.cmd("tail -c 384 $qProgLog 2>/dev/null || true").exec().out
+                        val lastPct = pctRegex.findAll(tailLines.joinToString(" ")).lastOrNull()?.groupValues?.get(1)?.toIntOrNull()
+                        val curSz = Shell.cmd("stat -c '%s' $qStageWim 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: lastMeasuredOutputBytes
+                        tailLines.lastOrNull()?.trim()?.takeIf { it.isNotBlank() }?.let { addConsole(it) }
+                        if (lastPct != null && lastPct in 0..100) publishConv("Step 3/4 · Exporting edition ${idx + 1}/${metaList.size}...", "${effectiveComp.label} · $lastPct%", sliceBase + (lastPct / 100f) * sliceSpan, curSz)
+                    }
+                }
+                val qMeta = shellQuote(metaPath)
+                val expRes = runIsolatedRootScript(appCtx, "wimexp", "set -e\n$pathHeader\n: > $qProgLog\nED_NAME=\$($qWim info $qMeta 3 2>/dev/null | sed -n 's/^Display Name:[[:space:]]*//p; s/^Name:[[:space:]]*//p' | head -n 1)\n[ -z \"\$ED_NAME\" ] && ED_NAME=\"Windows ${config.build.build}\"\nset --\nfor ref in \"\$PKG\"/*.esd \"\$PKG\"/*.ESD \"\$TMP\"/*.esd; do [ -f \"\$ref\" ] && set -- \"\$@\" --ref=\"\$ref\"; done\n$qWim export $qMeta 3 $qStageWim \"\$ED_NAME\" $exportArg \"\$@\" > $qProgLog 2>&1")
+                wimPollJob.cancel()
+                if (!expRes.isSuccess) {
+                    val err = Shell.cmd("tail -n 6 $qProgLog 2>/dev/null || true").exec().out.filter { it.isNotBlank() }.joinToString(" | ").take(260)
+                    Shell.cmd("rm -f $qProgLog 2>/dev/null || true").exec()
+                    throw IllegalStateException("install.${effectiveComp.ext} export failed: ${err.ifBlank { "code ${expRes.code}" }}")
+                }
+                Shell.cmd("rm -f $qProgLog 2>/dev/null || true").exec()
+            }
+
+            if (!config.skipWinRe) {
+                publishConv("Step 3/4 · Injecting Winre.wim (Recovery)...", "Embedding Recovery Environment (${metaList.size} edition(s))", 0.62f)
+                val winreRes = runIsolatedRootScript(appCtx, "winreinj", "set -e\n$pathHeader\nif [ -f \"\$TMP/winre.wim\" ]; then for idx in \$(seq 1 ${metaList.size}); do $qWim update $qStageWim \"\$idx\" --command=\"add '\$TMP/winre.wim' /Windows/System32/Recovery/Winre.wim\"; done; fi")
+                if (winreRes.isSuccess) { addConsole("Injected Winre.wim (${metaList.size} edition(s))"); emitConvLog("win-build", "Injected Winre.wim into /Windows/System32/Recovery/Winre.wim") }
+            }
+
+            if (useTwoStageSolidEsd) {
+                publishConv("Step 3/4 · Compressing to Solid ESD (LZMS)...", "0%", 0.66f)
+                val esdPoll = launch {
+                    val pctRegex = Regex("""(\d{1,3})%""")
+                    while (isActive && !convCancelledFlag.get()) {
+                        delay(800L)
+                        val p = pctRegex.findAll(Shell.cmd("tail -c 256 $qProgLog 2>/dev/null || true").exec().out.joinToString(" ")).lastOrNull()?.groupValues?.get(1)?.toIntOrNull()
+                        val curSz = Shell.cmd("stat -c '%s' $qFinalInstall 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: lastMeasuredOutputBytes
+                        if (p != null && p in 0..100) publishConv("Step 3/4 · Compressing to Solid ESD (LZMS)...", "$p%", 0.66f + (p / 100f) * 0.14f, curSz)
+                    }
+                }
+                val esdRes = runIsolatedRootScript(appCtx, "esdconv", "set -e\n$pathHeader\n: > $qProgLog\n$qWim export $qStageWim all $qFinalInstall --compress=LZMS --solid --threads=2 > $qProgLog 2>&1\nrm -f $qStageWim $qProgLog")
+                esdPoll.cancel()
+                if (!esdRes.isSuccess) throw IllegalStateException("Solid ESD compression failed (code ${esdRes.code})")
+                addConsole("Converted install.wim + Winre.wim -> Solid install.esd")
+            } else {
+                runIsolatedRootScript(appCtx, "wimopt", "$pathHeader\n$qWim optimize $qFinalInstall >/dev/null 2>&1 || true")
+            }
+
+            advanceStep(4, "oem-inject")
+            publishConv("Step 4/4 · Injecting \$OEM\$ packages & tweaks...", "Preparing unplug-safe setup layout", 0.81f)
+            val oemUpdates = "${isoDir.absolutePath}/sources/\$OEM\$/\$\$/Setup/Updates"
+            val oemApps = "${isoDir.absolutePath}/sources/\$OEM\$/\$\$/Setup/Apps"
+            val oemSxs = "${isoDir.absolutePath}/sources/\$OEM\$/\$\$/Setup/sxs"
+            val oemScripts = "${isoDir.absolutePath}/sources/\$OEM\$/\$\$/Setup/Scripts"
+            val oemCustom = "${isoDir.absolutePath}/sources/\$OEM\$/\$\$/Setup/Custom"
+            val oemPanther = "${isoDir.absolutePath}/sources/\$OEM\$/\$\$/Panther"
+
+            if (job.hasUpdates) {
+                addConsole("Staging Additional Updates into sources/\$OEM\$/\$\$/Setup/Updates/")
+                runIsolatedRootScript(appCtx, "oemupd", "$pathHeader\nmkdir -p ${shellQuote(oemUpdates)}\nfor f in \"\$PKG\"/*.msu \"\$PKG\"/*-KB*.cab \"\$PKG\"/*-kb*.cab \"\$PKG\"/*SSU*.cab \"\$PKG\"/*ssu*.cab \"\$PKG\"/*NDP*.cab; do [ -f \"\$f\" ] && cp -f \"\$f\" ${shellQuote(oemUpdates)}/ 2>/dev/null || true; done")
+            }
+            if (job.hasApps) {
+                addConsole("Staging Inbox Store Apps into sources/\$OEM\$/\$\$/Setup/Apps/")
+                runIsolatedRootScript(appCtx, "oemapp", "$pathHeader\nmkdir -p ${shellQuote(oemApps)}\nfor f in \"\$PKG\"/*.msixbundle \"\$PKG\"/*.appxbundle \"\$PKG\"/*.msix \"\$PKG\"/*.appx \"\$PKG\"/*License*.xml \"\$PKG\"/*license*.xml; do [ -f \"\$f\" ] && cp -f \"\$f\" ${shellQuote(oemApps)}/ 2>/dev/null || true; done")
+            }
+            if (job.hasNetFx3) {
+                addConsole("Staging .NET Framework 3.5 into sources/\$OEM\$/\$\$/Setup/sxs/")
+                runIsolatedRootScript(appCtx, "oemfx3", "$pathHeader\nmkdir -p ${shellQuote(oemSxs)}\nfor f in \"\$PKG\"/*netfx3-ondemand*.cab \"\$PKG\"/*NetFx3*.cab; do [ -f \"\$f\" ] && cp -f \"\$f\" ${shellQuote(oemSxs)}/ 2>/dev/null || true; done")
+            }
+            runIsolatedRootScript(appCtx, "w7efi", WindowsCustomizationEngine.applyWin7UefiFixSnippet(qWim, qFinalInstall, qIsoDir))
+            if (config.experience.useCa2023Bootloaders) {
+                addConsole("Applying Windows CA 2023 signed bootloaders...")
+                runIsolatedRootScript(appCtx, "ca2023", WindowsCustomizationEngine.applyCa2023BootloadersSnippet(qWim, qFinalInstall, qIsoDir)).out.filter { it.startsWith("LOG|") }.forEach { addConsole(it.substringAfterLast('|')) }
+            }
+            if (config.eiCfgUnlock) {
+                val tmpEi = File(appCtx.cacheDir, "wb_ei.cfg").apply { writeText("[Channel]\r\nRetail\r\n", Charsets.UTF_8) }
+                Shell.cmd("cp -f ${shellQuote(tmpEi.absolutePath)} ${shellQuote("${isoDir.absolutePath}/sources/ei.cfg")}").exec()
+                tmpEi.delete(); addConsole("Wrote sources/ei.cfg")
+            }
+
+            val needUnattendOrOem = config.experience.hasAnyActive() || config.winUtil.hasAnyActive() || job.hasUpdates || job.hasApps || job.hasNetFx3 || config.runComponentCleanup
+            if (needUnattendOrOem) {
+                val arch = if (config.build.arch.lowercase() in setOf("x86", "arm64", "amd64")) config.build.arch.lowercase() else "amd64"
+                val tmpXml = File(appCtx.cacheDir, "wb_auto.xml").apply { writeText(WindowsCustomizationEngine.generateAutounattendXml(config.experience, config.winUtil, arch, null, true, job.hasUpdates), Charsets.UTF_8) }
+                val tmpSpec = File(appCtx.cacheDir, "wb_spec.cmd").apply { writeText(WindowsCustomizationEngine.buildSpecializeScript(config.experience, config.winUtil, job.hasUpdates, job.hasApps, job.hasNetFx3), Charsets.UTF_8) }
+                val customPath = config.experience.customPostInstallScriptPath.trim()
+                val customName = if (customPath.isNotBlank()) customPath.substringAfterLast('/') else ""
+                val tmpComp = File(appCtx.cacheDir, "wb_comp.cmd").apply { writeText(WindowsCustomizationEngine.buildSetupCompleteScript(config.runComponentCleanup, customName.isNotBlank(), customName), Charsets.UTF_8) }
+                val customCopy = if (customPath.isNotBlank()) "mkdir -p ${shellQuote(oemCustom)} && cp -f ${shellQuote(UsbGadgetEngine.resolveDirectPath(customPath))} ${shellQuote(oemCustom)}/ 2>/dev/null || true" else "true"
+                Shell.cmd("mkdir -p ${shellQuote(oemPanther)} ${shellQuote(oemScripts)} && cp -f ${shellQuote(tmpXml.absolutePath)} ${shellQuote("${isoDir.absolutePath}/autounattend.xml")} && cp -f ${shellQuote(tmpXml.absolutePath)} ${shellQuote("$oemPanther/unattend.xml")} && cp -f ${shellQuote(tmpSpec.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_Specialize.cmd")} && cp -f ${shellQuote(tmpComp.absolutePath)} ${shellQuote("$oemScripts/SetupComplete.cmd")} && $customCopy").exec()
+                tmpXml.delete(); tmpSpec.delete(); tmpComp.delete()
+                addConsole("Injected autounattend.xml + unplug-safe \$OEM\$ scripts")
+            }
+
+            if (config.keepPackagesAfterBuild) {
+                saveBuildJobJson(appCtx, workRootPath, config, job.totalDownloadBytes, true)
+                Shell.cmd("rm -rf $qTmp /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive").exec()
+                addConsole("Kept base UUP packages for fast rebuilds")
+            } else {
+                Shell.cmd("rm -rf $qPkg $qTmp /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive").exec()
+            }
+
+            var injectedMbPath: String? = null
+            if (config.outputMode == WinBuildOutputMode.DIRECT_NTFS_USB) {
+                activeBin = "mkfs.ntfs"
+                publishConv("Step 4/4 · Building Direct Bootable USB...", "${config.scheme.label} · NTFS + UEFI/BIOS Boot", 0.85f)
+                val usbErr = buildDirectNtfsUsbFromDir(appCtx, isoDir.absolutePath, finalOutputPath, config) { stg, det, f, curB -> publishConv(stg, det, 0.85f + f * 0.12f, curB) }
+                if (usbErr != null) throw IllegalStateException(usbErr)
+            } else {
+                activeBin = "xorriso"
+                val qXor = shellQuote(tools.xorriso!!); val qOutIso = shellQuote(finalOutputPath)
+                val volId = "WIN_${config.build.build.substringBefore('.')}".take(28).uppercase()
+                val estIsoBytes = Shell.cmd("du -sb $qIsoDir 2>/dev/null | awk '{print \$1}'").exec().out.firstOrNull()?.trim()?.toLongOrNull()?.coerceAtLeast(1L) ?: (5L * 1024L * 1024L * 1024L)
+                publishConv("Step 4/4 · Packing bootable ISO...", finalFileName, 0.86f)
+                val isoPollJob = launch {
+                    while (isActive && !convCancelledFlag.get()) {
+                        delay(600L)
+                        val curSz = Shell.cmd("stat -c '%s' $qOutIso 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                        if (curSz > 0L) publishConv("Step 4/4 · Packing bootable ISO...", "${UsbGadgetEngine.formatBytes(curSz)} / ~${UsbGadgetEngine.formatBytes(estIsoBytes)}", 0.86f + (curSz.toFloat() / estIsoBytes.toFloat()).coerceIn(0f, 1f) * 0.10f, curSz)
+                    }
+                }
+                val xorRes = runIsolatedRootScript(appCtx, "xorriso", "set -e\n$pathHeader\nmkdir -p ${shellQuote(safeTargetDir)}\nrm -f $qOutIso\nEFI_BOOT=\"\"\nif [ -f \"\$ISODIR/efi/microsoft/boot/efisys.bin\" ]; then EFI_BOOT=\"efi/microsoft/boot/efisys.bin\"; elif [ -f \"\$ISODIR/EFI/Microsoft/Boot/efisys.bin\" ]; then EFI_BOOT=\"EFI/Microsoft/Boot/efisys.bin\"; fi\nBIOS_BOOT=\"\"\n[ -f \"\$ISODIR/boot/etfsboot.com\" ] && BIOS_BOOT=\"boot/etfsboot.com\"\nif [ -n \"\$BIOS_BOOT\" ] && [ -n \"\$EFI_BOOT\" ]; then $qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -volid \"$volId\" -udf -b \"\$BIOS_BOOT\" -no-emul-boot -boot-load-size 8 -boot-info-table -eltorito-alt-boot -e \"\$EFI_BOOT\" -no-emul-boot -o $qOutIso \"\$ISODIR\"\nelif [ -n \"\$EFI_BOOT\" ]; then $qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -volid \"$volId\" -udf -e \"\$EFI_BOOT\" -no-emul-boot -o $qOutIso \"\$ISODIR\"\nelse $qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -volid \"$volId\" -udf -o $qOutIso \"\$ISODIR\"; fi")
+                isoPollJob.cancel()
+                if (!xorRes.isSuccess) throw IllegalStateException("ISO packing failed: ${(xorRes.out + xorRes.err).takeLast(4).joinToString(" ").take(240)}")
+                UsbGadgetEngine.fixUserStoragePermissions(appCtx, safeTargetDir, isDir = true)
+                UsbGadgetEngine.fixUserStoragePermissions(appCtx, finalOutputPath, isDir = false)
+                if (config.outputMode == WinBuildOutputMode.DIRECT_MULTIBOOT && config.targetMultiBootPath.isNotBlank()) {
+                    val mbPath = UsbGadgetEngine.resolveDirectPath(config.targetMultiBootPath)
+                    publishConv("Moving ISO into Multi-Boot...", mbPath.substringAfterLast('/'), 0.97f)
+                    val addRes = VentoyImageBuilder.addIsoToVentoy(appCtx, mbPath, finalOutputPath, moveFile = true) { p -> publishConv("Moving into Multi-Boot...", p.detail.ifBlank { p.stage }, 0.98f) }
+                    if (addRes.success) injectedMbPath = mbPath
+                }
+            }
+
+            if (config.keepPackagesAfterBuild) Shell.cmd("rm -rf $qIsoDir").exec()
+            else UsbGadgetEngine.cleanupTempWorkDir(workRootPath)
+
+            val finalSize = Shell.cmd("stat -c '%s' ${shellQuote(finalOutputPath)} 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+            val totalSec = ((System.currentTimeMillis() - startMs) / 1000L).coerceAtLeast(1L)
+            val avgSpeed = if (finalSize > 0L) finalSize / totalSec else smoothDiskSpeed
+            val benchStr = "Built in ${formatDurationShort(totalSec)} · Avg ${FastIsoDownloader.formatSpeed(avgSpeed)} · ${UsbGadgetEngine.formatBytes(finalSize)}"
+            val bootLabel = if (injectedMbPath == null && finalSize > 0L) {
+                val rpt = IsoInspector.inspectBootReadiness(appCtx, finalOutputPath, finalSize)
+                when { rpt.hasUefiX64 && rpt.hasLegacyBios -> "✓ UEFI + BIOS Verified"; rpt.hasUefiX64 -> "✓ UEFI x64 Verified"; rpt.hasUefiArm64 -> "✓ UEFI ARM64 Verified"; rpt.hasLegacyBios -> "✓ Legacy BIOS Verified"; else -> null }
+            } else null
+
+            emitConvLog("win-build", "Completed $finalFileName ($benchStr${if (bootLabel != null) " · $bootLabel" else ""})")
+            val completion = DownloadCompletionEvent(job.jobTitle, finalFileName, finalOutputPath, injectedMbPath, null, null, ChecksumVerifyStatus.NONE, convAutoMountLive, benchStr, bootLabel)
+            FastIsoDownloader.publishExternalCompletion(completion)
+            NotificationHelper.showBuildComplete(appCtx, job.jobTitle, "$finalFileName · $benchStr")
+            job.onComplete(completion)
+        } catch (_: CancellationException) {
+            Shell.cmd("rm -rf ${shellQuote(isoDir.absolutePath)} ${shellQuote(tmpDir.absolutePath)} 2>/dev/null || true").exec()
+        } catch (e: Exception) {
+            Shell.cmd("rm -rf ${shellQuote(isoDir.absolutePath)} ${shellQuote(tmpDir.absolutePath)} 2>/dev/null || true").exec()
+            val msg = "Windows build failed: ${e.message ?: "Unexpected error"}"
+            emitConvLog("win-build", msg, true); job.onError(msg)
+        }
+    }
+
+    private fun buildDirectNtfsUsbFromDir(context: Context, isoDirPath: String, outImgPath: String, config: WindowsChannelBuildConfig, onSubProgress: (String, String, Float, Long) -> Unit): String? {
+        val ntfsFormatter = WindowsImageBuilder.findBundledBinary(context, "libmkfs_ntfs.so", listOf("mkfs.ntfs", "mkntfs")) ?: return "Bundled mkfs.ntfs not found."
+        val ntfs3g = WindowsImageBuilder.findBundledBinary(context, "libntfs_3g.so", listOf("ntfs-3g"))
+        val msSysBin = WindowsImageBuilder.findBundledBinary(context, "libms_sys.so", listOf("ms-sys"))
+        val uefiBytes = runCatching { context.assets.open("uefi-ntfs.img").use { it.readBytes() } }.getOrNull() ?: return "Missing uefi-ntfs.img asset."
+
+        val qSrcDir = shellQuote(isoDirPath); val qOut = shellQuote(outImgPath)
+        val dirBytes = Shell.cmd("du -sb $qSrcDir 2>/dev/null | awk '{print \$1}'").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: (6L * 1024L * 1024L * 1024L)
         val extraDrvBytes = if (config.extraDriversDir.isNotBlank()) {
             val qDrv = shellQuote(UsbGadgetEngine.resolveDirectPath(config.extraDriversDir))
-            Shell.cmd("[ -d $qDrv ] && du -sb $qDrv 2>/dev/null | awk '{print \$1}' || echo 0")
-                .exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+            Shell.cmd("[ -d $qDrv ] && du -sb $qDrv 2>/dev/null | awk '{print \$1}' || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
         } else 0L
 
         val layout = DiskPartitioner.calculateLayout(dirBytes + extraDrvBytes, uefiBytes.size.toLong())
-        val mntDir = "/data/local/tmp/pb_winbuild_usb_mnt"
-        var loopDev = ""
+        val mntDir = "/data/local/tmp/pb_winbuild_usb_mnt"; var loopDev = ""
         return try {
             val safeDir = outImgPath.substringBeforeLast('/')
+            onSubProgress("Step 4/4 · Allocating Direct USB...", UsbGadgetEngine.formatBytes(layout.totalBytes), 0.10f, 0L)
             Shell.cmd("mkdir -p ${shellQuote(safeDir)} && rm -f $qOut && truncate -s ${layout.totalBytes} $qOut").exec()
 
-            val gpt = DiskPartitioner.buildGptBuffers(layout, includeUefiPart = true)
-            val fPrim = File(context.cacheDir, "wb_gpt_p.bin").apply { writeBytes(gpt.primarySectors) }
-            val fBack = File(context.cacheDir, "wb_gpt_b.bin").apply { writeBytes(gpt.backupSectors) }
             val fUefi = File(context.cacheDir, "wb_uefi.bin").apply { writeBytes(uefiBytes) }
             try {
-                val pRes = Shell.cmd(
-                    "dd if=${shellQuote(fPrim.absolutePath)} of=$qOut bs=512 seek=0 count=34 conv=notrunc 2>&1 && " +
-                        "dd if=${shellQuote(fBack.absolutePath)} of=$qOut bs=512 seek=${layout.totalSectors - 33L} count=33 conv=notrunc 2>&1 && " +
-                        "dd if=${shellQuote(fUefi.absolutePath)} of=$qOut bs=512 seek=${layout.part2StartLba} conv=notrunc 2>&1"
-                ).exec()
-                if (!pRes.isSuccess) return "GPT write failed"
-            } finally {
-                fPrim.delete(); fBack.delete(); fUefi.delete()
-            }
+                if (config.scheme == PartitionScheme.MBR) {
+                    val mbr = DiskPartitioner.buildMbrSector(layout, part1IsFat32 = false, includeUefiPart = true)
+                    val fMbr = File(context.cacheDir, "wb_mbr.bin").apply { writeBytes(mbr) }
+                    try {
+                        if (!Shell.cmd("dd if=${shellQuote(fMbr.absolutePath)} of=$qOut bs=512 seek=0 count=1 conv=notrunc 2>&1 && dd if=${shellQuote(fUefi.absolutePath)} of=$qOut bs=512 seek=${layout.part2StartLba} conv=notrunc 2>&1").exec().isSuccess) return "MBR partition table write failed"
+                    } finally { fMbr.delete() }
+                } else {
+                    val gpt = DiskPartitioner.buildGptBuffers(layout, includeUefiPart = true)
+                    val fPrim = File(context.cacheDir, "wb_gpt_p.bin").apply { writeBytes(gpt.primarySectors) }
+                    val fBack = File(context.cacheDir, "wb_gpt_b.bin").apply { writeBytes(gpt.backupSectors) }
+                    try {
+                        if (!Shell.cmd("dd if=${shellQuote(fPrim.absolutePath)} of=$qOut bs=512 seek=0 count=34 conv=notrunc 2>&1 && dd if=${shellQuote(fBack.absolutePath)} of=$qOut bs=512 seek=${layout.totalSectors - 33L} count=33 conv=notrunc 2>&1 && dd if=${shellQuote(fUefi.absolutePath)} of=$qOut bs=512 seek=${layout.part2StartLba} conv=notrunc 2>&1").exec().isSuccess) return "GPT write failed"
+                    } finally { fPrim.delete(); fBack.delete() }
+                }
+            } finally { fUefi.delete() }
 
             val loopCmd = """
                 OUT_DEV=""
                 for idx in ${'$'}(seq 0 63); do
-                    CAND="/dev/block/loop${'$'}idx"
-                    [ -b "${'$'}CAND" ] || CAND="/dev/loop${'$'}idx"
-                    [ -b "${'$'}CAND" ] || continue
+                    CAND="/dev/block/loop${'$'}idx"; [ -b "${'$'}CAND" ] || CAND="/dev/loop${'$'}idx"; [ -b "${'$'}CAND" ] || continue
                     if losetup "${'$'}CAND" 2>/dev/null | grep -q '/'; then continue; fi
-                    if losetup -o ${layout.part1OffsetBytes} -S ${layout.part1SizeBytes} "${'$'}CAND" $qOut 2>/dev/null ||                        losetup -o ${layout.part1OffsetBytes} --sizelimit ${layout.part1SizeBytes} "${'$'}CAND" $qOut 2>/dev/null; then
-                        OUT_DEV="${'$'}CAND"
-                        break
-                    fi
+                    if losetup -o ${layout.part1OffsetBytes} -S ${layout.part1SizeBytes} "${'$'}CAND" $qOut 2>/dev/null || losetup -o ${layout.part1OffsetBytes} --sizelimit ${layout.part1SizeBytes} "${'$'}CAND" $qOut 2>/dev/null; then OUT_DEV="${'$'}CAND"; break; fi
                 done
-                if [ -z "${'$'}OUT_DEV" ]; then
-                    OUT_DEV=${'$'}(losetup -f -s -o ${layout.part1OffsetBytes} -S ${layout.part1SizeBytes} $qOut 2>/dev/null ||                       losetup -f --show -o ${layout.part1OffsetBytes} --sizelimit ${layout.part1SizeBytes} $qOut 2>/dev/null || true)
-                fi
+                [ -z "${'$'}OUT_DEV" ] && OUT_DEV=${'$'}(losetup -f -s -o ${layout.part1OffsetBytes} -S ${layout.part1SizeBytes} $qOut 2>/dev/null || losetup -f --show -o ${layout.part1OffsetBytes} --sizelimit ${layout.part1SizeBytes} $qOut 2>/dev/null || true)
                 echo "${'$'}OUT_DEV"
             """.trimIndent()
             loopDev = Shell.cmd(loopCmd).exec().out.lastOrNull().orEmpty().trim()
-            if (loopDev.isBlank()) return "Loop attach failed (all loop devices busy or losetup offset unsupported)"
+            if (loopDev.isBlank()) return "Loop attach failed"
 
             val qLoop = shellQuote(loopDev)
-            val fmtRes = Shell.cmd("${shellQuote(ntfsFormatter)} -F -Q -L POCKETBOOT -H 255 -S 63 -p ${layout.part1StartLba} $qLoop 2>&1").exec()
-            if (!fmtRes.isSuccess) return "NTFS format failed"
+            onSubProgress("Step 4/4 · Formatting NTFS...", config.scheme.label, 0.25f, 0L)
+            if (!Shell.cmd("${shellQuote(ntfsFormatter)} -F -Q -L POCKETBOOT -H 255 -S 63 -p ${layout.part1StartLba} $qLoop 2>&1").exec().isSuccess) return "NTFS format failed"
+            if (config.scheme == PartitionScheme.MBR && msSysBin != null) Shell.cmd("${shellQuote(msSysBin)} -n -f $qLoop >/dev/null 2>&1 || true").exec()
 
             val procFs = Shell.cmd("cat /proc/filesystems 2>/dev/null").exec().out.joinToString(" ").lowercase()
-            val mntCmd = buildList {
-                if (procFs.contains("ntfs3")) add("mount -t ntfs3 -o rw $qLoop $mntDir 2>&1")
-                if (ntfs3g != null) add("${shellQuote(ntfs3g)} -o rw,big_writes,noatime $qLoop $mntDir 2>&1")
-            }.joinToString(" || ")
-            val mntRes = Shell.cmd("mkdir -p $mntDir && ($mntCmd)").exec()
-            if (!mntRes.isSuccess) return "NTFS mount failed"
+            val mntCmd = buildList { if (procFs.contains("ntfs3")) add("mount -t ntfs3 -o rw $qLoop $mntDir 2>&1"); if (ntfs3g != null) add("${shellQuote(ntfs3g)} -o rw,big_writes,noatime $qLoop $mntDir 2>&1") }.joinToString(" || ")
+            if (!Shell.cmd("mkdir -p $mntDir && ($mntCmd)").exec().isSuccess) return "NTFS mount failed"
 
+            onSubProgress("Step 4/4 · Copying Windows files to USB...", UsbGadgetEngine.formatBytes(dirBytes), 0.50f, dirBytes / 2L)
             val cpRes = Shell.cmd("cp -rf $qSrcDir/. $mntDir/ 2>&1").exec()
             if (!cpRes.isSuccess) return "File copy into NTFS USB failed: ${cpRes.out.takeLast(3).joinToString(" ").take(180)}"
 
-            val anyBypass = config.bypassRequirements || config.bypassMicrosoftAccount ||
-                config.disableDataCollection || config.disableBitLocker
-            if (anyBypass) {
-                val xml = WindowsImageBuilder.generateAutounattendXml(
-                    WindowsBuildConfig(
-                        isoFile = ImageFile(outImgPath, outImgPath.substringAfterLast('/'), dirBytes, ""),
-                        outputDir = safeDir,
-                        outputName = outImgPath.substringAfterLast('/'),
-                        bypassRequirements = config.bypassRequirements,
-                        bypassMicrosoftAccount = config.bypassMicrosoftAccount,
-                        disableDataCollection = config.disableDataCollection,
-                        disableBitLocker = config.disableBitLocker
-                    )
-                )
-                val tmpXml = File(context.cacheDir, "wb_unattend.xml").apply { writeText(xml, Charsets.UTF_8) }
-                val oemPanther = "$mntDir/sources/\$OEM\$/\$\$/Panther"
-                Shell.cmd(
-                    "cp ${shellQuote(tmpXml.absolutePath)} $mntDir/autounattend.xml && " +
-                        "mkdir -p ${shellQuote(oemPanther)} && " +
-                        "cp ${shellQuote(tmpXml.absolutePath)} ${shellQuote("$oemPanther/unattend.xml")}"
-                ).exec()
-                tmpXml.delete()
-            }
-
             if (config.extraDriversDir.isNotBlank()) {
                 val drvSrc = UsbGadgetEngine.resolveDirectPath(config.extraDriversDir)
-                val qDrv = shellQuote(drvSrc)
-                Shell.cmd("if [ -d $qDrv ]; then mkdir -p $mntDir/Drivers && cp -rf $qDrv/. $mntDir/Drivers/ 2>&1; fi").exec()
+                onSubProgress("Step 4/4 · Copying /Drivers folder...", UsbGadgetEngine.friendlyFolderName(drvSrc), 0.85f, dirBytes)
+                Shell.cmd("if [ -d ${shellQuote(drvSrc)} ]; then mkdir -p $mntDir/Drivers && cp -rf ${shellQuote(drvSrc)}/. $mntDir/Drivers/ 2>&1; fi").exec()
             }
 
+            onSubProgress("Step 4/4 · Syncing bootable USB...", outImgPath.substringAfterLast('/'), 0.95f, dirBytes + extraDrvBytes)
+            Shell.cmd("sync; umount $mntDir 2>/dev/null || umount -l $mntDir 2>/dev/null; sleep 0.3; [ -n ${shellQuote(loopDev)} ] && losetup -d ${shellQuote(loopDev)} 2>/dev/null; rm -rf $mntDir").exec()
+            loopDev = ""
+
+            if (config.scheme == PartitionScheme.MBR && msSysBin != null) Shell.cmd("${shellQuote(msSysBin)} -7 -f $qOut >/dev/null 2>&1 || true").exec()
             UsbGadgetEngine.fixUserStoragePermissions(context, safeDir, isDir = true)
             UsbGadgetEngine.fixUserStoragePermissions(context, outImgPath, isDir = false)
             null
         } finally {
-            Shell.cmd("sync; umount $mntDir 2>/dev/null || umount -l $mntDir 2>/dev/null; sleep 1; [ -n ${shellQuote(loopDev)} ] && losetup -d ${shellQuote(loopDev)} 2>/dev/null; rm -rf $mntDir").exec()
+            if (loopDev.isNotBlank()) Shell.cmd("sync; umount $mntDir 2>/dev/null || umount -l $mntDir 2>/dev/null; sleep 0.3; losetup -d ${shellQuote(loopDev)} 2>/dev/null; rm -rf $mntDir").exec()
         }
     }
 }

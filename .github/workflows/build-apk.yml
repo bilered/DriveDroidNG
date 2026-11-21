@@ -169,6 +169,22 @@ jobs:
             chmod 755 "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libmkfs_exfat.so"
           ) || echo "::warning::Could not bundle static mkfs.exfat"
 
+          # 5b. Cross-compile STATIC ARM64 mkfs.fat (dosfstools) -> libmkfs_fat.so (Linux/Tool FAT32 USB Builder)
+          (
+            set -e
+            curl -fSL "https://github.com/dosfstools/dosfstools/releases/download/v4.2/dosfstools-4.2.tar.gz" -o /tmp/dosfstools.tar.gz
+            mkdir -p /tmp/dosfstools-src
+            tar -xzf /tmp/dosfstools.tar.gz --strip-components=1 -C /tmp/dosfstools-src
+            cd /tmp/dosfstools-src
+            ./configure --host=aarch64-linux-gnu --without-udev CFLAGS="-O2" LDFLAGS="-static"
+            make -j"$(nproc)" -C src mkfs.fat
+            if ! aarch64-linux-gnu-readelf -l src/mkfs.fat 2>/dev/null | grep -q INTERP; then
+              aarch64-linux-gnu-strip src/mkfs.fat
+              cp src/mkfs.fat "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libmkfs_fat.so"
+              chmod 755 "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libmkfs_fat.so"
+            fi
+          ) || echo "::warning::Could not bundle static mkfs.fat"
+
           # 6. Bundle official Ventoy boot files (~10 MB) inside app/src/main/assets/ventoy/
           (
             set -e

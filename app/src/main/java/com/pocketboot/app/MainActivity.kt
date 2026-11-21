@@ -229,14 +229,16 @@ fun PocketBootApp(initialShortcutPath: String = "") {
     var slimmerJob by remember { mutableStateOf<Job?>(null) }
     var slimmerProgress by remember { mutableStateOf(WindowsBuildProgress()) }
     var handledShortcut by remember { mutableStateOf(false) }
-    val winChannelBuildState by WindowsBuildEngine.jobState.collectAsState()
+    val winChannelDlState by WindowsBuildEngine.downloadState.collectAsState()
+    val winChannelConvState by WindowsBuildEngine.conversionState.collectAsState()
+    var refreshJob by remember { mutableStateOf<Job?>(null) }
     var drivesFreeBytes by remember { mutableStateOf(0L) }
     var tempCacheBytes by remember { mutableStateOf(0L) }
 
     val isLightSurface = settings.surfaceMode == SurfaceMode.LIGHT
     val keepScreenAwake = windowsBuildJob != null || linuxBuildJob != null ||
         ventoyBuildJob != null || slimmerJob != null ||
-        (winChannelBuildState != null && winChannelBuildState?.isPaused != true)
+        (winChannelDlState != null && winChannelDlState?.isPaused != true) || winChannelConvState != null
 
     SideEffect {
         val window = (view.context as? Activity)?.window ?: return@SideEffect
@@ -292,14 +294,11 @@ fun PocketBootApp(initialShortcutPath: String = "") {
         }
     }
 
-    fun syncKeepAlive(st: GadgetStatus) {
+    fun syncKeepAlive(st: GadgetStatus, forceRestart: Boolean = false) {
         if (st.isAnyMounted) {
+            if (!forceRestart && LinkWatchdogTracker.state.value.serviceActive) return
             val primaryName = st.mountedFile.substringAfterLast('/').ifBlank { st.secondaryMountedFile.substringAfterLast('/') }
-            val title = if (st.isMounted && st.isSecondaryMounted) {
-                "Dual LUN: $primaryName +1"
-            } else {
-                "Mounted: $primaryName"
-            }
+            val title = if (st.isMounted && st.isSecondaryMounted) "Dual LUN: $primaryName +1" else "Mounted: $primaryName"
             val sub = "${st.activeProtocolLabel} • Keep-Alive active"
             UsbKeepAliveService.start(context, title, sub, settings.keepAdbActive)
         } else {
@@ -323,12 +322,16 @@ fun PocketBootApp(initialShortcutPath: String = "") {
     }
 
     fun refreshAll() {
-        scope.launch {
+        refreshJob?.cancel()
+        refreshJob = scope.launch {
             busy = true
-            status = UsbGadgetEngine.getStatus()
-            images = UsbGadgetEngine.scanImages(settings.scanDirs, settings.pinnedFiles, settings.hiddenFiles)
-            syncKeepAlive(status)
-            busy = false
+            try {
+                status = UsbGadgetEngine.getStatus()
+                images = UsbGadgetEngine.scanImages(settings.scanDirs, settings.pinnedFiles, settings.hiddenFiles)
+                syncKeepAlive(status, forceRestart = false)
+            } finally {
+                busy = false
+            }
         }
     }
 
@@ -453,16 +456,18 @@ fun PocketBootApp(initialShortcutPath: String = "") {
     }
 
     fun unmountSlot(lunIndex: Int? = null) {
+        refreshJob?.cancel()
         scope.launch {
             busy = true
             try {
                 if (lunIndex == null) {
+                    UsbGadgetEngine.requestAbortWatchdog()
                     UsbKeepAliveService.stop(context)
                 }
                 val res = UsbGadgetEngine.unmountImage(lunIndex)
                 logs.addAll(res.entries)
                 status = UsbGadgetEngine.getStatus()
-                syncKeepAlive(status)
+                syncKeepAlive(status, forceRestart = false)
                 showFeedback(res.userMessage, !res.success)
             } finally {
                 busy = false
@@ -704,17 +709,7 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                             },
                             onOpenBrowse = { showRootBrowserSheet = true },
                             onTapFileCard = { img -> selectedInfoFile = img },
-                            freeSpaceBytes = drivesFreeBytes,
-                            tempCacheBytes = tempCacheBytes,
-                            onQuickCleanCache = {
-                                scope.launch {
-                                    val res = UsbGadgetEngine.cleanTempStorage(context, settings.scanDirs + settings.defaultDir)
-                                    logs.addAll(res.entries)
-                                    tempCacheBytes = 0L
-                                    drivesFreeBytes = withContext(Dispatchers.IO) { UsbGadgetEngine.getFreeSpaceBytes(settings.defaultDir) }
-                                    showFeedback(res.userMessage, !res.success)
-                                }
-                            }
+                            freeSpaceBytes = drivesFreeBytes
                         )
                     }
 
@@ -958,7 +953,8 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                             )
                             updateSettings(updated, rescan = true)
                             if (cfg.autoMountAfterBuild) {
-                                mountPath(res.createdPath, MountMode.USB_RW, lunIndex = 0)
+                                val targetMode = if (cfg.usbMode == LinuxUsbMode.WITH_PERSISTENCE) MountMode.USB_RW else MountMode.USB_RO
+                                mountPath(res.createdPath, targetMode, lunIndex = 0)
                             } else {
                                 showFeedback(res.userMessage, false)
                             }
@@ -975,7 +971,18 @@ fun PocketBootApp(initialShortcutPath: String = "") {
             VentoyBuilderSheet(
                 defaultDir = settings.defaultDir,
                 initialIso = ventoyBuilderInitialIso,
+                presets = settings.autounattendPresets,
                 building = ventoyBuildJob != null,
+                onSavePreset = { preset ->
+                    val updatedPresets = (settings.autounattendPresets.filterNot { it.name.equals(preset.name, true) } + preset)
+                    updateSettings(settings.copy(autounattendPresets = updatedPresets), rescan = false)
+                    showFeedback("Saved preset \"${preset.name}\".")
+                },
+                onDeletePreset = { presetName ->
+                    val updatedPresets = settings.autounattendPresets.filterNot { it.name == presetName }
+                    updateSettings(settings.copy(autounattendPresets = updatedPresets), rescan = false)
+                    showFeedback("Deleted preset \"$presetName\".")
+                },
                 progress = ventoyBuildProgress,
                 onDismiss = {
                     showVentoyBuilder = false
@@ -1026,6 +1033,18 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                 ventoyFile = vFile,
                 isMountedToPc = vMountedLun != null,
                 availableIsos = images,
+                presets = settings.autounattendPresets,
+                defaultDir = settings.defaultDir,
+                onSavePreset = { preset ->
+                    val updatedPresets = (settings.autounattendPresets.filterNot { it.name.equals(preset.name, true) } + preset)
+                    updateSettings(settings.copy(autounattendPresets = updatedPresets), rescan = false)
+                    showFeedback("Saved preset \"${preset.name}\".")
+                },
+                onDeletePreset = { presetName ->
+                    val updatedPresets = settings.autounattendPresets.filterNot { it.name == presetName }
+                    updateSettings(settings.copy(autounattendPresets = updatedPresets), rescan = false)
+                    showFeedback("Deleted preset \"$presetName\".")
+                },
                 onDismiss = { ventoyManagerTarget = null },
                 onUnmountFirst = { unmountSlot(vMountedLun) },
                 onLibraryChanged = { refreshAll() },
@@ -1112,7 +1131,6 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                 hasRoot = status.hasRoot,
                 busy = busy,
                 rememberedModeLabel = settings.fileModes[file.path]?.let { runCatching { MountMode.valueOf(it).shortLabel }.getOrNull() },
-                isQsFavorite = settings.favoriteQuickMountPath == file.path,
                 onDismiss = { selectedInfoFile = null },
                 onOpenMountSheet = {
                     selectedInfoFile = null
@@ -1138,15 +1156,7 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                     selectedInfoFile = null
                     ventoyManagerTarget = file
                 },
-                onPinShortcut = {
-                    selectedInfoFile = null
-                    pinHomeScreenShortcut(file)
-                },
-                onToggleQsFavorite = { makeFav ->
-                    val newFav = if (makeFav) file.path else ""
-                    updateSettings(settings.copy(favoriteQuickMountPath = newFav), rescan = false)
-                    showFeedback(if (makeFav) "${file.name} set as Quick Settings tile favorite." else "Cleared Quick Settings favorite.")
-                },
+
                 onClearRememberedMode = {
                     updateSettings(settings.copy(fileModes = settings.fileModes - file.path), rescan = false)
                     showFeedback("Cleared 1-tap quick mount mode for ${file.name}.")
@@ -1352,7 +1362,7 @@ private fun MountProtocolSheet(
 ) {
     val isIso = file.name.endsWith(".iso", ignoreCase = true)
     val isWindows = osType == IsoOsType.WINDOWS
-    val isLinux = osType == IsoOsType.LINUX
+    val isLinux = osType == IsoOsType.LINUX || osType == IsoOsType.UTILITY
     val isVentoy = osType == IsoOsType.VENTOY_IMAGE
     val exceedsKernelCdLimit = isIso && file.sizeBytes > IsoInspector.KERNEL_CDROM_MAX_BYTES
 
@@ -1590,9 +1600,9 @@ private fun MountProtocolSheet(
                 )
                 MountActionCard(
                     icon = Icons.Rounded.Terminal,
-                    title = "Persistent Linux USB",
-                    badge = "ext4",
-                    subtitle = "Appends casper-rw or persistence storage partition",
+                    title = "Linux & Tool USB Builder",
+                    badge = "2 Modes",
+                    subtitle = "With Persistence (ext4) or Without Persistence (FAT32/DD)",
                     highlighted = false,
                     onClick = onOpenLinuxBuilder
                 )
@@ -1826,7 +1836,6 @@ private fun FileInfoBottomSheet(
     hasRoot: Boolean,
     busy: Boolean,
     rememberedModeLabel: String?,
-    isQsFavorite: Boolean,
     onDismiss: () -> Unit,
     onOpenMountSheet: () -> Unit,
     onUnmountThis: (Int) -> Unit,
@@ -1834,8 +1843,7 @@ private fun FileInfoBottomSheet(
     onOpenWindowsSlimmer: () -> Unit,
     onOpenLinuxBuilder: () -> Unit,
     onOpenVentoyManager: () -> Unit,
-    onPinShortcut: () -> Unit,
-    onToggleQsFavorite: (Boolean) -> Unit,
+
     onClearRememberedMode: () -> Unit,
     onRequestRename: () -> Unit,
     onRemoveFromList: () -> Unit,
@@ -1945,12 +1953,12 @@ private fun FileInfoBottomSheet(
                         )
                     }
                 }
-                IsoOsType.LINUX -> {
+                IsoOsType.LINUX, IsoOsType.UTILITY -> {
                     MountActionCard(
                         icon = Icons.Rounded.Terminal,
-                        title = "Persistent Linux USB",
-                        badge = "ext4",
-                        subtitle = "Add casper-rw or persistence storage",
+                        title = "Linux & Tool USB Builder",
+                        badge = "Rufus-Style",
+                        subtitle = "With Persistence (writable/persistence) or Standard FAT32/DD",
                         highlighted = false,
                         onClick = onOpenLinuxBuilder
                     )
@@ -2020,37 +2028,6 @@ private fun FileInfoBottomSheet(
                         }
                         Text(rpt.summaryNote, style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary)
                     }
-                }
-            }
-
-            // Quick Shortcuts: Pin to Home Screen + Quick Settings Tile Favorite
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(
-                    onClick = onPinShortcut,
-                    modifier = Modifier.weight(1f).height(42.dp),
-                    shape = RoundedCornerShape(10.dp),
-                    contentPadding = PaddingValues(horizontal = 8.dp),
-                    border = BorderStroke(0.5.dp, PocketColors.border)
-                ) {
-                    Icon(Icons.Rounded.AddToHomeScreen, null, tint = PocketColors.accentSoft, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(5.dp))
-                    Text("Pin Shortcut", fontSize = 12.sp, color = PocketColors.textPrimary, maxLines = 1)
-                }
-                OutlinedButton(
-                    onClick = { onToggleQsFavorite(!isQsFavorite) },
-                    modifier = Modifier.weight(1f).height(42.dp),
-                    shape = RoundedCornerShape(10.dp),
-                    contentPadding = PaddingValues(horizontal = 8.dp),
-                    border = BorderStroke(0.5.dp, if (isQsFavorite) PocketColors.warning else PocketColors.border)
-                ) {
-                    Icon(
-                        imageVector = if (isQsFavorite) Icons.Rounded.Star else Icons.Rounded.StarBorder,
-                        contentDescription = null,
-                        tint = if (isQsFavorite) PocketColors.warning else PocketColors.textSecondary,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(modifier = Modifier.width(5.dp))
-                    Text(if (isQsFavorite) "QS Favorite" else "Set QS Tile", fontSize = 12.sp, color = if (isQsFavorite) PocketColors.warning else PocketColors.textPrimary, maxLines = 1)
                 }
             }
 
@@ -2225,9 +2202,7 @@ private fun HomeScreen(
     onOpenCreateVentoy: () -> Unit,
     onOpenBrowse: () -> Unit,
     onTapFileCard: (ImageFile) -> Unit,
-    freeSpaceBytes: Long = 0L,
-    tempCacheBytes: Long = 0L,
-    onQuickCleanCache: () -> Unit = {}
+    freeSpaceBytes: Long = 0L
 ) {
     var searchQuery by remember { mutableStateOf("") }
     var sortBy by remember { mutableStateOf(SortBy.NAME) }
@@ -2377,53 +2352,6 @@ private fun HomeScreen(
                 )
             }
 
-            if (freeSpaceBytes > 0L) {
-                val drivesUsedBytes = remember(images) { images.sumOf { it.actualDiskBytes } }
-                val showCleanPill = tempCacheBytes >= 500L * 1024L * 1024L
-                Surface(
-                    shape = RoundedCornerShape(PocketTokens.InnerCardRadius),
-                    color = PocketColors.surfaceCard,
-                    border = BorderStroke(0.5.dp, if (showCleanPill) PocketColors.warning.copy(alpha = 0.6f) else PocketColors.border)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 9.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.Storage,
-                            contentDescription = null,
-                            tint = if (showCleanPill) PocketColors.warning else PocketColors.accentSoft,
-                            modifier = Modifier.size(15.dp)
-                        )
-                        Text(
-                            text = "${UsbGadgetEngine.formatBytes(freeSpaceBytes)} free · ${UsbGadgetEngine.formatBytes(drivesUsedBytes)} in ${images.size} drive(s)",
-                            style = PocketColors.monoStyle,
-                            color = PocketColors.textSecondary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f)
-                        )
-                        if (showCleanPill) {
-                            Surface(
-                                modifier = Modifier.bounceClick { onQuickCleanCache() },
-                                shape = RoundedCornerShape(PocketTokens.PillRadius),
-                                color = PocketColors.warningBg,
-                                border = BorderStroke(0.75.dp, PocketColors.warning)
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                                ) {
-                                    Icon(Icons.Rounded.CleaningServices, null, tint = PocketColors.warning, modifier = Modifier.size(12.dp))
-                                    Text("Clean ${UsbGadgetEngine.formatBytes(tempCacheBytes)}", fontSize = 10.sp, fontWeight = FontWeight.SemiBold, color = PocketColors.warning)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
         }
 
         // Drives Section
@@ -2742,6 +2670,31 @@ private fun HomeScreen(
             }
         }
 
+        if (status.hasRoot && freeSpaceBytes > 0L) {
+            val drivesUsedBytes = remember(images) { images.sumOf { it.actualDiskBytes } }
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = PocketColors.surfaceCard,
+                border = BorderStroke(0.5.dp, PocketColors.border)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(Icons.Rounded.Storage, null, tint = PocketColors.accentSoft, modifier = Modifier.size(15.dp))
+                    Text(
+                        text = "${UsbGadgetEngine.formatBytes(freeSpaceBytes)} free · ${UsbGadgetEngine.formatBytes(drivesUsedBytes)} in ${images.size} drive(s)",
+                        style = PocketColors.monoStyle,
+                        color = PocketColors.textSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+        }
+
         Spacer(modifier = Modifier.height(16.dp))
     }
 }
@@ -2825,6 +2778,7 @@ private fun ConnectionStatusCard(
         var prevBytes = -1L
         var prevMs = System.currentTimeMillis()
         while (isActive) {
+            if (busy) { delay(1000L); continue }
             val sample = UsbGadgetEngine.readUsbActivitySample()
             val nowMs = System.currentTimeMillis()
             if (sample.linkState.isNotBlank()) liveLinkState = sample.linkState
@@ -2838,7 +2792,7 @@ private fun ConnectionStatusCard(
             }
             prevBytes = sample.ioBytesTotal
             prevMs = nowMs
-            delay(1500L)
+            delay(2500L)
         }
     }
 
@@ -2973,54 +2927,94 @@ private fun ConnectionStatusCard(
                             }
                         }
 
-                        // Compact 2-Column Hardware Telemetry Strip
-                        Surface(
-                            shape = RoundedCornerShape(11.dp),
-                            color = PocketColors.surfaceInput,
-                            border = BorderStroke(0.5.dp, PocketColors.border)
+                        // Compact 2-Pill Status Strip (full hardware telemetry tucked cleanly under Details)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Column(
-                                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
-                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            Surface(
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(10.dp),
+                                color = PocketColors.surfaceInput,
+                                border = BorderStroke(0.5.dp, PocketColors.border)
                             ) {
-                                TelemetryLine(
-                                    label = "Hardware Port",
-                                    value = if (status.udcName.isNotBlank()) "USB-C (${status.udcName})" else "Not detected",
-                                    valueColor = PocketColors.textPrimary
-                                )
-                                TelemetryLine(
-                                    label = "Link & Mode",
-                                    value = if (isLinked) status.friendlySpeedLabel else "Hot-plug auto-connect ready",
-                                    valueColor = if (isLinked) PocketColors.success else PocketColors.textSecondary
-                                )
-
-                                AnimatedVisibility(
-                                    visible = techExpanded,
-                                    enter = fadeIn(tween(180)) + expandVertically(),
-                                    exit = fadeOut(tween(140)) + shrinkVertically()
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                                 ) {
-                                    Column(
-                                        modifier = Modifier.padding(top = 4.dp),
-                                        verticalArrangement = Arrangement.spacedBy(5.dp)
-                                    ) {
-                                        PocketHairlineDivider()
-                                        Spacer(modifier = Modifier.height(2.dp))
-                                        TelemetryLine(
-                                            label = "ConfigFS",
-                                            value = if (status.configFsReady) "${status.gadgetPath} · Multi-LUN=${if (status.multiLunSupported) "Yes" else "No"}" else "Unavailable",
-                                            valueColor = PocketColors.textSecondary
-                                        )
-                                        TelemetryLine(
-                                            label = "USB Daemon",
-                                            value = "sys.usb.config=${status.activeUsbConfig.ifBlank { "none" }}",
-                                            valueColor = PocketColors.textSecondary
-                                        )
-                                        TelemetryLine(
-                                            label = "Security / Root",
-                                            value = "${status.rootManager} · SELinux ${status.selinuxMode}",
-                                            valueColor = PocketColors.textSecondary
-                                        )
-                                    }
+                                    Icon(Icons.Rounded.Usb, null, tint = PocketColors.accentSoft, modifier = Modifier.size(14.dp))
+                                    Text(
+                                        text = if (status.udcName.isNotBlank()) "USB-C Ready" else "No UDC",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = PocketColors.textPrimary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                            Surface(
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(10.dp),
+                                color = PocketColors.surfaceInput,
+                                border = BorderStroke(0.5.dp, PocketColors.border)
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Icon(Icons.Rounded.Bolt, null, tint = if (isLinked) PocketColors.success else PocketColors.accentSoft, modifier = Modifier.size(14.dp))
+                                    Text(
+                                        text = if (isLinked) status.friendlySpeedLabel else "Hot-Plug Ready",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (isLinked) PocketColors.success else PocketColors.textSecondary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                        }
+
+                        AnimatedVisibility(
+                            visible = techExpanded,
+                            enter = fadeIn(tween(180)) + expandVertically(),
+                            exit = fadeOut(tween(140)) + shrinkVertically()
+                        ) {
+                            Surface(
+                                shape = RoundedCornerShape(11.dp),
+                                color = PocketColors.surfaceInput,
+                                border = BorderStroke(0.5.dp, PocketColors.border)
+                            ) {
+                                Column(
+                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                                    verticalArrangement = Arrangement.spacedBy(5.dp)
+                                ) {
+                                    TelemetryLine(
+                                        label = "Hardware Port",
+                                        value = if (status.udcName.isNotBlank()) "USB-C (${status.udcName})" else "Not detected",
+                                        valueColor = PocketColors.textPrimary
+                                    )
+                                    TelemetryLine(
+                                        label = "Link & Mode",
+                                        value = if (isLinked) status.friendlySpeedLabel else "Hot-plug auto-connect ready",
+                                        valueColor = if (isLinked) PocketColors.success else PocketColors.textSecondary
+                                    )
+                                    TelemetryLine(
+                                        label = "ConfigFS",
+                                        value = if (status.configFsReady) "${status.gadgetPath} · Multi-LUN=${if (status.multiLunSupported) "Yes" else "No"}" else "Unavailable",
+                                        valueColor = PocketColors.textSecondary
+                                    )
+                                    TelemetryLine(
+                                        label = "USB Daemon",
+                                        value = "sys.usb.config=${status.activeUsbConfig.ifBlank { "none" }}",
+                                        valueColor = PocketColors.textSecondary
+                                    )
+                                    TelemetryLine(
+                                        label = "Security / Root",
+                                        value = "${status.rootManager} · SELinux ${status.selinuxMode}",
+                                        valueColor = PocketColors.textSecondary
+                                    )
                                 }
                             }
                         }
