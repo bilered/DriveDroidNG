@@ -1,0 +1,406 @@
+package com.pocketboot.app
+
+import android.content.Context
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.CheckBox
+import androidx.compose.material.icons.rounded.CheckBoxOutlineBlank
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Compress
+import androidx.compose.material.icons.rounded.Info
+import androidx.compose.material.icons.rounded.WarningAmber
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.topjohnwu.superuser.Shell
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
+import java.io.File
+
+data class IsoSlimConfig(
+    val sourceIso: ImageFile,
+    val outputDir: String,
+    val outputName: String,
+    val keepEditionIndices: List<Int>,
+    val convertToEsd: Boolean
+)
+
+object WindowsIsoSlimmer {
+
+    private fun shellQuote(value: String): String = "'${value.replace("'", "'\\''")}'"
+
+    suspend fun slimWindowsIso(
+        context: Context,
+        config: IsoSlimConfig,
+        onProgress: (WindowsBuildProgress) -> Unit
+    ): ActionResult = withContext(Dispatchers.IO) {
+        val sevenZip = WindowsImageBuilder.findBundledBinary(context, "lib7zzs.so", listOf("7zzs", "7zz", "7z"))
+            ?: return@withContext ActionResult(false, "Bundled 7-Zip extractor not found.")
+        val wimlib = WindowsImageBuilder.findBundledBinary(context, "libwimlib_imagex.so", listOf("wimlib-imagex"))
+            ?: return@withContext ActionResult(false, "Bundled wimlib-imagex not found.")
+        val xorriso = WindowsImageBuilder.findBundledBinary(context, "libxorriso.so", listOf("xorriso"))
+            ?: return@withContext ActionResult(false, "Bundled xorriso not found.")
+
+        val srcPath = UsbGadgetEngine.resolveDirectPath(config.sourceIso.path)
+        val outDir = UsbGadgetEngine.resolveDirectPath(config.outputDir).trimEnd('/')
+        val outName = config.outputName.trim().let { if (it.endsWith(".iso", true)) it else "$it.iso" }
+        val outPath = "$outDir/$outName"
+
+        val workRoot = UsbGadgetEngine.createSafeTempWorkDir(context, outDir, "slim_${System.currentTimeMillis() % 100000}")
+        val isoDir = "$workRoot/ISODIR"
+        val tmpDir = "$workRoot/TMP"
+        val qIso = shellQuote(srcPath)
+        val qIsoDir = shellQuote(isoDir)
+        val qTmp = shellQuote(tmpDir)
+        val qOut = shellQuote(outPath)
+        val q7z = shellQuote(sevenZip)
+        val qWim = shellQuote(wimlib)
+        val qXor = shellQuote(xorriso)
+        val envPrefix = "export TMPDIR=$qTmp HOME=$qTmp"
+
+        return@withContext runCatching {
+            onProgress(WindowsBuildProgress("Extracting source Windows ISO...", config.sourceIso.name, 0.14f, true))
+            Shell.cmd("mkdir -p $qIsoDir $qTmp").exec()
+            val extRes = Shell.cmd("$envPrefix && $q7z x -y -o$qIsoDir $qIso 2>&1").exec()
+            if (!isActive) {
+                UsbGadgetEngine.cleanupTempWorkDir(workRoot)
+                return@withContext ActionResult(false, "ISO slimming cancelled.")
+            }
+            if (!extRes.isSuccess) {
+                throw IllegalStateException("Extraction failed: ${(extRes.out + extRes.err).takeLast(3).joinToString(" ").take(180)}")
+            }
+
+            val srcWim = Shell.cmd(
+                "find $qIsoDir/sources -maxdepth 1 -type f \\( -iname 'install.wim' -o -iname 'install.esd' \\) 2>/dev/null | head -n 1"
+            ).exec().out.firstOrNull().orEmpty().trim()
+            if (srcWim.isBlank()) {
+                throw IllegalStateException("No sources/install.wim or install.esd found inside ISO.")
+            }
+
+            val dstExt = if (config.convertToEsd) "esd" else "wim"
+            val compArg = if (config.convertToEsd) "--compress=LZMS --solid --threads=2" else "--compress=maximum"
+            val newInstall = "$tmpDir/install.$dstExt"
+            val qSrcWim = shellQuote(srcWim)
+            val qNewInstall = shellQuote(newInstall)
+
+            config.keepEditionIndices.forEachIndexed { pos, edIdx ->
+                if (!isActive) {
+                    UsbGadgetEngine.cleanupTempWorkDir(workRoot)
+                    return@withContext ActionResult(false, "ISO slimming cancelled.")
+                }
+                val pct = 0.35f + (pos.toFloat() / config.keepEditionIndices.size.coerceAtLeast(1).toFloat()) * 0.42f
+                onProgress(
+                    WindowsBuildProgress(
+                        stage = "Exporting edition #$edIdx (${pos + 1}/${config.keepEditionIndices.size})...",
+                        detail = if (config.convertToEsd) "Solid ESD compression (smallest size)" else "Standard WIM compression",
+                        progress = pct,
+                        isIndeterminate = false
+                    )
+                )
+                val expRes = Shell.cmd("$envPrefix && $qWim export $qSrcWim $edIdx $qNewInstall $compArg 2>&1").exec()
+                if (!expRes.isSuccess) {
+                    throw IllegalStateException("Edition export failed: ${(expRes.out + expRes.err).takeLast(3).joinToString(" ").take(180)}")
+                }
+            }
+
+            // Replace old install.wim/esd with slimmed file
+            Shell.cmd("rm -f $qIsoDir/sources/install.wim $qIsoDir/sources/install.esd $qIsoDir/sources/INSTALL.WIM $qIsoDir/sources/INSTALL.ESD && mv -f $qNewInstall $qIsoDir/sources/install.$dstExt").exec()
+
+            onProgress(WindowsBuildProgress("Rebuilding bootable ISO...", outName, 0.86f, false))
+            val xorCmd = """
+                set -e
+                $envPrefix
+                mkdir -p ${shellQuote(outDir)}
+                rm -f $qOut
+                ISODIR=$qIsoDir
+                EFI_BOOT=""
+                [ -f "${'$'}ISODIR/efi/microsoft/boot/efisys.bin" ] && EFI_BOOT="efi/microsoft/boot/efisys.bin"
+                [ -z "${'$'}EFI_BOOT" ] && [ -f "${'$'}ISODIR/EFI/Microsoft/Boot/efisys.bin" ] && EFI_BOOT="EFI/Microsoft/Boot/efisys.bin"
+                BIOS_BOOT=""
+                [ -f "${'$'}ISODIR/boot/etfsboot.com" ] && BIOS_BOOT="boot/etfsboot.com"
+
+                if [ -n "${'$'}BIOS_BOOT" ] && [ -n "${'$'}EFI_BOOT" ]; then
+                    $qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -volid "POCKETBOOT_SLIM" -udf \
+                      -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -boot-info-table \
+                      -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot \
+                      -o $qOut "${'$'}ISODIR"
+                elif [ -n "${'$'}EFI_BOOT" ]; then
+                    $qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -volid "POCKETBOOT_SLIM" -udf \
+                      -e "${'$'}EFI_BOOT" -no-emul-boot \
+                      -o $qOut "${'$'}ISODIR"
+                else
+                    $qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -volid "POCKETBOOT_SLIM" -udf \
+                      -o $qOut "${'$'}ISODIR"
+                fi
+            """.trimIndent()
+            val xorRes = WindowsBuildEngine.runIsolatedRootScript(context, "slim_iso", xorCmd)
+            if (!xorRes.isSuccess) {
+                throw IllegalStateException("ISO rebuild failed: ${(xorRes.out + xorRes.err).takeLast(3).joinToString(" ").take(180)}")
+            }
+
+            UsbGadgetEngine.fixUserStoragePermissions(context, outDir, isDir = true)
+            UsbGadgetEngine.fixUserStoragePermissions(context, outPath, isDir = false)
+            UsbGadgetEngine.cleanupTempWorkDir(workRoot)
+
+            val newSize = Shell.cmd("stat -c '%s' $qOut 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+            val savedBytes = (config.sourceIso.sizeBytes - newSize).coerceAtLeast(0L)
+            onProgress(WindowsBuildProgress("Done!", outName, 1f, false))
+            ActionResult(
+                success = true,
+                userMessage = "Created $outName (${UsbGadgetEngine.formatBytes(newSize)} · saved ${UsbGadgetEngine.formatBytes(savedBytes)}).",
+                createdPath = outPath
+            )
+        }.getOrElse { e ->
+            UsbGadgetEngine.cleanupTempWorkDir(workRoot)
+            ActionResult(false, "ISO Slimmer failed: ${e.message ?: "Unexpected error"}")
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun WindowsIsoSlimmerSheet(
+    isoFile: ImageFile,
+    defaultDir: String,
+    building: Boolean,
+    progress: WindowsBuildProgress,
+    onDismiss: () -> Unit,
+    onCancel: () -> Unit,
+    onStartSlim: (IsoSlimConfig) -> Unit
+) {
+    val context = LocalContext.current
+    var loadingEditions by remember(isoFile.path) { mutableStateOf(true) }
+    var editions by remember(isoFile.path) { mutableStateOf<List<WindowsEditionItem>>(emptyList()) }
+    val selectedIndices = remember(isoFile.path) { mutableStateListOf<Int>() }
+    var convertToEsd by remember { mutableStateOf(true) }
+    val defaultOutName = remember(isoFile.name) {
+        isoFile.name.substringBeforeLast('.').take(34) + "-Slim.iso"
+    }
+    var outputName by remember(isoFile.path) { mutableStateOf(defaultOutName) }
+
+    val freeSpace = remember(defaultDir) { UsbGadgetEngine.getFreeSpaceBytes(defaultDir) }
+    val neededSpace = (isoFile.sizeBytes * 2L) + (512L * 1024L * 1024L)
+    val lowSpace = freeSpace in 1L until neededSpace
+
+    LaunchedEffect(isoFile.path) {
+        loadingEditions = true
+        editions = WindowsImageBuilder.inspectWindowsEditions(context, isoFile.path)
+        selectedIndices.clear()
+        val pro = editions.firstOrNull { it.name.contains("Pro", true) && !it.name.contains("Education", true) && !it.name.contains("N", true) }
+            ?: editions.firstOrNull()
+        if (pro != null) selectedIndices.add(pro.index)
+        loadingEditions = false
+    }
+
+    ModalBottomSheet(
+        onDismissRequest = { if (!building) onDismiss() },
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        containerColor = PocketColors.surfaceCard
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(13.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Box(
+                    modifier = Modifier.size(42.dp).clip(RoundedCornerShape(12.dp)).background(PocketColors.violetBg),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(Icons.Rounded.Compress, null, tint = PocketColors.violet, modifier = Modifier.size(22.dp))
+                }
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Windows ISO Slimmer", style = MaterialTheme.typography.titleLarge, color = PocketColors.textPrimary)
+                    Text("${isoFile.name} · ${UsbGadgetEngine.formatBytes(isoFile.sizeBytes)}", style = PocketColors.monoStyle, color = PocketColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+
+            if (building) {
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = PocketColors.surfaceInput,
+                    border = BorderStroke(1.dp, PocketColors.accent)
+                ) {
+                    Column(modifier = Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text(progress.stage, style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary)
+                        if (progress.detail.isNotBlank()) {
+                            Text(progress.detail, style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary)
+                        }
+                        if (progress.isIndeterminate) {
+                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(7.dp).clip(RoundedCornerShape(999.dp)), color = PocketColors.accent, trackColor = PocketColors.surfaceSubtle)
+                        } else {
+                            LinearProgressIndicator(progress = { progress.progress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth().height(7.dp).clip(RoundedCornerShape(999.dp)), color = PocketColors.accent, trackColor = PocketColors.surfaceSubtle)
+                        }
+                    }
+                }
+                OutlinedButton(
+                    onClick = onCancel,
+                    modifier = Modifier.fillMaxWidth().height(PocketTokens.PrimaryButtonHeight),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, PocketColors.danger)
+                ) {
+                    Icon(Icons.Rounded.Close, null, tint = PocketColors.danger, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Cancel", color = PocketColors.danger, fontWeight = FontWeight.SemiBold)
+                }
+            } else if (loadingEditions) {
+                Box(modifier = Modifier.fillMaxWidth().padding(vertical = 28.dp), contentAlignment = Alignment.Center) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        CircularProgressIndicator(color = PocketColors.accent)
+                        Text("Inspecting Windows editions inside ISO...", style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary)
+                    }
+                }
+            } else if (editions.isEmpty()) {
+                Surface(shape = RoundedCornerShape(12.dp), color = PocketColors.warningBg, border = BorderStroke(0.5.dp, PocketColors.warning)) {
+                    Text(
+                        "Could not read install.wim/install.esd editions from this ISO.",
+                        modifier = Modifier.padding(14.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = PocketColors.textPrimary
+                    )
+                }
+            } else {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    PocketSectionHeader("Editions to Keep", trailing = "${selectedIndices.size} / ${editions.size}")
+                    Surface(shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
+                        Column {
+                            editions.forEachIndexed { idx, ed ->
+                                if (idx > 0) PocketHairlineDivider()
+                                val checked = selectedIndices.contains(ed.index)
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            if (checked && selectedIndices.size > 1) selectedIndices.remove(ed.index)
+                                            else if (!checked) selectedIndices.add(ed.index)
+                                        }
+                                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = if (checked) Icons.Rounded.CheckBox else Icons.Rounded.CheckBoxOutlineBlank,
+                                        contentDescription = null,
+                                        tint = if (checked) PocketColors.accent else PocketColors.textMuted,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                    Text("#${ed.index}", style = PocketColors.monoStyle, color = PocketColors.textMuted)
+                                    Text(ed.name, style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary, modifier = Modifier.weight(1f))
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Surface(shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().bounceClick { convertToEsd = !convertToEsd }.padding(horizontal = 14.dp, vertical = 11.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Recompress to Compact ESD", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                            Text("Saves 1.5–2 GB extra (slower build)", fontSize = 11.sp, color = PocketColors.textSecondary)
+                        }
+                        PocketSwitch(checked = convertToEsd, onCheckedChange = { convertToEsd = it }, activeColor = PocketColors.success)
+                    }
+                }
+
+                OutlinedTextField(
+                    value = outputName,
+                    onValueChange = { outputName = it },
+                    label = { Text("Output Slim ISO Name") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = PocketColors.accent,
+                        unfocusedBorderColor = PocketColors.border
+                    )
+                )
+
+                Surface(
+                    shape = RoundedCornerShape(11.dp),
+                    color = if (lowSpace) PocketColors.dangerBg else PocketColors.surfaceInput,
+                    border = BorderStroke(0.5.dp, if (lowSpace) PocketColors.danger else PocketColors.border)
+                ) {
+                    Row(modifier = Modifier.fillMaxWidth().padding(11.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Icon(if (lowSpace) Icons.Rounded.WarningAmber else Icons.Rounded.Info, null, tint = if (lowSpace) PocketColors.danger else PocketColors.accentSoft, modifier = Modifier.size(17.dp))
+                        Text(
+                            text = if (lowSpace) "Need ~${UsbGadgetEngine.formatBytes(neededSpace)} free temporarily (have ${UsbGadgetEngine.formatBytes(freeSpace)})."
+                            else "Uses ${UsbGadgetEngine.friendlyFolderName(defaultDir)}/.pocketboot_tmp during build (${UsbGadgetEngine.formatBytes(freeSpace)} free).",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = PocketColors.textPrimary
+                        )
+                    }
+                }
+
+                Button(
+                    onClick = {
+                        onStartSlim(
+                            IsoSlimConfig(
+                                sourceIso = isoFile,
+                                outputDir = defaultDir,
+                                outputName = outputName.ifBlank { defaultOutName },
+                                keepEditionIndices = selectedIndices.sorted(),
+                                convertToEsd = convertToEsd
+                            )
+                        )
+                    },
+                    enabled = !lowSpace && selectedIndices.isNotEmpty() && outputName.isNotBlank(),
+                    modifier = Modifier.fillMaxWidth().height(PocketTokens.PrimaryButtonHeight),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)
+                ) {
+                    Text("Build Slim Windows ISO", fontWeight = FontWeight.SemiBold)
+                }
+            }
+
+            Spacer(modifier = Modifier.height(22.dp))
+        }
+    }
+}
