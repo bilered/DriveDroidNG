@@ -1085,13 +1085,23 @@ fun DownloadScreen(
                             }
                             Button(
                                 onClick = {
-                                    WindowsBuildEngine.startBuild(
-                                        context = context,
-                                        config = pb.config.copy(connections = settings.downloadConnections),
-                                        onComplete = { evt -> scope.launch { onDownloadCompleted(evt) } },
-                                        onError = { err -> scope.launch { onMessage(err, true) } },
-                                        onLog = { entry -> scope.launch { onAppendLog(entry) } }
-                                    )
+                                    if (pb.isCachedReady) {
+                                        WindowsBuildEngine.rebuildCachedPending(
+                                            context = context,
+                                            pending = pb,
+                                            onComplete = { evt -> scope.launch { onDownloadCompleted(evt) } },
+                                            onError = { err -> scope.launch { onMessage(err, true) } },
+                                            onLog = { entry -> scope.launch { onAppendLog(entry) } }
+                                        )
+                                    } else {
+                                        WindowsBuildEngine.startBuild(
+                                            context = context,
+                                            config = pb.config.copy(connections = settings.downloadConnections),
+                                            onComplete = { evt -> scope.launch { onDownloadCompleted(evt) } },
+                                            onError = { err -> scope.launch { onMessage(err, true) } },
+                                            onLog = { entry -> scope.launch { onAppendLog(entry) } }
+                                        )
+                                    }
                                 },
                                 contentPadding = PaddingValues(horizontal = 11.dp, vertical = 6.dp),
                                 shape = RoundedCornerShape(PocketTokens.CompactButtonRadius),

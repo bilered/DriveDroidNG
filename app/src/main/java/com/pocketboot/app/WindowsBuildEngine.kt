@@ -192,7 +192,7 @@ data class WindowsBuildToolsStatus(val cabextract: String?, val wimlib: String?,
 private data class QueuedConversionJob(
     val context: Context, val config: WindowsChannelBuildConfig, val workRootPath: String, val workPrefix: String,
     val jobTitle: String, val totalDownloadBytes: Long, val hasUpdates: Boolean, val hasApps: Boolean, val hasNetFx3: Boolean,
-    val isReadOnlySource: Boolean = false, val pkgDirOverride: String = "",
+    val isReadOnlySource: Boolean = false, val pkgDirOverride: String = "", val resumeFromStep4: Boolean = false,
     val onComplete: (DownloadCompletionEvent) -> Unit, val onError: (String) -> Unit, val onLog: (LogEntry) -> Unit
 )
 
@@ -1010,10 +1010,79 @@ object WindowsBuildEngine {
     }
     fun retryFailedConversion(): Boolean {
         val failed = lastFailedJob ?: return false
+        val failedAtStep4 = _conversionState.value?.currentStep == 4
         lastFailedJob = null
         _conversionState.value = null
-        enqueueConversion(failed.copy(config = failed.config.copy(autoMount = convAutoMountLive, keepPackagesAfterBuild = convKeepPackagesLive)))
+        enqueueConversion(
+            failed.copy(
+                config = failed.config.copy(autoMount = convAutoMountLive, keepPackagesAfterBuild = convKeepPackagesLive),
+                resumeFromStep4 = failedAtStep4
+            )
+        )
         return true
+    }
+
+    /**
+     * 100% offline rebuild from an already-downloaded cached build (zero internet calls, zero 8 GB re-hash).
+     * Automatically resumes directly at Step 4 if a finished ISODIR staging marker (.pb_isodir_ready) exists.
+     */
+    fun rebuildCachedPending(
+        context: Context,
+        pending: PendingWindowsBuild,
+        onComplete: (DownloadCompletionEvent) -> Unit,
+        onError: (String) -> Unit,
+        onLog: (LogEntry) -> Unit
+    ) {
+        val appCtx = context.applicationContext
+        val config = pending.config
+        val workRootPath = pending.workRootPath
+        val pkgPath = "$workRootPath/PKGS"
+        scope.launch {
+            try {
+                val tools = inspectTools(appCtx)
+                if (config.outputMode == WinBuildOutputMode.DIRECT_NTFS_USB && !tools.canBuildDirectUsb) {
+                    throw IllegalStateException("Bundled build tools missing. Reinstall the latest APK.")
+                }
+                if (config.outputMode != WinBuildOutputMode.DIRECT_NTFS_USB && !tools.canConvertIso) {
+                    throw IllegalStateException("Bundled ISO build tools (cabextract/wimlib/chntpw/xorriso) missing.")
+                }
+                val hasReadyIsoDir = Shell.cmd(
+                    "[ -f ${shellQuote("$workRootPath/.pb_isodir_ready")} ] && [ -f ${shellQuote("$workRootPath/ISODIR/sources/boot.wim")} ] && echo OK || true"
+                ).exec().out.any { it.trim() == "OK" }
+                val esdCount = Shell.cmd("ls ${shellQuote(pkgPath)}/*.esd ${shellQuote(pkgPath)}/*.ESD 2>/dev/null | wc -l").exec().out.firstOrNull()?.trim()?.toIntOrNull() ?: 0
+                if (!hasReadyIsoDir && esdCount <= 0) {
+                    throw IllegalStateException("Cached packages are incomplete or missing. Please tap Resume to verify/download.")
+                }
+                val hasUpd = Shell.cmd("ls ${shellQuote(pkgPath)}/*.msu ${shellQuote(pkgPath)}/*-KB*.cab ${shellQuote(pkgPath)}/*SSU*.cab 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
+                val hasApps = Shell.cmd("ls ${shellQuote(pkgPath)}/*.msixbundle ${shellQuote(pkgPath)}/*.appxbundle ${shellQuote(pkgPath)}/*.msix ${shellQuote(pkgPath)}/*.appx 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
+                val hasFx3 = Shell.cmd("ls ${shellQuote(pkgPath)}/*netfx3-ondemand*.cab ${shellQuote(pkgPath)}/*NetFx3*.cab 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
+
+                onLog(LogEntry(nowTs(), "win-build", "Queued 100% offline rebuild for ${pending.title}${if (hasReadyIsoDir) " (Fast Step-4 resume)" else " ($esdCount cached ESDs)"}"))
+                enqueueConversion(
+                    QueuedConversionJob(
+                        context = appCtx,
+                        config = config,
+                        workRootPath = workRootPath,
+                        workPrefix = pending.workPrefix,
+                        jobTitle = pending.title,
+                        totalDownloadBytes = pending.totalBytes.coerceAtLeast(pending.cachedBytes),
+                        hasUpdates = config.includeUpdates && hasUpd,
+                        hasApps = hasApps,
+                        hasNetFx3 = config.integrateNetFx3 && hasFx3,
+                        isReadOnlySource = false,
+                        pkgDirOverride = "",
+                        resumeFromStep4 = hasReadyIsoDir,
+                        onComplete = onComplete,
+                        onError = onError,
+                        onLog = onLog
+                    )
+                )
+            } catch (e: Exception) {
+                val msg = "Offline rebuild failed: ${e.message ?: "Unexpected error"}"
+                onLog(LogEntry(nowTs(), "win-build", msg, true))
+                onError(msg)
+            }
+        }
     }
 
     fun pauseDownload() {
@@ -1376,8 +1445,20 @@ object WindowsBuildEngine {
             val qPkg = shellQuote(pkgDir.absolutePath); val qIsoDir = shellQuote(isoDir.absolutePath); val qTmp = shellQuote(tmpDir.absolutePath)
             val pathHeader = "PKG=$qPkg\nISODIR=$qIsoDir\nTMP=$qTmp\nexport TMPDIR=\"\$TMP\" HOME=\"\$TMP\""
 
+            val isoReadyMarker = "$workRootPath/.pb_isodir_ready"
+            val qIsoReadyMarker = shellQuote(isoReadyMarker)
+            val canSkipToStep4Pack = job.resumeFromStep4 && Shell.cmd(
+                "[ -f $qIsoReadyMarker ] && [ -f ${shellQuote("${isoDir.absolutePath}/sources/boot.wim")} ] && ( [ -f ${shellQuote("${isoDir.absolutePath}/sources/install.wim")} ] || [ -f ${shellQuote("${isoDir.absolutePath}/sources/install.esd")} ] ) && echo OK || true"
+            ).exec().out.any { it.trim() == "OK" }
+
+            if (canSkipToStep4Pack) {
+                addConsole("Fast-Retry: Reusing completed ISODIR staging folder (skipping Steps 1–3)")
+                currentStep = 4
+                activeBin = if (config.outputMode == WinBuildOutputMode.DIRECT_NTFS_USB) "mkfs.ntfs" else "xorriso"
+                publishConv("Step 4/4 · Fast-Retry from staged ISODIR...", finalFileName, 0.84f)
+            } else {
             publishConv("Step 1/4 · Checking build tools...", "Verifying native ARM64 binaries", 0.02f)
-            if (!runIsolatedRootScript(appCtx, "toolcheck", "set -e\n$pathHeader\nrm -rf \"\$ISODIR\" \"\$TMP\" /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive\nmkdir -p \"\$ISODIR\" \"\$TMP\"\n$qCab --version >/dev/null\n$qWim --version >/dev/null").isSuccess) {
+            if (!runIsolatedRootScript(appCtx, "toolcheck", "set -e\n$pathHeader\nrm -rf $qIsoReadyMarker \"\$ISODIR\" \"\$TMP\" /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive\nmkdir -p \"\$ISODIR\" \"\$TMP\"\n$qCab --version >/dev/null\n$qWim --version >/dev/null").isSuccess) {
                 throw IllegalStateException("Build tool check failed")
             }
 
@@ -1583,8 +1664,9 @@ object WindowsBuildEngine {
                 addConsole("Injected autounattend.xml + unplug-safe \$OEM\$ scripts")
             }
 
-            // Free temporary CAB/WIM staging files now, but KEEP PKGS untouched until final output is verified!
-            Shell.cmd("rm -rf $qTmp /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive").exec()
+            // Free temporary CAB/WIM staging files and mark ISODIR complete for instant Step-4 retry if packing fails!
+            Shell.cmd("rm -rf $qTmp /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive && touch $qIsoReadyMarker").exec()
+            }
 
             var injectedMbPath: String? = null
             if (config.outputMode == WinBuildOutputMode.DIRECT_NTFS_USB) {
@@ -1603,7 +1685,8 @@ object WindowsBuildEngine {
                 val estIsoBytes = Shell.cmd("du -sb $qIsoDir 2>/dev/null | awk '{print \$1}'").exec().out.firstOrNull()?.trim()?.toLongOrNull()?.coerceAtLeast(1L) ?: (5L * 1024L * 1024L * 1024L)
                 val xorLog = "/data/local/tmp/pb_xorriso_prog.log"
                 val qXorLog = shellQuote(xorLog)
-                addConsole("xorriso: packing ~${UsbGadgetEngine.formatBytes(estIsoBytes)} (-iso-level 3 -udf -allow-limited-size)")
+                val preferNoPrompt = config.experience.hasAnyActive() || config.winUtil.hasAnyActive()
+                addConsole("xorriso: packing ~${UsbGadgetEngine.formatBytes(estIsoBytes)} (-iso-level 3 -J -joliet-long --stdio_sync 16m)")
                 publishConv("Step 4/4 · Packing bootable ISO...", finalFileName, 0.86f)
                 val isoPollJob = scope.launch {
                     while (isActive && !convCancelledFlag.get()) {
@@ -1619,21 +1702,31 @@ object WindowsBuildEngine {
                         )
                     }
                 }
-                val xorRes = runIsolatedRootScript(
-                    appCtx,
-                    "xorriso",
-                    "set -e\n$pathHeader\nmkdir -p ${shellQuote(safeTargetDir)}\nrm -f $qOutIso\n: > $qXorLog\n" +
-                        "EFI_BOOT=\"\"\n" +
-                        "if [ -f \"\$ISODIR/efi/microsoft/boot/efisys.bin\" ]; then EFI_BOOT=\"efi/microsoft/boot/efisys.bin\"; " +
-                        "elif [ -f \"\$ISODIR/EFI/Microsoft/Boot/efisys.bin\" ]; then EFI_BOOT=\"EFI/Microsoft/Boot/efisys.bin\"; fi\n" +
-                        "BIOS_BOOT=\"\"\n[ -f \"\$ISODIR/boot/etfsboot.com\" ] && BIOS_BOOT=\"boot/etfsboot.com\"\n" +
-                        "if [ -n \"\$BIOS_BOOT\" ] && [ -n \"\$EFI_BOOT\" ]; then " +
-                        "$qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -allow-limited-size -volid \"$volId\" -udf -b \"\$BIOS_BOOT\" -no-emul-boot -boot-load-size 8 -boot-info-table -eltorito-alt-boot -e \"\$EFI_BOOT\" -no-emul-boot -o $qOutIso \"\$ISODIR\" > $qXorLog 2>&1\n" +
-                        "elif [ -n \"\$EFI_BOOT\" ]; then " +
-                        "$qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -allow-limited-size -volid \"$volId\" -udf -e \"\$EFI_BOOT\" -no-emul-boot -o $qOutIso \"\$ISODIR\" > $qXorLog 2>&1\n" +
-                        "else " +
-                        "$qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -allow-limited-size -volid \"$volId\" -udf -o $qOutIso \"\$ISODIR\" > $qXorLog 2>&1; fi"
-                )
+                val xorScript = """
+                    set -e
+                    $pathHeader
+                    mkdir -p ${shellQuote(safeTargetDir)}
+                    rm -f $qOutIso
+                    : > $qXorLog
+                    cd "${'$'}ISODIR"
+                    EFI_BOOT=""
+                    if [ "${if (preferNoPrompt) "1" else "0"}" = "1" ]; then
+                        EFI_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'efisys_noprompt.bin' 2>/dev/null | head -n 1 | sed 's|^\./||')
+                    fi
+                    if [ -z "${'$'}EFI_BOOT" ]; then
+                        EFI_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'efisys.bin' 2>/dev/null | head -n 1 | sed 's|^\./||')
+                    fi
+                    BIOS_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'etfsboot.com' 2>/dev/null | head -n 1 | sed 's|^\./||')
+                    echo "Bootloaders: BIOS=${'$'}{BIOS_BOOT:-none} | EFI=${'$'}{EFI_BOOT:-none}" >> $qXorLog
+                    if [ -n "${'$'}BIOS_BOOT" ] && [ -n "${'$'}EFI_BOOT" ]; then
+                        $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "$volId"                           -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8                           -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot                           -o $qOutIso "${'$'}ISODIR" >> $qXorLog 2>&1
+                    elif [ -n "${'$'}EFI_BOOT" ]; then
+                        $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "$volId"                           -e "${'$'}EFI_BOOT" -no-emul-boot                           -o $qOutIso "${'$'}ISODIR" >> $qXorLog 2>&1
+                    else
+                        $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "$volId"                           -o $qOutIso "${'$'}ISODIR" >> $qXorLog 2>&1
+                    fi
+                """.trimIndent()
+                val xorRes = runIsolatedRootScript(appCtx, "xorriso", xorScript)
                 isoPollJob.cancel()
                 val xorLastLines = Shell.cmd("tail -n 8 $qXorLog 2>/dev/null | tr '\r' '\n' | tail -n 6 || true").exec().out.map { it.trim() }.filter { it.isNotEmpty() }
                 xorLastLines.forEach { addConsole(it) }
@@ -1678,7 +1771,7 @@ object WindowsBuildEngine {
                 UsbGadgetEngine.cleanupTempWorkDir(workRootPath)
             } else if (convKeepPackagesLive) {
                 saveBuildJobJson(appCtx, workRootPath, config.copy(keepPackagesAfterBuild = true), job.totalDownloadBytes, true)
-                Shell.cmd("rm -rf $qIsoDir $qTmp").exec()
+                Shell.cmd("rm -rf $qIsoDir $qTmp $qIsoReadyMarker").exec()
                 addConsole("Kept base UUP packages for fast rebuilds")
             } else {
                 UsbGadgetEngine.cleanupTempWorkDir(workRootPath)
@@ -1692,14 +1785,20 @@ object WindowsBuildEngine {
         } catch (_: CancellationException) {
             Shell.cmd("rm -rf ${shellQuote(isoDir.absolutePath)} ${shellQuote(tmpDir.absolutePath)} 2>/dev/null || true").exec()
         } catch (e: Exception) {
-            // Preserve PKGS & save pb_job.json so user never loses downloaded files and can retry with one tap!
-            Shell.cmd("rm -rf ${shellQuote(isoDir.absolutePath)} ${shellQuote(tmpDir.absolutePath)} 2>/dev/null || true").exec()
+            // Preserve PKGS & (if Step 4 already staged) preserve ISODIR so Retry jumps straight to Step 4 packing!
+            val keepIsoDir = currentStep == 4 && Shell.cmd("[ -f ${shellQuote("$workRootPath/.pb_isodir_ready")} ] && echo OK || true").exec().out.any { it.trim() == "OK" }
+            if (keepIsoDir) {
+                Shell.cmd("rm -rf ${shellQuote(tmpDir.absolutePath)} 2>/dev/null || true").exec()
+            } else {
+                Shell.cmd("rm -rf ${shellQuote(isoDir.absolutePath)} ${shellQuote(tmpDir.absolutePath)} ${shellQuote("$workRootPath/.pb_isodir_ready")} 2>/dev/null || true").exec()
+            }
             if (!job.isReadOnlySource) {
                 saveBuildJobJson(appCtx, workRootPath, config.copy(keepPackagesAfterBuild = true), job.totalDownloadBytes, true)
             }
             val msg = e.message ?: "Unexpected build error"
             addConsole("ERROR: $msg")
-            if (!job.isReadOnlySource) addConsole("Saved downloaded UUP packages for instant Retry.")
+            if (keepIsoDir) addConsole("Preserved staged ISODIR + packages — Retry will jump straight to Step 4 packing!")
+            else if (!job.isReadOnlySource) addConsole("Saved downloaded UUP packages for instant Retry.")
             lastFailedJob = job
             val elapsedSec = ((System.currentTimeMillis() - startMs) / 1000L).coerceAtLeast(1L)
             val (batPct, _) = readBatteryPercent(appCtx)

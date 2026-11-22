@@ -199,29 +199,34 @@ object WindowsIsoSlimmer {
             }
 
             onProgress(WindowsBuildProgress("Rebuilding bootable ISO...", outName, 0.87f, false))
+            val preferNoPrompt = config.experience.hasAnyActive() || config.winUtil.hasAnyActive()
             val xorCmd = """
                 set -e
                 $envPrefix
                 mkdir -p ${shellQuote(outDir)}
                 rm -f $qOut
                 ISODIR=$qIsoDir
+                cd "${'$'}ISODIR"
                 EFI_BOOT=""
-                [ -f "${'$'}ISODIR/efi/microsoft/boot/efisys.bin" ] && EFI_BOOT="efi/microsoft/boot/efisys.bin"
-                [ -z "${'$'}EFI_BOOT" ] && [ -f "${'$'}ISODIR/EFI/Microsoft/Boot/efisys.bin" ] && EFI_BOOT="EFI/Microsoft/Boot/efisys.bin"
-                BIOS_BOOT=""
-                [ -f "${'$'}ISODIR/boot/etfsboot.com" ] && BIOS_BOOT="boot/etfsboot.com"
+                if [ "${if (preferNoPrompt) "1" else "0"}" = "1" ]; then
+                    EFI_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'efisys_noprompt.bin' 2>/dev/null | head -n 1 | sed 's|^\./||')
+                fi
+                if [ -z "${'$'}EFI_BOOT" ]; then
+                    EFI_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'efisys.bin' 2>/dev/null | head -n 1 | sed 's|^\./||')
+                fi
+                BIOS_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'etfsboot.com' 2>/dev/null | head -n 1 | sed 's|^\./||')
 
                 if [ -n "${'$'}BIOS_BOOT" ] && [ -n "${'$'}EFI_BOOT" ]; then
-                    $qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -allow-limited-size -volid "POCKETBOOT_SLIM" -udf \
-                      -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -boot-info-table \
+                    $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "POCKETBOOT_SLIM" \
+                      -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 \
                       -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot \
                       -o $qOut "${'$'}ISODIR"
                 elif [ -n "${'$'}EFI_BOOT" ]; then
-                    $qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -allow-limited-size -volid "POCKETBOOT_SLIM" -udf \
+                    $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "POCKETBOOT_SLIM" \
                       -e "${'$'}EFI_BOOT" -no-emul-boot \
                       -o $qOut "${'$'}ISODIR"
                 else
-                    $qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -allow-limited-size -volid "POCKETBOOT_SLIM" -udf \
+                    $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "POCKETBOOT_SLIM" \
                       -o $qOut "${'$'}ISODIR"
                 fi
             """.trimIndent()

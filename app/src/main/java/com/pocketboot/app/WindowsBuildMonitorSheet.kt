@@ -177,7 +177,7 @@ fun WindowsBuildMonitorSheet(
                         )
                     } else if (!state.isReadOnlySource) {
                         Text(
-                            "Your downloaded UUP packages were preserved. Tap Retry Build below without re-downloading.",
+                            if (state.currentStep == 4) "Staged ISODIR & packages were preserved. Tap Retry Build to jump straight back to Step 4 packing (~30s)." else "Your downloaded UUP packages were preserved. Tap Retry Build below without re-downloading.",
                             style = MaterialTheme.typography.bodySmall,
                             color = PocketColors.accentSoft
                         )
