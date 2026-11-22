@@ -90,9 +90,27 @@ enum class WinDownloadMethod(val label: String, val subtitle: String) {
     DOWNLOAD_UPDATES_ONLY("Download Additional Updates Only", "Saves only .msu / KB*.cab / .NET update files")
 }
 
-enum class WinIsoCompression(val label: String, val subtitle: String, val ext: String, val wimlibArg: String, val recommended: Boolean = false) {
-    WIM("WIM · Fast", "~2–4 min · low RAM usage", "wim", "--compress=maximum", recommended = true),
-    ESD("ESD · Solid Compact", "~5–9 min · smallest ISO (LZMS solid)", "esd", "--compress=LZMS --solid --threads=2", recommended = false)
+enum class BuildThermalProfile(
+    val label: String,
+    val shortLabel: String,
+    val subtitle: String,
+    val wimThreads: Int,
+    val esdThreads: Int,
+    val sevenZipThreads: Int,
+    val niceLevel: Int,
+    val ionicePrio: Int,
+    val cooldownTriggerC: Float,
+    val cooldownResumeC: Float
+) {
+    COOL("Cool", "Cool", "2 threads · avoids Prime core · auto-cooldown @ 41.5°C", 2, 1, 2, 15, 7, 41.5f, 38.5f),
+    BALANCED("Balanced", "Balanced", "4 threads · low priority · auto-cooldown @ 43.0°C", 4, 2, 4, 10, 5, 43.0f, 39.0f),
+    MAX("Max Speed", "Max", "All cores · normal priority · no auto-cooldown", 0, 4, 0, 0, 0, 0f, 0f)
+}
+
+enum class WinIsoCompression(val label: String, val shortLabel: String, val subtitle: String, val ext: String, val wimlibArg: String, val recommended: Boolean = false) {
+    WIM("Standard (LZX)", "LZX", "Default · retail size · balanced heat", "wim", "--compress=maximum", recommended = true),
+    XPRESS("Fast & Cool (XPRESS)", "XPRESS", "~2× faster · lowest heat · +500 MB", "wim", "--compress=fast", recommended = false),
+    ESD("Compact (Solid ESD)", "ESD", "Smallest ISO · slowest & warmest", "esd", "--compress=LZMS --solid", recommended = false)
 }
 
 enum class WinBuildOutputMode(val label: String, val subtitle: String, val recommended: Boolean = false) {
@@ -162,7 +180,9 @@ data class WindowsChannelBuildConfig(
     val virtualEditions: List<String> = emptyList(),
     val localUupDirPath: String = "",
     val storeAppLevel: WinStoreAppLevel = if (includeStoreApps) WinStoreAppLevel.ALL_INBOX else WinStoreAppLevel.SECURITY_ONLY,
-    val splitWimForFat32: Boolean = false
+    val splitWimForFat32: Boolean = false,
+    val thermalProfile: BuildThermalProfile = BuildThermalProfile.BALANCED,
+    val autoThermalCooldown: Boolean = true
 )
 
 data class PendingWindowsBuild(
@@ -188,7 +208,11 @@ data class WindowsConversionJobState(
     val consoleTail: List<String> = emptyList(), val queuedCount: Int = 0, val queuedTitles: List<String> = emptyList(),
     val autoMount: Boolean = true, val workDirPath: String = "",
     val keepPackagesAfterBuild: Boolean = false, val isReadOnlySource: Boolean = false,
-    val isFailed: Boolean = false, val errorMessage: String = ""
+    val isFailed: Boolean = false, val errorMessage: String = "",
+    val batteryTempC: Float = 0f,
+    val thermalProfile: BuildThermalProfile = BuildThermalProfile.BALANCED,
+    val autoThermalCooldown: Boolean = true,
+    val isCoolingDown: Boolean = false
 )
 
 data class WindowsBuildToolsStatus(val cabextract: String?, val wimlib: String?, val chntpw: String?, val xorriso: String?) {
@@ -254,7 +278,128 @@ object WindowsBuildEngine {
     private val convCancelledFlag = AtomicBoolean(false)
     @Volatile private var convAutoMountLive: Boolean = true
     @Volatile private var convKeepPackagesLive: Boolean = false
+    @Volatile private var convThermalProfileLive: BuildThermalProfile = BuildThermalProfile.BALANCED
+    @Volatile private var convAutoCooldownLive: Boolean = true
+    @Volatile private var convThermalCoolingLive: Boolean = false
+    @Volatile private var defaultThermalProfile: BuildThermalProfile = BuildThermalProfile.BALANCED
+    @Volatile private var defaultAutoCooldown: Boolean = true
     @Volatile private var lastFailedJob: QueuedConversionJob? = null
+    @Volatile private var cachedCpuMasks: Triple<String, String, String>? = null
+    private const val ACTIVE_PID_FILE = "/data/local/tmp/pb_active_pid"
+
+    fun configureThermal(profile: BuildThermalProfile, autoCooldown: Boolean) {
+        defaultThermalProfile = profile
+        defaultAutoCooldown = autoCooldown
+    }
+
+    fun currentDefaultThermalProfile(): BuildThermalProfile = defaultThermalProfile
+
+    private fun detectCpuMasks(): Triple<String, String, String> {
+        cachedCpuMasks?.let { return it }
+        val res = runCatching {
+            val out = Shell.cmd(
+                "for c in /sys/devices/system/cpu/cpu[0-9]*; do " +
+                    "[ -d \"\$c\" ] || continue; " +
+                    "id=\${c##*cpu}; " +
+                    "f=\$(cat \"\$c/cpufreq/cpuinfo_max_freq\" 2>/dev/null || cat \"\$c/cpufreq/scaling_max_freq\" 2>/dev/null || echo 1000000); " +
+                    "echo \"\$id \$f\"; done"
+            ).exec().out
+            val pairs = out.mapNotNull { line ->
+                val p = line.trim().split(Regex("\\s+"))
+                val id = p.getOrNull(0)?.toIntOrNull() ?: return@mapNotNull null
+                val freq = p.getOrNull(1)?.toLongOrNull() ?: 1_000_000L
+                if (id in 0..30) id to freq else null
+            }.sortedBy { it.first }
+            if (pairs.size < 2) return@runCatching Triple("", "", "")
+            var allMask = 0
+            pairs.forEach { (id, _) -> allMask = allMask or (1 shl id) }
+            val maxFreq = pairs.maxOf { it.second }
+            val distinctFreqs = pairs.map { it.second }.distinct().sorted()
+            val nonPrime = pairs.filter { it.second < maxFreq }
+            var balancedMask = 0
+            if (nonPrime.size >= 2) {
+                nonPrime.forEach { (id, _) -> balancedMask = balancedMask or (1 shl id) }
+            } else {
+                val keepCnt = (pairs.size * 3 / 4).coerceAtLeast(2)
+                pairs.take(keepCnt).forEach { (id, _) -> balancedMask = balancedMask or (1 shl id) }
+            }
+            var coolMask = 0
+            if (distinctFreqs.size >= 3) {
+                val minFreq = distinctFreqs.first()
+                val little = pairs.filter { it.second == minFreq }
+                val mid = pairs.filter { it.second > minFreq && it.second < maxFreq }
+                val chosen = (little + mid.take(2)).ifEmpty { nonPrime }
+                chosen.forEach { (id, _) -> coolMask = coolMask or (1 shl id) }
+            } else if (nonPrime.size >= 2) {
+                nonPrime.take(nonPrime.size.coerceAtMost(4)).forEach { (id, _) -> coolMask = coolMask or (1 shl id) }
+            } else {
+                pairs.take((pairs.size / 2).coerceAtLeast(2)).forEach { (id, _) -> coolMask = coolMask or (1 shl id) }
+            }
+            Triple(
+                "0x" + coolMask.toString(16),
+                "0x" + balancedMask.toString(16),
+                "0x" + allMask.toString(16)
+            )
+        }.getOrDefault(Triple("", "", ""))
+        cachedCpuMasks = res
+        return res
+    }
+
+    internal fun cpuMaskForProfile(profile: BuildThermalProfile): String {
+        val (coolMask, balMask, allMask) = detectCpuMasks()
+        return when (profile) {
+            BuildThermalProfile.COOL -> coolMask
+            BuildThermalProfile.BALANCED -> balMask
+            BuildThermalProfile.MAX -> allMask
+        }
+    }
+
+    internal fun thermalExecPrefix(profile: BuildThermalProfile): String {
+        val mask = cpuMaskForProfile(profile)
+        val tsBit = if (profile != BuildThermalProfile.MAX && mask.isNotBlank()) {
+            "(command -v taskset >/dev/null 2>&1 && echo 'taskset $mask' || true)"
+        } else "true"
+        val niceBit = if (profile.niceLevel > 0) {
+            "(command -v nice >/dev/null 2>&1 && echo 'nice -n ${profile.niceLevel}' || true)"
+        } else "true"
+        val ioBit = if (profile.ionicePrio > 0) {
+            "(command -v ionice >/dev/null 2>&1 && echo 'ionice -c 2 -n ${profile.ionicePrio}' || true)"
+        } else "true"
+        return "THERM_PFX=\"\$($ioBit) \$($niceBit) \$($tsBit)\""
+    }
+
+    internal fun wimThreadArgFor(profile: BuildThermalProfile, isSolidEsd: Boolean = false): String {
+        val t = if (isSolidEsd) profile.esdThreads else profile.wimThreads
+        return if (t > 0) "--threads=$t" else ""
+    }
+
+    private fun applyLiveThermalTuningToActivePid(profile: BuildThermalProfile) {
+        val mask = cpuMaskForProfile(profile)
+        val cmd = buildString {
+            append("PID=\$(cat $ACTIVE_PID_FILE 2>/dev/null | tr -dc '0-9'); ")
+            append("if [ -n \"\$PID\" ] && kill -0 \"\$PID\" 2>/dev/null; then ")
+            append("if command -v renice >/dev/null 2>&1; then ")
+            append("renice -n ${profile.niceLevel} -p \"\$PID\" >/dev/null 2>&1 || renice ${profile.niceLevel} \"\$PID\" >/dev/null 2>&1 || true; ")
+            append("for t in /proc/\$PID/task/*; do tid=\${t##*/}; renice -n ${profile.niceLevel} -p \"\$tid\" >/dev/null 2>&1 || true; done; ")
+            append("fi; ")
+            append("if command -v ionice >/dev/null 2>&1; then ionice -c 2 -n ${profile.ionicePrio} -p \"\$PID\" >/dev/null 2>&1 || true; fi; ")
+            if (mask.isNotBlank()) {
+                append("if command -v taskset >/dev/null 2>&1; then ")
+                append("taskset -p $mask \"\$PID\" >/dev/null 2>&1 || true; ")
+                append("for t in /proc/\$PID/task/*; do tid=\${t##*/}; taskset -p $mask \"\$tid\" >/dev/null 2>&1 || true; done; ")
+                append("fi; ")
+            }
+            append("fi")
+        }
+        Shell.cmd(cmd).exec()
+    }
+
+    private fun signalActivePid(signal: String) {
+        Shell.cmd(
+            "PID=\$(cat $ACTIVE_PID_FILE 2>/dev/null | tr -dc '0-9'); " +
+                "if [ -n \"\$PID\" ] && kill -0 \"\$PID\" 2>/dev/null; then kill -$signal \"\$PID\" 2>/dev/null || true; fi"
+        ).exec()
+    }
     private var convContext: Context? = null
     private var convOnLog: ((LogEntry) -> Unit)? = null
 
@@ -315,6 +460,14 @@ object WindowsBuildEngine {
             val pct = if (level >= 0 && scale > 0) (level * 100) / scale else 100
             pct to plugged
         }.getOrDefault(100 to false)
+    }
+
+    fun readBatteryTempC(context: Context): Float {
+        return runCatching {
+            val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val tenths = intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
+            if (tenths > 0) tenths / 10f else 0f
+        }.getOrDefault(0f)
     }
 
     fun defaultOutputFileName(
@@ -1083,6 +1236,8 @@ object WindowsBuildEngine {
                 put("virtualEditions", JSONArray(config.virtualEditions))
                 put("storeAppLevel", config.storeAppLevel.name)
                 put("splitWimForFat32", config.splitWimForFat32)
+                put("thermalProfile", config.thermalProfile.name)
+                put("autoThermalCooldown", config.autoThermalCooldown)
                 put("winUtilJson", config.winUtil.toJsonString()); put("totalBytes", totalBytes); put("isCachedReady", isCachedReady)
             }
             val tmp = File(context.applicationContext.cacheDir, "pb_build_meta.json").apply { writeText(obj.toString(), Charsets.UTF_8) }
@@ -1132,7 +1287,7 @@ object WindowsBuildEngine {
                         customPostInstallScriptPath = o.optString("customPostInstallScriptPath", "")
                     )
                     val veList = mutableListOf<String>(); o.optJSONArray("virtualEditions")?.let { va -> for (k in 0 until va.length()) va.optString(k, "").trim().takeIf { it.isNotEmpty() }?.let { veList.add(it) } }
-                    val cfg = WindowsChannelBuildConfig(bld, lang, eds, comp, mode, method, o.optString("targetDir", baseDir), o.optString("customOutputName", ""), o.optString("targetMultiBootPath", ""), o.optInt("connections", 8), o.optBoolean("autoMount", true), o.optBoolean("includeUpdates", false), o.optBoolean("includeStoreApps", false), o.optBoolean("integrateNetFx3", false), o.optBoolean("runComponentCleanup", false), o.optBoolean("skipWinRe", false), o.optBoolean("eiCfgUnlock", false), o.optBoolean("keepPackagesAfterBuild", false), scheme, exp, WinUtilTweaksConfig.fromJsonString(o.optString("winUtilJson", "")), extraDriversDir = o.optString("extraDriversDir", ""), virtualEditions = veList, storeAppLevel = runCatching { WinStoreAppLevel.valueOf(o.optString("storeAppLevel", if (o.optBoolean("includeStoreApps", false)) "ALL_INBOX" else "SECURITY_ONLY")) }.getOrDefault(WinStoreAppLevel.SECURITY_ONLY), splitWimForFat32 = o.optBoolean("splitWimForFat32", false))
+                    val cfg = WindowsChannelBuildConfig(bld, lang, eds, comp, mode, method, o.optString("targetDir", baseDir), o.optString("customOutputName", ""), o.optString("targetMultiBootPath", ""), o.optInt("connections", 8), o.optBoolean("autoMount", true), o.optBoolean("includeUpdates", false), o.optBoolean("includeStoreApps", false), o.optBoolean("integrateNetFx3", false), o.optBoolean("runComponentCleanup", false), o.optBoolean("skipWinRe", false), o.optBoolean("eiCfgUnlock", false), o.optBoolean("keepPackagesAfterBuild", false), scheme, exp, WinUtilTweaksConfig.fromJsonString(o.optString("winUtilJson", "")), extraDriversDir = o.optString("extraDriversDir", ""), virtualEditions = veList, storeAppLevel = runCatching { WinStoreAppLevel.valueOf(o.optString("storeAppLevel", if (o.optBoolean("includeStoreApps", false)) "ALL_INBOX" else "SECURITY_ONLY")) }.getOrDefault(WinStoreAppLevel.SECURITY_ONLY), splitWimForFat32 = o.optBoolean("splitWimForFat32", false), thermalProfile = runCatching { BuildThermalProfile.valueOf(o.optString("thermalProfile", defaultThermalProfile.name)) }.getOrDefault(defaultThermalProfile), autoThermalCooldown = o.optBoolean("autoThermalCooldown", defaultAutoCooldown))
                     val workPrefix = workRoot.substringAfterLast('/')
                     val pkgBytes = Shell.cmd("du -sb ${shellQuote("$workRoot/PKGS")} 2>/dev/null | awk '{print \$1}'").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
                     val stageBytes = stageCacheDir(context, workPrefix).walkTopDown().filter { it.isFile && it.name.endsWith(".part") }.sumOf { it.length() }
@@ -1159,6 +1314,41 @@ object WindowsBuildEngine {
     fun updateDownloadAutoMount(value: Boolean) { dlAutoMountLive = value; _downloadState.value = _downloadState.value?.copy(autoMount = value) }
     fun updateConversionAutoMount(value: Boolean) { convAutoMountLive = value; _conversionState.value = _conversionState.value?.copy(autoMount = value) }
     fun updateConversionKeepPackages(value: Boolean) { convKeepPackagesLive = value; _conversionState.value = _conversionState.value?.copy(keepPackagesAfterBuild = value) }
+
+    fun updateConversionThermalProfile(profile: BuildThermalProfile) {
+        convThermalProfileLive = profile
+        val cur = _conversionState.value
+        val shouldResumeNow = convThermalCoolingLive && (profile.cooldownTriggerC <= 0f || (cur != null && cur.batteryTempC > 0f && cur.batteryTempC <= profile.cooldownResumeC))
+        if (shouldResumeNow) convThermalCoolingLive = false
+        if (cur != null) {
+            val updatedTail = (cur.consoleTail + "Thermal profile -> ${profile.label} (${profile.subtitle})").takeLast(80)
+            _conversionState.value = cur.copy(
+                thermalProfile = profile,
+                isCoolingDown = if (shouldResumeNow) false else cur.isCoolingDown,
+                consoleTail = updatedTail
+            )
+        }
+        scope.launch {
+            applyLiveThermalTuningToActivePid(profile)
+            if (shouldResumeNow) signalActivePid("CONT")
+        }
+    }
+
+    fun updateConversionAutoCooldown(enabled: Boolean) {
+        convAutoCooldownLive = enabled
+        val shouldResumeNow = !enabled && convThermalCoolingLive
+        if (shouldResumeNow) convThermalCoolingLive = false
+        val cur = _conversionState.value
+        if (cur != null) {
+            _conversionState.value = cur.copy(
+                autoThermalCooldown = enabled,
+                isCoolingDown = if (shouldResumeNow) false else cur.isCoolingDown
+            )
+        }
+        if (shouldResumeNow) {
+            scope.launch { signalActivePid("CONT") }
+        }
+    }
     fun dismissFailedConversion() {
         if (_conversionState.value?.isFailed == true) {
             lastFailedJob = null
@@ -1172,7 +1362,7 @@ object WindowsBuildEngine {
         _conversionState.value = null
         enqueueConversion(
             failed.copy(
-                config = failed.config.copy(autoMount = convAutoMountLive, keepPackagesAfterBuild = convKeepPackagesLive),
+                config = failed.config.copy(autoMount = convAutoMountLive, keepPackagesAfterBuild = convKeepPackagesLive, thermalProfile = convThermalProfileLive, autoThermalCooldown = convAutoCooldownLive),
                 resumeFromStep4 = failedAtStep4
             )
         )
@@ -1276,7 +1466,7 @@ object WindowsBuildEngine {
         _conversionState.value = null
         convContext?.let { IsoBuilderService.stop(it) }
         scope.launch {
-            Shell.cmd("pkill -f 'libwimlib_imagex|libxorriso|libcabextract' 2>/dev/null || true; rm -rf /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive /data/local/tmp/pb_wim_prog.log /data/local/tmp/pb_ca2023 /data/local/tmp/pb_win7_efi 2>/dev/null || true").exec()
+            Shell.cmd("PID=\$(cat $ACTIVE_PID_FILE 2>/dev/null | tr -dc '0-9'); [ -n \"\$PID\" ] && kill -CONT \"\$PID\" 2>/dev/null || true; pkill -CONT -f 'libwimlib_imagex|libxorriso|libcabextract' 2>/dev/null || true; [ -n \"\$PID\" ] && kill -TERM \"\$PID\" 2>/dev/null || true; pkill -f 'libwimlib_imagex|libxorriso|libcabextract' 2>/dev/null || true; rm -rf $ACTIVE_PID_FILE /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive /data/local/tmp/pb_wim_prog.log /data/local/tmp/pb_cab_prog.log /data/local/tmp/pb_ca2023 /data/local/tmp/pb_win7_efi 2>/dev/null || true").exec()
             if (curWork.isNotBlank()) Shell.cmd("rm -rf ${shellQuote("$curWork/ISODIR")} ${shellQuote("$curWork/TMP")} 2>/dev/null || true").exec()
         }
         emitConvLog("win-build", "Cancelled active ISO/USB build and cleared scratch files.", true)
@@ -1579,6 +1769,9 @@ object WindowsBuildEngine {
         convCancelledFlag.set(false)
         convAutoMountLive = next.config.autoMount
         convKeepPackagesLive = next.config.keepPackagesAfterBuild
+        convThermalProfileLive = next.config.thermalProfile
+        convAutoCooldownLive = next.config.autoThermalCooldown
+        convThermalCoolingLive = false
         convContext = next.context
         convOnLog = next.onLog
         IsoBuilderService.start(next.context)
@@ -1626,6 +1819,12 @@ object WindowsBuildEngine {
         val startMs = System.currentTimeMillis(); var currentStep = 1; var stepStartMs = startMs
         val stepDurations = mutableMapOf<Int, Long>(); val consoleLines = mutableListOf<String>()
         var lastMeasuredOutputBytes = 0L; var lastMeasuredMs = startMs; var smoothDiskSpeed = 0L; var activeBin = "init"
+        var cachedFreeBytes = UsbGadgetEngine.getFreeSpaceBytes(config.targetDir)
+        var lastFreeCheckMs = startMs
+        var lastNotifMs = 0L
+        var lastPublishedStage = ""
+        var lastPublishedDetail = ""
+        var lastPublishedPct = 0f
 
         fun addConsole(line: String) { val c = line.replace("\r", "").trim(); if (c.isNotEmpty() && consoleLines.lastOrNull() != c.take(160)) { consoleLines.add(c.take(160)); if (consoleLines.size > 80) consoleLines.removeAt(0) } }
         fun advanceStep(newStep: Int, binName: String) {
@@ -1633,20 +1832,72 @@ object WindowsBuildEngine {
             if (newStep > currentStep) { stepDurations[currentStep] = ((now - stepStartMs) / 1000L).coerceAtLeast(1L); stepStartMs = now; currentStep = newStep }
             activeBin = binName
         }
-        fun publishConv(stage: String, detail: String, pct: Float, outBytes: Long = lastMeasuredOutputBytes) {
+        fun publishConv(stage: String, detail: String, pct: Float, outBytes: Long = lastMeasuredOutputBytes, forceNotif: Boolean = false) {
             val now = System.currentTimeMillis(); val elapsedSec = ((now - startMs) / 1000L).coerceAtLeast(1L); val dt = (now - lastMeasuredMs).coerceAtLeast(1L)
             if (outBytes > lastMeasuredOutputBytes && dt >= 300L) {
                 val inst = ((outBytes - lastMeasuredOutputBytes) * 1000L) / dt
                 smoothDiskSpeed = if (smoothDiskSpeed == 0L) inst else ((smoothDiskSpeed * 6 + inst * 4) / 10)
                 lastMeasuredOutputBytes = outBytes; lastMeasuredMs = now
             }
+            if (now - lastFreeCheckMs >= 3000L) {
+                cachedFreeBytes = UsbGadgetEngine.getFreeSpaceBytes(config.targetDir)
+                lastFreeCheckMs = now
+            }
             val clampedPct = pct.coerceIn(0f, 1f)
             val etaSec = if (clampedPct >= 0.04f && clampedPct < 0.99f) ((elapsedSec.toFloat() / clampedPct) * (1f - clampedPct)).toLong() else -1L
             val (batPct, _) = readBatteryPercent(appCtx)
+            val batTemp = readBatteryTempC(appCtx)
             val queued = conversionQueue.toList()
-            val st = WindowsConversionJobState(job.jobTitle, finalFileName, config.outputMode, currentStep, stage, detail, clampedPct, smoothDiskSpeed, elapsedSec, etaSec, outBytes, UsbGadgetEngine.getFreeSpaceBytes(config.targetDir), activeBin, batPct, stepDurations.toMap(), consoleLines.toList(), queued.size, queued.map { it.jobTitle }, convAutoMountLive, workRootPath, convKeepPackagesLive, job.isReadOnlySource, false, "")
+            lastPublishedStage = stage; lastPublishedDetail = detail; lastPublishedPct = clampedPct
+            val st = WindowsConversionJobState(
+                title = job.jobTitle, outputFileName = finalFileName, outputMode = config.outputMode,
+                currentStep = currentStep, stageLabel = stage, detailText = detail, overallProgress = clampedPct,
+                diskSpeedBytesPerSec = if (convThermalCoolingLive) 0L else smoothDiskSpeed,
+                elapsedSeconds = elapsedSec, etaSeconds = etaSec, currentOutputBytes = outBytes,
+                freeSpaceBytes = cachedFreeBytes, activeBinary = activeBin, batteryPct = batPct,
+                stepDurationsSec = stepDurations.toMap(), consoleTail = consoleLines.toList(),
+                queuedCount = queued.size, queuedTitles = queued.map { it.jobTitle },
+                autoMount = convAutoMountLive, workDirPath = workRootPath,
+                keepPackagesAfterBuild = convKeepPackagesLive, isReadOnlySource = job.isReadOnlySource,
+                isFailed = false, errorMessage = "",
+                batteryTempC = batTemp, thermalProfile = convThermalProfileLive,
+                autoThermalCooldown = convAutoCooldownLive, isCoolingDown = convThermalCoolingLive
+            )
             _conversionState.value = st
-            NotificationHelper.updateIsoBuilderProgress(appCtx, st)
+            if (forceNotif || now - lastNotifMs >= 2500L) {
+                lastNotifMs = now
+                NotificationHelper.updateIsoBuilderProgress(appCtx, st)
+            }
+        }
+
+        val thermalWatchdogJob = scope.launch {
+            while (isActive && !convCancelledFlag.get()) {
+                delay(1500L)
+                val tempC = readBatteryTempC(appCtx)
+                val prof = convThermalProfileLive
+                val triggerC = prof.cooldownTriggerC
+                val resumeC = prof.cooldownResumeC
+                if (convAutoCooldownLive && triggerC > 0f && tempC >= triggerC && !convThermalCoolingLive) {
+                    convThermalCoolingLive = true
+                    signalActivePid("STOP")
+                    addConsole("Thermal cooldown: paused at ${String.format(Locale.US, "%.1f", tempC)}°C (resuming at ${String.format(Locale.US, "%.1f", resumeC)}°C)")
+                    publishConv(lastPublishedStage.ifBlank { "Cooling down..." }, "Paused at ${String.format(Locale.US, "%.1f", tempC)}°C → waiting for ${String.format(Locale.US, "%.1f", resumeC)}°C", lastPublishedPct, forceNotif = true)
+                } else if (convThermalCoolingLive && (!convAutoCooldownLive || triggerC <= 0f || tempC <= resumeC)) {
+                    convThermalCoolingLive = false
+                    signalActivePid("CONT")
+                    addConsole("Thermal cooldown finished (${String.format(Locale.US, "%.1f", tempC)}°C) — build resumed")
+                    publishConv(lastPublishedStage.ifBlank { "Resuming build..." }, lastPublishedDetail, lastPublishedPct, forceNotif = true)
+                } else if (convThermalCoolingLive) {
+                    publishConv(lastPublishedStage.ifBlank { "Cooling down..." }, "Cooling ${String.format(Locale.US, "%.1f", tempC)}°C → ${String.format(Locale.US, "%.1f", resumeC)}°C", lastPublishedPct)
+                } else {
+                    val cur = _conversionState.value
+                    if (cur != null && !cur.isFailed) {
+                        val (bp, _) = readBatteryPercent(appCtx)
+                        val elapsedSec = ((System.currentTimeMillis() - startMs) / 1000L).coerceAtLeast(1L)
+                        _conversionState.value = cur.copy(batteryTempC = tempC, batteryPct = bp, elapsedSeconds = elapsedSec, thermalProfile = prof, autoThermalCooldown = convAutoCooldownLive)
+                    }
+                }
+            }
         }
 
         try {
@@ -1675,14 +1926,78 @@ object WindowsBuildEngine {
             advanceStep(1, "cabextract")
             val allCabPaths = runIsolatedRootScript(appCtx, "listcabs", "$pathHeader\nfor c in \"\$PKG\"/*.cab \"\$PKG\"/*.CAB; do [ -f \"\$c\" ] && echo \"\$c\"; done").out.map { it.trim() }.filter { it.startsWith("/") && it.lowercase().endsWith(".cab") }
             val editionCabs = allCabPaths.filter { !isSkippableNonEditionCab(it.substringAfterLast('/')) }
-            addConsole("Step 1/4: ${editionCabs.size} edition CAB(s) (${allCabPaths.size - editionCabs.size} non-edition skipped)")
-            editionCabs.forEachIndexed { idx, cabPath ->
-                if (convCancelledFlag.get()) return
-                val cabName = cabPath.substringAfterLast('/')
-                publishConv("Step 1/4 · Converting CAB ${idx + 1}/${editionCabs.size}...", cabName, 0.03f + (idx.toFloat() / editionCabs.size.coerceAtLeast(1).toFloat()) * 0.14f)
-                val oneCabRes = runIsolatedRootScript(appCtx, "cab", "set -e\n$pathHeader\nBN=${shellQuote(cabName)}\nif ! $qCab -l ${shellQuote(cabPath)} 2>/dev/null | grep -qi 'update\\.mum'; then exit 0; fi\nEXTDIR=\"/data/local/tmp/pb_uup_ext\"\nrm -rf \"\$EXTDIR\" && mkdir -p \"\$EXTDIR\"\nset +e\n$qCab -q -d \"\$EXTDIR\" ${shellQuote(cabPath)}\nset -e\nif [ -z \"\$(ls -A \"\$EXTDIR\" 2>/dev/null)\" ]; then rm -rf \"\$EXTDIR\"; exit 0; fi\n$qWim capture \"\$EXTDIR\" \"\$TMP/\$BN.esd\" \"Edition Package\" \"Edition Package\" --compress=none --no-acls --norpfix\nrm -rf \"\$EXTDIR\"")
-                if (!oneCabRes.isSuccess) throw IllegalStateException("CAB convert failed ($cabName)")
-                addConsole("Converted $cabName")
+            addConsole("Step 1/4: ${editionCabs.size} edition CAB(s) (${allCabPaths.size - editionCabs.size} non-edition skipped) · Thermal: ${convThermalProfileLive.label}")
+            if (editionCabs.isNotEmpty()) {
+                val cabProgLog = "/data/local/tmp/pb_cab_prog.log"
+                val qCabProg = shellQuote(cabProgLog)
+                val cabListFile = File(appCtx.cacheDir, "pb_cab_list.txt").apply {
+                    writeText(editionCabs.joinToString("\n"), Charsets.UTF_8)
+                }
+                val qCabList = shellQuote(cabListFile.absolutePath)
+                val thermSetup1 = thermalExecPrefix(convThermalProfileLive)
+                val cabPollJob = scope.launch {
+                    var lastCount = 0
+                    while (isActive && !convCancelledFlag.get()) {
+                        delay(900L)
+                        val lines = Shell.cmd("tail -n 6 $qCabProg 2>/dev/null || true").exec().out.map { it.trim() }.filter { it.startsWith("CAB_DONE|") }
+                        val last = lines.lastOrNull() ?: continue
+                        val parts = last.split('|')
+                        val idxDone = parts.getOrNull(1)?.toIntOrNull() ?: lastCount
+                        val nameDone = parts.getOrNull(3).orEmpty()
+                        if (idxDone > lastCount) {
+                            lastCount = idxDone
+                            if (nameDone.isNotBlank()) addConsole("Converted $nameDone")
+                            publishConv(
+                                "Step 1/4 · Converting CAB $idxDone/${editionCabs.size}...",
+                                nameDone,
+                                0.03f + (idxDone.toFloat() / editionCabs.size.coerceAtLeast(1).toFloat()) * 0.14f
+                            )
+                        }
+                    }
+                }
+                val batchCabScript = """
+                    set -e
+                    $pathHeader
+                    $thermSetup1
+                    : > $qCabProg
+                    trap 'rm -f $ACTIVE_PID_FILE' EXIT
+                    EXTDIR="/data/local/tmp/pb_uup_ext"
+                    TOTAL=${editionCabs.size}
+                    IDX=0
+                    while IFS= read -r CABPATH || [ -n "${'$'}CABPATH" ]; do
+                        [ -f "${'$'}CABPATH" ] || continue
+                        IDX=${'$'}((IDX + 1))
+                        BN=${'$'}(basename "${'$'}CABPATH")
+                        if ! $qCab -l "${'$'}CABPATH" 2>/dev/null | grep -qi 'update\.mum'; then
+                            echo "CAB_DONE|${'$'}IDX|${'$'}TOTAL|${'$'}BN (skipped)" >> $qCabProg
+                            continue
+                        fi
+                        rm -rf "${'$'}EXTDIR" && mkdir -p "${'$'}EXTDIR"
+                        set +e
+                        ${'$'}THERM_PFX $qCab -q -d "${'$'}EXTDIR" "${'$'}CABPATH" &
+                        CPID=${'$'}!; echo "${'$'}CPID" > $ACTIVE_PID_FILE; wait "${'$'}CPID"
+                        set -e
+                        if [ -z "${'$'}(ls -A "${'$'}EXTDIR" 2>/dev/null)" ]; then
+                            rm -rf "${'$'}EXTDIR"
+                            echo "CAB_DONE|${'$'}IDX|${'$'}TOTAL|${'$'}BN" >> $qCabProg
+                            continue
+                        fi
+                        ${'$'}THERM_PFX $qWim capture "${'$'}EXTDIR" "${'$'}TMP/${'$'}BN.esd" "Edition Package" "Edition Package" --compress=none --no-acls --norpfix >/dev/null 2>&1 &
+                        WPID=${'$'}!; echo "${'$'}WPID" > $ACTIVE_PID_FILE; wait "${'$'}WPID"
+                        rm -rf "${'$'}EXTDIR"
+                        echo "CAB_DONE|${'$'}IDX|${'$'}TOTAL|${'$'}BN" >> $qCabProg
+                    done < $qCabList
+                    rm -f $ACTIVE_PID_FILE
+                """.trimIndent()
+                val batchCabRes = try {
+                    runIsolatedRootScript(appCtx, "cabs_batch", batchCabScript)
+                } finally {
+                    cabPollJob.cancel()
+                    cabListFile.delete()
+                    Shell.cmd("rm -f $qCabProg $ACTIVE_PID_FILE 2>/dev/null || true").exec()
+                }
+                if (!batchCabRes.isSuccess) throw IllegalStateException("CAB batch convert failed: ${(batchCabRes.out + batchCabRes.err).takeLast(3).joinToString(" ").take(200)}")
+                addConsole("Step 1/4 complete: converted ${editionCabs.size} edition CAB(s)")
             }
 
             advanceStep(2, "wimlib-imagex")
@@ -1740,7 +2055,11 @@ object WindowsBuildEngine {
                         rm -rf "${'$'}TMP/bootfonts"
                     fi
 
-                    $qWim export $firstMeta 2 "${'$'}TMP/winre.wim" --compress=maximum --boot
+                    ${thermalExecPrefix(convThermalProfileLive)}
+                    trap 'rm -f $ACTIVE_PID_FILE' EXIT
+                    ${'$'}THERM_PFX $qWim export $firstMeta 2 "${'$'}TMP/winre.wim" --compress=maximum ${wimThreadArgFor(convThermalProfileLive, false)} --boot &
+                    WPID=${'$'}!; echo "${'$'}WPID" > $ACTIVE_PID_FILE; wait "${'$'}WPID"
+                    rm -f $ACTIVE_PID_FILE
                     cp -f "${'$'}TMP/winre.wim" "${'$'}ISODIR/sources/boot.wim"
                     $qWim info "${'$'}ISODIR/sources/boot.wim" 1 "Microsoft Windows PE ($archTag)" "Microsoft Windows PE ($archTag)"
                     $qWim info "${'$'}ISODIR/sources/boot.wim" 1 --image-property FLAGS=9
@@ -1819,24 +2138,29 @@ object WindowsBuildEngine {
             val finalInstallPath = "${isoDir.absolutePath}/sources/install.${effectiveComp.ext}"
             val qStageWim = shellQuote(stageWimPath); val qFinalInstall = shellQuote(finalInstallPath)
             val wimProgLog = "/data/local/tmp/pb_wim_prog.log"; val qProgLog = shellQuote(wimProgLog)
-            val exportArg = if (useTwoStageSolidEsd) "--compress=LZX:50" else effectiveComp.wimlibArg
+            val baseExportArg = if (useTwoStageSolidEsd) "--compress=fast" else effectiveComp.wimlibArg
 
             metaList.forEachIndexed { idx, metaPath ->
                 if (convCancelledFlag.get()) return
                 val spanTotal = if (useTwoStageSolidEsd) 0.30f else 0.48f
                 val sliceBase = 0.28f + (idx.toFloat() / metaList.size.toFloat()) * spanTotal
                 val sliceSpan = spanTotal / metaList.size.toFloat()
-                publishConv("Step 3/4 · Exporting edition ${idx + 1}/${metaList.size}...", "${effectiveComp.label} · 0%", sliceBase)
+                val curProf = convThermalProfileLive
+                val threadArg = wimThreadArgFor(curProf, isSolidEsd = !useTwoStageSolidEsd && effectiveComp == WinIsoCompression.ESD)
+                val thermSetup = thermalExecPrefix(curProf)
+                addConsole("Step 3/4: Exporting edition ${idx + 1}/${metaList.size} (${effectiveComp.shortLabel} · ${curProf.label}${if (threadArg.isNotBlank()) " $threadArg" else ""})")
+                publishConv("Step 3/4 · Exporting edition ${idx + 1}/${metaList.size}...", "${effectiveComp.label} · 0%", sliceBase, forceNotif = true)
                 val wimPollJob = scope.launch {
                     val pctRegex = Regex("""(\d{1,3})%""")
                     var lastSeenPct = 0
                     while (isActive && !convCancelledFlag.get()) {
-                        delay(800L)
-                        val rawTail = Shell.cmd("tail -c 512 $qProgLog 2>/dev/null | tr '\r' '\n' | tail -n 6 || true").exec().out
-                        val cleanLines = rawTail.map { it.trim() }.filter { it.isNotEmpty() }
+                        delay(1200L)
+                        if (convThermalCoolingLive) continue
+                        val pollOut = Shell.cmd("stat -c 'SZ|%s' $qStageWim 2>/dev/null || echo 'SZ|0'; tail -c 512 $qProgLog 2>/dev/null | tr '\r' '\n' | tail -n 5 || true").exec().out
+                        val curSz = pollOut.firstOrNull { it.startsWith("SZ|") }?.substringAfter('|')?.trim()?.toLongOrNull() ?: lastMeasuredOutputBytes
+                        val cleanLines = pollOut.filterNot { it.startsWith("SZ|") }.map { it.trim() }.filter { it.isNotEmpty() }
                         val foundPct = pctRegex.findAll(cleanLines.joinToString(" ")).lastOrNull()?.groupValues?.get(1)?.toIntOrNull()
                         if (foundPct != null && foundPct in 0..100) lastSeenPct = foundPct
-                        val curSz = Shell.cmd("stat -c '%s' $qStageWim 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: lastMeasuredOutputBytes
                         cleanLines.lastOrNull()?.let { addConsole(it) }
                         publishConv(
                             "Step 3/4 · Exporting edition ${idx + 1}/${metaList.size}...",
@@ -1850,7 +2174,9 @@ object WindowsBuildEngine {
                 val expRes = runIsolatedRootScript(appCtx, "wimexp", """
                     set -e
                     $pathHeader
+                    $thermSetup
                     : > $qProgLog
+                    trap 'rm -f $ACTIVE_PID_FILE' EXIT
                     INFO_TXT=${'$'}($qWim info $qMeta 3 2>/dev/null || true)
                     ED_NAME=${'$'}(printf '%s\n' "${'$'}INFO_TXT" | sed -n 's/^Display Name:[[:space:]]*//p; s/^Name:[[:space:]]*//p' | head -n 1)
                     ED_DESC=${'$'}(printf '%s\n' "${'$'}INFO_TXT" | sed -n 's/^Display Description:[[:space:]]*//p; s/^Description:[[:space:]]*//p' | head -n 1)
@@ -1859,7 +2185,9 @@ object WindowsBuildEngine {
                     [ -z "${'$'}ED_DESC" ] && ED_DESC="${'$'}ED_NAME"
                     set --
                     for ref in "${'$'}PKG"/*.esd "${'$'}PKG"/*.ESD "${'$'}TMP"/*.esd; do [ -f "${'$'}ref" ] && set -- "${'$'}@" --ref="${'$'}ref"; done
-                    $qWim export $qMeta 3 $qStageWim "${'$'}ED_NAME" $exportArg "${'$'}@" > $qProgLog 2>&1
+                    ${'$'}THERM_PFX $qWim export $qMeta 3 $qStageWim "${'$'}ED_NAME" $baseExportArg $threadArg "${'$'}@" > $qProgLog 2>&1 &
+                    WPID=${'$'}!; echo "${'$'}WPID" > $ACTIVE_PID_FILE; wait "${'$'}WPID"
+                    rm -f $ACTIVE_PID_FILE
                     NEW_IDX=${'$'}($qWim info $qStageWim 2>/dev/null | grep -c '^Index:' || echo 1)
                     if [ -n "${'$'}ED_ID" ]; then
                         $qWim info $qStageWim "${'$'}NEW_IDX" \
@@ -1899,27 +2227,33 @@ object WindowsBuildEngine {
             }
 
             if (useTwoStageSolidEsd) {
-                publishConv("Step 3/4 · Compressing to Solid ESD (LZMS)...", "0%", 0.66f)
+                val esdProf = convThermalProfileLive
+                val esdThreadArg = wimThreadArgFor(esdProf, isSolidEsd = true)
+                val esdTherm = thermalExecPrefix(esdProf)
+                addConsole("Step 3/4: Solid ESD compression (${esdProf.label}${if (esdThreadArg.isNotBlank()) " $esdThreadArg" else ""})")
+                publishConv("Step 3/4 · Compressing to Solid ESD (LZMS)...", "0%", 0.66f, forceNotif = true)
                 val esdPoll = scope.launch {
                     val pctRegex = Regex("""(\d{1,3})%""")
                     var lastSeenPct = 0
                     while (isActive && !convCancelledFlag.get()) {
-                        delay(850L)
-                        val rawTail = Shell.cmd("tail -c 512 $qProgLog 2>/dev/null | tr '\r' '\n' | tail -n 6 || true").exec().out
-                        val cleanLines = rawTail.map { it.trim() }.filter { it.isNotEmpty() }
+                        delay(1200L)
+                        if (convThermalCoolingLive) continue
+                        val pollOut = Shell.cmd("stat -c 'SZ|%s' $qFinalInstall 2>/dev/null || echo 'SZ|0'; tail -c 512 $qProgLog 2>/dev/null | tr '\r' '\n' | tail -n 5 || true").exec().out
+                        val curSz = pollOut.firstOrNull { it.startsWith("SZ|") }?.substringAfter('|')?.trim()?.toLongOrNull() ?: lastMeasuredOutputBytes
+                        val cleanLines = pollOut.filterNot { it.startsWith("SZ|") }.map { it.trim() }.filter { it.isNotEmpty() }
                         val foundPct = pctRegex.findAll(cleanLines.joinToString(" ")).lastOrNull()?.groupValues?.get(1)?.toIntOrNull()
                         if (foundPct != null && foundPct in 0..100) lastSeenPct = foundPct
-                        val curSz = Shell.cmd("stat -c '%s' $qFinalInstall 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: lastMeasuredOutputBytes
                         cleanLines.lastOrNull()?.let { addConsole(it) }
                         publishConv("Step 3/4 · Compressing to Solid ESD (LZMS)...", "$lastSeenPct%", 0.66f + (lastSeenPct / 100f) * 0.14f, curSz)
                     }
                 }
-                val esdRes = runIsolatedRootScript(appCtx, "esdconv", "set -e\n$pathHeader\n: > $qProgLog\n$qWim export $qStageWim all $qFinalInstall --compress=LZMS --solid --threads=2 > $qProgLog 2>&1\nrm -f $qStageWim $qProgLog")
+                val esdRes = runIsolatedRootScript(appCtx, "esdconv", "set -e\n$pathHeader\n$esdTherm\n: > $qProgLog\ntrap 'rm -f $ACTIVE_PID_FILE' EXIT\n\$THERM_PFX $qWim export $qStageWim all $qFinalInstall --compress=LZMS --solid $esdThreadArg > $qProgLog 2>&1 &\nEPID=\$!; echo \"\$EPID\" > $ACTIVE_PID_FILE; wait \"\$EPID\"\nrm -f $qStageWim $qProgLog $ACTIVE_PID_FILE")
                 esdPoll.cancel()
                 if (!esdRes.isSuccess) throw IllegalStateException("Solid ESD compression failed (code ${esdRes.code})")
                 addConsole("Converted install.wim + Winre.wim -> Solid install.esd")
-            } else {
-                runIsolatedRootScript(appCtx, "wimopt", "$pathHeader\n$qWim optimize $qFinalInstall >/dev/null 2>&1 || true")
+            } else if (requestedVirtualEds.isNotEmpty()) {
+                addConsole("Optimizing install.wim after Virtual Editions...")
+                runIsolatedRootScript(appCtx, "wimopt", "$pathHeader\n${thermalExecPrefix(convThermalProfileLive)}\n\$THERM_PFX $qWim optimize $qFinalInstall >/dev/null 2>&1 || true")
             }
 
             advanceStep(4, "oem-inject")
@@ -1945,7 +2279,7 @@ object WindowsBuildEngine {
                     for f in "${'$'}PKG"/*.msu "${'$'}PKG"/*.MSU; do
                         [ -f "${'$'}f" ] || continue
                         bn=${'$'}(basename "${'$'}f")
-                        cp -f "${'$'}f" ${shellQuote(oemUpdates)}/"3_${'$'}bn"
+                        (ln -f "${'$'}f" ${shellQuote(oemUpdates)}/"3_${'$'}bn" 2>/dev/null || cp -f "${'$'}f" ${shellQuote(oemUpdates)}/"3_${'$'}bn")
                         echo "UPD_LOG|LCU MSU -> 3_${'$'}bn"
                     done
 
@@ -1997,10 +2331,10 @@ object WindowsBuildEngine {
                         fi
 
                         if printf '%s' "${'$'}low" | grep -qiE '^ssu-|-ssu-' || $qCab -l "${'$'}f" 2>/dev/null | grep -qi 'microsoft-windows-servicingstack_'; then
-                            cp -f "${'$'}f" ${shellQuote(oemUpdates)}/"1_${'$'}bn"
+                            (ln -f "${'$'}f" ${shellQuote(oemUpdates)}/"1_${'$'}bn" 2>/dev/null || cp -f "${'$'}f" ${shellQuote(oemUpdates)}/"1_${'$'}bn")
                             echo "UPD_LOG|SSU -> 1_${'$'}bn"
                         else
-                            cp -f "${'$'}f" ${shellQuote(oemUpdates)}/"2_${'$'}bn"
+                            (ln -f "${'$'}f" ${shellQuote(oemUpdates)}/"2_${'$'}bn" 2>/dev/null || cp -f "${'$'}f" ${shellQuote(oemUpdates)}/"2_${'$'}bn")
                             echo "UPD_LOG|Update CAB -> 2_${'$'}bn"
                         fi
                         rm -rf "${'$'}MUM_TMP"
@@ -2014,11 +2348,11 @@ object WindowsBuildEngine {
             }
             if (job.hasApps) {
                 addConsole("Staging Inbox Store Apps into sources/\$OEM\$/\$\$/Setup/Apps/")
-                runIsolatedRootScript(appCtx, "oemapp", "$pathHeader\nmkdir -p ${shellQuote(oemApps)}\nfor f in \"\$PKG\"/*.msixbundle \"\$PKG\"/*.appxbundle \"\$PKG\"/*.msix \"\$PKG\"/*.appx \"\$PKG\"/*License*.xml \"\$PKG\"/*license*.xml; do [ -f \"\$f\" ] && cp -f \"\$f\" ${shellQuote(oemApps)}/ 2>/dev/null || true; done")
+                runIsolatedRootScript(appCtx, "oemapp", "$pathHeader\nmkdir -p ${shellQuote(oemApps)}\nfor f in \"\$PKG\"/*.msixbundle \"\$PKG\"/*.appxbundle \"\$PKG\"/*.msix \"\$PKG\"/*.appx \"\$PKG\"/*License*.xml \"\$PKG\"/*license*.xml; do [ -f \"\$f\" ] && bn=\$(basename \"\$f\") && (ln -f \"\$f\" ${shellQuote(oemApps)}/\"\$bn\" 2>/dev/null || cp -f \"\$f\" ${shellQuote(oemApps)}/\"\$bn\") 2>/dev/null || true; done")
             }
             if (job.hasNetFx3) {
                 addConsole("Staging .NET Framework 3.5 into sources/\$OEM\$/\$\$/Setup/sxs/")
-                runIsolatedRootScript(appCtx, "oemfx3", "$pathHeader\nmkdir -p ${shellQuote(oemSxs)}\nfor f in \"\$PKG\"/*netfx3-ondemand*.cab \"\$PKG\"/*NetFx3*.cab; do [ -f \"\$f\" ] && cp -f \"\$f\" ${shellQuote(oemSxs)}/ 2>/dev/null || true; done")
+                runIsolatedRootScript(appCtx, "oemfx3", "$pathHeader\nmkdir -p ${shellQuote(oemSxs)}\nfor f in \"\$PKG\"/*netfx3-ondemand*.cab \"\$PKG\"/*NetFx3*.cab; do [ -f \"\$f\" ] && bn=\$(basename \"\$f\") && (ln -f \"\$f\" ${shellQuote(oemSxs)}/\"\$bn\" 2>/dev/null || cp -f \"\$f\" ${shellQuote(oemSxs)}/\"\$bn\") 2>/dev/null || true; done")
             }
             runIsolatedRootScript(appCtx, "w7efi", WindowsCustomizationEngine.applyWin7UefiFixSnippet(qWim, qFinalInstall, qIsoDir))
             if (config.experience.useCa2023Bootloaders) {
@@ -2045,7 +2379,7 @@ object WindowsBuildEngine {
                 addConsole("Injected autounattend.xml + unplug-safe \$OEM\$ scripts")
             }
 
-            if (config.splitWimForFat32 && effectiveComp == WinIsoCompression.WIM && config.outputMode != WinBuildOutputMode.DIRECT_NTFS_USB) {
+            if (config.splitWimForFat32 && effectiveComp != WinIsoCompression.ESD && config.outputMode != WinBuildOutputMode.DIRECT_NTFS_USB) {
                 val wimSz = Shell.cmd("stat -c '%s' $qFinalInstall 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
                 if (wimSz > 4_000_000_000L) {
                     activeBin = "wimlib-imagex"
@@ -2082,12 +2416,14 @@ object WindowsBuildEngine {
                 val preferNoPrompt = config.experience.hasAnyActive() || config.winUtil.hasAnyActive()
                 addConsole("xorriso: packing ~${UsbGadgetEngine.formatBytes(estIsoBytes)} (-iso-level 3 -J -joliet-long --stdio_sync 16m)")
                 publishConv("Step 4/4 · Packing bootable ISO...", finalFileName, 0.86f)
+                val xorTherm = thermalExecPrefix(convThermalProfileLive)
                 val isoPollJob = scope.launch {
                     while (isActive && !convCancelledFlag.get()) {
-                        delay(700L)
-                        val curSz = Shell.cmd("stat -c '%s' $qOutIso 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: lastMeasuredOutputBytes
-                        val xorTail = Shell.cmd("tail -c 512 $qXorLog 2>/dev/null | tr '\r' '\n' | tail -n 5 || true").exec().out
-                        xorTail.map { it.trim() }.filter { it.isNotEmpty() }.lastOrNull()?.let { addConsole(it) }
+                        delay(1200L)
+                        if (convThermalCoolingLive) continue
+                        val pollOut = Shell.cmd("stat -c 'SZ|%s' $qOutIso 2>/dev/null || echo 'SZ|0'; tail -c 512 $qXorLog 2>/dev/null | tr '\r' '\n' | tail -n 5 || true").exec().out
+                        val curSz = pollOut.firstOrNull { it.startsWith("SZ|") }?.substringAfter('|')?.trim()?.toLongOrNull() ?: lastMeasuredOutputBytes
+                        pollOut.filterNot { it.startsWith("SZ|") }.map { it.trim() }.filter { it.isNotEmpty() }.lastOrNull()?.let { addConsole(it) }
                         publishConv(
                             "Step 4/4 · Packing bootable ISO...",
                             "${UsbGadgetEngine.formatBytes(curSz)} / ~${UsbGadgetEngine.formatBytes(estIsoBytes)}",
@@ -2099,9 +2435,11 @@ object WindowsBuildEngine {
                 val xorScript = """
                     set -e
                     $pathHeader
+                    $xorTherm
                     mkdir -p ${shellQuote(safeTargetDir)}
                     rm -f $qOutIso
                     : > $qXorLog
+                    trap 'rm -f $ACTIVE_PID_FILE' EXIT
                     cd "${'$'}ISODIR"
                     EFI_BOOT=""
                     if [ "${if (preferNoPrompt) "1" else "0"}" = "1" ]; then
@@ -2113,12 +2451,14 @@ object WindowsBuildEngine {
                     BIOS_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'etfsboot.com' 2>/dev/null | head -n 1 | sed 's|^\./||')
                     echo "Bootloaders: BIOS=${'$'}{BIOS_BOOT:-none} | EFI=${'$'}{EFI_BOOT:-none}" >> $qXorLog
                     if [ -n "${'$'}BIOS_BOOT" ] && [ -n "${'$'}EFI_BOOT" ]; then
-                        $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "$volId"                           -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8                           -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot                           -o $qOutIso "${'$'}ISODIR" >> $qXorLog 2>&1
+                        ${'$'}THERM_PFX $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "$volId" -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOutIso "${'$'}ISODIR" >> $qXorLog 2>&1 &
                     elif [ -n "${'$'}EFI_BOOT" ]; then
-                        $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "$volId"                           -e "${'$'}EFI_BOOT" -no-emul-boot                           -o $qOutIso "${'$'}ISODIR" >> $qXorLog 2>&1
+                        ${'$'}THERM_PFX $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "$volId" -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOutIso "${'$'}ISODIR" >> $qXorLog 2>&1 &
                     else
-                        $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "$volId"                           -o $qOutIso "${'$'}ISODIR" >> $qXorLog 2>&1
+                        ${'$'}THERM_PFX $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "$volId" -o $qOutIso "${'$'}ISODIR" >> $qXorLog 2>&1 &
                     fi
+                    XPID=${'$'}!; echo "${'$'}XPID" > $ACTIVE_PID_FILE; wait "${'$'}XPID"
+                    rm -f $ACTIVE_PID_FILE
                 """.trimIndent()
                 val xorRes = runIsolatedRootScript(appCtx, "xorriso", xorScript)
                 isoPollJob.cancel()
@@ -2220,11 +2560,22 @@ object WindowsBuildEngine {
                 keepPackagesAfterBuild = true,
                 isReadOnlySource = job.isReadOnlySource,
                 isFailed = true,
-                errorMessage = msg
+                errorMessage = msg,
+                batteryTempC = readBatteryTempC(appCtx),
+                thermalProfile = convThermalProfileLive,
+                autoThermalCooldown = convAutoCooldownLive,
+                isCoolingDown = false
             )
             NotificationHelper.showBuildFailed(appCtx, job.jobTitle, msg)
             emitConvLog("win-build", "Windows build failed: $msg", true)
             job.onError("Windows build failed: $msg")
+        } finally {
+            thermalWatchdogJob.cancel()
+            if (convThermalCoolingLive) {
+                convThermalCoolingLive = false
+                signalActivePid("CONT")
+            }
+            Shell.cmd("rm -f $ACTIVE_PID_FILE 2>/dev/null || true").exec()
         }
     }
 

@@ -107,7 +107,9 @@ object WindowsIsoSlimmer {
         return@withContext runCatching {
             onProgress(WindowsBuildProgress("Extracting source Windows ISO...", config.sourceIso.name, 0.14f, true))
             Shell.cmd("mkdir -p $qIsoDir $qTmp").exec()
-            val extRes = Shell.cmd("$envPrefix && $q7z x -y -o$qIsoDir $qIso 2>&1").exec()
+            val slimProf = WindowsBuildEngine.currentDefaultThermalProfile()
+            val mmtArg = if (slimProf.sevenZipThreads > 0) "-mmt=${slimProf.sevenZipThreads}" else ""
+            val extRes = WindowsBuildEngine.runIsolatedRootScript(context, "slim_ext", "set -e\n$envPrefix\n${WindowsBuildEngine.thermalExecPrefix(slimProf)}\n\$THERM_PFX $q7z x -y $mmtArg -o$qIsoDir $qIso")
             if (!isActive) {
                 UsbGadgetEngine.cleanupTempWorkDir(workRoot)
                 return@withContext ActionResult(false, "ISO slimming cancelled.")
@@ -124,7 +126,8 @@ object WindowsIsoSlimmer {
             }
 
             val dstExt = if (config.convertToEsd) "esd" else "wim"
-            val compArg = if (config.convertToEsd) "--compress=LZMS --solid --threads=2" else "--compress=maximum"
+            val wimThrArg = WindowsBuildEngine.wimThreadArgFor(slimProf, isSolidEsd = config.convertToEsd)
+            val compArg = if (config.convertToEsd) "--compress=LZMS --solid $wimThrArg" else "--compress=maximum $wimThrArg"
             val newInstall = "$tmpDir/install.$dstExt"
             val qSrcWim = shellQuote(srcWim)
             val qNewInstall = shellQuote(newInstall)
@@ -143,7 +146,7 @@ object WindowsIsoSlimmer {
                         isIndeterminate = false
                     )
                 )
-                val expRes = Shell.cmd("$envPrefix && $qWim export $qSrcWim $edIdx $qNewInstall $compArg 2>&1").exec()
+                val expRes = WindowsBuildEngine.runIsolatedRootScript(context, "slim_exp", "set -e\n$envPrefix\n${WindowsBuildEngine.thermalExecPrefix(slimProf)}\n\$THERM_PFX $qWim export $qSrcWim $edIdx $qNewInstall $compArg")
                 if (!expRes.isSuccess) {
                     throw IllegalStateException("Edition export failed: ${(expRes.out + expRes.err).takeLast(3).joinToString(" ").take(180)}")
                 }

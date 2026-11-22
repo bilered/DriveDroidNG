@@ -99,10 +99,12 @@ object NotificationHelper {
             .setSmallIcon(R.drawable.ic_usb).setOngoing(true).setSilent(true).setOnlyAlertOnce(true).setContentIntent(openAppPending(context, 20))
         if (state == null) return builder.setContentTitle("PocketBoot ISO Builder").setContentText("Preparing build pipeline...").setProgress(0, 0, true).build()
         val pct = (state.overallProgress * 100f).toInt().coerceIn(0, 100)
-        val speedPart = if (state.diskSpeedBytesPerSec >= 1024L * 1024L) " · ${FastIsoDownloader.formatSpeed(state.diskSpeedBytesPerSec)}" else ""
+        val tempPart = if (state.batteryTempC > 0f) " · ${String.format(java.util.Locale.US, "%.1f°C", state.batteryTempC)}" else ""
+        val speedPart = if (state.isCoolingDown) " · Cooling down" else if (state.diskSpeedBytesPerSec >= 1024L * 1024L) " · ${FastIsoDownloader.formatSpeed(state.diskSpeedBytesPerSec)}" else ""
         val queuePart = if (state.queuedCount > 0) " · +${state.queuedCount} queued" else ""
         val cancelPending = PendingIntent.getBroadcast(context, 21, Intent(context, IsoBuilderActionReceiver::class.java).setAction(ACTION_BUILD_CANCEL), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        return builder.setContentTitle("Building ${state.title} ($pct%)").setContentText("${state.stageLabel}$speedPart$queuePart").setProgress(100, pct, false).addAction(R.drawable.ic_usb, "Cancel Build", cancelPending).build()
+        val titlePrefix = if (state.isCoolingDown) "Cooling" else "Building"
+        return builder.setContentTitle("$titlePrefix ${state.title} ($pct%)$tempPart").setContentText("${state.stageLabel}$speedPart$queuePart").setProgress(100, pct, false).addAction(R.drawable.ic_usb, "Cancel Build", cancelPending).build()
     }
 
     fun updateIsoBuilderProgress(context: Context, state: WindowsConversionJobState) {

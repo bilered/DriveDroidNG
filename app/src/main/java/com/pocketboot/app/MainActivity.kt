@@ -236,9 +236,13 @@ fun PocketBootApp(initialShortcutPath: String = "") {
     var tempCacheBytes by remember { mutableStateOf(0L) }
 
     val isLightSurface = settings.surfaceMode == SurfaceMode.LIGHT
-    val keepScreenAwake = windowsBuildJob != null || linuxBuildJob != null ||
+    val winDlActive = winChannelDlState != null
+    val winConvActive = winChannelConvState != null
+    val winConvFailed = winChannelConvState?.isFailed == true
+    val anyBuildOrDlActive = windowsBuildJob != null || linuxBuildJob != null ||
         ventoyBuildJob != null || slimmerJob != null ||
-        (winChannelDlState != null && winChannelDlState?.isPaused != true) || (winChannelConvState != null && winChannelConvState?.isFailed != true)
+        (winDlActive && winChannelDlState?.isPaused != true) || (winConvActive && !winConvFailed)
+    val keepScreenAwake = settings.keepScreenAwakeDuringBuilds && anyBuildOrDlActive
 
     SideEffect {
         val window = (view.context as? Activity)?.window ?: return@SideEffect
@@ -256,7 +260,11 @@ fun PocketBootApp(initialShortcutPath: String = "") {
         WindowsBuildEngine.configureNetwork(settings.customUupApiUrl, settings.preferDirectMicrosoftUup)
     }
 
-    LaunchedEffect(images.size, settings.defaultDir, winChannelDlState, winChannelConvState, windowsBuildJob, ventoyBuildJob) {
+    LaunchedEffect(settings.buildThermalProfile, settings.autoThermalCooldown) {
+        WindowsBuildEngine.configureThermal(settings.buildThermalProfile, settings.autoThermalCooldown)
+    }
+
+    LaunchedEffect(images.size, settings.defaultDir, winDlActive, winConvActive, winConvFailed, windowsBuildJob != null, ventoyBuildJob != null) {
         withContext(Dispatchers.IO) {
             drivesFreeBytes = UsbGadgetEngine.getFreeSpaceBytes(settings.defaultDir)
             tempCacheBytes = UsbGadgetEngine.getTempStorageStats(context, settings.scanDirs + settings.defaultDir).totalBytes

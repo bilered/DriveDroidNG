@@ -122,6 +122,8 @@ fun WindowsDownloadSheet(
     customUupApiUrl: String = AppSettings.DEFAULT_UUP_API_URL,
     preferDirectMicrosoftUup: Boolean = false,
     cachedUupBuildsJson: String = "",
+    defaultThermalProfile: BuildThermalProfile = BuildThermalProfile.BALANCED,
+    defaultAutoThermalCooldown: Boolean = true,
     onUpdateCachedUupBuilds: (String) -> Unit = {},
     onSavePreset: (AutounattendPreset) -> Unit = {},
     onDeletePreset: (String) -> Unit = {},
@@ -200,6 +202,7 @@ fun WindowsDownloadSheet(
     var includeUpdates by remember { mutableStateOf(false) }
     var storeAppLevel by remember { mutableStateOf(WinStoreAppLevel.SECURITY_ONLY) }
     var splitWimForFat32 by remember { mutableStateOf(false) }
+    var selectedThermalProfile by remember(defaultThermalProfile) { mutableStateOf(defaultThermalProfile) }
     var integrateNetFx3 by remember { mutableStateOf(false) }
     var runComponentCleanup by remember { mutableStateOf(false) }
     var skipWinRe by remember { mutableStateOf(false) }
@@ -1544,8 +1547,57 @@ fun WindowsDownloadSheet(
                                         }
                                         if (downloadMethod == WinDownloadMethod.DOWNLOAD_AND_BUILD) {
                                             DirectUsbOptionRow("Run component cleanup (/ResetBase)", runComponentCleanup) { runComponentCleanup = it }; PocketHairlineDivider()
-                                            DirectUsbOptionRow("Use solid (ESD) compression${if (!detOs.supportsEsd) " (N/A Win 7/8)" else ""}", buildCompression == WinIsoCompression.ESD && detOs.supportsEsd) { if (detOs.supportsEsd) { buildCompression = if (it) WinIsoCompression.ESD else WinIsoCompression.WIM; if (it) splitWimForFat32 = false } }; PocketHairlineDivider()
-                                            if (buildCompression == WinIsoCompression.WIM && buildOutputMode != WinBuildOutputMode.DIRECT_NTFS_USB) {
+                                            Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                                    Text("WIM / ESD Compression", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                                                    Text(buildCompression.label, style = PocketColors.monoStyle, fontSize = 10.5.sp, color = PocketColors.accentSoft)
+                                                }
+                                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                                    WinIsoCompression.entries.forEach { comp ->
+                                                        val disabled = comp == WinIsoCompression.ESD && !detOs.supportsEsd
+                                                        val sel = buildCompression == comp && !disabled
+                                                        Surface(
+                                                            modifier = Modifier.weight(1f).height(34.dp).bounceClick(enabled = !disabled) {
+                                                                buildCompression = comp
+                                                                if (comp == WinIsoCompression.ESD) splitWimForFat32 = false
+                                                            },
+                                                            shape = RoundedCornerShape(8.dp),
+                                                            color = if (sel) PocketColors.accentBg else PocketColors.surfaceCard,
+                                                            border = BorderStroke(if (sel) 1.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                                                        ) {
+                                                            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                                                Text(comp.shortLabel, style = MaterialTheme.typography.labelSmall, fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Medium, color = if (disabled) PocketColors.textMuted else if (sel) PocketColors.accentSoft else PocketColors.textSecondary, maxLines = 1)
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Text(buildCompression.subtitle, fontSize = 10.5.sp, color = PocketColors.textSecondary)
+                                            }
+                                            PocketHairlineDivider()
+                                            Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                                    Text("Thermal Profile (Changeable Live)", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                                                    Text(selectedThermalProfile.label, style = PocketColors.monoStyle, fontSize = 10.5.sp, color = PocketColors.infoBlue)
+                                                }
+                                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                                    BuildThermalProfile.entries.forEach { prof ->
+                                                        val sel = selectedThermalProfile == prof
+                                                        Surface(
+                                                            modifier = Modifier.weight(1f).height(34.dp).bounceClick { selectedThermalProfile = prof },
+                                                            shape = RoundedCornerShape(8.dp),
+                                                            color = if (sel) PocketColors.infoBlueBg else PocketColors.surfaceCard,
+                                                            border = BorderStroke(if (sel) 1.dp else 0.5.dp, if (sel) PocketColors.infoBlue else PocketColors.border)
+                                                        ) {
+                                                            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                                                Text(prof.shortLabel, style = MaterialTheme.typography.labelSmall, fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Medium, color = if (sel) PocketColors.infoBlue else PocketColors.textSecondary, maxLines = 1)
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Text(selectedThermalProfile.subtitle, fontSize = 10.5.sp, color = PocketColors.textSecondary)
+                                            }
+                                            PocketHairlineDivider()
+                                            if (buildCompression != WinIsoCompression.ESD && buildOutputMode != WinBuildOutputMode.DIRECT_NTFS_USB) {
                                                 DirectUsbOptionRow("Split WIM for FAT32 (install*.swm ≤ 3.5 GB)", splitWimForFat32) { splitWimForFat32 = it }; PocketHairlineDivider()
                                             }
                                             DirectUsbOptionRow("Skip WinRE Recovery (~480 MB smaller)", skipWinRe) { skipWinRe = it }; PocketHairlineDivider()
@@ -1662,7 +1714,7 @@ fun WindowsDownloadSheet(
                                         build = b, lang = lang, editions = chosenEds, compression = buildCompression, outputMode = buildOutputMode, downloadMethod = downloadMethod,
                                         targetDir = targetDir, customOutputName = customOutputName.trim(), targetMultiBootPath = mbPath, connections = turboConnections, autoMount = true,
                                         includeUpdates = includeUpdates, includeStoreApps = storeAppLevel != WinStoreAppLevel.SECURITY_ONLY, integrateNetFx3 = integrateNetFx3, runComponentCleanup = runComponentCleanup,
-                                        skipWinRe = skipWinRe, eiCfgUnlock = eiCfgUnlock, keepPackagesAfterBuild = keepPackagesAfterBuild, scheme = usbScheme, experience = experience, winUtil = winUtil, extraDriversDir = usbExtraDriversDir.trim(), virtualEditions = selectedVirtualEditions.filter { id -> availableVirtualEds.any { it.editionId == id } }, storeAppLevel = storeAppLevel, splitWimForFat32 = splitWimForFat32
+                                        skipWinRe = skipWinRe, eiCfgUnlock = eiCfgUnlock, keepPackagesAfterBuild = keepPackagesAfterBuild, scheme = usbScheme, experience = experience, winUtil = winUtil, extraDriversDir = usbExtraDriversDir.trim(), virtualEditions = selectedVirtualEditions.filter { id -> availableVirtualEds.any { it.editionId == id } }, storeAppLevel = storeAppLevel, splitWimForFat32 = splitWimForFat32, thermalProfile = selectedThermalProfile, autoThermalCooldown = defaultAutoThermalCooldown
                                     )
                                 )
                             },

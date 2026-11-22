@@ -637,7 +637,12 @@ fun DownloadScreen(
 
     var pendingResumables by remember { mutableStateOf<List<PendingResumableDownload>>(emptyList()) }
     var pendingWinBuilds by remember { mutableStateOf<List<PendingWindowsBuild>>(emptyList()) }
-    LaunchedEffect(turboState, winDlState, winConvState, settings.defaultDir) {
+    val turboActive = turboState != null
+    val winDlActive = winDlState != null
+    val winDlPaused = winDlState?.isPaused == true
+    val winConvActive = winConvState != null
+    val winConvFailed = winConvState?.isFailed == true
+    LaunchedEffect(turboActive, winDlActive, winDlPaused, winConvActive, winConvFailed, settings.defaultDir) {
         pendingResumables = FastIsoDownloader.scanPendingResumableDownloads(context)
         pendingWinBuilds = WindowsBuildEngine.scanPendingBuilds(context, settings.scanDirs + settings.defaultDir)
     }
@@ -1368,8 +1373,8 @@ fun DownloadScreen(
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    Surface(shape = RoundedCornerShape(5.dp), color = if (conv.isFailed) PocketColors.dangerBg else PocketColors.accentBg) {
-                                        Text(if (conv.isFailed) "FAILED" else "BUILD", modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, color = if (conv.isFailed) PocketColors.danger else PocketColors.accentSoft)
+                                    Surface(shape = RoundedCornerShape(5.dp), color = when { conv.isFailed -> PocketColors.dangerBg; conv.isCoolingDown -> PocketColors.warningBg; else -> PocketColors.accentBg }) {
+                                        Text(when { conv.isFailed -> "FAILED"; conv.isCoolingDown -> "COOLING"; else -> "BUILD" }, modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, color = when { conv.isFailed -> PocketColors.danger; conv.isCoolingDown -> PocketColors.warning; else -> PocketColors.accentSoft })
                                     }
                                     Text(conv.title, style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
                                     if (conv.queuedCount > 0) Surface(shape = RoundedCornerShape(5.dp), color = PocketColors.infoBlueBg) { Text("+${conv.queuedCount} queued", modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, color = PocketColors.infoBlue) }
@@ -1381,7 +1386,7 @@ fun DownloadScreen(
                         LinearProgressIndicator(progress = { conv.overallProgress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(999.dp)), color = PocketColors.accent, trackColor = PocketColors.surfaceSubtle)
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                             Text("$pctStr · ${formatDurationShort(conv.elapsedSeconds)}${if (conv.etaSeconds > 0L) " · ETA ${FastIsoDownloader.formatEta(conv.etaSeconds)}" else ""}", style = PocketColors.monoStyle, color = PocketColors.accentSoft)
-                            Text(if (conv.diskSpeedBytesPerSec >= 1024L) FastIsoDownloader.formatSpeed(conv.diskSpeedBytesPerSec) else conv.activeBinary, style = PocketColors.monoStyle, color = PocketColors.success)
+                            Text(buildString { append(if (conv.isCoolingDown) "Cooling" else if (conv.diskSpeedBytesPerSec >= 1024L) FastIsoDownloader.formatSpeed(conv.diskSpeedBytesPerSec) else conv.activeBinary); if (conv.batteryTempC > 0f) append(" · ${String.format(java.util.Locale.US, "%.1f°C", conv.batteryTempC)}") }, style = PocketColors.monoStyle, color = if (conv.batteryTempC >= 42f) PocketColors.danger else if (conv.batteryTempC >= 38f) PocketColors.warning else PocketColors.success)
                         }
                     }
                 }
@@ -1736,6 +1741,8 @@ fun DownloadScreen(
             customUupApiUrl = settings.customUupApiUrl,
             preferDirectMicrosoftUup = settings.preferDirectMicrosoftUup,
             cachedUupBuildsJson = settings.cachedUupBuildsJson,
+            defaultThermalProfile = settings.buildThermalProfile,
+            defaultAutoThermalCooldown = settings.autoThermalCooldown,
             onUpdateCachedUupBuilds = { freshJson ->
                 if (freshJson != settings.cachedUupBuildsJson) {
                     onUpdateSettings(settings.copy(cachedUupBuildsJson = freshJson))
@@ -1980,6 +1987,13 @@ fun DownloadScreen(
             onDismiss = { showBuildMonitorSheet = false },
             onToggleAutoMount = { WindowsBuildEngine.updateConversionAutoMount(it) },
             onToggleKeepPackages = { WindowsBuildEngine.updateConversionKeepPackages(it) },
+            onChangeThermalProfile = { prof ->
+                WindowsBuildEngine.updateConversionThermalProfile(prof)
+                onMessage("Live thermal profile switched to ${prof.label}.", false)
+            },
+            onToggleAutoCooldown = { enabled ->
+                WindowsBuildEngine.updateConversionAutoCooldown(enabled)
+            },
             onRetryBuild = {
                 if (WindowsBuildEngine.retryFailedConversion()) {
                     onMessage("Retrying Windows build from cached packages...", false)

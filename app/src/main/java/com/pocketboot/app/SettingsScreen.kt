@@ -34,6 +34,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material.icons.rounded.Backup
 import androidx.compose.material.icons.rounded.Bolt
+import androidx.compose.material.icons.rounded.DeviceThermostat
 import androidx.compose.material.icons.rounded.CleaningServices
 import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.Check
@@ -333,6 +334,82 @@ fun SettingsScreen(
                             )
                         }
                         Icon(Icons.Rounded.ChevronRight, null, tint = PocketColors.textMuted, modifier = Modifier.size(18.dp))
+                    }
+
+                    PocketHairlineDivider()
+
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(9.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            SettingsIconBadge(Icons.Rounded.DeviceThermostat, PocketColors.infoBlue, PocketColors.infoBlueBg)
+                            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                                Text("ISO Builder Thermal Profile", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                                Text(settings.buildThermalProfile.subtitle, style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary)
+                            }
+                        }
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            BuildThermalProfile.entries.forEach { prof ->
+                                val sel = settings.buildThermalProfile == prof
+                                Surface(
+                                    modifier = Modifier.weight(1f).height(34.dp).bounceClick {
+                                        onUpdateSettings(settings.copy(buildThermalProfile = prof))
+                                    },
+                                    shape = RoundedCornerShape(9.dp),
+                                    color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput,
+                                    border = BorderStroke(if (sel) 1.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                                ) {
+                                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                        Text(
+                                            text = prof.shortLabel,
+                                            style = MaterialTheme.typography.labelMedium,
+                                            fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Medium,
+                                            color = if (sel) PocketColors.accentSoft else PocketColors.textSecondary,
+                                            maxLines = 1
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth().clickable {
+                                onUpdateSettings(settings.copy(autoThermalCooldown = !settings.autoThermalCooldown))
+                            }.padding(top = 2.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Auto Thermal Cooldown", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                                Text("Pauses native binary if battery gets hot, resumes when cool", fontSize = 11.sp, color = PocketColors.textSecondary)
+                            }
+                            PocketSwitch(
+                                checked = settings.autoThermalCooldown,
+                                onCheckedChange = { onUpdateSettings(settings.copy(autoThermalCooldown = it)) },
+                                activeColor = PocketColors.accent
+                            )
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth().clickable {
+                                onUpdateSettings(settings.copy(keepScreenAwakeDuringBuilds = !settings.keepScreenAwakeDuringBuilds))
+                            }.padding(top = 2.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Keep Screen Awake During Builds", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                                Text("Off (recommended): screen sleeps to reduce heat while wake lock runs", fontSize = 11.sp, color = PocketColors.textSecondary)
+                            }
+                            PocketSwitch(
+                                checked = settings.keepScreenAwakeDuringBuilds,
+                                onCheckedChange = { onUpdateSettings(settings.copy(keepScreenAwakeDuringBuilds = it)) },
+                                activeColor = PocketColors.accent
+                            )
+                        }
                     }
 
                     PocketHairlineDivider()

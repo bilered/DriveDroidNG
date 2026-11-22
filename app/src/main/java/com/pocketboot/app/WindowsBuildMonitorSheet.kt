@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -36,6 +37,7 @@ import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.ErrorOutline
+import androidx.compose.material.icons.rounded.DeviceThermostat
 import androidx.compose.material.icons.rounded.Memory
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Schedule
@@ -105,6 +107,8 @@ fun WindowsBuildMonitorSheet(
     onDismiss: () -> Unit,
     onToggleAutoMount: (Boolean) -> Unit,
     onToggleKeepPackages: (Boolean) -> Unit = {},
+    onChangeThermalProfile: (BuildThermalProfile) -> Unit = {},
+    onToggleAutoCooldown: (Boolean) -> Unit = {},
     onRetryBuild: () -> Unit = {},
     onDismissFailed: () -> Unit = {},
     onCancelBuild: () -> Unit
@@ -194,13 +198,49 @@ fun WindowsBuildMonitorSheet(
                 }
             }
 
+            if (state.isCoolingDown && !state.isFailed) {
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = PocketColors.warningBg.copy(alpha = 0.7f),
+                    border = BorderStroke(1.dp, PocketColors.warning)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(9.dp)
+                    ) {
+                        Icon(Icons.Rounded.DeviceThermostat, null, tint = PocketColors.warning, modifier = Modifier.size(20.dp))
+                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text(
+                                "Thermal Cooldown Active (${String.format(Locale.US, "%.1f°C", state.batteryTempC)})",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = PocketColors.warning
+                            )
+                            Text(
+                                "Native binary paused to protect your phone. Auto-resumes at ${String.format(Locale.US, "%.1f°C", state.thermalProfile.cooldownResumeC)} (or switch to Max below).",
+                                fontSize = 11.sp,
+                                color = PocketColors.textPrimary
+                            )
+                        }
+                    }
+                }
+            }
+
+            val tempColor = when {
+                state.batteryTempC >= 42.0f -> PocketColors.danger
+                state.batteryTempC >= 38.0f -> PocketColors.warning
+                state.batteryTempC > 0f -> PocketColors.success
+                else -> PocketColors.infoBlue
+            }
+            val tempLabel = if (state.batteryTempC > 0f) String.format(Locale.US, "%.1f°C", state.batteryTempC) else "${state.batteryPct}%"
+
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     MonitorMetricBox(
                         Icons.Rounded.Speed,
                         "Disk Speed",
-                        if (state.diskSpeedBytesPerSec >= 1024L) FastIsoDownloader.formatSpeed(state.diskSpeedBytesPerSec) else if (state.isFailed) "Stopped" else "Active...",
-                        PocketColors.accentSoft,
+                        if (state.isCoolingDown) "Cooling..." else if (state.diskSpeedBytesPerSec >= 1024L) FastIsoDownloader.formatSpeed(state.diskSpeedBytesPerSec) else if (state.isFailed) "Stopped" else "Active...",
+                        if (state.isCoolingDown) PocketColors.warning else PocketColors.accentSoft,
                         Modifier.weight(1f)
                     )
                     MonitorMetricBox(
@@ -220,10 +260,10 @@ fun WindowsBuildMonitorSheet(
                         Modifier.weight(1f)
                     )
                     MonitorMetricBox(
-                        Icons.Rounded.Memory,
-                        "Binary / Battery",
-                        "${state.activeBinary.ifBlank { "shell" }} · ${state.batteryPct}%",
-                        PocketColors.infoBlue,
+                        Icons.Rounded.DeviceThermostat,
+                        "Binary / Temp",
+                        "${state.activeBinary.ifBlank { "shell" }} · $tempLabel (${state.batteryPct}%)",
+                        tempColor,
                         Modifier.weight(1f)
                     )
                 }
@@ -343,6 +383,63 @@ fun WindowsBuildMonitorSheet(
             }
 
             if (!state.isFailed) {
+                Surface(shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
+                    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Icon(Icons.Rounded.DeviceThermostat, null, tint = tempColor, modifier = Modifier.size(16.dp))
+                                Text("Live Thermal Control", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                            }
+                            Text(
+                                "${state.thermalProfile.label} · ${if (state.batteryTempC > 0f) String.format(Locale.US, "%.1f°C", state.batteryTempC) else "--"}",
+                                style = PocketColors.monoStyle,
+                                fontSize = 10.5.sp,
+                                color = tempColor
+                            )
+                        }
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            BuildThermalProfile.entries.forEach { prof ->
+                                val sel = state.thermalProfile == prof
+                                Surface(
+                                    modifier = Modifier.weight(1f).height(34.dp).bounceClick { onChangeThermalProfile(prof) },
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = if (sel) PocketColors.accentBg else PocketColors.surfaceCard,
+                                    border = BorderStroke(if (sel) 1.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                                ) {
+                                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                        Text(
+                                            prof.shortLabel,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Medium,
+                                            color = if (sel) PocketColors.accentSoft else PocketColors.textSecondary,
+                                            maxLines = 1
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                        Text(state.thermalProfile.subtitle, fontSize = 10.5.sp, color = PocketColors.textSecondary)
+                        if (state.thermalProfile != BuildThermalProfile.MAX) {
+                            PocketHairlineDivider()
+                            Row(
+                                modifier = Modifier.fillMaxWidth().clickable { onToggleAutoCooldown(!state.autoThermalCooldown) }.padding(top = 2.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text("Auto Thermal Cooldown", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                                    Text("Pause at ${String.format(Locale.US, "%.1f°C", state.thermalProfile.cooldownTriggerC)}, resume at ${String.format(Locale.US, "%.1f°C", state.thermalProfile.cooldownResumeC)}", fontSize = 10.5.sp, color = PocketColors.textSecondary)
+                                }
+                                PocketSwitch(checked = state.autoThermalCooldown, onCheckedChange = onToggleAutoCooldown, activeColor = PocketColors.accent)
+                            }
+                        }
+                    }
+                }
+
                 Surface(shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
                     Column(modifier = Modifier.fillMaxWidth()) {
                         Row(
