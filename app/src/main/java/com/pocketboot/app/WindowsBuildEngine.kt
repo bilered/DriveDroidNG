@@ -362,16 +362,17 @@ object WindowsBuildEngine {
 
     internal fun thermalExecPrefix(profile: BuildThermalProfile): String {
         val mask = cpuMaskForProfile(profile)
-        val tsBit = if (profile != BuildThermalProfile.MAX && mask.isNotBlank()) {
-            "(command -v taskset >/dev/null 2>&1 && echo 'taskset $mask' || true)"
-        } else "true"
-        val niceBit = if (profile.niceLevel > 0) {
-            "(command -v nice >/dev/null 2>&1 && echo 'nice -n ${profile.niceLevel}' || true)"
-        } else "true"
-        val ioBit = if (profile.ionicePrio > 0) {
-            "(command -v ionice >/dev/null 2>&1 && echo 'ionice -c 2 -n ${profile.ionicePrio}' || true)"
-        } else "true"
-        return "THERM_PFX=\"\$($ioBit) \$($niceBit) \$($tsBit)\""
+        val parts = mutableListOf("THERM_PFX=\"\"")
+        if (profile.ionicePrio > 0) {
+            parts += "if ionice -c 2 -n ${profile.ionicePrio} true >/dev/null 2>&1; then THERM_PFX=\"\$THERM_PFX ionice -c 2 -n ${profile.ionicePrio}\"; fi"
+        }
+        if (profile.niceLevel > 0) {
+            parts += "if nice -n ${profile.niceLevel} true >/dev/null 2>&1; then THERM_PFX=\"\$THERM_PFX nice -n ${profile.niceLevel}\"; fi"
+        }
+        if (profile != BuildThermalProfile.MAX && mask.isNotBlank()) {
+            parts += "if taskset $mask true >/dev/null 2>&1; then THERM_PFX=\"\$THERM_PFX taskset $mask\"; fi"
+        }
+        return parts.joinToString("; ")
     }
 
     internal fun wimThreadArgFor(profile: BuildThermalProfile, isSolidEsd: Boolean = false): String {
@@ -2087,10 +2088,12 @@ object WindowsBuildEngine {
 
                     BG_FILE=""
                     for bg in "${'$'}ISODIR/sources/background_cli.bmp" "${'$'}ISODIR/sources/background_svr.bmp" "${'$'}ISODIR/sources/background_cli.png" "${'$'}ISODIR/sources/background_svr.png"; do
-                        [ -f "${'$'}bg" ] && BG_FILE="${'$'}bg" && break
+                        if [ -f "${'$'}bg" ]; then BG_FILE="${'$'}bg"; break; fi
                     done
-                    [ -n "${'$'}BG_FILE" ] && ($qWim update "${'$'}ISODIR/sources/boot.wim" 1 --command="add '${'$'}BG_FILE' /Windows/system32/winre.jpg" || true)
-                    [ -n "${'$'}BG_FILE" ] && ($qWim update "${'$'}ISODIR/sources/boot.wim" 1 --command="add '${'$'}BG_FILE' /Windows/system32/winpe.jpg" || true)
+                    if [ -n "${'$'}BG_FILE" ]; then
+                        $qWim update "${'$'}ISODIR/sources/boot.wim" 1 --command="add '${'$'}BG_FILE' /Windows/system32/winre.jpg" || true
+                        $qWim update "${'$'}ISODIR/sources/boot.wim" 1 --command="add '${'$'}BG_FILE' /Windows/system32/winpe.jpg" || true
+                    fi
                     $qWim update "${'$'}ISODIR/sources/boot.wim" 1 --command="delete --force /Windows/System32/winpeshl.ini" || true
 
                     $qWim export "${'$'}TMP/winre.wim" 1 "${'$'}ISODIR/sources/boot.wim" "Microsoft Windows Setup ($archTag)" "Microsoft Windows Setup ($archTag)"
@@ -2111,9 +2114,9 @@ object WindowsBuildEngine {
                     $qWim extract $firstMeta 3 "/Windows/System32/xmllite.dll" --dest-dir="${'$'}ISODIR/sources" --no-acls --no-attributes >/dev/null 2>&1 || true
                     UPD_TXT="/data/local/tmp/pb_boot_update.txt"; : > "${'$'}UPD_TXT"
                     echo "delete --force /Windows/System32/winpeshl.ini" >> "${'$'}UPD_TXT"
-                    [ -n "${'$'}HIVE2" ] && echo "add '${'$'}HIVE2' /Windows/System32/config/SOFTWARE" >> "${'$'}UPD_TXT"
-                    [ -f "${'$'}ISODIR/setup.exe" ] && echo "add '${'$'}ISODIR/setup.exe' /setup.exe" >> "${'$'}UPD_TXT"
-                    [ -f "${'$'}ISODIR/sources/inf/setup.cfg" ] && echo "add '${'$'}ISODIR/sources/inf/setup.cfg' /sources/inf/setup.cfg" >> "${'$'}UPD_TXT"
+                    if [ -n "${'$'}HIVE2" ]; then echo "add '${'$'}HIVE2' /Windows/System32/config/SOFTWARE" >> "${'$'}UPD_TXT"; fi
+                    if [ -f "${'$'}ISODIR/setup.exe" ]; then echo "add '${'$'}ISODIR/setup.exe' /setup.exe" >> "${'$'}UPD_TXT"; fi
+                    if [ -f "${'$'}ISODIR/sources/inf/setup.cfg" ]; then echo "add '${'$'}ISODIR/sources/inf/setup.cfg' /sources/inf/setup.cfg" >> "${'$'}UPD_TXT"; fi
                     if [ -n "${'$'}BG_FILE" ]; then
                         echo "add '${'$'}BG_FILE' /sources/background.bmp" >> "${'$'}UPD_TXT"
                         echo "add '${'$'}BG_FILE' /Windows/system32/setup.bmp" >> "${'$'}UPD_TXT"
@@ -2188,10 +2191,12 @@ object WindowsBuildEngine {
                     ED_NAME=${'$'}(printf '%s\n' "${'$'}INFO_TXT" | sed -n 's/^Display Name:[[:space:]]*//p; s/^Name:[[:space:]]*//p' | head -n 1)
                     ED_DESC=${'$'}(printf '%s\n' "${'$'}INFO_TXT" | sed -n 's/^Display Description:[[:space:]]*//p; s/^Description:[[:space:]]*//p' | head -n 1)
                     ED_ID=${'$'}(printf '%s\n' "${'$'}INFO_TXT" | sed -n 's/^Edition ID:[[:space:]]*//p' | head -n 1)
-                    [ -z "${'$'}ED_NAME" ] && ED_NAME="Windows ${config.build.build}"
-                    [ -z "${'$'}ED_DESC" ] && ED_DESC="${'$'}ED_NAME"
+                    if [ -z "${'$'}ED_NAME" ]; then ED_NAME="Windows ${config.build.build}"; fi
+                    if [ -z "${'$'}ED_DESC" ]; then ED_DESC="${'$'}ED_NAME"; fi
                     set --
-                    for ref in "${'$'}PKG"/*.esd "${'$'}PKG"/*.ESD "${'$'}TMP"/*.esd; do [ -f "${'$'}ref" ] && set -- "${'$'}@" --ref="${'$'}ref"; done
+                    for ref in "${'$'}PKG"/*.esd "${'$'}PKG"/*.ESD "${'$'}TMP"/*.esd; do
+                        if [ -f "${'$'}ref" ]; then set -- "${'$'}@" --ref="${'$'}ref"; fi
+                    done
                     ${'$'}THERM_PFX $qWim export $qMeta 3 $qStageWim "${'$'}ED_NAME" $baseExportArg $threadArg "${'$'}@" > $qProgLog 2>&1 &
                     WPID=${'$'}!; echo "${'$'}WPID" > $ACTIVE_PID_FILE; wait "${'$'}WPID"
                     rm -f $ACTIVE_PID_FILE
@@ -2205,7 +2210,8 @@ object WindowsBuildEngine {
                 """.trimIndent())
                 wimPollJob.cancel()
                 if (!expRes.isSuccess) {
-                    val err = Shell.cmd("tail -n 6 $qProgLog 2>/dev/null || true").exec().out.filter { it.isNotBlank() }.joinToString(" | ").take(260)
+                    val progErr = Shell.cmd("tail -n 6 $qProgLog 2>/dev/null || true").exec().out.filter { it.isNotBlank() }.joinToString(" | ")
+                    val err = progErr.ifBlank { (expRes.out + expRes.err).filter { it.isNotBlank() }.takeLast(4).joinToString(" | ") }.take(260)
                     Shell.cmd("rm -f $qProgLog 2>/dev/null || true").exec()
                     throw IllegalStateException("install.${effectiveComp.ext} export failed: ${err.ifBlank { "code ${expRes.code}" }}")
                 }
@@ -2256,7 +2262,12 @@ object WindowsBuildEngine {
                 }
                 val esdRes = runIsolatedRootScript(appCtx, "esdconv", "set -e\n$pathHeader\n$esdTherm\n: > $qProgLog\ntrap 'rm -f $ACTIVE_PID_FILE' EXIT\n\$THERM_PFX $qWim export $qStageWim all $qFinalInstall --compress=LZMS --solid $esdThreadArg > $qProgLog 2>&1 &\nEPID=\$!; echo \"\$EPID\" > $ACTIVE_PID_FILE; wait \"\$EPID\"\nrm -f $qStageWim $qProgLog $ACTIVE_PID_FILE")
                 esdPoll.cancel()
-                if (!esdRes.isSuccess) throw IllegalStateException("Solid ESD compression failed (code ${esdRes.code})")
+                if (!esdRes.isSuccess) {
+                    val esdProgErr = Shell.cmd("tail -n 6 $qProgLog 2>/dev/null || true").exec().out.filter { it.isNotBlank() }.joinToString(" | ")
+                    val esdDetail = esdProgErr.ifBlank { (esdRes.out + esdRes.err).filter { it.isNotBlank() }.takeLast(4).joinToString(" | ") }.take(260)
+                    Shell.cmd("rm -f $qProgLog 2>/dev/null || true").exec()
+                    throw IllegalStateException("Solid ESD compression failed: ${esdDetail.ifBlank { "code ${esdRes.code}" }}")
+                }
                 addConsole("Converted install.wim + Winre.wim -> Solid install.esd")
             } else if (requestedVirtualEds.isNotEmpty()) {
                 addConsole("Optimizing install.wim after Virtual Editions...")

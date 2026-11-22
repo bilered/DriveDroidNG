@@ -394,6 +394,7 @@ object VirtualEditionsPlugin {
 
         val script = """
             set -e
+            export WIMLIB_IMAGEX_IGNORE_CASE=1
             VE_TMP="/data/local/tmp/pb_ve_$edId"
             rm -rf "${'$'}VE_TMP" && mkdir -p "${'$'}VE_TMP"
             cleanup() { rm -rf "${'$'}VE_TMP"; }
@@ -420,7 +421,7 @@ object VirtualEditionsPlugin {
             fi
 
             BUILD_NUM=${'$'}($qWim info $qWimPath "${'$'}SRC_IDX" 2>/dev/null | sed -n 's/^Build:[[:space:]]*//p' | head -n 1 | cut -d. -f1)
-            [ -z "${'$'}BUILD_NUM" ] && BUILD_NUM=22000
+            if [ -z "${'$'}BUILD_NUM" ]; then BUILD_NUM=22000; fi
             if [ "${'$'}BUILD_NUM" -lt ${target.minBuild} ]; then
                 echo "VE_SKIP|$edId requires build ${target.minBuild}+ (found ${'$'}BUILD_NUM)"
                 exit 0
