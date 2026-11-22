@@ -198,7 +198,8 @@ fun WindowsDownloadSheet(
     var customOutputName by remember { mutableStateOf("") }
 
     var includeUpdates by remember { mutableStateOf(false) }
-    var includeStoreApps by remember { mutableStateOf(false) }
+    var storeAppLevel by remember { mutableStateOf(WinStoreAppLevel.SECURITY_ONLY) }
+    var splitWimForFat32 by remember { mutableStateOf(false) }
     var integrateNetFx3 by remember { mutableStateOf(false) }
     var runComponentCleanup by remember { mutableStateOf(false) }
     var skipWinRe by remember { mutableStateOf(false) }
@@ -381,7 +382,7 @@ fun WindowsDownloadSheet(
         )
         if (selectedBuildEditions.isNotEmpty()) {
             estimateLoading = true
-            detailedManifest = WindowsBuildEngine.fetchDetailedManifest(b.uuid, l.code, selectedBuildEditions.toList())
+            detailedManifest = WindowsBuildEngine.fetchDetailedManifest(b.uuid, l.code, selectedBuildEditions.toList(), archHint = b.arch, buildHint = b.build)
             estimateLoading = false
         } else {
             detailedManifest = null
@@ -1254,11 +1255,16 @@ fun WindowsDownloadSheet(
                 } else {
                     // STEP 2: CONFIGURE SELECTED BUILD
                     val b = selectedBuild!!
+                    val selectedLangCode = selectedBuildLang?.code ?: "en-us"
+                    val filteredAppsForSel = remember(detailedManifest, storeAppLevel, selectedLangCode, b.arch) {
+                        detailedManifest?.let { WindowsBuildEngine.filterStoreApps(it.appFiles, selectedLangCode, b.arch, storeAppLevel) }.orEmpty()
+                    }
+                    val selAppBytes = remember(filteredAppsForSel) { filteredAppsForSel.sumOf { it.sizeBytes } }
                     val selDlBytes = when (downloadMethod) {
                         WinDownloadMethod.DOWNLOAD_UPDATES_ONLY -> detailedManifest?.updateBytes ?: 0L
                         else -> (detailedManifest?.baseBytes ?: 3_500_000_000L) +
                             (if (includeUpdates) detailedManifest?.updateBytes ?: 0L else 0L) +
-                            (if (includeStoreApps) detailedManifest?.appBytes ?: 0L else 0L) +
+                            selAppBytes +
                             (if (integrateNetFx3) detailedManifest?.netFx3Bytes ?: 0L else 0L)
                     }
                     val estBuildOutBytes = if (downloadMethod == WinDownloadMethod.DOWNLOAD_AND_BUILD) {
@@ -1509,14 +1515,39 @@ fun WindowsDownloadSheet(
                                             DirectUsbOptionRow("Include additional updates$updSz", includeUpdates) { includeUpdates = it }; PocketHairlineDivider()
                                         }
                                         if (detailedManifest?.hasApps == true) {
-                                            DirectUsbOptionRow("Include Inbox Store Apps (+${UsbGadgetEngine.formatBytes(detailedManifest!!.appBytes)})", includeStoreApps) { includeStoreApps = it }; PocketHairlineDivider()
+                                            Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                                    Text("Inbox Store Apps", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                                                    Text("${filteredAppsForSel.size} pkg(s) · +${UsbGadgetEngine.formatBytes(selAppBytes)}", style = PocketColors.monoStyle, fontSize = 10.5.sp, color = PocketColors.accentSoft)
+                                                }
+                                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                                    WinStoreAppLevel.entries.forEach { lvl ->
+                                                        val sel = storeAppLevel == lvl
+                                                        Surface(
+                                                            modifier = Modifier.weight(1f).height(34.dp).bounceClick { storeAppLevel = lvl },
+                                                            shape = RoundedCornerShape(8.dp),
+                                                            color = if (sel) PocketColors.accentBg else PocketColors.surfaceCard,
+                                                            border = BorderStroke(if (sel) 1.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                                                        ) {
+                                                            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                                                Text(lvl.shortLabel, style = MaterialTheme.typography.labelSmall, fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Medium, color = if (sel) PocketColors.accentSoft else PocketColors.textSecondary, maxLines = 1)
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Text(storeAppLevel.subtitle, fontSize = 10.5.sp, color = PocketColors.textSecondary)
+                                            }
+                                            PocketHairlineDivider()
                                         }
                                         if (detailedManifest?.hasNetFx3 == true) {
                                             DirectUsbOptionRow("Integrate .NET Framework 3.5 (Offline)", integrateNetFx3) { integrateNetFx3 = it }; PocketHairlineDivider()
                                         }
                                         if (downloadMethod == WinDownloadMethod.DOWNLOAD_AND_BUILD) {
                                             DirectUsbOptionRow("Run component cleanup (/ResetBase)", runComponentCleanup) { runComponentCleanup = it }; PocketHairlineDivider()
-                                            DirectUsbOptionRow("Use solid (ESD) compression${if (!detOs.supportsEsd) " (N/A Win 7/8)" else ""}", buildCompression == WinIsoCompression.ESD && detOs.supportsEsd) { if (detOs.supportsEsd) buildCompression = if (it) WinIsoCompression.ESD else WinIsoCompression.WIM }; PocketHairlineDivider()
+                                            DirectUsbOptionRow("Use solid (ESD) compression${if (!detOs.supportsEsd) " (N/A Win 7/8)" else ""}", buildCompression == WinIsoCompression.ESD && detOs.supportsEsd) { if (detOs.supportsEsd) { buildCompression = if (it) WinIsoCompression.ESD else WinIsoCompression.WIM; if (it) splitWimForFat32 = false } }; PocketHairlineDivider()
+                                            if (buildCompression == WinIsoCompression.WIM && buildOutputMode != WinBuildOutputMode.DIRECT_NTFS_USB) {
+                                                DirectUsbOptionRow("Split WIM for FAT32 (install*.swm ≤ 3.5 GB)", splitWimForFat32) { splitWimForFat32 = it }; PocketHairlineDivider()
+                                            }
                                             DirectUsbOptionRow("Skip WinRE Recovery (~480 MB smaller)", skipWinRe) { skipWinRe = it }; PocketHairlineDivider()
                                             DirectUsbOptionRow("Unlock all editions (ei.cfg)", eiCfgUnlock) { eiCfgUnlock = it }; PocketHairlineDivider()
                                             DirectUsbOptionRow("Keep base UUP packages after build", keepPackagesAfterBuild) { keepPackagesAfterBuild = it }
@@ -1630,8 +1661,8 @@ fun WindowsDownloadSheet(
                                     WindowsChannelBuildConfig(
                                         build = b, lang = lang, editions = chosenEds, compression = buildCompression, outputMode = buildOutputMode, downloadMethod = downloadMethod,
                                         targetDir = targetDir, customOutputName = customOutputName.trim(), targetMultiBootPath = mbPath, connections = turboConnections, autoMount = true,
-                                        includeUpdates = includeUpdates, includeStoreApps = includeStoreApps, integrateNetFx3 = integrateNetFx3, runComponentCleanup = runComponentCleanup,
-                                        skipWinRe = skipWinRe, eiCfgUnlock = eiCfgUnlock, keepPackagesAfterBuild = keepPackagesAfterBuild, scheme = usbScheme, experience = experience, winUtil = winUtil, extraDriversDir = usbExtraDriversDir.trim(), virtualEditions = selectedVirtualEditions.filter { id -> availableVirtualEds.any { it.editionId == id } }
+                                        includeUpdates = includeUpdates, includeStoreApps = storeAppLevel != WinStoreAppLevel.SECURITY_ONLY, integrateNetFx3 = integrateNetFx3, runComponentCleanup = runComponentCleanup,
+                                        skipWinRe = skipWinRe, eiCfgUnlock = eiCfgUnlock, keepPackagesAfterBuild = keepPackagesAfterBuild, scheme = usbScheme, experience = experience, winUtil = winUtil, extraDriversDir = usbExtraDriversDir.trim(), virtualEditions = selectedVirtualEditions.filter { id -> availableVirtualEds.any { it.editionId == id } }, storeAppLevel = storeAppLevel, splitWimForFat32 = splitWimForFat32
                                     )
                                 )
                             },

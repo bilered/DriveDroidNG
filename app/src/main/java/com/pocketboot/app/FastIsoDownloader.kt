@@ -358,7 +358,7 @@ object FastIsoDownloader {
         while (redirects < 12) {
             val conn = (URL(current).openConnection() as HttpURLConnection).apply {
                 requestMethod = method; instanceFollowRedirects = false; connectTimeout = 15_000; readTimeout = 25_000
-                setRequestProperty("User-Agent", userAgent); setRequestProperty("Accept", "*/*"); setRequestProperty("Accept-Encoding", "identity"); setRequestProperty("Connection", "keep-alive")
+                setRequestProperty("User-Agent", userAgent); setRequestProperty("Accept", "*/*"); setRequestProperty("Accept-Encoding", "identity"); setRequestProperty("Connection", "keep-alive"); setRequestProperty("Connection", "keep-alive")
                 if (cookies.isNotEmpty()) setRequestProperty("Cookie", cookies.entries.joinToString("; ") { "${it.key}=${it.value}" })
                 if (rangeHeader != null) setRequestProperty("Range", rangeHeader)
             }
@@ -1400,6 +1400,7 @@ object FastIsoDownloader {
                                     try {
                                         val activeUrl = resolveFreshUrl(item, forceRefresh = false)
                                         val conn = openFollowingRedirects(activeUrl, "GET", rangeHeader = "bytes=${task.start}-${task.end}")
+                                        var keepAliveReusable = false
                                         try {
                                             val code = conn.responseCode
                                             if (code == 403 || code == 410) throw IllegalStateException("EXPIRED_$code")
@@ -1432,9 +1433,10 @@ object FastIsoDownloader {
                                                 if (!pausedFlag.get() && !cancelledFlag.get() && writtenThisAttempt < expectedLen) {
                                                     throw IllegalStateException("Truncated range slice ($writtenThisAttempt/$expectedLen)")
                                                 }
+                                                if (!pausedFlag.get() && !cancelledFlag.get()) keepAliveReusable = true
                                             }
                                         } finally {
-                                            conn.disconnect()
+                                            if (!keepAliveReusable) conn.disconnect()
                                         }
                                         if (pausedFlag.get() || cancelledFlag.get()) {
                                             totalCounter.addAndGet(-writtenThisAttempt)
@@ -1504,6 +1506,7 @@ object FastIsoDownloader {
                 val md = if (cleanSha1.length == 40) MessageDigest.getInstance("SHA-1") else null
                 val activeUrl = urlResolver(item, false)
                 val conn = openFollowingRedirects(activeUrl, "GET")
+                var keepAliveReusable = false
                 try {
                     val code = conn.responseCode
                     if (code == 403 || code == 410) throw IllegalStateException("EXPIRED_$code")
@@ -1523,8 +1526,9 @@ object FastIsoDownloader {
                             }
                         }
                     }
+                    if (!pausedFlag.get() && !cancelledFlag.get()) keepAliveReusable = true
                 } finally {
-                    conn.disconnect()
+                    if (!keepAliveReusable) conn.disconnect()
                 }
                 if (pausedFlag.get() || cancelledFlag.get()) {
                     item.partFile.delete()

@@ -116,6 +116,11 @@ data class WindowsChannelBuild(
 data class WinBuildLangOption(val code: String, val displayName: String)
 data class WinBuildEditionOption(val code: String, val displayName: String)
 enum class UupDataSource(val label: String) { UUPDUMP_LIVE("UUPdump Live"), DIRECT_MICROSOFT("Direct Microsoft"), OFFLINE_CATALOG("Offline Catalog") }
+enum class WinStoreAppLevel(val label: String, val shortLabel: String, val subtitle: String) {
+    SECURITY_ONLY("Security Only (Default)", "Security", "Auto-stages SecHealthUI on Win 11 22H2+ (~25 MB)"),
+    ESSENTIAL("Essential Apps", "Essential", "Store, Security, Terminal, Notepad, Photos, Paint + Frameworks"),
+    ALL_INBOX("All Inbox Apps", "All Apps", "Full filtered inbox Store apps + Frameworks")
+}
 enum class WinPackageKind(val badge: String) { BASE_OS("Base OS"), UPDATE("Update"), STORE_APP("Store App"), NETFX3(".NET 3.5") }
 data class WinPackageFileEntry(val name: String, val url: String, val sizeBytes: Long, val sha1: String, val kind: WinPackageKind = WinPackageKind.BASE_OS, val expireEpochSec: Long = 0L)
 data class WinManifestEstimate(val fileCount: Int, val totalBytes: Long)
@@ -155,7 +160,9 @@ data class WindowsChannelBuildConfig(
     val disableBitLocker: Boolean = experience.disableBitLocker,
     val extraDriversDir: String = "",
     val virtualEditions: List<String> = emptyList(),
-    val localUupDirPath: String = ""
+    val localUupDirPath: String = "",
+    val storeAppLevel: WinStoreAppLevel = if (includeStoreApps) WinStoreAppLevel.ALL_INBOX else WinStoreAppLevel.SECURITY_ONLY,
+    val splitWimForFat32: Boolean = false
 )
 
 data class PendingWindowsBuild(
@@ -744,11 +751,12 @@ object WindowsBuildEngine {
     private fun isSkippableNonEditionCab(fileName: String): Boolean {
         val low = fileName.lowercase()
         if (!low.endsWith(".cab")) return false
-        return low.contains("windows10.0-kb") || low.contains("windows11.0-kb") ||
+        return low.contains("windows10.0-kb") || low.contains("windows11.0-kb") || low.contains("windows12.0-kb") ||
             low.startsWith("ssu-") || low.contains("-ssu-") ||
             low.contains("desktopdeployment") || low.contains("aggregatedmetadata") ||
             low.contains("baseless") || low.contains("safeos") ||
             low.contains("dynamicupdate") || low.contains("netfx3-ondemand") ||
+            low.contains("retaildemo") || low.contains("holographic-desktop-fod") ||
             low.contains("-express.cab")
     }
 
@@ -805,17 +813,136 @@ object WindowsBuildEngine {
         return buildDetailedManifestFromEntries(entries)
     }
 
-    suspend fun fetchDetailedManifest(updateId: String, langCode: String, editionCodes: List<String>): WinDetailedManifest? = withContext(Dispatchers.IO) {
+    private val FRAMEWORK_APP_TOKENS = listOf("vclibs", "ui.xaml", "windowsappruntime", "net.native", "directx")
+    private val ESSENTIAL_APP_TOKENS = listOf(
+        "sechealthui", "windowsstore", "storepurchaseapp", "desktopappinstaller",
+        "startexperiencesapp", "applicationcompatibilityenhancements",
+        "windowsterminal", "windowsnotepad", "windows.photos", "paint",
+        "screensketch", "windowscalculator", "windowscamera"
+    )
+
+    /**
+     * Cleans raw UUPdump `edition=app` file lists (which can contain ~2,800 items including foreign
+     * `_language-*.msix`, `qps-ploc*` pseudo-locales, mismatched architectures, and ~8 KB stub bundles)
+     * down to clean, installable packages matching the chosen architecture, language, and app level.
+     */
+    fun filterStoreApps(
+        rawApps: List<WinPackageFileEntry>,
+        langCode: String,
+        arch: String,
+        level: WinStoreAppLevel = WinStoreAppLevel.ALL_INBOX
+    ): List<WinPackageFileEntry> {
+        if (rawApps.isEmpty()) return emptyList()
+        val langFull = langCode.lowercase()
+        val langShort = langFull.substringBefore('-')
+        val archLow = arch.lowercase()
+        val langSatRegex = Regex("""_language-([a-z0-9-]+)(?:[._]|$)""", RegexOption.IGNORE_CASE)
+
+        val cleaned = rawApps.filter { f ->
+            val low = f.name.lowercase()
+            // Keep only real installable appx/msix packages (skip loose xml/blockmap/etc.)
+            if (!(low.endsWith(".msixbundle") || low.endsWith(".appxbundle") || low.endsWith(".msix") || low.endsWith(".appx"))) return@filter false
+            // Drop pseudo-locales, stubs, and LanguageExperiencePack bloat
+            if (low.contains("qps-ploc") || low.contains("stub.") || low.contains("stub_") || low.contains("languageexperiencepack")) return@filter false
+            // Filter foreign `_language-<xx>` satellite packages
+            val satMatch = langSatRegex.find(low)
+            if (satMatch != null) {
+                val tag = satMatch.groupValues[1]
+                if (tag != langFull && tag != langShort && !tag.startsWith("$langShort-")) return@filter false
+            }
+            // Filter mismatched architecture packages (keep neutral & x86 frameworks on amd64)
+            val isFw = FRAMEWORK_APP_TOKENS.any { low.contains(it) }
+            when (archLow) {
+                "amd64", "x64" -> if (low.contains("_arm64_") || low.contains("_arm_")) return@filter false
+                "arm64" -> if (low.contains("_x64_") || low.contains("_amd64_")) return@filter false
+                "x86" -> if (low.contains("_x64_") || low.contains("_amd64_") || low.contains("_arm64_") || low.contains("_arm_")) return@filter false
+            }
+            if (!isFw && archLow in setOf("amd64", "x64") && low.contains("_x86_")) return@filter false
+            true
+        }
+
+        // Deduplicate ~8 KB stub bundles (e.g., `Microsoft.WindowsStore_8wekyb3d8bbwe.msixbundle`)
+        // whenever a larger full versioned package exists for the same app family prefix.
+        val byFamily = cleaned.groupBy { f -> f.name.substringBefore('_').lowercase() }
+        val deduped = buildList {
+            byFamily.values.forEach { group ->
+                val hasFullBundle = group.any { it.sizeBytes >= 65_536L }
+                group.forEach { item ->
+                    if (hasFullBundle && item.sizeBytes in 1L until 65_536L && (item.name.endsWith(".msixbundle", true) || item.name.endsWith(".appxbundle", true))) {
+                        // Drop ~8 KB stub wrapper in favor of the full bundle (StubAppsFull=1 parity)
+                    } else {
+                        add(item)
+                    }
+                }
+            }
+        }
+
+        return when (level) {
+            WinStoreAppLevel.ALL_INBOX -> deduped
+            WinStoreAppLevel.SECURITY_ONLY -> deduped.filter { f ->
+                val low = f.name.lowercase()
+                low.contains("sechealthui")
+            }
+            WinStoreAppLevel.ESSENTIAL -> deduped.filter { f ->
+                val low = f.name.lowercase()
+                FRAMEWORK_APP_TOKENS.any { low.contains(it) } || ESSENTIAL_APP_TOKENS.any { low.contains(it) }
+            }
+        }.sortedBy { it.name.lowercase() }
+    }
+
+    private fun fetchSeparateStoreAppsFromApi(
+        updateId: String,
+        langCode: String,
+        archHint: String,
+        requireUrl: Boolean
+    ): List<WinPackageFileEntry> {
+        val noLinksParam = if (requireUrl) "" else "&noLinks=1"
+        val appUrl = "$apiBaseUrl/get.php?id=${URLEncoder.encode(updateId, "UTF-8")}&lang=neutral&edition=app$noLinksParam"
+        val appRoot = fetchJsonWithRetry(appUrl, timeoutMs = 12_000) ?: return emptyList()
+        val parsedApps = parseDetailedManifest(appRoot, requireUrl).appFiles
+        return filterStoreApps(parsedApps, langCode, archHint, WinStoreAppLevel.ALL_INBOX)
+    }
+
+    private fun mergeAppsIntoManifest(baseManifest: WinDetailedManifest, extraApps: List<WinPackageFileEntry>): WinDetailedManifest {
+        if (extraApps.isEmpty()) return baseManifest
+        val mergedApps = (baseManifest.appFiles + extraApps).distinctBy { it.name.lowercase() }.sortedBy { it.name.lowercase() }
+        val mergedAll = (baseManifest.baseFiles + baseManifest.updateFiles + mergedApps + baseManifest.netFx3Files)
+            .distinctBy { it.name.lowercase() }
+            .sortedBy { it.name.lowercase() }
+        return baseManifest.copy(appFiles = mergedApps, allFiles = mergedAll)
+    }
+
+    suspend fun fetchDetailedManifest(
+        updateId: String,
+        langCode: String,
+        editionCodes: List<String>,
+        archHint: String = "amd64",
+        buildHint: String = ""
+    ): WinDetailedManifest? = withContext(Dispatchers.IO) {
         val edParam = editionCodes.sorted().joinToString(";") { it.lowercase() }
-        val key = "$updateId|$langCode|$edParam"
+        val key = "$updateId|$langCode|$edParam|$archHint"
         detailedManifestCache[key]?.let { return@withContext it }
+
+        val buildMajor = buildHint.substringBefore('.').toIntOrNull() ?: 0
+        val supportsInboxApps = buildMajor == 0 || buildMajor >= 22563
 
         if (shouldUseUupDumpApi()) {
             val url = "$apiBaseUrl/get.php?id=${URLEncoder.encode(updateId, "UTF-8")}&lang=${URLEncoder.encode(langCode, "UTF-8")}&edition=${URLEncoder.encode(edParam, "UTF-8")}&noLinks=1"
             val root = fetchJsonWithRetry(url)
             if (root != null) {
-                val parsed = parseDetailedManifest(root, false)
+                var parsed = parseDetailedManifest(root, false)
                 if (parsed.allFiles.isNotEmpty()) {
+                    // Secondary `edition=app` query (matches UUPdump aria2_download.log) for Win 11 22H2+ Store Apps & SecHealthUI
+                    if (supportsInboxApps && parsed.appFiles.isEmpty()) {
+                        val extraApps = fetchSeparateStoreAppsFromApi(updateId, langCode, archHint, requireUrl = false)
+                        parsed = mergeAppsIntoManifest(parsed, extraApps)
+                    } else if (parsed.appFiles.isNotEmpty()) {
+                        val filteredApps = filterStoreApps(parsed.appFiles, langCode, archHint, WinStoreAppLevel.ALL_INBOX)
+                        parsed = parsed.copy(
+                            appFiles = filteredApps,
+                            allFiles = (parsed.baseFiles + parsed.updateFiles + filteredApps + parsed.netFx3Files).sortedBy { it.name.lowercase() }
+                        )
+                    }
                     detailedManifestCache[key] = parsed
                     return@withContext parsed
                 }
@@ -826,7 +953,14 @@ object WindowsBuildEngine {
         val rawFiles = MicrosoftUupClient.syncFilesCache[updateId] ?: fetchGitHubBuildManifest(updateId)?.second ?: return@withContext null
         val filtered = MicrosoftUupClient.filterFilesForSelection(rawFiles, langCode, editionCodes)
         val entries = filtered.map { WinPackageFileEntry(it.name, "", it.sizeBytes, it.sha1Hex, classifyPackageFile(it.name), 0L) }
-        val parsed = buildDetailedManifestFromEntries(entries)
+        var parsed = buildDetailedManifestFromEntries(entries)
+        if (parsed.appFiles.isNotEmpty()) {
+            val cleanApps = filterStoreApps(parsed.appFiles, langCode, archHint, WinStoreAppLevel.ALL_INBOX)
+            parsed = parsed.copy(
+                appFiles = cleanApps,
+                allFiles = (parsed.baseFiles + parsed.updateFiles + cleanApps + parsed.netFx3Files).sortedBy { it.name.lowercase() }
+            )
+        }
         if (parsed.allFiles.isEmpty()) return@withContext null
         detailedManifestCache[key] = parsed
         parsed
@@ -839,16 +973,30 @@ object WindowsBuildEngine {
         updateId: String,
         langCode: String,
         editionCodes: List<String>,
-        archHint: String = "amd64"
+        archHint: String = "amd64",
+        buildHint: String = ""
     ): WinDetailedManifest = withContext(Dispatchers.IO) {
+        val buildMajor = buildHint.substringBefore('.').toIntOrNull() ?: 0
+        val supportsInboxApps = buildMajor == 0 || buildMajor >= 22563
+
         // Layer 1: UUPdump API if enabled and healthy
         if (shouldUseUupDumpApi()) {
             val edParam = editionCodes.joinToString(";") { it.lowercase() }
             val url = "$apiBaseUrl/get.php?id=${URLEncoder.encode(updateId, "UTF-8")}&lang=${URLEncoder.encode(langCode, "UTF-8")}&edition=${URLEncoder.encode(edParam, "UTF-8")}"
             val root = fetchJsonWithRetry(url)
             if (root != null) {
-                val parsed = parseDetailedManifest(root, true)
+                var parsed = parseDetailedManifest(root, true)
                 if (parsed.allFiles.isNotEmpty()) {
+                    if (supportsInboxApps && parsed.appFiles.isEmpty()) {
+                        val extraApps = fetchSeparateStoreAppsFromApi(updateId, langCode, archHint, requireUrl = true)
+                        parsed = mergeAppsIntoManifest(parsed, extraApps)
+                    } else if (parsed.appFiles.isNotEmpty()) {
+                        val cleanApps = filterStoreApps(parsed.appFiles, langCode, archHint, WinStoreAppLevel.ALL_INBOX)
+                        parsed = parsed.copy(
+                            appFiles = cleanApps,
+                            allFiles = (parsed.baseFiles + parsed.updateFiles + cleanApps + parsed.netFx3Files).sortedBy { it.name.lowercase() }
+                        )
+                    }
                     _activeSource.value = UupDataSource.UUPDUMP_LIVE
                     return@withContext parsed
                 }
@@ -873,7 +1021,6 @@ object WindowsBuildEngine {
             ?: MicrosoftUupClient.syncFilesCache[cleanUid]
             ?: fetchGitHubBuildManifest(cleanUid)?.second
         if (rawMetaFiles.isNullOrEmpty()) {
-            // Last-resort live SyncUpdates query to populate filenames for this branch
             val synced = MicrosoftUupClient.syncLatestBuildsDirect(arch = archHint, ring = ring, baselineBuild = checkBuild, sku = sku)
             rawMetaFiles = synced.firstOrNull { it.build.uuid.equals(cleanUid, true) }?.files
                 ?: MicrosoftUupClient.syncFilesCache[cleanUid]
@@ -891,7 +1038,15 @@ object WindowsBuildEngine {
 
         if (matched.isNotEmpty()) {
             _activeSource.value = UupDataSource.DIRECT_MICROSOFT
-            return@withContext buildDetailedManifestFromEntries(matched)
+            var built = buildDetailedManifestFromEntries(matched)
+            if (built.appFiles.isNotEmpty()) {
+                val cleanApps = filterStoreApps(built.appFiles, langCode, archHint, WinStoreAppLevel.ALL_INBOX)
+                built = built.copy(
+                    appFiles = cleanApps,
+                    allFiles = (built.baseFiles + built.updateFiles + cleanApps + built.netFx3Files).sortedBy { it.name.lowercase() }
+                )
+            }
+            return@withContext built
         }
         WinDetailedManifest()
     }
@@ -926,6 +1081,8 @@ object WindowsBuildEngine {
                 put("customPostInstallScriptPath", config.experience.customPostInstallScriptPath)
                 put("extraDriversDir", config.extraDriversDir)
                 put("virtualEditions", JSONArray(config.virtualEditions))
+                put("storeAppLevel", config.storeAppLevel.name)
+                put("splitWimForFat32", config.splitWimForFat32)
                 put("winUtilJson", config.winUtil.toJsonString()); put("totalBytes", totalBytes); put("isCachedReady", isCachedReady)
             }
             val tmp = File(context.applicationContext.cacheDir, "pb_build_meta.json").apply { writeText(obj.toString(), Charsets.UTF_8) }
@@ -975,7 +1132,7 @@ object WindowsBuildEngine {
                         customPostInstallScriptPath = o.optString("customPostInstallScriptPath", "")
                     )
                     val veList = mutableListOf<String>(); o.optJSONArray("virtualEditions")?.let { va -> for (k in 0 until va.length()) va.optString(k, "").trim().takeIf { it.isNotEmpty() }?.let { veList.add(it) } }
-                    val cfg = WindowsChannelBuildConfig(bld, lang, eds, comp, mode, method, o.optString("targetDir", baseDir), o.optString("customOutputName", ""), o.optString("targetMultiBootPath", ""), o.optInt("connections", 8), o.optBoolean("autoMount", true), o.optBoolean("includeUpdates", false), o.optBoolean("includeStoreApps", false), o.optBoolean("integrateNetFx3", false), o.optBoolean("runComponentCleanup", false), o.optBoolean("skipWinRe", false), o.optBoolean("eiCfgUnlock", false), o.optBoolean("keepPackagesAfterBuild", false), scheme, exp, WinUtilTweaksConfig.fromJsonString(o.optString("winUtilJson", "")), extraDriversDir = o.optString("extraDriversDir", ""), virtualEditions = veList)
+                    val cfg = WindowsChannelBuildConfig(bld, lang, eds, comp, mode, method, o.optString("targetDir", baseDir), o.optString("customOutputName", ""), o.optString("targetMultiBootPath", ""), o.optInt("connections", 8), o.optBoolean("autoMount", true), o.optBoolean("includeUpdates", false), o.optBoolean("includeStoreApps", false), o.optBoolean("integrateNetFx3", false), o.optBoolean("runComponentCleanup", false), o.optBoolean("skipWinRe", false), o.optBoolean("eiCfgUnlock", false), o.optBoolean("keepPackagesAfterBuild", false), scheme, exp, WinUtilTweaksConfig.fromJsonString(o.optString("winUtilJson", "")), extraDriversDir = o.optString("extraDriversDir", ""), virtualEditions = veList, storeAppLevel = runCatching { WinStoreAppLevel.valueOf(o.optString("storeAppLevel", if (o.optBoolean("includeStoreApps", false)) "ALL_INBOX" else "SECURITY_ONLY")) }.getOrDefault(WinStoreAppLevel.SECURITY_ONLY), splitWimForFat32 = o.optBoolean("splitWimForFat32", false))
                     val workPrefix = workRoot.substringAfterLast('/')
                     val pkgBytes = Shell.cmd("du -sb ${shellQuote("$workRoot/PKGS")} 2>/dev/null | awk '{print \$1}'").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
                     val stageBytes = stageCacheDir(context, workPrefix).walkTopDown().filter { it.isFile && it.name.endsWith(".part") }.sumOf { it.length() }
@@ -1199,12 +1356,15 @@ object WindowsBuildEngine {
                 pruneOldWorkDirs(config.targetDir, workPrefix)
                 Shell.cmd("mkdir -p ${shellQuote(pkgDir.absolutePath)}").exec()
 
-                val manifest = fetchFullDownloadManifest(config.build.uuid, config.lang.code, config.editions.map { it.code }, archHint = config.build.arch)
+                val manifest = fetchFullDownloadManifest(config.build.uuid, config.lang.code, config.editions.map { it.code }, archHint = config.build.arch, buildHint = config.build.build)
                 if (manifest.allFiles.isEmpty()) throw IllegalStateException("Could not load package list from UUPdump or Microsoft servers.")
 
                 val buildMajor = config.build.build.substringBefore('.').toIntOrNull() ?: 0
-                val autoSecHealthApps = if (buildMajor >= 22621 && !config.includeStoreApps) {
-                    manifest.appFiles.filter { it.name.contains("sechealthui", ignoreCase = true) }
+                val effectiveAppLevel = if (config.includeStoreApps && config.storeAppLevel == WinStoreAppLevel.SECURITY_ONLY) {
+                    WinStoreAppLevel.ALL_INBOX
+                } else config.storeAppLevel
+                val selectedApps = if (manifest.hasApps && (buildMajor == 0 || buildMajor >= 22563)) {
+                    filterStoreApps(manifest.appFiles, config.lang.code, config.build.arch, effectiveAppLevel)
                 } else emptyList()
 
                 val targetFiles = when (config.downloadMethod) {
@@ -1212,13 +1372,14 @@ object WindowsBuildEngine {
                     else -> buildList {
                         addAll(manifest.baseFiles)
                         if (config.includeUpdates) addAll(manifest.updateFiles)
-                        if (config.includeStoreApps) addAll(manifest.appFiles)
-                        else if (autoSecHealthApps.isNotEmpty()) addAll(autoSecHealthApps)
+                        if (selectedApps.isNotEmpty()) addAll(selectedApps)
                         if (config.integrateNetFx3) addAll(manifest.netFx3Files)
                     }
                 }.distinctBy { it.name }
-                val hasEffectiveApps = (config.includeStoreApps && manifest.hasApps) || autoSecHealthApps.isNotEmpty()
-                if (autoSecHealthApps.isNotEmpty()) emitLog("win-dl", "Auto-included ${autoSecHealthApps.size} Windows Security (SecHealthUI) package(s) for Win 11 22H2+")
+                val hasEffectiveApps = selectedApps.isNotEmpty()
+                if (selectedApps.isNotEmpty()) {
+                    emitLog("win-dl", "Included ${selectedApps.size} Store/Security app package(s) (${effectiveAppLevel.shortLabel}, ${UsbGadgetEngine.formatBytes(selectedApps.sumOf { it.sizeBytes })})")
+                }
                 if (targetFiles.isEmpty()) throw IllegalStateException("No downloadable packages matched the selected options.")
 
                 val totalBytes = targetFiles.sumOf { it.sizeBytes }.coerceAtLeast(1L)
@@ -1260,14 +1421,35 @@ object WindowsBuildEngine {
                         FastIsoDownloader.TurboBatchItem(entry.name, entry.url, File(appStageDir, "$safeName.part"), File(appStageDir, "$safeName.part.pbmeta"), entry.sizeBytes, entry.sha1, entry.expireEpochSec)
                     }
                     val refreshCallback: suspend () -> Map<String, Pair<String, Long>> = {
-                        val freshMf = fetchFullDownloadManifest(config.build.uuid, config.lang.code, config.editions.map { it.code }, archHint = config.build.arch)
+                        val freshMf = fetchFullDownloadManifest(config.build.uuid, config.lang.code, config.editions.map { it.code }, archHint = config.build.arch, buildHint = config.build.build)
                         freshMf.allFiles.associate { it.name to (it.url to it.expireEpochSec) }
                     }
+                    val pendingMoves = ConcurrentLinkedQueue<Pair<String, String>>()
+                    val moveLock = Any()
+                    fun flushMoves(force: Boolean) {
+                        val batch = mutableListOf<Pair<String, String>>()
+                        synchronized(moveLock) {
+                            if (!force && pendingMoves.size < 25) return
+                            while (true) {
+                                val next = pendingMoves.poll() ?: break
+                                batch.add(next)
+                            }
+                        }
+                        if (batch.isEmpty()) return
+                        val cmdLines = batch.joinToString("
+") { (src, dst) -> "mv -f ${shellQuote(src)} ${shellQuote(dst)}" }
+                        val mvRes = runIsolatedRootScript(appCtx, "mvbatch", "set -e
+$cmdLines")
+                        if (!mvRes.isSuccess) throw IllegalStateException("Batch move failed for ${batch.size} package(s)")
+                    }
                     FastIsoDownloader.downloadBatchTurbo(batchItems, maxConns, dlPausedFlag, dlCancelledFlag, downloadedCounter, liveThreadsCounter, onRefreshUrls = refreshCallback) { doneItem ->
-                        val mvRes = Shell.cmd("mv -f ${shellQuote(doneItem.partFile.absolutePath)} ${shellQuote("${pkgDir.absolutePath}/${doneItem.id}")} 2>&1").exec()
-                        if (!mvRes.isSuccess) throw IllegalStateException("Move failed for ${doneItem.id}")
+                        pendingMoves.add(doneItem.partFile.absolutePath to "${pkgDir.absolutePath}/${doneItem.id}")
+                        if (doneItem.expectedSize >= 32L * 1024L * 1024L || pendingMoves.size >= 25) {
+                            flushMoves(force = true)
+                        }
                         filesDoneCounter.incrementAndGet()
                     }
+                    flushMoves(force = true)
                 } finally { meterJob.cancel() }
 
                 if (dlPausedFlag.get() || dlCancelledFlag.get()) return@launch
@@ -1417,6 +1599,18 @@ object WindowsBuildEngine {
         }
     }
 
+    private fun toRegExpandSzHex(value: String): String {
+        val sb = StringBuilder()
+        val withNull = value + "\u0000"
+        withNull.forEachIndexed { idx, ch ->
+            if (idx > 0) sb.append(',')
+            val lo = ch.code and 0xFF
+            val hi = (ch.code ushr 8) and 0xFF
+            sb.append(String.format("%02x,%02x", lo, hi))
+        }
+        return sb.toString()
+    }
+
     private suspend fun executeConversionJob(job: QueuedConversionJob) {
         val appCtx = job.context; val config = job.config; val workRootPath = job.workRootPath
         val pkgDir = if (job.pkgDirOverride.isNotBlank()) File(job.pkgDirOverride) else File(workRootPath, "PKGS")
@@ -1466,7 +1660,7 @@ object WindowsBuildEngine {
             val isoReadyMarker = "$workRootPath/.pb_isodir_ready"
             val qIsoReadyMarker = shellQuote(isoReadyMarker)
             val canSkipToStep4Pack = job.resumeFromStep4 && Shell.cmd(
-                "[ -f $qIsoReadyMarker ] && [ -f ${shellQuote("${isoDir.absolutePath}/sources/boot.wim")} ] && ( [ -f ${shellQuote("${isoDir.absolutePath}/sources/install.wim")} ] || [ -f ${shellQuote("${isoDir.absolutePath}/sources/install.esd")} ] ) && echo OK || true"
+                "[ -f $qIsoReadyMarker ] && [ -f ${shellQuote("${isoDir.absolutePath}/sources/boot.wim")} ] && ( [ -f ${shellQuote("${isoDir.absolutePath}/sources/install.wim")} ] || [ -f ${shellQuote("${isoDir.absolutePath}/sources/install.esd")} ] || [ -f ${shellQuote("${isoDir.absolutePath}/sources/install.swm")} ] ) && echo OK || true"
             ).exec().out.any { it.trim() == "OK" }
 
             if (canSkipToStep4Pack) {
@@ -1488,7 +1682,7 @@ object WindowsBuildEngine {
                 if (convCancelledFlag.get()) return
                 val cabName = cabPath.substringAfterLast('/')
                 publishConv("Step 1/4 · Converting CAB ${idx + 1}/${editionCabs.size}...", cabName, 0.03f + (idx.toFloat() / editionCabs.size.coerceAtLeast(1).toFloat()) * 0.14f)
-                val oneCabRes = runIsolatedRootScript(appCtx, "cab", "set -e\n$pathHeader\nBN=${shellQuote(cabName)}\nEXTDIR=\"/data/local/tmp/pb_uup_ext\"\nrm -rf \"\$EXTDIR\" && mkdir -p \"\$EXTDIR\"\nset +e\n$qCab -q -d \"\$EXTDIR\" ${shellQuote(cabPath)}\nset -e\nif [ -z \"\$(ls -A \"\$EXTDIR\" 2>/dev/null)\" ]; then rm -rf \"\$EXTDIR\"; exit 0; fi\n$qWim capture \"\$EXTDIR\" \"\$TMP/\$BN.esd\" \"Edition Package\" \"Edition Package\" --compress=none --no-acls --norpfix\nrm -rf \"\$EXTDIR\"")
+                val oneCabRes = runIsolatedRootScript(appCtx, "cab", "set -e\n$pathHeader\nBN=${shellQuote(cabName)}\nif ! $qCab -l ${shellQuote(cabPath)} 2>/dev/null | grep -qi 'update\\.mum'; then exit 0; fi\nEXTDIR=\"/data/local/tmp/pb_uup_ext\"\nrm -rf \"\$EXTDIR\" && mkdir -p \"\$EXTDIR\"\nset +e\n$qCab -q -d \"\$EXTDIR\" ${shellQuote(cabPath)}\nset -e\nif [ -z \"\$(ls -A \"\$EXTDIR\" 2>/dev/null)\" ]; then rm -rf \"\$EXTDIR\"; exit 0; fi\n$qWim capture \"\$EXTDIR\" \"\$TMP/\$BN.esd\" \"Edition Package\" \"Edition Package\" --compress=none --no-acls --norpfix\nrm -rf \"\$EXTDIR\"")
                 if (!oneCabRes.isSuccess) throw IllegalStateException("CAB convert failed ($cabName)")
                 addConsole("Converted $cabName")
             }
@@ -1499,48 +1693,122 @@ object WindowsBuildEngine {
             if (metaList.isEmpty()) throw IllegalStateException("No Windows edition metadata ESD (3+ indexes) found.")
             val firstMeta = shellQuote(metaList.first())
 
-            val bootWimRes = runIsolatedRootScript(appCtx, "bootwim", """
-                set -e
-                $pathHeader
-                $qWim apply $firstMeta 1 "${'$'}ISODIR" --no-acls --no-attributes
-                mkdir -p "${'$'}ISODIR/sources"
-                $qWim export $firstMeta 2 "${'$'}TMP/winre.wim" --compress=maximum --boot
-                cp -f "${'$'}TMP/winre.wim" "${'$'}ISODIR/sources/boot.wim"
-                $qWim info "${'$'}ISODIR/sources/boot.wim" 1 "Microsoft Windows PE" "Microsoft Windows PE"
-                $qWim info "${'$'}ISODIR/sources/boot.wim" 1 --image-property FLAGS=9
-                HIVEDIR="/data/local/tmp/pb_uup_hive"
-                rm -rf "${'$'}HIVEDIR" && mkdir -p "${'$'}HIVEDIR"
-                $qWim extract "${'$'}ISODIR/sources/boot.wim" 1 "/Windows/System32/config/SOFTWARE" --dest-dir="${'$'}HIVEDIR" --no-acls --no-attributes >/dev/null 2>&1 || \
-                  $qWim extract "${'$'}ISODIR/sources/boot.wim" 1 "/windows/system32/config/software" --dest-dir="${'$'}HIVEDIR" --no-acls --no-attributes >/dev/null 2>&1 || true
-                HIVE_FILE=${'$'}(find "${'$'}HIVEDIR" -maxdepth 1 -type f -iname 'software' | head -n 1)
-                if [ -n "${'$'}HIVE_FILE" ]; then
-                    set +e
-                    printf 'cd Microsoft\\Windows NT\\CurrentVersion\nnv 1 SystemRoot\ned SystemRoot\nX:\\${'$'}Windows.~bt\\Windows\ncd WinPE\nnv 1 InstRoot\ned InstRoot\nX:\\${'$'}Windows.~bt\nq\n' | $qChntpw -C -e "${'$'}HIVE_FILE"
+            val boot1RegFile = File(appCtx.cacheDir, "pb_boot1_soft.reg").apply {
+                val bgWinreHex = toRegExpandSzHex("%SystemRoot%\\System32\\winre.jpg")
+                writeText(
+                    "REGEDIT4\r\n\r\n" +
+                        "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion]\r\n" +
+                        "\"SystemRoot\"=\"X:\\\\${'$'}windows.~bt\\\\Windows\"\r\n\r\n" +
+                        "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\WinPE]\r\n" +
+                        "\"InstRoot\"=\"X:\\\\${'$'}windows.~bt\\\\\"\r\n" +
+                        "\"CustomBackground\"=hex(2):$bgWinreHex\r\n" +
+                        "\"CustomShell\"=-\r\n\r\n",
+                    Charsets.US_ASCII
+                )
+            }
+            val boot2RegFile = File(appCtx.cacheDir, "pb_boot2_soft.reg").apply {
+                val bgSetupHex = toRegExpandSzHex("%SystemRoot%\\System32\\setup.bmp")
+                writeText(
+                    "REGEDIT4\r\n\r\n" +
+                        "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\WinPE]\r\n" +
+                        "\"CustomBackground\"=hex(2):$bgSetupHex\r\n" +
+                        "\"CustomShell\"=-\r\n\r\n",
+                    Charsets.US_ASCII
+                )
+            }
+            val qBoot1Reg = shellQuote(boot1RegFile.absolutePath)
+            val qBoot2Reg = shellQuote(boot2RegFile.absolutePath)
+            val archTag = config.build.archDisplay.lowercase()
+            val bldMajorForFonts = config.build.build.substringBefore('.').toIntOrNull() ?: 0
+            val wantBootFonts = bldMajorForFonts == 0 || bldMajorForFonts in 18890..27499
+
+            val bootWimRes = try {
+                runIsolatedRootScript(appCtx, "bootwim", """
                     set -e
-                    $qWim update "${'$'}ISODIR/sources/boot.wim" 1 --command="add '${'$'}HIVE_FILE' /Windows/System32/config/SOFTWARE"
-                fi
-                rm -rf "${'$'}HIVEDIR"
-                BG_FILE=""
-                for bg in "${'$'}ISODIR/sources/background_cli.bmp" "${'$'}ISODIR/sources/background_svr.bmp" "${'$'}ISODIR/sources/background_cli.png"; do [ -f "${'$'}bg" ] && BG_FILE="${'$'}bg" && break; done
-                [ -n "${'$'}BG_FILE" ] && ($qWim update "${'$'}ISODIR/sources/boot.wim" 1 --command="add '${'$'}BG_FILE' /Windows/system32/winre.jpg" || true)
-                $qWim update "${'$'}ISODIR/sources/boot.wim" 1 --command="delete --force /Windows/System32/winpeshl.ini" || true
-                $qWim export "${'$'}TMP/winre.wim" 1 "${'$'}ISODIR/sources/boot.wim" "Microsoft Windows Setup" "Microsoft Windows Setup"
-                $qWim info "${'$'}ISODIR/sources/boot.wim" 2 --image-property FLAGS=2
-                $qWim info "${'$'}ISODIR/sources/boot.wim" 2 --boot
-                $qWim extract $firstMeta 3 "/Windows/System32/xmllite.dll" --dest-dir="${'$'}ISODIR/sources" --no-acls --no-attributes >/dev/null 2>&1 || true
-                UPD_TXT="/data/local/tmp/pb_boot_update.txt"; : > "${'$'}UPD_TXT"
-                echo "delete --force /Windows/System32/winpeshl.ini" >> "${'$'}UPD_TXT"
-                [ -f "${'$'}ISODIR/setup.exe" ] && echo "add '${'$'}ISODIR/setup.exe' /setup.exe" >> "${'$'}UPD_TXT"
-                [ -n "${'$'}BG_FILE" ] && echo "add '${'$'}BG_FILE' /sources/background.bmp" >> "${'$'}UPD_TXT" && echo "add '${'$'}BG_FILE' /Windows/system32/winre.jpg" >> "${'$'}UPD_TXT"
-                for sf in "${'$'}ISODIR"/sources/*; do
-                    [ -e "${'$'}sf" ] || continue; sbn=${'$'}(basename "${'$'}sf")
-                    case "${'$'}sbn" in boot.wim|install.wim|install.esd|sxs|SXS|uup|UUP) continue ;; esac
-                    echo "add '${'$'}sf' '/sources/${'$'}sbn'" >> "${'$'}UPD_TXT"
-                done
-                $qWim update "${'$'}ISODIR/sources/boot.wim" 2 < "${'$'}UPD_TXT"
-                $qWim optimize "${'$'}ISODIR/sources/boot.wim"
-                rm -f "${'$'}ISODIR/sources/xmllite.dll" "${'$'}UPD_TXT"
-            """.trimIndent())
+                    $pathHeader
+                    $qWim apply $firstMeta 1 "${'$'}ISODIR" --no-acls --no-attributes
+                    rm -f "${'$'}ISODIR/MediaMeta.xml" "${'$'}ISODIR/mediameta.xml" 2>/dev/null || true
+                    mkdir -p "${'$'}ISODIR/sources"
+                    if [ "${if (wantBootFonts) "1" else "0"}" = "1" ]; then
+                        mkdir -p "${'$'}ISODIR/boot/fonts" "${'$'}ISODIR/efi/microsoft/boot/fonts"
+                        $qWim extract $firstMeta 3 "/Windows/Boot/Fonts" --dest-dir="${'$'}TMP/bootfonts" --no-acls --no-attributes >/dev/null 2>&1 || true
+                        if [ -d "${'$'}TMP/bootfonts/Fonts" ]; then
+                            cp -f "${'$'}TMP/bootfonts/Fonts"/* "${'$'}ISODIR/boot/fonts/" 2>/dev/null || true
+                            cp -f "${'$'}TMP/bootfonts/Fonts"/* "${'$'}ISODIR/efi/microsoft/boot/fonts/" 2>/dev/null || true
+                        elif [ -d "${'$'}TMP/bootfonts" ]; then
+                            cp -f "${'$'}TMP/bootfonts"/* "${'$'}ISODIR/boot/fonts/" 2>/dev/null || true
+                            cp -f "${'$'}TMP/bootfonts"/* "${'$'}ISODIR/efi/microsoft/boot/fonts/" 2>/dev/null || true
+                        fi
+                        rm -rf "${'$'}TMP/bootfonts"
+                    fi
+
+                    $qWim export $firstMeta 2 "${'$'}TMP/winre.wim" --compress=maximum --boot
+                    cp -f "${'$'}TMP/winre.wim" "${'$'}ISODIR/sources/boot.wim"
+                    $qWim info "${'$'}ISODIR/sources/boot.wim" 1 "Microsoft Windows PE ($archTag)" "Microsoft Windows PE ($archTag)"
+                    $qWim info "${'$'}ISODIR/sources/boot.wim" 1 --image-property FLAGS=9
+
+                    HIVEDIR="/data/local/tmp/pb_uup_hive"
+                    rm -rf "${'$'}HIVEDIR" && mkdir -p "${'$'}HIVEDIR"
+                    $qWim extract "${'$'}ISODIR/sources/boot.wim" 1 "/Windows/System32/config/SOFTWARE" --dest-dir="${'$'}HIVEDIR" --no-acls --no-attributes >/dev/null 2>&1 || \
+                      $qWim extract "${'$'}ISODIR/sources/boot.wim" 1 "/windows/system32/config/software" --dest-dir="${'$'}HIVEDIR" --no-acls --no-attributes >/dev/null 2>&1 || true
+                    HIVE_FILE=${'$'}(find "${'$'}HIVEDIR" -maxdepth 1 -type f -iname 'software' | head -n 1)
+                    if [ -n "${'$'}HIVE_FILE" ]; then
+                        set +e
+                        printf 'y\n' | $qChntpw -C -I "${'$'}HIVE_FILE" 'HKEY_LOCAL_MACHINE\SOFTWARE' $qBoot1Reg >/dev/null 2>&1
+                        printf 'cd Microsoft\\Windows NT\\CurrentVersion\\WinPE\ndv CustomShell\nq\ny\n' | $qChntpw -C -e "${'$'}HIVE_FILE" >/dev/null 2>&1
+                        set -e
+                        $qWim update "${'$'}ISODIR/sources/boot.wim" 1 --command="add '${'$'}HIVE_FILE' /Windows/System32/config/SOFTWARE"
+                    fi
+                    rm -rf "${'$'}HIVEDIR"
+
+                    BG_FILE=""
+                    for bg in "${'$'}ISODIR/sources/background_cli.bmp" "${'$'}ISODIR/sources/background_svr.bmp" "${'$'}ISODIR/sources/background_cli.png" "${'$'}ISODIR/sources/background_svr.png"; do
+                        [ -f "${'$'}bg" ] && BG_FILE="${'$'}bg" && break
+                    done
+                    [ -n "${'$'}BG_FILE" ] && ($qWim update "${'$'}ISODIR/sources/boot.wim" 1 --command="add '${'$'}BG_FILE' /Windows/system32/winre.jpg" || true)
+                    [ -n "${'$'}BG_FILE" ] && ($qWim update "${'$'}ISODIR/sources/boot.wim" 1 --command="add '${'$'}BG_FILE' /Windows/system32/winpe.jpg" || true)
+                    $qWim update "${'$'}ISODIR/sources/boot.wim" 1 --command="delete --force /Windows/System32/winpeshl.ini" || true
+
+                    $qWim export "${'$'}TMP/winre.wim" 1 "${'$'}ISODIR/sources/boot.wim" "Microsoft Windows Setup ($archTag)" "Microsoft Windows Setup ($archTag)"
+                    $qWim info "${'$'}ISODIR/sources/boot.wim" 2 --image-property FLAGS=2
+                    $qWim info "${'$'}ISODIR/sources/boot.wim" 2 --boot
+
+                    rm -rf "${'$'}HIVEDIR" && mkdir -p "${'$'}HIVEDIR"
+                    $qWim extract "${'$'}ISODIR/sources/boot.wim" 2 "/Windows/System32/config/SOFTWARE" --dest-dir="${'$'}HIVEDIR" --no-acls --no-attributes >/dev/null 2>&1 || \
+                      $qWim extract "${'$'}ISODIR/sources/boot.wim" 2 "/windows/system32/config/software" --dest-dir="${'$'}HIVEDIR" --no-acls --no-attributes >/dev/null 2>&1 || true
+                    HIVE2=${'$'}(find "${'$'}HIVEDIR" -maxdepth 1 -type f -iname 'software' | head -n 1)
+                    if [ -n "${'$'}HIVE2" ]; then
+                        set +e
+                        printf 'y\n' | $qChntpw -C -I "${'$'}HIVE2" 'HKEY_LOCAL_MACHINE\SOFTWARE' $qBoot2Reg >/dev/null 2>&1
+                        printf 'cd Microsoft\\Windows NT\\CurrentVersion\\WinPE\ndv CustomShell\nq\ny\n' | $qChntpw -C -e "${'$'}HIVE2" >/dev/null 2>&1
+                        set -e
+                    fi
+
+                    $qWim extract $firstMeta 3 "/Windows/System32/xmllite.dll" --dest-dir="${'$'}ISODIR/sources" --no-acls --no-attributes >/dev/null 2>&1 || true
+                    UPD_TXT="/data/local/tmp/pb_boot_update.txt"; : > "${'$'}UPD_TXT"
+                    echo "delete --force /Windows/System32/winpeshl.ini" >> "${'$'}UPD_TXT"
+                    [ -n "${'$'}HIVE2" ] && echo "add '${'$'}HIVE2' /Windows/System32/config/SOFTWARE" >> "${'$'}UPD_TXT"
+                    [ -f "${'$'}ISODIR/setup.exe" ] && echo "add '${'$'}ISODIR/setup.exe' /setup.exe" >> "${'$'}UPD_TXT"
+                    [ -f "${'$'}ISODIR/sources/inf/setup.cfg" ] && echo "add '${'$'}ISODIR/sources/inf/setup.cfg' /sources/inf/setup.cfg" >> "${'$'}UPD_TXT"
+                    if [ -n "${'$'}BG_FILE" ]; then
+                        echo "add '${'$'}BG_FILE' /sources/background.bmp" >> "${'$'}UPD_TXT"
+                        echo "add '${'$'}BG_FILE' /Windows/system32/setup.bmp" >> "${'$'}UPD_TXT"
+                        echo "add '${'$'}BG_FILE' /Windows/system32/winpe.jpg" >> "${'$'}UPD_TXT"
+                        echo "add '${'$'}BG_FILE' /Windows/system32/winre.jpg" >> "${'$'}UPD_TXT"
+                    fi
+                    for sf in "${'$'}ISODIR"/sources/*; do
+                        [ -e "${'$'}sf" ] || continue; sbn=${'$'}(basename "${'$'}sf")
+                        case "${'$'}sbn" in boot.wim|install.wim|install.esd|install*.swm|sxs|SXS|uup|UUP) continue ;; esac
+                        echo "add '${'$'}sf' '/sources/${'$'}sbn'" >> "${'$'}UPD_TXT"
+                    done
+                    $qWim update "${'$'}ISODIR/sources/boot.wim" 2 < "${'$'}UPD_TXT"
+                    $qWim optimize "${'$'}ISODIR/sources/boot.wim"
+                    rm -rf "${'$'}HIVEDIR" "${'$'}ISODIR/sources/xmllite.dll" "${'$'}UPD_TXT"
+                """.trimIndent())
+            } finally {
+                boot1RegFile.delete()
+                boot2RegFile.delete()
+            }
             if (!bootWimRes.isSuccess) throw IllegalStateException("boot.wim assembly failed: ${(bootWimRes.out + bootWimRes.err).takeLast(4).joinToString(" ").take(240)}")
             addConsole("Step 2/4 complete: boot.wim assembled + winre.wim kept")
 
@@ -1581,7 +1849,27 @@ object WindowsBuildEngine {
                     }
                 }
                 val qMeta = shellQuote(metaPath)
-                val expRes = runIsolatedRootScript(appCtx, "wimexp", "set -e\n$pathHeader\n: > $qProgLog\nED_NAME=\$($qWim info $qMeta 3 2>/dev/null | sed -n 's/^Display Name:[[:space:]]*//p; s/^Name:[[:space:]]*//p' | head -n 1)\n[ -z \"\$ED_NAME\" ] && ED_NAME=\"Windows ${config.build.build}\"\nset --\nfor ref in \"\$PKG\"/*.esd \"\$PKG\"/*.ESD \"\$TMP\"/*.esd; do [ -f \"\$ref\" ] && set -- \"\$@\" --ref=\"\$ref\"; done\n$qWim export $qMeta 3 $qStageWim \"\$ED_NAME\" $exportArg \"\$@\" > $qProgLog 2>&1")
+                val expRes = runIsolatedRootScript(appCtx, "wimexp", """
+                    set -e
+                    $pathHeader
+                    : > $qProgLog
+                    INFO_TXT=${'$'}($qWim info $qMeta 3 2>/dev/null || true)
+                    ED_NAME=${'$'}(printf '%s\n' "${'$'}INFO_TXT" | sed -n 's/^Display Name:[[:space:]]*//p; s/^Name:[[:space:]]*//p' | head -n 1)
+                    ED_DESC=${'$'}(printf '%s\n' "${'$'}INFO_TXT" | sed -n 's/^Display Description:[[:space:]]*//p; s/^Description:[[:space:]]*//p' | head -n 1)
+                    ED_ID=${'$'}(printf '%s\n' "${'$'}INFO_TXT" | sed -n 's/^Edition ID:[[:space:]]*//p' | head -n 1)
+                    [ -z "${'$'}ED_NAME" ] && ED_NAME="Windows ${config.build.build}"
+                    [ -z "${'$'}ED_DESC" ] && ED_DESC="${'$'}ED_NAME"
+                    set --
+                    for ref in "${'$'}PKG"/*.esd "${'$'}PKG"/*.ESD "${'$'}TMP"/*.esd; do [ -f "${'$'}ref" ] && set -- "${'$'}@" --ref="${'$'}ref"; done
+                    $qWim export $qMeta 3 $qStageWim "${'$'}ED_NAME" $exportArg "${'$'}@" > $qProgLog 2>&1
+                    NEW_IDX=${'$'}($qWim info $qStageWim 2>/dev/null | grep -c '^Index:' || echo 1)
+                    if [ -n "${'$'}ED_ID" ]; then
+                        $qWim info $qStageWim "${'$'}NEW_IDX" \
+                            --image-property DISPLAYNAME="${'$'}ED_NAME" \
+                            --image-property DISPLAYDESCRIPTION="${'$'}ED_DESC" \
+                            --image-property FLAGS="${'$'}ED_ID" >/dev/null 2>&1 || true
+                    fi
+                """.trimIndent())
                 wimPollJob.cancel()
                 if (!expRes.isSuccess) {
                     val err = Shell.cmd("tail -n 6 $qProgLog 2>/dev/null || true").exec().out.filter { it.isNotBlank() }.joinToString(" | ").take(260)
@@ -1646,8 +1934,85 @@ object WindowsBuildEngine {
             val oemPanther = "${isoDir.absolutePath}/sources/\$OEM\$/\$\$/Panther"
 
             if (job.hasUpdates) {
-                addConsole("Staging Additional Updates into sources/\$OEM\$/\$\$/Setup/Updates/")
-                runIsolatedRootScript(appCtx, "oemupd", "$pathHeader\nmkdir -p ${shellQuote(oemUpdates)}\nfor f in \"\$PKG\"/*.msu \"\$PKG\"/*-KB*.cab \"\$PKG\"/*-kb*.cab \"\$PKG\"/*SSU*.cab \"\$PKG\"/*ssu*.cab \"\$PKG\"/*NDP*.cab; do [ -f \"\$f\" ] && cp -f \"\$f\" ${shellQuote(oemUpdates)}/ 2>/dev/null || true; done")
+                addConsole("Classifying updates: Setup DU -> sources/, OS Updates -> 1_SSU / 2_UPD / 3_LCU")
+                val updRes = runIsolatedRootScript(appCtx, "oemupd", """
+                    set -e
+                    $pathHeader
+                    mkdir -p ${shellQuote(oemUpdates)}
+                    MUM_TMP="/data/local/tmp/pb_upd_mum"
+                    DU_TMP="/data/local/tmp/pb_upd_du"
+                    rm -rf "${'$'}MUM_TMP" "${'$'}DU_TMP"
+
+                    # 1. Stage unified .msu cumulative updates as 3_<name>
+                    for f in "${'$'}PKG"/*.msu "${'$'}PKG"/*.MSU; do
+                        [ -f "${'$'}f" ] || continue
+                        bn=${'$'}(basename "${'$'}f")
+                        cp -f "${'$'}f" ${shellQuote(oemUpdates)}/"3_${'$'}bn"
+                        echo "UPD_LOG|LCU MSU -> 3_${'$'}bn"
+                    done
+
+                    # 2. Classify & stage .cab updates (Setup DU -> ISODIR/sources, skip SafeOS/WinPE-only & MSU-duplicated KBs)
+                    for f in "${'$'}PKG"/*-KB*.cab "${'$'}PKG"/*-kb*.cab "${'$'}PKG"/*SSU*.cab "${'$'}PKG"/*ssu*.cab "${'$'}PKG"/*NDP*.cab; do
+                        [ -f "${'$'}f" ] || continue
+                        bn=${'$'}(basename "${'$'}f")
+                        low=${'$'}(printf '%s' "${'$'}bn" | tr 'A-Z' 'a-z')
+                        case "${'$'}low" in
+                            *desktopdeployment*|*aggregatedmetadata*|*baseless*|*-express.cab|*netfx3-ondemand*) continue ;;
+                        esac
+                        # Skip CAB if a combined .msu with the same KB number already exists
+                        kb_num=${'$'}(printf '%s' "${'$'}bn" | grep -oiE 'KB[0-9]{6,8}' | head -n 1 || true)
+                        if [ -n "${'$'}kb_num" ] && ls "${'$'}PKG"/*${'$'}kb_num*.msu "${'$'}PKG"/*${'$'}kb_num*.MSU >/dev/null 2>&1; then
+                            echo "UPD_LOG|Skipped duplicate CAB (superseded by MSU): ${'$'}bn"
+                            continue
+                        fi
+
+                        # Check for update.mum inside CAB
+                        if ! $qCab -l "${'$'}f" 2>/dev/null | grep -qi 'update\.mum'; then
+                            # No update.mum -> Setup Dynamic Update! Extract directly into ISODIR/sources/ (:addDU parity)
+                            rm -rf "${'$'}DU_TMP" && mkdir -p "${'$'}DU_TMP"
+                            set +e
+                            $qCab -q -d "${'$'}DU_TMP" "${'$'}f" >/dev/null 2>&1
+                            set -e
+                            if [ -n "${'$'}(ls -A "${'$'}DU_TMP" 2>/dev/null)" ]; then
+                                cp -rf "${'$'}DU_TMP"/* "${'$'}ISODIR/sources/" 2>/dev/null || true
+                                echo "UPD_LOG|Applied Setup DU directly to sources/: ${'$'}bn"
+                            fi
+                            rm -rf "${'$'}DU_TMP"
+                            continue
+                        fi
+
+                        # Extract update.mum to skip SafeOS/WinPE-only CABs and detect SSU accurately
+                        rm -rf "${'$'}MUM_TMP" && mkdir -p "${'$'}MUM_TMP"
+                        set +e
+                        $qCab -q -F 'update.mum' -d "${'$'}MUM_TMP" "${'$'}f" >/dev/null 2>&1
+                        set -e
+                        MUM_F=${'$'}(find "${'$'}MUM_TMP" -maxdepth 2 -type f -iname 'update.mum' | head -n 1)
+                        if [ -n "${'$'}MUM_F" ]; then
+                            if grep -qi 'Package_for_SafeOSDU' "${'$'}MUM_F" 2>/dev/null; then
+                                echo "UPD_LOG|Skipped SafeOS WinRE-only CAB: ${'$'}bn"
+                                rm -rf "${'$'}MUM_TMP"; continue
+                            fi
+                            if grep -qi 'WinPE' "${'$'}MUM_F" 2>/dev/null && ! grep -qi 'Edition"' "${'$'}MUM_F" 2>/dev/null; then
+                                echo "UPD_LOG|Skipped WinPE-only CAB: ${'$'}bn"
+                                rm -rf "${'$'}MUM_TMP"; continue
+                            fi
+                        fi
+
+                        if printf '%s' "${'$'}low" | grep -qiE '^ssu-|-ssu-' || $qCab -l "${'$'}f" 2>/dev/null | grep -qi 'microsoft-windows-servicingstack_'; then
+                            cp -f "${'$'}f" ${shellQuote(oemUpdates)}/"1_${'$'}bn"
+                            echo "UPD_LOG|SSU -> 1_${'$'}bn"
+                        else
+                            cp -f "${'$'}f" ${shellQuote(oemUpdates)}/"2_${'$'}bn"
+                            echo "UPD_LOG|Update CAB -> 2_${'$'}bn"
+                        fi
+                        rm -rf "${'$'}MUM_TMP"
+                    done
+                    # Remove Updates dir if everything was Setup DU / skipped
+                    if [ -z "${'$'}(ls -A ${shellQuote(oemUpdates)} 2>/dev/null)" ]; then
+                        rmdir ${shellQuote(oemUpdates)} 2>/dev/null || true
+                    fi
+                """.trimIndent())
+                updRes.out.filter { it.startsWith("UPD_LOG|") }.forEach { addConsole(it.substringAfter('|')) }
             }
             if (job.hasApps) {
                 addConsole("Staging Inbox Store Apps into sources/\$OEM\$/\$\$/Setup/Apps/")
@@ -1680,6 +2045,19 @@ object WindowsBuildEngine {
                 Shell.cmd("mkdir -p ${shellQuote(oemPanther)} ${shellQuote(oemScripts)} && cp -f ${shellQuote(tmpXml.absolutePath)} ${shellQuote("${isoDir.absolutePath}/autounattend.xml")} && cp -f ${shellQuote(tmpXml.absolutePath)} ${shellQuote("$oemPanther/unattend.xml")} && cp -f ${shellQuote(tmpSpec.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_Specialize.cmd")} && cp -f ${shellQuote(tmpComp.absolutePath)} ${shellQuote("$oemScripts/SetupComplete.cmd")} && $customCopy").exec()
                 tmpXml.delete(); tmpSpec.delete(); tmpComp.delete()
                 addConsole("Injected autounattend.xml + unplug-safe \$OEM\$ scripts")
+            }
+
+            if (config.splitWimForFat32 && effectiveComp == WinIsoCompression.WIM && config.outputMode != WinBuildOutputMode.DIRECT_NTFS_USB) {
+                val wimSz = Shell.cmd("stat -c '%s' $qFinalInstall 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                if (wimSz > 4_000_000_000L) {
+                    activeBin = "wimlib-imagex"
+                    addConsole("Splitting install.wim (${UsbGadgetEngine.formatBytes(wimSz)}) into FAT32-safe install*.swm (3,500 MB chunks)...")
+                    publishConv("Step 4/4 · Splitting install.wim (FAT32)...", "3,500 MB chunks (install*.swm)", 0.84f, wimSz)
+                    val swmPath = "${isoDir.absolutePath}/sources/install.swm"
+                    val swmRes = runIsolatedRootScript(appCtx, "wimsplit", "set -e\n$pathHeader\n$qWim split $qFinalInstall ${shellQuote(swmPath)} 3500 >/dev/null 2>&1\nrm -f $qFinalInstall")
+                    if (swmRes.isSuccess) addConsole("Split complete: sources/install*.swm ready for FAT32")
+                    else addConsole("WIM split failed (kept single install.wim)")
+                }
             }
 
             // Free temporary CAB/WIM staging files and mark ISODIR complete for instant Step-4 retry if packing fails!
