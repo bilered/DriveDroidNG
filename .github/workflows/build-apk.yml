@@ -30,7 +30,7 @@ jobs:
           mkdir -p app/src/main/jniLibs/arm64-v8a app/src/main/assets
 
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu autoconf automake libtool pkg-config libgcrypt20-dev gettext autopoint file cmake patch qemu-user
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu autoconf automake libtool pkg-config libgcrypt20-dev gettext autopoint file cmake patch
 
           # 1. Official Rufus UEFI:NTFS boot partition image
           curl -fSL "https://raw.githubusercontent.com/pbatard/rufus/master/res/uefi/uefi-ntfs.img" -o app/src/main/assets/uefi-ntfs.img
@@ -377,30 +377,25 @@ jobs:
             sed -i 's/FATAL_ERROR/STATUS/g' wodim/CMakeLists.txt || true
             sed -i 's/icedax//g; s/readom//g; s/libedc//g; s/libparanoia//g; s/netscsid//g; s|3rd-party/dirsplit||g' CMakeLists.txt || true
 
-            QEMU_BIN=$(command -v qemu-aarch64 || command -v qemu-aarch64-static || echo "")
+            CC_ABS=$(command -v aarch64-linux-gnu-gcc)
+            AR_ABS=$(command -v aarch64-linux-gnu-ar)
+            RANLIB_ABS=$(command -v aarch64-linux-gnu-ranlib)
             mkdir -p build
             cd build
-            CMAKE_EMU_ARG=""
-            [ -n "$QEMU_BIN" ] && CMAKE_EMU_ARG="-DCMAKE_CROSSCOMPILING_EMULATOR=${QEMU_BIN};-L;/usr/aarch64-linux-gnu"
 
             cmake .. \
               -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
               -DCMAKE_SYSTEM_NAME=Linux \
               -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
-              -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
-              -DCMAKE_AR=aarch64-linux-gnu-ar \
-              -DCMAKE_RANLIB=aarch64-linux-gnu-ranlib \
+              -DCMAKE_C_COMPILER="$CC_ABS" \
+              -DCMAKE_AR="$AR_ABS" \
+              -DCMAKE_RANLIB="$RANLIB_ABS" \
               -DCMAKE_FIND_ROOT_PATH="$SYSROOT;/usr/aarch64-linux-gnu" \
               -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
               -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
               -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
-              $CMAKE_EMU_ARG \
               -DCMAKE_C_FLAGS="-O2 -std=gnu17 -fcommon -D_FILE_OFFSET_BITS=64 -I${SYSROOT}/include -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-format-security" \
               -DCMAKE_EXE_LINKER_FLAGS="-static -L${SYSROOT}/lib" \
-              -DZLIB_INCLUDE_DIR="$SYSROOT/include" \
-              -DZLIB_LIBRARY="$SYSROOT/lib/libz.a" \
-              -DBZIP2_INCLUDE_DIR="$SYSROOT/include" \
-              -DBZIP2_LIBRARIES="$SYSROOT/lib/libbz2.a" \
               -DUSE_MAGIC=0
 
             cmake --build . --target genisoimage -j"$(nproc)"
@@ -408,6 +403,8 @@ jobs:
             file "$GEN_BIN"
             if ! aarch64-linux-gnu-readelf -l "$GEN_BIN" 2>/dev/null | grep -q INTERP; then
               # Smoke-test UDF 1.02 + Dual BIOS/UEFI El Torito flags under qemu-aarch64
+              sudo apt-get install -y -qq qemu-user >/dev/null 2>&1 || true
+              QEMU_BIN=$(command -v qemu-aarch64 || command -v qemu-aarch64-static || echo "")
               if [ -n "$QEMU_BIN" ]; then
                 mkdir -p /tmp/geniso_test/boot /tmp/geniso_test/efi/microsoft/boot /tmp/geniso_test/sources
                 dd if=/dev/zero of=/tmp/geniso_test/boot/etfsboot.com bs=512 count=8 status=none
