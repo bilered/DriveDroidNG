@@ -24,8 +24,10 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
@@ -67,10 +69,19 @@ enum class WinBuildTier(val sectionTitle: String, val badgeLabel: String) {
 data class GroupedWindowsBuilds(
     val stable: List<WindowsChannelBuild> = emptyList(),
     val preview: List<WindowsChannelBuild> = emptyList(),
-    val insider: List<WindowsChannelBuild> = emptyList()
+    val insider: List<WindowsChannelBuild> = emptyList(),
+    val hiddenOlderCount: Int = 0
 ) {
     val isEmpty: Boolean get() = stable.isEmpty() && preview.isEmpty() && insider.isEmpty()
     val totalCount: Int get() = stable.size + preview.size + insider.size
+    val allBuilds: List<WindowsChannelBuild> get() = (stable + preview + insider).sortedByDescending { it.createdEpoch }
+
+    fun groupedByYear(): List<Pair<Int, List<WindowsChannelBuild>>> =
+        allBuilds
+            .groupBy { it.createdYear }
+            .entries
+            .sortedWith(compareByDescending<Map.Entry<Int, List<WindowsChannelBuild>>> { it.key > 0 }.thenByDescending { it.key })
+            .map { it.key to it.value }
 }
 
 enum class WinDownloadMethod(val label: String, val subtitle: String) {
@@ -95,6 +106,9 @@ data class WindowsChannelBuild(
     val createdEpoch: Long, val tier: WinBuildTier = WinBuildTier.STABLE, val channelBadge: String = "Stable"
 ) {
     val archDisplay: String get() = when (arch.lowercase()) { "amd64" -> "x64"; "arm64" -> "ARM64"; "x86" -> "x86"; else -> arch.uppercase() }
+    val createdYear: Int get() = if (createdEpoch > 0L) runCatching {
+        Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply { timeInMillis = createdEpoch * 1000L }.get(Calendar.YEAR)
+    }.getOrDefault(0) else 0
     val createdDateLabel: String get() = if (createdEpoch > 0L) runCatching { SimpleDateFormat("MMM d, yyyy", Locale.US).format(Date(createdEpoch * 1000L)) }.getOrDefault("") else ""
     val dateDisplay: String get() = createdDateLabel
 }
@@ -467,7 +481,8 @@ object WindowsBuildEngine {
         featureVer: WinFeatureVersion,
         archFilter: String,
         cleanQuery: String,
-        hideCumulativeUpdates: Boolean
+        hideCumulativeUpdates: Boolean,
+        hideOlderBuilds: Boolean = true
     ): GroupedWindowsBuilds {
         val collected = mutableListOf<WindowsChannelBuild>()
         val seenUuids = mutableSetOf<String>()
@@ -501,11 +516,29 @@ object WindowsBuildEngine {
             collected.add(b)
         }
 
-        val sorted = collected.sortedByDescending { it.createdEpoch }
+        val sortedAll = collected.sortedByDescending { it.createdEpoch }
+        val cutoffEpoch = (System.currentTimeMillis() / 1000L) - (365L * 86400L)
+        var hiddenOlder = 0
+        val effective = if (hideOlderBuilds && cleanQuery.isBlank()) {
+            val recent = sortedAll.filter { it.createdEpoch <= 0L || it.createdEpoch >= cutoffEpoch }
+            val older = sortedAll.filter { it.createdEpoch in 1L until cutoffEpoch }
+            if (recent.isNotEmpty()) {
+                hiddenOlder = older.size
+                recent
+            } else {
+                // Legacy Feature Version (all builds >12m old): keep latest 5 so list is not blank
+                hiddenOlder = (older.size - 5).coerceAtLeast(0)
+                older.take(5)
+            }
+        } else {
+            sortedAll
+        }
+        val perTierCap = if (hideOlderBuilds) 30 else 80
         return GroupedWindowsBuilds(
-            stable = sorted.filter { it.tier == WinBuildTier.STABLE }.take(15),
-            preview = sorted.filter { it.tier == WinBuildTier.PREVIEW }.take(15),
-            insider = sorted.filter { it.tier == WinBuildTier.INSIDER }.take(15)
+            stable = effective.filter { it.tier == WinBuildTier.STABLE }.take(perTierCap),
+            preview = effective.filter { it.tier == WinBuildTier.PREVIEW }.take(perTierCap),
+            insider = effective.filter { it.tier == WinBuildTier.INSIDER }.take(perTierCap),
+            hiddenOlderCount = hiddenOlder
         )
     }
 
@@ -555,7 +588,8 @@ object WindowsBuildEngine {
         customQuery: String = "",
         context: Context? = null,
         cachedCatalogJson: String = "",
-        hideCumulativeUpdates: Boolean = true
+        hideCumulativeUpdates: Boolean = true,
+        hideOlderBuilds: Boolean = true
     ): GroupedWindowsBuilds = withContext(Dispatchers.IO) {
         val cleanQuery = customQuery.trim()
         val rawQueries = if (cleanQuery.isNotBlank()) listOf(cleanQuery) else featureVer.searchTerms
@@ -594,7 +628,7 @@ object WindowsBuildEngine {
                 }
             }
             if (anyApiResponse && collected.isNotEmpty()) {
-                val grouped = filterBuildsToGroups(collected, family, featureVer, archFilter, cleanQuery, hideCumulativeUpdates)
+                val grouped = filterBuildsToGroups(collected, family, featureVer, archFilter, cleanQuery, hideCumulativeUpdates, hideOlderBuilds)
                 if (!grouped.isEmpty) {
                     _activeSource.value = UupDataSource.UUPDUMP_LIVE
                     return@withContext grouped
@@ -604,13 +638,13 @@ object WindowsBuildEngine {
 
         // Layer 2: Automatic Failover -> Local/Bundled/GitHub Catalog + Direct Microsoft SyncUpdates
         val offlineList = loadOfflineCatalogBuilds(context, cachedCatalogJson).toMutableList()
-        var groupedOffline = filterBuildsToGroups(offlineList, family, featureVer, archFilter, cleanQuery, hideCumulativeUpdates)
+        var groupedOffline = filterBuildsToGroups(offlineList, family, featureVer, archFilter, cleanQuery, hideCumulativeUpdates, hideOlderBuilds)
 
         if (groupedOffline.isEmpty || preferDirectMicrosoft) {
             val liveMs = fetchLatestDirectFromMicrosoft(family, featureVer, archFilter)
             if (liveMs.isNotEmpty()) {
                 offlineList.addAll(0, liveMs)
-                groupedOffline = filterBuildsToGroups(offlineList, family, featureVer, archFilter, cleanQuery, hideCumulativeUpdates)
+                groupedOffline = filterBuildsToGroups(offlineList, family, featureVer, archFilter, cleanQuery, hideCumulativeUpdates, hideOlderBuilds)
                 _activeSource.value = UupDataSource.DIRECT_MICROSOFT
                 return@withContext groupedOffline
             }

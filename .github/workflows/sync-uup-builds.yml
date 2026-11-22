@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '0 4 * * *'
   workflow_dispatch:
+    inputs:
+      max_manifests:
+        description: 'Max new per-build manifests (uup-db/*.json) to cache in this run'
+        required: false
+        default: '50'
 
 permissions:
   contents: write
@@ -15,13 +20,23 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Update uup-builds.json and uup-db manifests
+      - name: Update full uup-builds.json archive and uup-db manifests
+        env:
+          MAX_MANIFESTS: ${{ github.event.inputs.max_manifests || '50' }}
         run: |
           python3 - <<'PYEOF'
-          import json, os, re, time, urllib.request, urllib.parse, datetime
+          import base64, datetime, html, json, os, re, time, urllib.error, urllib.parse, urllib.request, uuid
 
           UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot-Sync/4.5.0"
+          WU_UA = "Windows-Update-Agent/10.0.10011.16384 Client-Protocol/1.40"
           API = "https://api.uupdump.net"
+          MS_ENDPOINT = "https://fe3.delivery.mp.microsoft.com/ClientWebService/client.asmx"
+          MAX_ARCHIVE_BUILDS = 3000
+          try:
+              MAX_MANIFESTS = max(1, min(300, int(os.environ.get("MAX_MANIFESTS", "50"))))
+          except Exception:
+              MAX_MANIFESTS = 50
+
           JUNK = (
               "critical oobe", "dynamic update", "safe os", "setup dynamic",
               ".net framework", "microsoft edge", "security intelligence", "defender",
@@ -29,18 +44,239 @@ jobs:
               "feature on demand", "hotpatch", "cumulative update"
           )
 
+          LANG_NAMES = {
+              "en-us": "English (United States)", "en-gb": "English (United Kingdom)",
+              "ar-sa": "Arabic (Saudi Arabia)", "bg-bg": "Bulgarian", "cs-cz": "Czech",
+              "da-dk": "Danish", "de-de": "German", "el-gr": "Greek",
+              "es-es": "Spanish (Spain)", "es-mx": "Spanish (Mexico)", "et-ee": "Estonian",
+              "fi-fi": "Finnish", "fr-ca": "French (Canada)", "fr-fr": "French (France)",
+              "he-il": "Hebrew", "hr-hr": "Croatian", "hu-hu": "Hungarian",
+              "it-it": "Italian", "ja-jp": "Japanese", "ko-kr": "Korean",
+              "lt-lt": "Lithuanian", "lv-lv": "Latvian", "nb-no": "Norwegian (Bokmal)",
+              "nl-nl": "Dutch", "pl-pl": "Polish", "pt-br": "Portuguese (Brazil)",
+              "pt-pt": "Portuguese (Portugal)", "ro-ro": "Romanian", "ru-ru": "Russian",
+              "sk-sk": "Slovak", "sl-si": "Slovenian", "sr-latn-rs": "Serbian (Latin)",
+              "sv-se": "Swedish", "th-th": "Thai", "tr-tr": "Turkish",
+              "uk-ua": "Ukrainian", "zh-cn": "Chinese (Simplified)", "zh-tw": "Chinese (Traditional)"
+          }
+
+          def utc_year(epoch):
+              try:
+                  ep = int(epoch or 0)
+                  if ep > 0:
+                      return datetime.datetime.fromtimestamp(ep, tz=datetime.timezone.utc).year
+              except Exception:
+                  pass
+              return 0
+
+          def is_unusable_file(name):
+              low = name.lower()
+              return (
+                  low.startswith("baseless_")
+                  or "-express.cab" in low
+                  or "aggregatedmetadata" in low
+                  or "desktopdeployment" in low
+                  or low.endswith(".psf")
+              )
+
           def get_json(url, retries=3):
               for i in range(retries):
                   try:
                       req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
-                      with urllib.request.urlopen(req, timeout=20) as resp:
+                      with urllib.request.urlopen(req, timeout=25) as resp:
                           if resp.status == 200:
                               return json.loads(resp.read().decode("utf-8"))
+                  except urllib.error.HTTPError as e:
+                      if e.code == 429:
+                          print(f"HTTP 429 rate-limited on {url}; backing off...")
+                          time.sleep(4 + i * 4)
+                          continue
+                      print(f"HTTP {e.code} on {url}")
+                      time.sleep(2 + i * 2)
                   except Exception as e:
                       print(f"Fetch attempt {i+1} failed for {url}: {e}")
                       time.sleep(2 + i * 2)
               return None
 
+          # --- Direct Microsoft SOAP client (pure stdlib fallback) ---
+          def gen_device_token():
+              hdr = "13003002c377040014d5bcac7a66de0d50beddf9bba16c87edb9e019898000"
+              raw = bytes.fromhex(hdr + os.urandom(527).hex() + "b401")
+              t_val = base64.b64encode(raw).decode("ascii")
+              payload = f"t={t_val}&p=".encode("utf-16le")
+              return base64.b64encode(payload).decode("ascii")
+
+          def post_soap(body):
+              req = urllib.request.Request(
+                  MS_ENDPOINT,
+                  data=body.encode("utf-8"),
+                  headers={"Content-Type": "application/soap+xml; charset=utf-8", "User-Agent": WU_UA},
+                  method="POST",
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      return resp.read().decode("utf-8", errors="replace") if resp.status == 200 else None
+              except Exception as e:
+                  print(f"Direct Microsoft SOAP call failed: {e}")
+                  return None
+
+          def ms_iso(ts):
+              return datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+          def ms_branch(build_str):
+              parts = build_str.split(".")
+              major = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 0
+              return {
+                  17763: "rs5_release", 18362: "19h1_release", 18363: "19h1_release",
+                  19041: "vb_release", 19042: "vb_release", 19043: "vb_release", 19044: "vb_release", 19045: "vb_release",
+                  20348: "fe_release", 22000: "co_release", 22621: "ni_release", 22631: "ni_release",
+                  25398: "zn_release", 26100: "ge_release", 26200: "ge_release", 26300: "ge_release",
+                  28000: "br_release", 28100: "br_release",
+              }.get(major, "rs_prerelease")
+
+          def ms_get_cookie():
+              now = int(time.time())
+              c, e = ms_iso(now), ms_iso(now + 120)
+              xml = (
+                  '<s:Envelope xmlns:a="http://www.w3.org/2005/08/addressing" xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
+                  '<s:Header>'
+                  '<a:Action s:mustUnderstand="1">http://www.microsoft.com/SoftwareDistribution/Server/ClientWebService/GetCookie</a:Action>'
+                  f'<a:MessageID>urn:uuid:{uuid.uuid4()}</a:MessageID>'
+                  f'<a:To s:mustUnderstand="1">{MS_ENDPOINT}</a:To>'
+                  '<o:Security s:mustUnderstand="1" xmlns:o="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">'
+                  f'<Timestamp xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"><Created>{c}</Created><Expires>{e}</Expires></Timestamp>'
+                  '<wuws:WindowsUpdateTicketsToken wsu:id="ClientMSA" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd" xmlns:wuws="http://schemas.microsoft.com/msus/2014/10/WindowsUpdateAuthorization">'
+                  f'<TicketType Name="MSA" Version="1.0" Policy="MBI_SSL"><Device>{gen_device_token()}</Device></TicketType>'
+                  '</wuws:WindowsUpdateTicketsToken></o:Security></s:Header>'
+                  '<s:Body><GetCookie xmlns="http://www.microsoft.com/SoftwareDistribution/Server/ClientWebService">'
+                  f'<oldCookie><Expiration>{c}</Expiration></oldCookie><lastChange>{c}</lastChange><currentTime>{c}</currentTime><protocolVersion>2.0</protocolVersion>'
+                  '</GetCookie></s:Body></s:Envelope>'
+              )
+              resp = post_soap(xml)
+              if not resp:
+                  return None
+              m = re.search(r"<EncryptedData>([^<]+)</EncryptedData>", resp)
+              return m.group(1).strip() if m else None
+
+          def ms_sync_direct(cookie_enc, arch, ring, baseline, sku=48):
+              now = int(time.time())
+              c, e, cexp = ms_iso(now), ms_iso(now + 120), ms_iso(now + 604800)
+              branch = ms_branch(baseline)
+              is_srv = sku in (7, 8, 12, 13, 79, 80, 145, 146, 406, 407)
+              dvc_fam = "Windows.Server" if is_srv else "Windows.Desktop"
+              ins_type = "Server" if is_srv else "Client"
+              prod_type = "ServerNT" if is_srv else "WinNT"
+              main_prod = "Server.OS" if is_srv else "Client.OS.rs2"
+              r_up = ring.upper()
+              flt_ring = "Retail" if r_up == "RETAIL" else "External"
+              flt_branch = {"DEV": "Dev", "WIF": "Dev", "BETA": "Beta", "WIS": "Beta", "RP": "ReleasePreview", "CANARY": "CanaryChannel"}.get(r_up, "")
+              flt_en = 0 if r_up == "RETAIL" else 1
+              is_ret = 1 if r_up == "RETAIL" else 0
+              exp, past = now + 82800, now - 3600
+              attrs = [
+                  "App=WU_OS", f"AppVer={baseline}", "AttrDataVer=370", "AllowInPlaceUpgrade=1", "AllowOptionalContent=1",
+                  "AllowUpgradesWithUnsupportedTPMOrCPU=1", "AllowWindowsServerFeatureUpdate=1",
+                  f"BlockFeatureUpdates={1 if is_srv else 0}", "BranchReadinessLevel=CB", "CIOptin=1",
+                  f"CurrentBranch={branch}", f"DataExpDateEpoch_GE26H2={exp}", f"DataExpDateEpoch_GE25H2={exp}",
+                  f"DataExpDateEpoch_GE24H2={exp}", f"DataExpDateEpoch_NI23H2={exp}", f"DataExpDateEpoch_22H2={exp}",
+                  "DefaultUserRegion=191", f"DeviceFamily={dvc_fam}", "DeviceInfoGatherSuccessful=1",
+                  f"FlightingBranchName={flt_branch}", f"FlightRing={flt_ring}", "Free=gt64",
+                  "GStatus_GE26H2=2", "GStatus_GE25H2=2", "GStatus_GE24H2=2", "GStatus_NI23H2=2", "GStatus_22H2=2",
+                  "InstallDate=1438196400", "InstallLanguage=en-US", f"InstallationType={ins_type}",
+                  f"IsFlightingEnabled={flt_en}", f"IsRetailOS={is_ret}", "LCUVer=0.0.0.0", f"MediaVersion={baseline}",
+                  "CloudPBR=1", "DUScan=1", f"OSArchitecture={arch}", f"OSSkuId={sku}", "OSUILocale=en-US",
+                  f"OSVersion={baseline}", f"ProductType={prod_type}", "ReleaseType=Production", "SecureBootCapable=1",
+                  "TelemetryLevel=3", f"TimestampEpochString_GE26H2={past}", f"TimestampEpochString_GE25H2={past}",
+                  f"TimestampEpochString_GE24H2={past}", "TPMVersion=2", "UpdateManagementGroup=2",
+                  "UpgEx_GE26H2=Green", "UpgEx_GE25H2=Green", "UpgEx_GE24H2=Green", "UpgEx_NI23H2=Green", "UpgEx_22H2=Green",
+                  "UpgradeAccepted=1", "UpgradeEligible=1", "UserInPlaceUpgrade=1", "VBSState=2",
+                  "Win10CommercialAzureESUEligible=1", "Win10CommercialKeybasedESUEligible=3", "Win10ConsumerESUStatus=3",
+                  f"WuClientVer={baseline}",
+              ]
+              dev_attr = html.escape("E:" + "&".join(attrs), quote=True)
+              prods = html.escape(f"PN={main_prod}.{arch}&Branch={branch}&PrimaryOSProduct=1&Repairable=1&V={baseline}&ReofferUpdate=1;PN=Microsoft.NETFX.{arch}&V=0.0.0.0", quote=True)
+              caller = html.escape("E:Profile=AUv2&Acquisition=1&Interactive=1&IsSeeker=1&SheddingAware=1&Id=MoUpdateOrchestrator", quote=True)
+              ids_xml = "".join(f"<int>{x}</int>" for x in (1, 2, 3, 10, 11, 17, 19, 2359974, 2359977, 5143990, 5169043, 5169044, 5169047, 8788830, 8806526, 9125350, 9154769, 10809856, 23110993, 23110994, 23110995, 23110996, 23110999, 23111000, 23111001, 23111002, 23111003, 23111004, 24513870, 28880263, 30077688, 30486944, 59830006, 59830007, 59830008, 60484010, 62450018, 62450019, 62450020, 69801474, 98959022, 98959023, 98959024, 98959025, 98959026, 105939029, 105995585, 106017178, 107825194, 117765322, 129905029, 130040030, 130040031, 130040032, 130040033, 133399034, 138372035, 138372036, 139536037, 139536038, 139536039, 139536040, 142045136, 158941041, 158941042, 158941043, 158941044, 159776047, 160733048, 160733049, 160733050, 160733051, 160733055, 160733056, 161870057, 161870058, 161870059, 296374060, 316003061, 326686062, 326686063, 327065581, 327072300, 327072305, 333703234))
+              xml = (
+                  '<s:Envelope xmlns:a="http://www.w3.org/2005/08/addressing" xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
+                  '<s:Header>'
+                  '<a:Action s:mustUnderstand="1">http://www.microsoft.com/SoftwareDistribution/Server/ClientWebService/SyncUpdates</a:Action>'
+                  f'<a:MessageID>urn:uuid:{uuid.uuid4()}</a:MessageID>'
+                  f'<a:To s:mustUnderstand="1">{MS_ENDPOINT}</a:To>'
+                  '<o:Security s:mustUnderstand="1" xmlns:o="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">'
+                  f'<Timestamp xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"><Created>{c}</Created><Expires>{e}</Expires></Timestamp>'
+                  '<wuws:WindowsUpdateTicketsToken wsu:id="ClientMSA" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd" xmlns:wuws="http://schemas.microsoft.com/msus/2014/10/WindowsUpdateAuthorization">'
+                  f'<TicketType Name="MSA" Version="1.0" Policy="MBI_SSL"><Device>{gen_device_token()}</Device></TicketType>'
+                  '</wuws:WindowsUpdateTicketsToken></o:Security></s:Header>'
+                  '<s:Body><SyncUpdates xmlns="http://www.microsoft.com/SoftwareDistribution/Server/ClientWebService">'
+                  f'<cookie><Expiration>{cexp}</Expiration><EncryptedData>{cookie_enc}</EncryptedData></cookie>'
+                  f'<parameters><ExpressQuery>false</ExpressQuery><InstalledNonLeafUpdateIDs>{ids_xml}</InstalledNonLeafUpdateIDs>'
+                  '<OtherCachedUpdateIDs/><SkipSoftwareSync>false</SkipSoftwareSync><NeedTwoGroupOutOfScopeUpdates>true</NeedTwoGroupOutOfScopeUpdates>'
+                  '<AlsoPerformRegularSync>true</AlsoPerformRegularSync><ComputerSpec/>'
+                  '<ExtendedUpdateInfoParameters><XmlUpdateFragmentTypes><XmlUpdateFragmentType>Extended</XmlUpdateFragmentType><XmlUpdateFragmentType>LocalizedProperties</XmlUpdateFragmentType></XmlUpdateFragmentTypes><Locales><string>en-US</string></Locales></ExtendedUpdateInfoParameters>'
+                  '<ClientPreferredLanguages/>'
+                  f'<ProductsParameters><SyncCurrentVersionOnly>false</SyncCurrentVersionOnly><DeviceAttributes>{dev_attr}</DeviceAttributes><CallerAttributes>{caller}</CallerAttributes><Products>{prods}</Products></ProductsParameters>'
+                  '</parameters></SyncUpdates></s:Body></s:Envelope>'
+              )
+              resp = post_soap(xml)
+              if not resp:
+                  return []
+              dec = html.unescape(resp)
+              id_to_uuid, id_to_title, id_to_files = {}, {}, {}
+              for blk in re.findall(r"<UpdateInfo>(.*?)</UpdateInfo>", dec, re.S):
+                  nm = re.search(r"<ID>(\d+)</ID>", blk)
+                  um = re.search(r'UpdateID="([0-9a-fA-F-]{36})"', blk)
+                  if nm and um:
+                      id_to_uuid[nm.group(1)] = um.group(1).lower()
+              for blk in re.findall(r"<Update>(.*?)</Update>", dec, re.S):
+                  nm = re.search(r"<ID>(\d+)</ID>", blk)
+                  if not nm:
+                      continue
+                  nid = nm.group(1)
+                  tm = re.search(r"<Title>([^<]+)</Title>", blk)
+                  if tm:
+                      id_to_title[nid] = tm.group(1).strip()
+                  if "<Files>" in blk:
+                      fb = blk.split("<Files>", 1)[1].split("</Files>", 1)[0]
+                      files = {}
+                      for attrs_s, inner_s in re.findall(r"<File\s+([^>]+?)(?:/>|>(.*?)</File>)", fb, re.S):
+                          fn_m = re.search(r'FileName="([^"]+)"', attrs_s)
+                          sz_m = re.search(r'Size="(\d+)"', attrs_s)
+                          sha_m = re.search(r'<AdditionalDigest\s+Algorithm="SHA1">([^<]+)</AdditionalDigest>', inner_s or "") or re.search(r'Digest="([^"]+)"', attrs_s)
+                          if not fn_m or not sha_m:
+                              continue
+                          fname = fn_m.group(1).strip()
+                          if is_unusable_file(fname):
+                              continue
+                          try:
+                              sha_hex = base64.b64decode(sha_m.group(1).strip()).hex()
+                          except Exception:
+                              continue
+                          if len(sha_hex) == 40:
+                              files[fname] = {"size": int(sz_m.group(1)) if sz_m else 0, "sha1": sha_hex}
+                      if files:
+                          id_to_files[nid] = files
+              found = []
+              for nid, files in id_to_files.items():
+                  uid = id_to_uuid.get(nid)
+                  if not uid:
+                      continue
+                  if not any(k.lower().endswith(".esd") and any(t in k.lower() for t in ("core_", "professional_", "serverstandard", "serverdatacenter")) for k in files):
+                      continue
+                  title = id_to_title.get(nid, f"Windows Update ({arch})")
+                  bm = re.search(r"(\d{5}\.\d+)", title)
+                  bld = bm.group(1) if bm else baseline.replace("10.0.", "")
+                  ch = {"CANARY": "Canary", "DEV": "Dev", "BETA": "Beta", "RP": "Preview"}.get(r_up, "Stable")
+                  found.append((
+                      {
+                          "uuid": uid, "title": title, "build": bld, "arch": arch,
+                          "created": now, "year": utc_year(now), "ring": r_up, "sku": sku, "channel": ch
+                      },
+                      files
+                  ))
+              return found
+
+          # --- Load existing archive ---
           existing_path = "uup-builds.json"
           existing = []
           if os.path.exists(existing_path):
@@ -49,33 +285,43 @@ jobs:
               except Exception:
                   existing = []
 
-          by_uuid = {b["uuid"]: b for b in existing if b.get("uuid")}
+          by_uuid = {}
+          for b in existing:
+              uid = b.get("uuid")
+              if uid:
+                  if not b.get("year"):
+                      b["year"] = utc_year(b.get("created", 0))
+                  by_uuid[uid] = b
 
-          # Pull latest builds from UUPdump API if reachable
+          os.makedirs("app/src/main/assets", exist_ok=True)
+          os.makedirs("uup-db", exist_ok=True)
+
+          # --- Layer 1: Full archive sync from api.uupdump.net (no 180 cap) ---
+          uupdump_ok = False
           data = get_json(f"{API}/listid.php?sortByDate=1")
           raw_field = data.get("response", {}).get("builds") if isinstance(data, dict) else None
           raw_builds = list(raw_field.values()) if isinstance(raw_field, dict) else (raw_field if isinstance(raw_field, list) else [])
           if raw_builds:
+              uupdump_ok = True
               added = 0
               for b in raw_builds:
                   title = (b.get("title") or "").strip()
                   low = title.lower()
-                  uuid = (b.get("uuid") or "").strip()
+                  uid = (b.get("uuid") or "").strip()
                   build = (b.get("build") or "").strip()
                   arch = (b.get("arch") or "amd64").strip().lower()
-                  if not uuid or not title or not build:
+                  if not uid or not title or not build:
                       continue
                   if any(j in low for j in JUNK):
                       continue
-                  if low.startswith("update for ") or low.startswith("202") and "update for" in low:
+                  if low.startswith("update for ") or (re.match(r"^20\d{2}-\d{2}\s+", low) and "update for" in low):
                       continue
                   major = int(build.split(".")[0]) if build.split(".")[0].isdigit() else 0
                   if major < 17763:
                       continue
                   if arch not in ("amd64", "arm64", "x86"):
                       continue
-                  ring = "RETAIL"
-                  channel = "Stable"
+                  ring, channel = "RETAIL", "Stable"
                   if "canary" in low or major >= 29000 or 27000 <= major <= 27999:
                       ring, channel = "CANARY", "Canary"
                   elif "dev" in low or 26340 <= major <= 26999 or 28100 <= major <= 28999:
@@ -85,70 +331,116 @@ jobs:
                   elif "preview" in low:
                       ring, channel = "RP", "Preview"
                   sku = 7 if "server" in low else 48
-                  by_uuid[uuid] = {
-                      "uuid": uuid,
-                      "title": title,
+                  created = int(b.get("created") or 0)
+                  by_uuid[uid] = {
+                      "uuid": uid,
+                      "title": re.sub(r"\s*\(\d+\)\s*$", "", title).strip(),
                       "build": build,
                       "arch": arch,
-                      "created": int(b.get("created") or 0),
+                      "created": created,
+                      "year": utc_year(created),
                       "ring": ring,
                       "sku": sku,
                       "channel": channel,
                   }
                   added += 1
-                  if added >= 150:
-                      break
-              print(f"Synced {added} builds from api.uupdump.net")
+              print(f"Synced {added} total installable builds from api.uupdump.net")
           else:
-              print("api.uupdump.net unreachable; keeping existing uup-builds.json intact.")
+              print("api.uupdump.net unreachable; falling back to Direct Microsoft SOAP sync...")
 
-          sorted_builds = sorted(by_uuid.values(), key=lambda x: x.get("created", 0), reverse=True)[:180]
+          # --- Layer 2: Direct Microsoft SOAP fallback when UUPdump is unreachable ---
+          ms_cached = 0
+          if not uupdump_ok:
+              cookie = ms_get_cookie()
+              if cookie:
+                  targets = [
+                      ("amd64", "RETAIL", "10.0.26300.1", 48),
+                      ("amd64", "RP", "10.0.26300.1", 48),
+                      ("arm64", "RETAIL", "10.0.26300.1", 48),
+                      ("amd64", "RETAIL", "10.0.26200.1", 48),
+                      ("amd64", "RP", "10.0.26200.1", 48),
+                      ("amd64", "RETAIL", "10.0.26100.1", 48),
+                      ("amd64", "DEV", "10.0.26300.1", 48),
+                      ("amd64", "CANARY", "10.0.26300.1", 48),
+                      ("amd64", "RETAIL", "10.0.19045.1", 48),
+                      ("amd64", "RETAIL", "10.0.26100.1", 7),
+                  ]
+                  for arch, ring, base_bld, sku in targets:
+                      for b_meta, f_map in ms_sync_direct(cookie, arch, ring, base_bld, sku):
+                          uid = b_meta["uuid"]
+                          if uid not in by_uuid:
+                              by_uuid[uid] = b_meta
+                          mf_path = os.path.join("uup-db", f"{uid}.json")
+                          if not os.path.exists(mf_path) and f_map:
+                              langs = sorted({
+                                  m.group(1).lower()
+                                  for fn in f_map
+                                  for m in [re.match(r"^(?:core|coren|professional|professionaln|serverstandard|serverdatacenter)_([a-z]{2}-[a-z]{2,4}(?:-[a-z]{2})?)\.esd$", fn, re.I)]
+                                  if m
+                              }) or ["en-us"]
+                              mf = {
+                                  "uuid": uid,
+                                  "langs": langs,
+                                  "langNames": {c: LANG_NAMES.get(c, c.upper()) for c in langs},
+                                  "files": f_map,
+                              }
+                              open(mf_path, "w", encoding="utf-8").write(json.dumps(mf, separators=(",", ":")))
+                              ms_cached += 1
+                      time.sleep(0.3)
+                  print(f"Direct Microsoft SOAP sync cached {ms_cached} new manifest(s)")
+
+          sorted_builds = sorted(by_uuid.values(), key=lambda x: x.get("created", 0), reverse=True)[:MAX_ARCHIVE_BUILDS]
           out_doc = {
               "version": 450,
               "updated": datetime.date.today().isoformat(),
-              "source": "github-daily-sync",
+              "source": "github-daily-sync" if uupdump_ok else "github-direct-ms-fallback",
+              "totalCount": len(sorted_builds),
               "builds": sorted_builds,
           }
-          os.makedirs("app/src/main/assets", exist_ok=True)
-          os.makedirs("uup-db", exist_ok=True)
-          serialized = json.dumps(out_doc, indent=2) + "\n"
-          open("uup-builds.json", "w", encoding="utf-8").write(serialized)
-          open("app/src/main/assets/uup-builds.json", "w", encoding="utf-8").write(serialized)
+          open("uup-builds.json", "w", encoding="utf-8").write(json.dumps(out_doc, indent=2) + "\n")
+          # Compact JSON inside APK assets to keep APK size minimal even with thousands of builds
+          open("app/src/main/assets/uup-builds.json", "w", encoding="utf-8").write(json.dumps(out_doc, separators=(",", ":")))
 
-          # Cache compact language + edition + fileinfo manifests for the top 30 builds
+          # --- Layer 3: Incremental uup-db/<uuid>.json backfill across entire archive ---
           cached_manifests = 0
-          for b in sorted_builds[:30]:
-              uid = b["uuid"]
-              mf_path = os.path.join("uup-db", f"{uid}.json")
-              if os.path.exists(mf_path):
-                  continue
-              langs_doc = get_json(f"{API}/listlangs.php?id={urllib.parse.quote(uid)}", retries=2)
-              if not langs_doc:
-                  break
-              files_doc = get_json(f"{API}/get.php?id={urllib.parse.quote(uid)}&noLinks=1", retries=2)
-              if not files_doc:
-                  continue
-              raw_files = files_doc.get("response", {}).get("files", {})
-              if not isinstance(raw_files, dict) or not raw_files:
-                  continue
-              compact_files = {}
-              for fname, meta in raw_files.items():
-                  if not isinstance(meta, dict):
+          if uupdump_ok:
+              for b in sorted_builds:
+                  if cached_manifests >= MAX_MANIFESTS:
+                      break
+                  uid = b["uuid"]
+                  mf_path = os.path.join("uup-db", f"{uid}.json")
+                  if os.path.exists(mf_path):
                       continue
-                  compact_files[fname] = {
-                      "size": int(str(meta.get("size") or "0") or "0"),
-                      "sha1": (meta.get("sha1") or "").lower(),
+                  langs_doc = get_json(f"{API}/listlangs.php?id={urllib.parse.quote(uid)}", retries=2)
+                  if not langs_doc:
+                      break
+                  files_doc = get_json(f"{API}/get.php?id={urllib.parse.quote(uid)}&noLinks=1", retries=2)
+                  if not files_doc:
+                      continue
+                  raw_files = files_doc.get("response", {}).get("files", {})
+                  if not isinstance(raw_files, dict) or not raw_files:
+                      continue
+                  compact_files = {}
+                  for fname, meta in raw_files.items():
+                      if not isinstance(meta, dict) or is_unusable_file(fname):
+                          continue
+                      compact_files[fname] = {
+                          "size": int(str(meta.get("size") or "0") or "0"),
+                          "sha1": (meta.get("sha1") or "").lower(),
+                      }
+                  if not compact_files:
+                      continue
+                  mf = {
+                      "uuid": uid,
+                      "langs": langs_doc.get("response", {}).get("langList", []),
+                      "langNames": langs_doc.get("response", {}).get("langFancyNames", {}),
+                      "files": compact_files,
                   }
-              mf = {
-                  "uuid": uid,
-                  "langs": langs_doc.get("response", {}).get("langList", []),
-                  "langNames": langs_doc.get("response", {}).get("langFancyNames", {}),
-                  "files": compact_files,
-              }
-              open(mf_path, "w", encoding="utf-8").write(json.dumps(mf, separators=(",", ":")))
-              cached_manifests += 1
-              time.sleep(0.5)
-          print(f"Total builds: {len(sorted_builds)} | New cached manifests: {cached_manifests}")
+                  open(mf_path, "w", encoding="utf-8").write(json.dumps(mf, separators=(",", ":")))
+                  cached_manifests += 1
+                  time.sleep(0.6)
+          total_db = len([f for f in os.listdir("uup-db") if f.endswith(".json")])
+          print(f"Archive total: {len(sorted_builds)} builds | New manifests: {cached_manifests + ms_cached} | Total mirrored uup-db: {total_db}")
           PYEOF
 
       - name: Commit updated UUP catalog
@@ -157,7 +449,7 @@ jobs:
           git config user.email "actions@users.noreply.github.com"
           git add uup-builds.json app/src/main/assets/uup-builds.json uup-db/
           if ! git diff --cached --quiet; then
-            git commit -m "Auto-sync UUP builds database ($(date -u +%Y-%m-%d))"
+            git commit -m "Auto-sync UUP builds archive ($(date -u +%Y-%m-%d))"
             git push
           else
             echo "No UUP catalog changes to commit."

@@ -222,6 +222,9 @@ fun WindowsDownloadSheet(
     // v4.5.0 Direct Microsoft fallback, Virtual Editions & Local UUP Folder state
     val activeUupSource by WindowsBuildEngine.activeSource.collectAsState()
     var hideCumulativeUpdates by remember { mutableStateOf(true) }
+    var hideOlderBuilds by remember { mutableStateOf(true) }
+    var groupByYear by remember { mutableStateOf(true) }
+    var selectedYearFilter by remember { mutableStateOf<Int?>(null) }
     var directMsFetching by remember { mutableStateOf(false) }
     var selectedVirtualEditions by remember(family.id) { mutableStateOf<Set<String>>(emptySet()) }
     var showLocalUupFolderPicker by remember { mutableStateOf(false) }
@@ -245,14 +248,14 @@ fun WindowsDownloadSheet(
         ver: WinFeatureVersion = selectedFeatureVer,
         arch: String = archFilter,
         query: String = customSearchQuery,
-        hideCu: Boolean = hideCumulativeUpdates
+        hideCu: Boolean = hideCumulativeUpdates,
+        hideOlder: Boolean = hideOlderBuilds
     ) {
         scope.launch {
             WindowsBuildEngine.configureNetwork(customUupApiUrl, preferDirectMicrosoftUup)
-            // Instant offline display if list is currently empty so user never stalls on "Finding builds..."
             if (groupedBuilds.isEmpty) {
                 val quickOffline = WindowsBuildEngine.loadOfflineCatalogBuilds(context, cachedUupBuildsJson)
-                val quickGrouped = WindowsBuildEngine.filterBuildsToGroups(quickOffline, fam, ver, arch, query.trim(), hideCu)
+                val quickGrouped = WindowsBuildEngine.filterBuildsToGroups(quickOffline, fam, ver, arch, query.trim(), hideCu, hideOlder)
                 if (!quickGrouped.isEmpty) groupedBuilds = quickGrouped
             }
             buildsLoading = true
@@ -263,8 +266,13 @@ fun WindowsDownloadSheet(
                 customQuery = query,
                 context = context,
                 cachedCatalogJson = cachedUupBuildsJson,
-                hideCumulativeUpdates = hideCu
+                hideCumulativeUpdates = hideCu,
+                hideOlderBuilds = hideOlder
             )
+            val availYears = groupedBuilds.allBuilds.map { it.createdYear }.toSet()
+            if (selectedYearFilter != null && selectedYearFilter !in availYears) {
+                selectedYearFilter = null
+            }
             buildsLoading = false
         }
     }
@@ -1012,23 +1020,92 @@ fun WindowsDownloadSheet(
                         }
                     }
 
-                    Row(
-                        modifier = Modifier.fillMaxWidth().clickable {
-                            hideCumulativeUpdates = !hideCumulativeUpdates
-                            loadGroupedBuilds(selectedWinFamily, selectedFeatureVer, archFilter, customSearchQuery, hideCumulativeUpdates)
-                        }.padding(vertical = 2.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                    // Build Filters & Categorization Controls
+                    Surface(
+                        shape = RoundedCornerShape(11.dp),
+                        color = PocketColors.surfaceInput,
+                        border = BorderStroke(0.5.dp, PocketColors.border)
                     ) {
-                        Text("Hide standalone Cumulative Updates (non-ISO)", fontSize = 11.5.sp, color = PocketColors.textSecondary)
-                        PocketSwitch(
-                            checked = hideCumulativeUpdates,
-                            onCheckedChange = {
-                                hideCumulativeUpdates = it
-                                loadGroupedBuilds(selectedWinFamily, selectedFeatureVer, archFilter, customSearchQuery, it)
-                            },
-                            activeColor = PocketColors.accent
-                        )
+                        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 11.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().clickable {
+                                    hideOlderBuilds = !hideOlderBuilds
+                                    loadGroupedBuilds(selectedWinFamily, selectedFeatureVer, archFilter, customSearchQuery, hideCumulativeUpdates, hideOlderBuilds)
+                                },
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text("Hide older builds (>12 months)", fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = PocketColors.textPrimary)
+                                    val olderSub = if (hideOlderBuilds && groupedBuilds.hiddenOlderCount > 0) {
+                                        "${groupedBuilds.hiddenOlderCount} older archive build(s) hidden"
+                                    } else if (hideOlderBuilds) {
+                                        "Showing recent builds from the last 12 months"
+                                    } else {
+                                        "Showing full multi-year build archive"
+                                    }
+                                    Text(olderSub, fontSize = 10.sp, color = PocketColors.textSecondary)
+                                }
+                                PocketSwitch(
+                                    checked = hideOlderBuilds,
+                                    onCheckedChange = {
+                                        hideOlderBuilds = it
+                                        loadGroupedBuilds(selectedWinFamily, selectedFeatureVer, archFilter, customSearchQuery, hideCumulativeUpdates, it)
+                                    },
+                                    activeColor = PocketColors.accent
+                                )
+                            }
+
+                            PocketHairlineDivider()
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth().clickable {
+                                    hideCumulativeUpdates = !hideCumulativeUpdates
+                                    loadGroupedBuilds(selectedWinFamily, selectedFeatureVer, archFilter, customSearchQuery, hideCumulativeUpdates, hideOlderBuilds)
+                                },
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("Hide standalone Cumulative Updates (non-ISO)", fontSize = 11.5.sp, color = PocketColors.textSecondary, modifier = Modifier.weight(1f))
+                                PocketSwitch(
+                                    checked = hideCumulativeUpdates,
+                                    onCheckedChange = {
+                                        hideCumulativeUpdates = it
+                                        loadGroupedBuilds(selectedWinFamily, selectedFeatureVer, archFilter, customSearchQuery, it, hideOlderBuilds)
+                                    },
+                                    activeColor = PocketColors.accent
+                                )
+                            }
+
+                            PocketHairlineDivider()
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("Categorize builds", fontSize = 11.5.sp, color = PocketColors.textSecondary)
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    listOf(true to "By Year", false to "By Channel").forEach { (isYearMode, lbl) ->
+                                        val isSel = groupByYear == isYearMode
+                                        Surface(
+                                            modifier = Modifier.bounceClick { groupByYear = isYearMode },
+                                            shape = RoundedCornerShape(7.dp),
+                                            color = if (isSel) PocketColors.accentBg else PocketColors.surfaceCard,
+                                            border = BorderStroke(if (isSel) 1.dp else 0.5.dp, if (isSel) PocketColors.accent else PocketColors.border)
+                                        ) {
+                                            Text(
+                                                text = lbl,
+                                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
+                                                fontSize = 11.sp,
+                                                fontWeight = if (isSel) FontWeight.SemiBold else FontWeight.Medium,
+                                                color = if (isSel) PocketColors.accentSoft else PocketColors.textSecondary
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     if (buildsLoading) {
@@ -1045,47 +1122,123 @@ fun WindowsDownloadSheet(
                             border = BorderStroke(0.5.dp, PocketColors.border)
                         ) {
                             Text(
-                                "No installable builds matched ${selectedWinFamily.label} ${selectedFeatureVer.label}. Try another Feature Version or Architecture.",
+                                "No installable builds matched ${selectedWinFamily.label} ${selectedFeatureVer.label}. Try turning off \"Hide older builds\" or picking another Feature Version.",
                                 modifier = Modifier.padding(14.dp),
                                 style = MaterialTheme.typography.bodySmall,
                                 color = PocketColors.textSecondary
                             )
                         }
                     } else {
-                        // GROUP 1: STABLE (General Availability)
-                        if (groupedBuilds.stable.isNotEmpty()) {
-                            BuildTierSection(
-                                title = WinBuildTier.STABLE.sectionTitle,
-                                count = groupedBuilds.stable.size,
-                                badgeTint = PocketColors.success,
-                                badgeBg = PocketColors.successBg,
-                                builds = groupedBuilds.stable,
-                                onSelectBuild = { selectedBuild = it }
-                            )
+                        if (groupByYear) {
+                            val yearGroups = remember(groupedBuilds) { groupedBuilds.groupedByYear() }
+                            if (yearGroups.size > 1) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    val allSel = selectedYearFilter == null
+                                    Surface(
+                                        modifier = Modifier.bounceClick { selectedYearFilter = null },
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = if (allSel) PocketColors.accentBg else PocketColors.surfaceInput,
+                                        border = BorderStroke(if (allSel) 1.dp else 0.5.dp, if (allSel) PocketColors.accent else PocketColors.border)
+                                    ) {
+                                        Text(
+                                            text = "All Years (${groupedBuilds.totalCount})",
+                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = if (allSel) PocketColors.accentSoft else PocketColors.textSecondary
+                                        )
+                                    }
+                                    yearGroups.forEach { (yr, list) ->
+                                        val isSel = selectedYearFilter == yr
+                                        Surface(
+                                            modifier = Modifier.bounceClick { selectedYearFilter = if (isSel) null else yr },
+                                            shape = RoundedCornerShape(8.dp),
+                                            color = if (isSel) PocketColors.accentBg else PocketColors.surfaceInput,
+                                            border = BorderStroke(if (isSel) 1.dp else 0.5.dp, if (isSel) PocketColors.accent else PocketColors.border)
+                                        ) {
+                                            Text(
+                                                text = "${if (yr > 0) yr.toString() else "Other"} (${list.size})",
+                                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = if (isSel) PocketColors.accentSoft else PocketColors.textSecondary
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            val shownYearGroups = if (selectedYearFilter == null) yearGroups else yearGroups.filter { it.first == selectedYearFilter }
+                            shownYearGroups.forEach { (yr, list) ->
+                                BuildYearSection(
+                                    year = yr,
+                                    builds = list,
+                                    onSelectBuild = { selectedBuild = it }
+                                )
+                            }
+                        } else {
+                            // GROUP 1: STABLE (General Availability)
+                            if (groupedBuilds.stable.isNotEmpty()) {
+                                BuildTierSection(
+                                    title = WinBuildTier.STABLE.sectionTitle,
+                                    count = groupedBuilds.stable.size,
+                                    badgeTint = PocketColors.success,
+                                    badgeBg = PocketColors.successBg,
+                                    builds = groupedBuilds.stable,
+                                    onSelectBuild = { selectedBuild = it }
+                                )
+                            }
+
+                            // GROUP 2: PREVIEW (Release / Cumulative Preview)
+                            if (groupedBuilds.preview.isNotEmpty()) {
+                                BuildTierSection(
+                                    title = WinBuildTier.PREVIEW.sectionTitle,
+                                    count = groupedBuilds.preview.size,
+                                    badgeTint = PocketColors.infoBlue,
+                                    badgeBg = PocketColors.infoBlueBg,
+                                    builds = groupedBuilds.preview,
+                                    onSelectBuild = { selectedBuild = it }
+                                )
+                            }
+
+                            // GROUP 3: OTHER / INSIDER BUILDS
+                            if (groupedBuilds.insider.isNotEmpty()) {
+                                BuildTierSection(
+                                    title = WinBuildTier.INSIDER.sectionTitle,
+                                    count = groupedBuilds.insider.size,
+                                    badgeTint = PocketColors.violet,
+                                    badgeBg = PocketColors.violetBg,
+                                    builds = groupedBuilds.insider,
+                                    onSelectBuild = { selectedBuild = it }
+                                )
+                            }
                         }
 
-                        // GROUP 2: PREVIEW (Release / Cumulative Preview)
-                        if (groupedBuilds.preview.isNotEmpty()) {
-                            BuildTierSection(
-                                title = WinBuildTier.PREVIEW.sectionTitle,
-                                count = groupedBuilds.preview.size,
-                                badgeTint = PocketColors.infoBlue,
-                                badgeBg = PocketColors.infoBlueBg,
-                                builds = groupedBuilds.preview,
-                                onSelectBuild = { selectedBuild = it }
-                            )
-                        }
-
-                        // GROUP 3: OTHER / INSIDER BUILDS
-                        if (groupedBuilds.insider.isNotEmpty()) {
-                            BuildTierSection(
-                                title = WinBuildTier.INSIDER.sectionTitle,
-                                count = groupedBuilds.insider.size,
-                                badgeTint = PocketColors.violet,
-                                badgeBg = PocketColors.violetBg,
-                                builds = groupedBuilds.insider,
-                                onSelectBuild = { selectedBuild = it }
-                            )
+                        if (hideOlderBuilds && groupedBuilds.hiddenOlderCount > 0) {
+                            Surface(
+                                modifier = Modifier.fillMaxWidth().bounceClick {
+                                    hideOlderBuilds = false
+                                    loadGroupedBuilds(selectedWinFamily, selectedFeatureVer, archFilter, customSearchQuery, hideCumulativeUpdates, false)
+                                },
+                                shape = RoundedCornerShape(10.dp),
+                                color = PocketColors.surfaceSubtle,
+                                border = BorderStroke(0.5.dp, PocketColors.border)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 9.dp),
+                                    horizontalArrangement = Arrangement.Center,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(Icons.Rounded.CalendarMonth, null, tint = PocketColors.accentSoft, modifier = Modifier.size(15.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "Show ${groupedBuilds.hiddenOlderCount} older build(s) from previous years",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = PocketColors.accentSoft
+                                    )
+                                }
+                            }
                         }
                     }
                 } else {
@@ -1632,6 +1785,66 @@ private fun WinManifestInspectorSheet(title: String, subtitle: String, files: Li
                 }
             }
             OutlinedButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth().padding(bottom = 18.dp).height(46.dp), shape = RoundedCornerShape(12.dp), border = BorderStroke(0.75.dp, PocketColors.border)) { Text("Close", color = PocketColors.textPrimary) }
+        }
+    }
+}
+
+@Composable
+private fun BuildYearSection(
+    year: Int,
+    builds: List<WindowsChannelBuild>,
+    onSelectBuild: (WindowsChannelBuild) -> Unit
+) {
+    val yearTitle = if (year > 0) "$year Builds" else "Undated Builds"
+    Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(7.dp)
+        ) {
+            Icon(Icons.Rounded.CalendarMonth, null, tint = PocketColors.accentSoft, modifier = Modifier.size(14.dp))
+            Text(
+                text = yearTitle.uppercase(),
+                fontSize = 11.5.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 0.8.sp,
+                color = PocketColors.accentSoft
+            )
+            Box(modifier = Modifier.weight(1f).height(0.5.dp).background(PocketColors.border))
+            Text("${builds.size}", style = PocketColors.monoStyle, color = PocketColors.textMuted)
+        }
+        builds.forEach { b ->
+            val (badgeTint, badgeBg) = when (b.tier) {
+                WinBuildTier.STABLE -> PocketColors.success to PocketColors.successBg
+                WinBuildTier.PREVIEW -> PocketColors.infoBlue to PocketColors.infoBlueBg
+                WinBuildTier.INSIDER -> PocketColors.violet to PocketColors.violetBg
+            }
+            Surface(
+                modifier = Modifier.fillMaxWidth().bounceClick { onSelectBuild(b) },
+                shape = RoundedCornerShape(12.dp),
+                color = PocketColors.surfaceInput,
+                border = BorderStroke(0.75.dp, PocketColors.border)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                        Text(b.title, style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Surface(shape = RoundedCornerShape(5.dp), color = badgeBg) {
+                                Text(b.channelBadge, modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, color = badgeTint)
+                            }
+                            Surface(shape = RoundedCornerShape(5.dp), color = PocketColors.surfaceSubtle) {
+                                Text(b.archDisplay, modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, color = PocketColors.textPrimary)
+                            }
+                            Text("Build ${b.build}${if (b.dateDisplay.isNotBlank()) " · ${b.dateDisplay}" else ""}", style = PocketColors.monoStyle, color = PocketColors.textMuted)
+                        }
+                    }
+                    Icon(Icons.Rounded.ChevronRight, null, tint = PocketColors.accentSoft, modifier = Modifier.size(18.dp))
+                }
+            }
         }
     }
 }
