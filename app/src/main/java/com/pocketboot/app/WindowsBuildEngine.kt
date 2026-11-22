@@ -2439,7 +2439,7 @@ object WindowsBuildEngine {
                 val qXorLog = shellQuote(xorLog)
                 val preferNoPrompt = config.experience.hasAnyActive() || config.winUtil.hasAnyActive()
                 if (useUdfGenIso) {
-                    addConsole("genisoimage (UDF 1.02): packing ~${UsbGadgetEngine.formatBytes(estIsoBytes)} (-udf -allow-limited-size -iso-level 3 -J -joliet-long)")
+                    addConsole("genisoimage (UDF 1.02): packing ~${UsbGadgetEngine.formatBytes(estIsoBytes)} (-udf -allow-limited-size -iso-level 3)")
                 } else {
                     addConsole("xorriso: packing ~${UsbGadgetEngine.formatBytes(estIsoBytes)} (-iso-level 3 -J -joliet-long --stdio_sync 16m)")
                 }
@@ -2481,11 +2481,11 @@ object WindowsBuildEngine {
                     BIOS_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'etfsboot.com' 2>/dev/null | head -n 1 | sed 's|^\./||')
                     echo "UDF 1.02 Bootloaders: BIOS=${'$'}{BIOS_BOOT:-none} | EFI=${'$'}{EFI_BOOT:-none}" >> $qXorLog
                     if [ -n "${'$'}BIOS_BOOT" ] && [ -n "${'$'}EFI_BOOT" ]; then
-                        ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -J -joliet-long -D -N -relaxed-filenames -V "$volId" -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOutIso . >> $qXorLog 2>&1 &
+                        ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -V "$volId" -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOutIso . >> $qXorLog 2>&1 &
                     elif [ -n "${'$'}EFI_BOOT" ]; then
-                        ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -J -joliet-long -D -N -relaxed-filenames -V "$volId" -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOutIso . >> $qXorLog 2>&1 &
+                        ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -V "$volId" -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOutIso . >> $qXorLog 2>&1 &
                     else
-                        ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -J -joliet-long -D -N -relaxed-filenames -V "$volId" -o $qOutIso . >> $qXorLog 2>&1 &
+                        ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -V "$volId" -o $qOutIso . >> $qXorLog 2>&1 &
                     fi
                     XPID=${'$'}!; echo "${'$'}XPID" > $ACTIVE_PID_FILE; wait "${'$'}XPID"
                     rm -f $ACTIVE_PID_FILE
