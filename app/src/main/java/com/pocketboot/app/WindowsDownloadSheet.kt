@@ -40,6 +40,9 @@ import androidx.compose.material.icons.rounded.CheckBox
 import androidx.compose.material.icons.rounded.CheckBoxOutlineBlank
 import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Layers
+import androidx.compose.material.icons.rounded.CloudSync
+import androidx.compose.runtime.collectAsState
 import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.SystemUpdateAlt
@@ -115,11 +118,16 @@ fun WindowsDownloadSheet(
     activeMultiBootTarget: ImageFile?,
     turboConnections: Int,
     presets: List<AutounattendPreset> = emptyList(),
+    customUupApiUrl: String = AppSettings.DEFAULT_UUP_API_URL,
+    preferDirectMicrosoftUup: Boolean = false,
+    cachedUupBuildsJson: String = "",
+    onUpdateCachedUupBuilds: (String) -> Unit = {},
     onSavePreset: (AutounattendPreset) -> Unit = {},
     onDeletePreset: (String) -> Unit = {},
     onDismiss: () -> Unit,
     onStartDirectDownload: (title: String, url: String, fileName: String, expectedSha256: String) -> Unit,
-    onStartChannelBuild: (WindowsChannelBuildConfig) -> Unit
+    onStartChannelBuild: (WindowsChannelBuildConfig) -> Unit,
+    onStartLocalUupBuild: (String, WindowsChannelBuildConfig) -> Unit = { _, _ -> }
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -211,6 +219,14 @@ fun WindowsDownloadSheet(
     var langMenuOpen by remember { mutableStateOf(false) }
     var langSearch by remember { mutableStateOf("") }
 
+    // v4.5.0 Direct Microsoft fallback, Virtual Editions & Local UUP Folder state
+    val activeUupSource by WindowsBuildEngine.activeSource.collectAsState()
+    var hideCumulativeUpdates by remember { mutableStateOf(true) }
+    var directMsFetching by remember { mutableStateOf(false) }
+    var selectedVirtualEditions by remember(family.id) { mutableStateOf<Set<String>>(emptySet()) }
+    var showLocalUupFolderPicker by remember { mutableStateOf(false) }
+    var localUupSelectedFolder by remember { mutableStateOf<String?>(null) }
+
     fun loadDirectReleases(force: Boolean) {
         scope.launch {
             directLoadingReleases = true
@@ -228,19 +244,44 @@ fun WindowsDownloadSheet(
         fam: WinFamilyFilter = selectedWinFamily,
         ver: WinFeatureVersion = selectedFeatureVer,
         arch: String = archFilter,
-        query: String = customSearchQuery
+        query: String = customSearchQuery,
+        hideCu: Boolean = hideCumulativeUpdates
     ) {
         scope.launch {
+            WindowsBuildEngine.configureNetwork(customUupApiUrl, preferDirectMicrosoftUup)
+            // Instant offline display if list is currently empty so user never stalls on "Finding builds..."
+            if (groupedBuilds.isEmpty) {
+                val quickOffline = WindowsBuildEngine.loadOfflineCatalogBuilds(context, cachedUupBuildsJson)
+                val quickGrouped = WindowsBuildEngine.filterBuildsToGroups(quickOffline, fam, ver, arch, query.trim(), hideCu)
+                if (!quickGrouped.isEmpty) groupedBuilds = quickGrouped
+            }
             buildsLoading = true
-            groupedBuilds = WindowsBuildEngine.fetchGroupedBuilds(fam, ver, arch, query)
+            groupedBuilds = WindowsBuildEngine.fetchGroupedBuilds(
+                family = fam,
+                featureVer = ver,
+                archFilter = arch,
+                customQuery = query,
+                context = context,
+                cachedCatalogJson = cachedUupBuildsJson,
+                hideCumulativeUpdates = hideCu
+            )
             buildsLoading = false
         }
     }
 
     LaunchedEffect(family.id, activeTab) {
+        WindowsBuildEngine.configureNetwork(customUupApiUrl, preferDirectMicrosoftUup)
         when (activeTab) {
             WindowsDownloadTab.DIRECT_ISO -> if (directReleaseGroups.isEmpty()) loadDirectReleases(force = false)
-            WindowsDownloadTab.ALL_CHANNELS -> if (groupedBuilds.isEmpty && selectedBuild == null) loadGroupedBuilds()
+            WindowsDownloadTab.ALL_CHANNELS -> {
+                if (groupedBuilds.isEmpty && selectedBuild == null) loadGroupedBuilds()
+                // Quietly sync daily uup-builds.json from GitHub in the background
+                scope.launch {
+                    WindowsBuildEngine.syncOfflineCatalogFromGitHub()?.let { freshJson ->
+                        onUpdateCachedUupBuilds(freshJson)
+                    }
+                }
+            }
         }
     }
 
@@ -295,6 +336,7 @@ fun WindowsDownloadSheet(
         val b = selectedBuild ?: return@LaunchedEffect
         buildLangLoading = true
         detailedManifest = null
+        selectedVirtualEditions = emptySet()
         val detOs = WindowsCustomizationEngine.detectWindowsOsKind(b.title)
         experience = WindowsExperienceConfig.defaultForOs(detOs)
         usbScheme = if (detOs == WindowsOsKind.WIN7 || b.arch.equals("x86", true)) PartitionScheme.MBR else PartitionScheme.GPT
@@ -877,12 +919,117 @@ fun WindowsDownloadSheet(
                         }
                     }
 
-                    // Breadcrumb summary
-                    Text(
-                        text = "${selectedWinFamily.label} › ${selectedFeatureVer.label} › ${if (archFilter == "amd64") "x64" else archFilter.uppercase()}",
-                        style = PocketColors.monoStyle,
-                        color = PocketColors.accentSoft
-                    )
+                    // Source status bar + Direct Microsoft Fetch Latest + Offline Local UUP Folder
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "${selectedWinFamily.label} › ${selectedFeatureVer.label} › ${if (archFilter == "amd64") "x64" else archFilter.uppercase()}",
+                            style = PocketColors.monoStyle,
+                            color = PocketColors.accentSoft,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
+                        )
+                        val srcBg = when (activeUupSource) {
+                            UupDataSource.UUPDUMP_LIVE -> PocketColors.successBg
+                            UupDataSource.DIRECT_MICROSOFT -> PocketColors.infoBlueBg
+                            UupDataSource.OFFLINE_CATALOG -> PocketColors.warningBg
+                        }
+                        val srcTint = when (activeUupSource) {
+                            UupDataSource.UUPDUMP_LIVE -> PocketColors.success
+                            UupDataSource.DIRECT_MICROSOFT -> PocketColors.infoBlue
+                            UupDataSource.OFFLINE_CATALOG -> PocketColors.warning
+                        }
+                        Surface(shape = RoundedCornerShape(6.dp), color = srcBg) {
+                            Text(
+                                text = activeUupSource.label,
+                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = srcTint
+                            )
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(7.dp)
+                    ) {
+                        Surface(
+                            modifier = Modifier.weight(1f).bounceClick(enabled = !directMsFetching && !buildsLoading) {
+                                scope.launch {
+                                    directMsFetching = true
+                                    val freshMs = WindowsBuildEngine.fetchLatestDirectFromMicrosoft(selectedWinFamily, selectedFeatureVer, archFilter)
+                                    directMsFetching = false
+                                    if (freshMs.isNotEmpty()) {
+                                        groupedBuilds = GroupedWindowsBuilds(
+                                            stable = freshMs.filter { it.tier == WinBuildTier.STABLE },
+                                            preview = freshMs.filter { it.tier == WinBuildTier.PREVIEW },
+                                            insider = freshMs.filter { it.tier == WinBuildTier.INSIDER }
+                                        )
+                                        Toast.makeText(context, "Fetched ${freshMs.size} live build(s) directly from Microsoft.", Toast.LENGTH_SHORT).show()
+                                    } else {
+                                        Toast.makeText(context, "Microsoft returned no newer build for this branch.", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            },
+                            shape = RoundedCornerShape(10.dp),
+                            color = PocketColors.infoBlueBg.copy(alpha = 0.7f),
+                            border = BorderStroke(0.75.dp, PocketColors.infoBlue.copy(alpha = 0.7f))
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.Center
+                            ) {
+                                if (directMsFetching) {
+                                    CircularProgressIndicator(modifier = Modifier.size(13.dp), strokeWidth = 1.8.dp, color = PocketColors.infoBlue)
+                                } else {
+                                    Icon(Icons.Rounded.CloudSync, null, tint = PocketColors.infoBlue, modifier = Modifier.size(15.dp))
+                                }
+                                Spacer(modifier = Modifier.width(5.dp))
+                                Text("Fetch Direct MS", style = MaterialTheme.typography.labelSmall, color = PocketColors.infoBlue, maxLines = 1)
+                            }
+                        }
+
+                        Surface(
+                            modifier = Modifier.weight(1f).bounceClick { showLocalUupFolderPicker = true },
+                            shape = RoundedCornerShape(10.dp),
+                            color = PocketColors.surfaceInput,
+                            border = BorderStroke(0.75.dp, PocketColors.border)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.Center
+                            ) {
+                                Icon(Icons.Rounded.FolderOpen, null, tint = PocketColors.accentSoft, modifier = Modifier.size(15.dp))
+                                Spacer(modifier = Modifier.width(5.dp))
+                                Text("Local UUP Folder", style = MaterialTheme.typography.labelSmall, color = PocketColors.textPrimary, maxLines = 1)
+                            }
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth().clickable {
+                            hideCumulativeUpdates = !hideCumulativeUpdates
+                            loadGroupedBuilds(selectedWinFamily, selectedFeatureVer, archFilter, customSearchQuery, hideCumulativeUpdates)
+                        }.padding(vertical = 2.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Hide standalone Cumulative Updates (non-ISO)", fontSize = 11.5.sp, color = PocketColors.textSecondary)
+                        PocketSwitch(
+                            checked = hideCumulativeUpdates,
+                            onCheckedChange = {
+                                hideCumulativeUpdates = it
+                                loadGroupedBuilds(selectedWinFamily, selectedFeatureVer, archFilter, customSearchQuery, it)
+                            },
+                            activeColor = PocketColors.accent
+                        )
+                    }
 
                     if (buildsLoading) {
                         Box(modifier = Modifier.fillMaxWidth().padding(vertical = 26.dp), contentAlignment = Alignment.Center) {
@@ -1081,6 +1228,59 @@ fun WindowsDownloadSheet(
                         }
                     }
 
+                    val buildMajorNum = remember(b.build) { b.build.substringBefore('.').toIntOrNull() ?: 22000 }
+                    val availableVirtualEds = remember(selectedBuildEditions, buildMajorNum) {
+                        VirtualEditionTarget.availableForBaseEditions(selectedBuildEditions, buildMajorNum)
+                    }
+                    if (downloadMethod == WinDownloadMethod.DOWNLOAD_AND_BUILD && availableVirtualEds.isNotEmpty()) {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                PocketSectionHeader("Virtual Editions (0 MB Extra Download)")
+                                Surface(shape = RoundedCornerShape(6.dp), color = PocketColors.accentBg) {
+                                    Text("${selectedVirtualEditions.count { id -> availableVirtualEds.any { it.editionId == id } }} added", modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.5.dp), style = MaterialTheme.typography.labelSmall, color = PocketColors.accentSoft)
+                                }
+                            }
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = PocketColors.surfaceInput,
+                                border = BorderStroke(0.5.dp, PocketColors.border)
+                            ) {
+                                Column(modifier = Modifier.fillMaxWidth()) {
+                                    availableVirtualEds.forEachIndexed { idx, ve ->
+                                        val isChecked = selectedVirtualEditions.contains(ve.editionId)
+                                        if (idx > 0) PocketHairlineDivider()
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .clickable {
+                                                    selectedVirtualEditions = if (isChecked) selectedVirtualEditions - ve.editionId else selectedVirtualEditions + ve.editionId
+                                                }
+                                                .padding(horizontal = 12.dp, vertical = 9.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = if (isChecked) Icons.Rounded.CheckBox else Icons.Rounded.CheckBoxOutlineBlank,
+                                                contentDescription = null,
+                                                tint = if (isChecked) PocketColors.accent else PocketColors.textMuted,
+                                                modifier = Modifier.size(19.dp)
+                                            )
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(ve.displayNameForBuild(buildMajorNum), style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                                                Text("Cloned from ${ve.requiredBaseEdition} inside WIM", fontSize = 10.sp, color = PocketColors.textSecondary)
+                                            }
+                                            Icon(Icons.Rounded.Layers, null, tint = if (isChecked) PocketColors.accentSoft else PocketColors.textMuted, modifier = Modifier.size(15.dp))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         PocketSectionHeader("Download Method")
                         WinDownloadMethod.entries.forEach { method ->
@@ -1268,7 +1468,7 @@ fun WindowsDownloadSheet(
                                         build = b, lang = lang, editions = chosenEds, compression = buildCompression, outputMode = buildOutputMode, downloadMethod = downloadMethod,
                                         targetDir = targetDir, customOutputName = customOutputName.trim(), targetMultiBootPath = mbPath, connections = turboConnections, autoMount = true,
                                         includeUpdates = includeUpdates, includeStoreApps = includeStoreApps, integrateNetFx3 = integrateNetFx3, runComponentCleanup = runComponentCleanup,
-                                        skipWinRe = skipWinRe, eiCfgUnlock = eiCfgUnlock, keepPackagesAfterBuild = keepPackagesAfterBuild, scheme = usbScheme, experience = experience, winUtil = winUtil, extraDriversDir = usbExtraDriversDir.trim()
+                                        skipWinRe = skipWinRe, eiCfgUnlock = eiCfgUnlock, keepPackagesAfterBuild = keepPackagesAfterBuild, scheme = usbScheme, experience = experience, winUtil = winUtil, extraDriversDir = usbExtraDriversDir.trim(), virtualEditions = selectedVirtualEditions.filter { id -> availableVirtualEds.any { it.editionId == id } }
                                     )
                                 )
                             },
@@ -1295,6 +1495,116 @@ fun WindowsDownloadSheet(
     }
     if (showFullFilesInspector && detailedManifest != null) {
         WinManifestInspectorSheet("Full Build File List (${detailedManifest!!.allFiles.size})", "Total manifest: ${UsbGadgetEngine.formatBytes(detailedManifest!!.allFiles.sumOf { it.sizeBytes })}", detailedManifest!!.allFiles) { showFullFilesInspector = false }
+    }
+    if (showLocalUupFolderPicker) {
+        RootFolderPickerSheet(
+            title = "Select Local UUP Folder",
+            subtitle = "Pick a folder containing downloaded .esd / .cab files (kept read-only)",
+            initialDir = targetDir,
+            onDismiss = { showLocalUupFolderPicker = false },
+            onSelectFolder = { chosen ->
+                showLocalUupFolderPicker = false
+                localUupSelectedFolder = chosen
+            }
+        )
+    }
+    localUupSelectedFolder?.let { folderPath ->
+        var localOutName by remember(folderPath) { mutableStateOf("${folderPath.substringAfterLast('/').replace(Regex("[^A-Za-z0-9._-]"), "_")}.iso") }
+        var localMode by remember(folderPath) { mutableStateOf(WinBuildOutputMode.STANDARD_ISO) }
+        var localComp by remember(folderPath) { mutableStateOf(WinIsoCompression.WIM) }
+        var localAddEnterprise by remember(folderPath) { mutableStateOf(false) }
+        var localAddEducation by remember(folderPath) { mutableStateOf(false) }
+        AlertDialog(
+            onDismissRequest = { localUupSelectedFolder = null },
+            containerColor = PocketColors.surfaceCard,
+            title = { Text("Build from Local UUP Folder", color = PocketColors.textPrimary) },
+            text = {
+                Column(modifier = Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+                    Text(
+                        "Source (read-only, never deleted): ${folderPath.replace("/data/media/0", "/sdcard")}",
+                        style = PocketColors.monoStyle,
+                        fontSize = 10.5.sp,
+                        color = PocketColors.accentSoft
+                    )
+                    OutlinedTextField(
+                        value = localOutName,
+                        onValueChange = { localOutName = it },
+                        label = { Text("Output Name") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(10.dp)
+                    )
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf(WinBuildOutputMode.STANDARD_ISO to "ISO (.iso)", WinBuildOutputMode.DIRECT_NTFS_USB to "Direct USB (.img)").forEach { (m, lbl) ->
+                            val sel = localMode == m
+                            Surface(
+                                modifier = Modifier.weight(1f).bounceClick {
+                                    localMode = m
+                                    localOutName = localOutName.substringBeforeLast('.') + if (m == WinBuildOutputMode.DIRECT_NTFS_USB) ".img" else ".iso"
+                                },
+                                shape = RoundedCornerShape(9.dp),
+                                color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput,
+                                border = BorderStroke(0.75.dp, if (sel) PocketColors.accent else PocketColors.border)
+                            ) {
+                                Box(modifier = Modifier.padding(vertical = 8.dp), contentAlignment = Alignment.Center) {
+                                    Text(lbl, style = MaterialTheme.typography.labelSmall, color = if (sel) PocketColors.accentSoft else PocketColors.textPrimary)
+                                }
+                            }
+                        }
+                    }
+                    DirectUsbOptionRow("Solid ESD compression (smallest)", localComp == WinIsoCompression.ESD) { localComp = if (it) WinIsoCompression.ESD else WinIsoCompression.WIM }
+                    DirectUsbOptionRow("Add Virtual Edition: Enterprise", localAddEnterprise) { localAddEnterprise = it }
+                    DirectUsbOptionRow("Add Virtual Edition: Education", localAddEducation) { localAddEducation = it }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val dummyBuild = WindowsChannelBuild(
+                            uuid = "local-${System.currentTimeMillis()}",
+                            title = "Local UUP (${folderPath.substringAfterLast('/')})",
+                            build = "Local",
+                            arch = "amd64",
+                            createdEpoch = System.currentTimeMillis() / 1000L
+                        )
+                        val ves = buildList {
+                            if (localAddEnterprise) add("Enterprise")
+                            if (localAddEducation) add("Education")
+                        }
+                        val cfg = WindowsChannelBuildConfig(
+                            build = dummyBuild,
+                            lang = WinBuildLangOption("en-us", "English (United States)"),
+                            editions = listOf(WinBuildEditionOption("LOCAL", "Local UUP")),
+                            compression = localComp,
+                            outputMode = localMode,
+                            targetDir = targetDir,
+                            customOutputName = localOutName.trim(),
+                            autoMount = true,
+                            includeUpdates = true,
+                            integrateNetFx3 = true,
+                            scheme = usbScheme,
+                            experience = experience,
+                            winUtil = winUtil,
+                            extraDriversDir = usbExtraDriversDir.trim(),
+                            virtualEditions = ves,
+                            localUupDirPath = folderPath
+                        )
+                        localUupSelectedFolder = null
+                        onDismiss()
+                        onStartLocalUupBuild(folderPath, cfg)
+                    },
+                    enabled = localOutName.trim().isNotEmpty(),
+                    colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)
+                ) {
+                    Text("Start Offline Build", fontWeight = FontWeight.SemiBold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { localUupSelectedFolder = null }) {
+                    Text("Cancel", color = PocketColors.textSecondary)
+                }
+            }
+        )
     }
 }
 

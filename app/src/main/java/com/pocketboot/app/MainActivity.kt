@@ -252,6 +252,10 @@ fun PocketBootApp(initialShortcutPath: String = "") {
         }
     }
 
+    LaunchedEffect(settings.customUupApiUrl, settings.preferDirectMicrosoftUup) {
+        WindowsBuildEngine.configureNetwork(settings.customUupApiUrl, settings.preferDirectMicrosoftUup)
+    }
+
     LaunchedEffect(images.size, settings.defaultDir, winChannelDlState, winChannelConvState, windowsBuildJob, ventoyBuildJob) {
         withContext(Dispatchers.IO) {
             drivesFreeBytes = UsbGadgetEngine.getFreeSpaceBytes(settings.defaultDir)

@@ -1,0 +1,164 @@
+name: Sync UUP Builds Database
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Update uup-builds.json and uup-db manifests
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, re, time, urllib.request, urllib.parse, datetime
+
+          UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot-Sync/4.5.0"
+          API = "https://api.uupdump.net"
+          JUNK = (
+              "critical oobe", "dynamic update", "safe os", "setup dynamic",
+              ".net framework", "microsoft edge", "security intelligence", "defender",
+              "windows update stack", "servicing stack", "language pack",
+              "feature on demand", "hotpatch", "cumulative update"
+          )
+
+          def get_json(url, retries=3):
+              for i in range(retries):
+                  try:
+                      req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+                      with urllib.request.urlopen(req, timeout=20) as resp:
+                          if resp.status == 200:
+                              return json.loads(resp.read().decode("utf-8"))
+                  except Exception as e:
+                      print(f"Fetch attempt {i+1} failed for {url}: {e}")
+                      time.sleep(2 + i * 2)
+              return None
+
+          existing_path = "uup-builds.json"
+          existing = []
+          if os.path.exists(existing_path):
+              try:
+                  existing = json.load(open(existing_path, encoding="utf-8")).get("builds", [])
+              except Exception:
+                  existing = []
+
+          by_uuid = {b["uuid"]: b for b in existing if b.get("uuid")}
+
+          # Pull latest builds from UUPdump API if reachable
+          data = get_json(f"{API}/listid.php?sortByDate=1")
+          raw_field = data.get("response", {}).get("builds") if isinstance(data, dict) else None
+          raw_builds = list(raw_field.values()) if isinstance(raw_field, dict) else (raw_field if isinstance(raw_field, list) else [])
+          if raw_builds:
+              added = 0
+              for b in raw_builds:
+                  title = (b.get("title") or "").strip()
+                  low = title.lower()
+                  uuid = (b.get("uuid") or "").strip()
+                  build = (b.get("build") or "").strip()
+                  arch = (b.get("arch") or "amd64").strip().lower()
+                  if not uuid or not title or not build:
+                      continue
+                  if any(j in low for j in JUNK):
+                      continue
+                  if low.startswith("update for ") or low.startswith("202") and "update for" in low:
+                      continue
+                  major = int(build.split(".")[0]) if build.split(".")[0].isdigit() else 0
+                  if major < 17763:
+                      continue
+                  if arch not in ("amd64", "arm64", "x86"):
+                      continue
+                  ring = "RETAIL"
+                  channel = "Stable"
+                  if "canary" in low or major >= 29000 or 27000 <= major <= 27999:
+                      ring, channel = "CANARY", "Canary"
+                  elif "dev" in low or 26340 <= major <= 26999 or 28100 <= major <= 28999:
+                      ring, channel = "DEV", "Dev"
+                  elif "beta" in low or 26320 <= major <= 26339 or 28020 <= major <= 28099 or major == 22635:
+                      ring, channel = "BETA", "Beta"
+                  elif "preview" in low:
+                      ring, channel = "RP", "Preview"
+                  sku = 7 if "server" in low else 48
+                  by_uuid[uuid] = {
+                      "uuid": uuid,
+                      "title": title,
+                      "build": build,
+                      "arch": arch,
+                      "created": int(b.get("created") or 0),
+                      "ring": ring,
+                      "sku": sku,
+                      "channel": channel,
+                  }
+                  added += 1
+                  if added >= 150:
+                      break
+              print(f"Synced {added} builds from api.uupdump.net")
+          else:
+              print("api.uupdump.net unreachable; keeping existing uup-builds.json intact.")
+
+          sorted_builds = sorted(by_uuid.values(), key=lambda x: x.get("created", 0), reverse=True)[:180]
+          out_doc = {
+              "version": 450,
+              "updated": datetime.date.today().isoformat(),
+              "source": "github-daily-sync",
+              "builds": sorted_builds,
+          }
+          os.makedirs("app/src/main/assets", exist_ok=True)
+          os.makedirs("uup-db", exist_ok=True)
+          serialized = json.dumps(out_doc, indent=2) + "\n"
+          open("uup-builds.json", "w", encoding="utf-8").write(serialized)
+          open("app/src/main/assets/uup-builds.json", "w", encoding="utf-8").write(serialized)
+
+          # Cache compact language + edition + fileinfo manifests for the top 30 builds
+          cached_manifests = 0
+          for b in sorted_builds[:30]:
+              uid = b["uuid"]
+              mf_path = os.path.join("uup-db", f"{uid}.json")
+              if os.path.exists(mf_path):
+                  continue
+              langs_doc = get_json(f"{API}/listlangs.php?id={urllib.parse.quote(uid)}", retries=2)
+              if not langs_doc:
+                  break
+              files_doc = get_json(f"{API}/get.php?id={urllib.parse.quote(uid)}&noLinks=1", retries=2)
+              if not files_doc:
+                  continue
+              raw_files = files_doc.get("response", {}).get("files", {})
+              if not isinstance(raw_files, dict) or not raw_files:
+                  continue
+              compact_files = {}
+              for fname, meta in raw_files.items():
+                  if not isinstance(meta, dict):
+                      continue
+                  compact_files[fname] = {
+                      "size": int(str(meta.get("size") or "0") or "0"),
+                      "sha1": (meta.get("sha1") or "").lower(),
+                  }
+              mf = {
+                  "uuid": uid,
+                  "langs": langs_doc.get("response", {}).get("langList", []),
+                  "langNames": langs_doc.get("response", {}).get("langFancyNames", {}),
+                  "files": compact_files,
+              }
+              open(mf_path, "w", encoding="utf-8").write(json.dumps(mf, separators=(",", ":")))
+              cached_manifests += 1
+              time.sleep(0.5)
+          print(f"Total builds: {len(sorted_builds)} | New cached manifests: {cached_manifests}")
+          PYEOF
+
+      - name: Commit updated UUP catalog
+        run: |
+          git config user.name "PocketBoot Sync Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add uup-builds.json app/src/main/assets/uup-builds.json uup-db/
+          if ! git diff --cached --quiet; then
+            git commit -m "Auto-sync UUP builds database ($(date -u +%Y-%m-%d))"
+            git push
+          else
+            echo "No UUP catalog changes to commit."
+          fi

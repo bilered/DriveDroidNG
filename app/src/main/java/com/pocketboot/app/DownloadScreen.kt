@@ -1719,6 +1719,14 @@ fun DownloadScreen(
             activeMultiBootTarget = activeMultiBootTarget,
             turboConnections = settings.downloadConnections,
             presets = settings.autounattendPresets,
+            customUupApiUrl = settings.customUupApiUrl,
+            preferDirectMicrosoftUup = settings.preferDirectMicrosoftUup,
+            cachedUupBuildsJson = settings.cachedUupBuildsJson,
+            onUpdateCachedUupBuilds = { freshJson ->
+                if (freshJson != settings.cachedUupBuildsJson) {
+                    onUpdateSettings(settings.copy(cachedUupBuildsJson = freshJson))
+                }
+            },
             onSavePreset = { preset ->
                 val updatedPresets = (settings.autounattendPresets.filterNot { it.name.equals(preset.name, true) } + preset)
                 onUpdateSettings(settings.copy(autounattendPresets = updatedPresets))
@@ -1734,8 +1742,19 @@ fun DownloadScreen(
                 startTurboDownload(title, url, fileName, expectedSha256 = sha)
             },
             onStartChannelBuild = { cfg ->
+                WindowsBuildEngine.configureNetwork(settings.customUupApiUrl, settings.preferDirectMicrosoftUup)
                 WindowsBuildEngine.startBuild(
                     context = context,
+                    config = cfg,
+                    onComplete = { evt -> scope.launch { onDownloadCompleted(evt) } },
+                    onError = { err -> scope.launch { onMessage(err, true) } },
+                    onLog = { entry -> scope.launch { onAppendLog(entry) } }
+                )
+            },
+            onStartLocalUupBuild = { localDir, cfg ->
+                WindowsBuildEngine.startLocalUupFolderBuild(
+                    context = context,
+                    localFolderPath = localDir,
                     config = cfg,
                     onComplete = { evt -> scope.launch { onDownloadCompleted(evt) } },
                     onError = { err -> scope.launch { onMessage(err, true) } },

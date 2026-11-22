@@ -195,7 +195,7 @@ object WindowsCustomizationEngine {
         sb.appendLine("set \"PB_FLAG=C:\\Windows\\Setup\\Scripts\\.pb_spec_done\"")
         sb.appendLine("if exist \"%PB_FLAG%\" exit /b 0")
         sb.appendLine("mkdir \"C:\\Windows\\Setup\\Scripts\" >nul 2>&1")
-        sb.appendLine("echo [PocketBoot v4.4.0] Specialize started %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.5.0] Specialize started %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("set \"PB_BUILD=0\"")
         sb.appendLine("for /f \"tokens=3\" %%B in ('reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\" /v CurrentBuildNumber 2^>nul ^| findstr /i CurrentBuildNumber') do set \"PB_BUILD=%%B\"")
         sb.appendLine("set \"PB_REBOOT_REQ=0\"")
@@ -357,28 +357,33 @@ object WindowsCustomizationEngine {
             sb.appendLine(")")
         }
         if (hasNetFx3) sb.appendLine("if exist \"C:\\Windows\\Setup\\sxs\" (dism /Online /Enable-Feature /FeatureName:NetFx3 /All /LimitAccess /Source:\"C:\\Windows\\Setup\\sxs\" /NoRestart >> \"%PB_LOG%\" 2>&1 & rmdir /s /q \"C:\\Windows\\Setup\\sxs\" >> \"%PB_LOG%\" 2>&1)")
-        if (hasOemApps) {
-            sb.appendLine("if exist \"C:\\Windows\\Setup\\Apps\" (")
-            sb.appendLine("  for %%A in (\"C:\\Windows\\Setup\\Apps\\*.msixbundle\" \"C:\\Windows\\Setup\\Apps\\*.appxbundle\" \"C:\\Windows\\Setup\\Apps\\*.msix\" \"C:\\Windows\\Setup\\Apps\\*.appx\") do if exist \"%%~fA\" (")
-            sb.appendLine("    echo Provisioning App: %%~nxA >> \"%PB_LOG%\"")
-            sb.appendLine("    dism /Online /Add-ProvisionedAppxPackage /PackagePath:\"%%~fA\" /SkipLicense >> \"%PB_LOG%\" 2>&1")
-            sb.appendLine("  )")
-            sb.appendLine("  rmdir /s /q \"C:\\Windows\\Setup\\Apps\" >> \"%PB_LOG%\" 2>&1")
-            sb.appendLine(")")
-        }
+        if (hasOemApps) sb.appendLine("echo [PocketBoot v4.5.0] Store Apps & SecHealthUI deferred to SetupComplete.cmd >> \"%PB_LOG%\"")
         sb.appendLine("echo done > \"%PB_FLAG%\"")
-        sb.appendLine("echo [PocketBoot v4.4.0] Specialize finished %DATE% %TIME% (RebootReq=!PB_REBOOT_REQ!) >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.5.0] Specialize finished %DATE% %TIME% (RebootReq=!PB_REBOOT_REQ!) >> \"%PB_LOG%\"")
         sb.appendLine("if \"!PB_REBOOT_REQ!\"==\"1\" exit /b 3010")
         sb.appendLine("exit /b 0")
         return sb.toString()
     }
 
-    fun buildSetupCompleteScript(runComponentCleanup: Boolean, hasCustomScript: Boolean, customScriptFileName: String = ""): String {
+    fun buildSetupCompleteScript(runComponentCleanup: Boolean, hasCustomScript: Boolean, customScriptFileName: String = "", hasOemApps: Boolean = false): String {
         val sb = StringBuilder()
         sb.appendLine("@echo off")
         sb.appendLine("setlocal EnableExtensions")
         sb.appendLine("set \"PB_LOG=C:\\Windows\\Setup\\PocketBoot_Updates.log\"")
         sb.appendLine("if not exist \"C:\\Windows\\Setup\\Scripts\\.pb_spec_done\" if exist \"C:\\Windows\\Setup\\Scripts\\PocketBoot_Specialize.cmd\" call \"C:\\Windows\\Setup\\Scripts\\PocketBoot_Specialize.cmd\"")
+        if (hasOemApps) {
+            sb.appendLine("if exist \"C:\\Windows\\Setup\\Apps\" (")
+            sb.appendLine("  echo [PocketBoot v4.5.0] Provisioning inbox Store Apps & Windows Security... >> \"%PB_LOG%\"")
+            sb.appendLine("  for %%A in (\"C:\\Windows\\Setup\\Apps\\*SecHealthUI*.appx*\" \"C:\\Windows\\Setup\\Apps\\*SecHealthUI*.msix*\") do if exist \"%%~fA\" (")
+            sb.appendLine("    echo Provisioning Security App: %%~nxA >> \"%PB_LOG%\"")
+            sb.appendLine("    dism /Online /Add-ProvisionedAppxPackage /PackagePath:\"%%~fA\" /SkipLicense >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("  )")
+            sb.appendLine("  for %%A in (\"C:\\Windows\\Setup\\Apps\\*.msixbundle\" \"C:\\Windows\\Setup\\Apps\\*.appxbundle\" \"C:\\Windows\\Setup\\Apps\\*.msix\" \"C:\\Windows\\Setup\\Apps\\*.appx\") do if exist \"%%~fA\" (")
+            sb.appendLine("    echo %%~nxA | findstr /i \"SecHealthUI\" >nul || (echo Provisioning App: %%~nxA >> \"%PB_LOG%\" & dism /Online /Add-ProvisionedAppxPackage /PackagePath:\"%%~fA\" /SkipLicense >> \"%PB_LOG%\" 2>&1)")
+            sb.appendLine("  )")
+            sb.appendLine("  rmdir /s /q \"C:\\Windows\\Setup\\Apps\" >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine(")")
+        }
         if (runComponentCleanup) sb.appendLine("dism /Online /Cleanup-Image /StartComponentCleanup /ResetBase >> \"%PB_LOG%\" 2>&1")
         if (hasCustomScript && customScriptFileName.isNotBlank()) {
             if (customScriptFileName.lowercase().endsWith(".ps1")) sb.appendLine("if exist \"C:\\Windows\\Setup\\Custom\\$customScriptFileName\" powershell -NoProfile -ExecutionPolicy Bypass -File \"C:\\Windows\\Setup\\Custom\\$customScriptFileName\" >> \"%PB_LOG%\" 2>&1")

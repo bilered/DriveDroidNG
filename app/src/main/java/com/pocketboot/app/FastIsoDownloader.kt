@@ -24,6 +24,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -206,7 +208,7 @@ object FastIsoDownloader {
     private var cachedOnError: ((String) -> Unit)? = null
     private var cachedOnLog: ((LogEntry) -> Unit)? = null
     @Volatile private var cachedUserAgent: String = BROWSER_UA
-    private const val BROWSER_UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.4.0"
+    private const val BROWSER_UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.5.0"
     private const val WGET_UA = "Wget/1.21.4"
     private const val CURL_UA = "curl/8.5.0"
     private fun logDl(msg: String, isError: Boolean = false) { cachedOnLog?.invoke(LogEntry(SimpleDateFormat("HH:mm:ss", Locale.US).format(Date()), "download", msg, isError)) }
@@ -1223,13 +1225,15 @@ object FastIsoDownloader {
         val partFile: File,
         val metaFile: File,
         val expectedSize: Long,
-        val expectedSha1: String
+        val expectedSha1: String,
+        val urlExpiryEpoch: Long = 0L
     )
 
     /**
-     * Global work-stealing multi-file Turbo engine.
+     * Global work-stealing multi-file Turbo engine with Mutex-locked URL auto-refresh.
      * Splits files >= 4 MB into dynamic 4–8 MB byte-range slices and keeps all `connections`
-     * workers 100% saturated across files with zero small/large barriers and zero straggler stalls.
+     * workers saturated across files. When Microsoft CDN links expire (HTTP 403/410 or near P1= expiry),
+     * a single Mutex-guarded refresh updates URLs for all concurrent workers seamlessly.
      */
     suspend fun downloadBatchTurbo(
         items: List<TurboBatchItem>,
@@ -1238,11 +1242,50 @@ object FastIsoDownloader {
         cancelledFlag: AtomicBoolean,
         totalCounter: AtomicLong,
         activeStreamsOut: AtomicInteger,
+        onRefreshUrls: (suspend () -> Map<String, Pair<String, Long>>)? = null,
         onFileVerified: suspend (TurboBatchItem) -> Unit
     ) = withContext(Dispatchers.IO) {
         if (items.isEmpty()) return@withContext
         val workerCount = connections.coerceIn(1, 16)
         val bufSize = 262_144
+
+        val liveUrls = ConcurrentHashMap<String, String>()
+        val liveExpiries = ConcurrentHashMap<String, Long>()
+        items.forEach {
+            liveUrls[it.id] = it.url
+            if (it.urlExpiryEpoch > 0L) liveExpiries[it.id] = it.urlExpiryEpoch
+        }
+        val refreshMutex = Mutex()
+        val lastRefreshMs = AtomicLong(0L)
+
+        suspend fun resolveFreshUrl(item: TurboBatchItem, forceRefresh: Boolean): String {
+            val nowSec = System.currentTimeMillis() / 1000L
+            val expSec = liveExpiries[item.id] ?: item.urlExpiryEpoch
+            val nearExpiry = expSec > 0L && nowSec >= (expSec - 45L)
+            if (onRefreshUrls != null && (forceRefresh || nearExpiry)) {
+                refreshMutex.withLock {
+                    val nowMs = System.currentTimeMillis()
+                    val latestExp = liveExpiries[item.id] ?: item.urlExpiryEpoch
+                    val stillNeeds = forceRefresh || (latestExp > 0L && (nowMs / 1000L) >= (latestExp - 45L))
+                    if (stillNeeds && (nowMs - lastRefreshMs.get() >= 15_000L)) {
+                        runCatching {
+                            val refreshed = onRefreshUrls.invoke()
+                            if (refreshed.isNotEmpty()) {
+                                refreshed.forEach { (id, pair) ->
+                                    if (pair.first.startsWith("http")) {
+                                        liveUrls[id] = pair.first
+                                        if (pair.second > 0L) liveExpiries[id] = pair.second
+                                    }
+                                }
+                                lastRefreshMs.set(System.currentTimeMillis())
+                                logDl("Auto-refreshed ${refreshed.size} Microsoft CDN download URLs mid-batch")
+                            }
+                        }
+                    }
+                }
+            }
+            return liveUrls[item.id] ?: item.url
+        }
 
         class FileTracker(val item: TurboBatchItem, val sliceCount: Int) {
             val completedSlices = ConcurrentHashMap.newKeySet<Int>()
@@ -1277,7 +1320,6 @@ object FastIsoDownloader {
         val queue = ConcurrentLinkedQueue<WorkSlice>()
         val trackers = mutableListOf<FileTracker>()
 
-        // Largest files first so huge .esd files keep all workers saturated; small files fill the tail
         val ordered = items.sortedByDescending { it.expectedSize }
         for (item in ordered) {
             val sz = item.expectedSize
@@ -1286,7 +1328,6 @@ object FastIsoDownloader {
                 val count = ((sz + sliceSize - 1L) / sliceSize).toInt().coerceAtLeast(1)
                 val tracker = FileTracker(item, count)
 
-                // Restore previously completed slices from .pbmeta if partFile matches size
                 val doneSet = mutableSetOf<Int>()
                 if (item.partFile.exists() && item.metaFile.exists() && item.partFile.length() == sz) {
                     runCatching {
@@ -1318,7 +1359,6 @@ object FastIsoDownloader {
                 }
 
                 if (tracker.remainingSlices.get() == 0) {
-                    // All slices already downloaded — verify SHA-1 & finalize immediately
                     verifyAndFinalize(tracker.item, bufSize)
                     onFileVerified(tracker.item)
                 } else {
@@ -1348,7 +1388,6 @@ object FastIsoDownloader {
                         val tracker = task.tracker
                         val item = tracker.item
 
-                        // If another worker switched this file to single-stream fallback, skip redundant slices
                         if (task.isRanged && tracker.fallbackSingleStream.get()) continue
 
                         activeStreamsOut.incrementAndGet()
@@ -1359,14 +1398,15 @@ object FastIsoDownloader {
                                 while (!sliceDone && !pausedFlag.get() && !cancelledFlag.get()) {
                                     var writtenThisAttempt = 0L
                                     try {
-                                        val conn = openFollowingRedirects(item.url, "GET", rangeHeader = "bytes=${task.start}-${task.end}")
+                                        val activeUrl = resolveFreshUrl(item, forceRefresh = false)
+                                        val conn = openFollowingRedirects(activeUrl, "GET", rangeHeader = "bytes=${task.start}-${task.end}")
                                         try {
                                             val code = conn.responseCode
+                                            if (code == 403 || code == 410) throw IllegalStateException("EXPIRED_$code")
                                             if (code == 429 || code == 503) throw IllegalStateException("THROTTLE_$code")
                                             if (code == 200 && task.start > 0L) {
-                                                // Server ignored Range header; fall back cleanly to single-stream once for this file
                                                 if (tracker.fallbackSingleStream.compareAndSet(false, true)) {
-                                                    val okSingle = downloadSingleKeepAlive(item, buf, pausedFlag, cancelledFlag, totalCounter)
+                                                    val okSingle = downloadSingleKeepAlive(item, buf, pausedFlag, cancelledFlag, totalCounter, ::resolveFreshUrl)
                                                     if (okSingle && tracker.finalized.compareAndSet(false, true)) {
                                                         item.metaFile.delete()
                                                         onFileVerified(item)
@@ -1417,13 +1457,19 @@ object FastIsoDownloader {
                                         if (pausedFlag.get() || cancelledFlag.get()) break
                                         attempt++
                                         if (attempt > 6) throw IllegalStateException("${item.partFile.name}: ${e.message}")
-                                        val isThrottle = e.message?.startsWith("THROTTLE_") == true
-                                        val jitter = (System.nanoTime() and 0xFFL)
-                                        delay((if (isThrottle) 700L * attempt else 500L * attempt) + jitter)
+                                        val isExpired = e.message?.startsWith("EXPIRED_") == true
+                                        if (isExpired && onRefreshUrls != null) {
+                                            resolveFreshUrl(item, forceRefresh = true)
+                                            delay(400L)
+                                        } else {
+                                            val isThrottle = e.message?.startsWith("THROTTLE_") == true
+                                            val jitter = (System.nanoTime() and 0xFFL)
+                                            delay((if (isThrottle) 700L * attempt else 500L * attempt) + jitter)
+                                        }
                                     }
                                 }
                             } else {
-                                val ok = downloadSingleKeepAlive(item, buf, pausedFlag, cancelledFlag, totalCounter)
+                                val ok = downloadSingleKeepAlive(item, buf, pausedFlag, cancelledFlag, totalCounter, ::resolveFreshUrl)
                                 if (ok && tracker.finalized.compareAndSet(false, true)) {
                                     item.metaFile.delete()
                                     onFileVerified(item)
@@ -1437,7 +1483,6 @@ object FastIsoDownloader {
             }.awaitAll()
         }
 
-        // Persist checkpoints for any partially completed files on pause
         if (pausedFlag.get()) {
             trackers.forEach { if (!it.finalized.get()) it.persistMeta() }
         }
@@ -1448,7 +1493,8 @@ object FastIsoDownloader {
         buf: ByteArray,
         pausedFlag: AtomicBoolean,
         cancelledFlag: AtomicBoolean,
-        totalCounter: AtomicLong
+        totalCounter: AtomicLong,
+        urlResolver: suspend (TurboBatchItem, Boolean) -> String
     ): Boolean {
         val cleanSha1 = item.expectedSha1.trim().lowercase()
         var attempt = 0
@@ -1456,9 +1502,11 @@ object FastIsoDownloader {
             var written = 0L
             try {
                 val md = if (cleanSha1.length == 40) MessageDigest.getInstance("SHA-1") else null
-                val conn = openFollowingRedirects(item.url, "GET")
+                val activeUrl = urlResolver(item, false)
+                val conn = openFollowingRedirects(activeUrl, "GET")
                 try {
                     val code = conn.responseCode
+                    if (code == 403 || code == 410) throw IllegalStateException("EXPIRED_$code")
                     if (code == 429 || code == 503) throw IllegalStateException("THROTTLE_$code")
                     if (code !in 200..299) throw IllegalStateException("HTTP $code")
                     item.partFile.parentFile?.mkdirs()
@@ -1500,8 +1548,14 @@ object FastIsoDownloader {
                 if (pausedFlag.get() || cancelledFlag.get()) return false
                 attempt++
                 if (attempt > 6) throw IllegalStateException("${item.partFile.name}: ${e.message}")
-                val isThrottle = e.message?.startsWith("THROTTLE_") == true
-                delay(if (isThrottle) 800L * attempt else 500L * attempt)
+                val isExpired = e.message?.startsWith("EXPIRED_") == true
+                if (isExpired) {
+                    urlResolver(item, true)
+                    delay(400L)
+                } else {
+                    val isThrottle = e.message?.startsWith("THROTTLE_") == true
+                    delay(if (isThrottle) 800L * attempt else 500L * attempt)
+                }
             }
         }
         return false

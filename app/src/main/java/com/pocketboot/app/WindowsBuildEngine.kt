@@ -101,8 +101,9 @@ data class WindowsChannelBuild(
 
 data class WinBuildLangOption(val code: String, val displayName: String)
 data class WinBuildEditionOption(val code: String, val displayName: String)
+enum class UupDataSource(val label: String) { UUPDUMP_LIVE("UUPdump Live"), DIRECT_MICROSOFT("Direct Microsoft"), OFFLINE_CATALOG("Offline Catalog") }
 enum class WinPackageKind(val badge: String) { BASE_OS("Base OS"), UPDATE("Update"), STORE_APP("Store App"), NETFX3(".NET 3.5") }
-data class WinPackageFileEntry(val name: String, val url: String, val sizeBytes: Long, val sha1: String, val kind: WinPackageKind = WinPackageKind.BASE_OS)
+data class WinPackageFileEntry(val name: String, val url: String, val sizeBytes: Long, val sha1: String, val kind: WinPackageKind = WinPackageKind.BASE_OS, val expireEpochSec: Long = 0L)
 data class WinManifestEstimate(val fileCount: Int, val totalBytes: Long)
 
 data class WinDetailedManifest(
@@ -138,7 +139,9 @@ data class WindowsChannelBuildConfig(
     val bypassMicrosoftAccount: Boolean = experience.bypassMicrosoftAccount,
     val disableDataCollection: Boolean = experience.disableDataCollection,
     val disableBitLocker: Boolean = experience.disableBitLocker,
-    val extraDriversDir: String = ""
+    val extraDriversDir: String = "",
+    val virtualEditions: List<String> = emptyList(),
+    val localUupDirPath: String = ""
 )
 
 data class PendingWindowsBuild(
@@ -173,12 +176,18 @@ data class WindowsBuildToolsStatus(val cabextract: String?, val wimlib: String?,
 private data class QueuedConversionJob(
     val context: Context, val config: WindowsChannelBuildConfig, val workRootPath: String, val workPrefix: String,
     val jobTitle: String, val totalDownloadBytes: Long, val hasUpdates: Boolean, val hasApps: Boolean, val hasNetFx3: Boolean,
+    val isReadOnlySource: Boolean = false, val pkgDirOverride: String = "",
     val onComplete: (DownloadCompletionEvent) -> Unit, val onError: (String) -> Unit, val onLog: (LogEntry) -> Unit
 )
 
 object WindowsBuildEngine {
-    private const val API_BASE = "https://api.uupdump.net"
-    private const val UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.4.0"
+    private const val DEFAULT_API_BASE = "https://api.uupdump.net"
+    private const val GITHUB_RAW_BASE = "https://raw.githubusercontent.com/bilered/PocketBoot/main"
+    private const val UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.5.0"
+
+    @Volatile private var apiBaseUrl: String = DEFAULT_API_BASE
+    @Volatile private var preferDirectMicrosoft: Boolean = false
+    @Volatile private var uupDumpBackoffUntilMs: Long = 0L
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val _downloadState = MutableStateFlow<WindowsBuildJobState?>(null)
@@ -187,9 +196,22 @@ object WindowsBuildEngine {
     private val _conversionState = MutableStateFlow<WindowsConversionJobState?>(null)
     val conversionState: StateFlow<WindowsConversionJobState?> = _conversionState.asStateFlow()
 
+    private val _activeSource = MutableStateFlow(UupDataSource.UUPDUMP_LIVE)
+    val activeSource: StateFlow<UupDataSource> = _activeSource.asStateFlow()
+
     private val langsCache = ConcurrentHashMap<String, List<WinBuildLangOption>>()
     private val editionsCache = ConcurrentHashMap<String, List<WinBuildEditionOption>>()
     private val detailedManifestCache = ConcurrentHashMap<String, WinDetailedManifest>()
+    private val uupDbManifestCache = ConcurrentHashMap<String, Pair<List<WinBuildLangOption>, List<DirectSyncFileMeta>>>()
+    private val catalogMetaByUuid = ConcurrentHashMap<String, Triple<String, Int, String>>() // ring, sku, build
+
+    fun configureNetwork(customApiUrl: String, preferDirectMs: Boolean) {
+        apiBaseUrl = customApiUrl.trim().trimEnd('/').let {
+            if (it.startsWith("http://") || it.startsWith("https://")) it else DEFAULT_API_BASE
+        }
+        preferDirectMicrosoft = preferDirectMs
+        if (preferDirectMs) _activeSource.value = UupDataSource.DIRECT_MICROSOFT
+    }
 
     private var activeDownloadJob: Job? = null
     private val dlCancelledFlag = AtomicBoolean(false)
@@ -283,13 +305,13 @@ object WindowsBuildEngine {
         return if (outputMode == WinBuildOutputMode.DIRECT_NTFS_USB) "${slug}_USB.img" else "$slug.iso"
     }
 
-    private fun fetchJsonWithRetry(urlStr: String): JSONObject? {
+    private fun fetchJsonWithRetry(urlStr: String, timeoutMs: Int = 10_000): JSONObject? {
         for (attempt in 0..2) {
             val res = runCatching {
                 val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
                     requestMethod = "GET"
-                    connectTimeout = 12_000
-                    readTimeout = 20_000
+                    connectTimeout = timeoutMs
+                    readTimeout = timeoutMs + 6_000
                     instanceFollowRedirects = true
                     setRequestProperty("User-Agent", UA)
                     setRequestProperty("Accept", "application/json")
@@ -312,18 +334,33 @@ object WindowsBuildEngine {
             }.getOrDefault("ERR" to null)
 
             if (res.first == "OK") return res.second
-            if (res.first == "RATE_LIMIT" && attempt < 2) {
-                Thread.sleep(1300L * (attempt + 1))
-                continue
+            if (res.first == "RATE_LIMIT") {
+                if (attempt < 2) {
+                    Thread.sleep(1400L * (attempt + 1))
+                    continue
+                }
+                // Back off UUPdump for 90s on persistent 429 so Direct Microsoft takes over immediately
+                uupDumpBackoffUntilMs = System.currentTimeMillis() + 90_000L
+                return null
             }
-            if (attempt < 2) Thread.sleep(500L)
+            if (attempt < 1) Thread.sleep(450L) else break
         }
         return null
     }
 
+    private fun shouldUseUupDumpApi(): Boolean =
+        !preferDirectMicrosoft && System.currentTimeMillis() >= uupDumpBackoffUntilMs
+
     private fun isJunkStubTitle(title: String): Boolean {
         val low = title.lowercase()
         return JUNK_TITLE_PATTERNS.any { low.contains(it) }
+    }
+
+    private fun isStandaloneCumulativeUpdate(title: String): Boolean {
+        val low = title.lowercase().trim()
+        return low.startsWith("update for ") ||
+            low.startsWith("cumulative update") ||
+            (Regex("""^20\d{2}-\d{2}\s+""").containsMatchIn(low) && low.contains("update for"))
     }
 
     private fun cleanNormalizedTitleKey(title: String, build: String, arch: String): String {
@@ -335,149 +372,336 @@ object WindowsBuildEngine {
         val low = title.lowercase()
         val major = build.substringBefore('.').toIntOrNull() ?: 0
         return when {
-            low.contains("canary") || major >= 29000 || major in 27000..27999 ->
-                WinBuildTier.INSIDER to "Canary"
-            low.contains("dev") || major in 26340..26999 || major in 28100..28999 ->
-                WinBuildTier.INSIDER to "Dev"
-            low.contains("beta") || major in 26320..26339 || major in 28020..28099 || major == 22635 ->
-                WinBuildTier.INSIDER to "Beta"
-            low.contains("insider") ->
-                WinBuildTier.INSIDER to "Insider"
-            low.contains("release preview") || low.contains("preview update") || low.contains("rp") ->
-                WinBuildTier.PREVIEW to "Preview"
-            else ->
-                WinBuildTier.STABLE to "Stable"
+            low.contains("canary") || major >= 29000 || major in 27000..27999 -> WinBuildTier.INSIDER to "Canary"
+            low.contains("dev") || major in 26340..26999 || major in 28100..28999 -> WinBuildTier.INSIDER to "Dev"
+            low.contains("beta") || major in 26320..26339 || major in 28020..28099 || major == 22635 -> WinBuildTier.INSIDER to "Beta"
+            low.contains("insider") -> WinBuildTier.INSIDER to "Insider"
+            low.contains("release preview") || low.contains("preview update") || low.contains("rp") -> WinBuildTier.PREVIEW to "Preview"
+            else -> WinBuildTier.STABLE to "Stable"
         }
     }
 
-    suspend fun fetchGroupedBuilds(
+    /** Loads offline baseline builds from bundled assets/uup-builds.json + cached JSON + live SyncUpdates memory cache. */
+    fun loadOfflineCatalogBuilds(context: Context?, cachedJson: String = ""): List<WindowsChannelBuild> {
+        val out = LinkedHashMap<String, WindowsChannelBuild>()
+        fun ingestJson(raw: String) {
+            if (raw.isBlank()) return
+            runCatching {
+                val arr = JSONObject(raw).optJSONArray("builds") ?: return@runCatching
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val uuid = o.optString("uuid", "").trim()
+                    val title = o.optString("title", "").trim()
+                    val build = o.optString("build", "").trim()
+                    val arch = o.optString("arch", "amd64").trim()
+                    val created = o.optLong("created", 0L)
+                    if (uuid.isEmpty() || title.isEmpty()) continue
+                    val ring = o.optString("ring", "RETAIL")
+                    val sku = o.optInt("sku", if (title.contains("server", true)) 7 else 48)
+                    catalogMetaByUuid[uuid] = Triple(ring, sku, "10.0.$build")
+                    val (tier, badge) = classifyBuildTier(title, build)
+                    val chBadge = o.optString("channel", badge).ifBlank { badge }
+                    val effTier = when (chBadge.lowercase()) {
+                        "preview" -> WinBuildTier.PREVIEW
+                        "canary", "dev", "beta", "insider" -> WinBuildTier.INSIDER
+                        else -> tier
+                    }
+                    out[uuid] = WindowsChannelBuild(uuid, title, build, arch, created, effTier, chBadge)
+                }
+            }
+        }
+        context?.let { ctx ->
+            runCatching { ctx.assets.open("uup-builds.json").bufferedReader(Charsets.UTF_8).use { it.readText() } }
+                .getOrNull()?.let { ingestJson(it) }
+        }
+        ingestJson(cachedJson)
+        MicrosoftUupClient.syncMetaCache.values.forEach { res ->
+            catalogMetaByUuid[res.build.uuid] = Triple(res.ring, res.sku, res.checkBuild)
+            out[res.build.uuid] = res.build
+        }
+        return out.values.sortedByDescending { it.createdEpoch }
+    }
+
+    /** Quietly fetches the daily-synced uup-builds.json from GitHub so offline fallback stays fresh even when uupdump is down. */
+    suspend fun syncOfflineCatalogFromGitHub(): String? = withContext(Dispatchers.IO) {
+        val obj = fetchJsonWithRetry("$GITHUB_RAW_BASE/uup-builds.json", timeoutMs = 8_000) ?: return@withContext null
+        val arr = obj.optJSONArray("builds")
+        if (arr != null && arr.length() > 0) obj.toString() else null
+    }
+
+    private fun fetchGitHubBuildManifest(updateId: String): Pair<List<WinBuildLangOption>, List<DirectSyncFileMeta>>? {
+        uupDbManifestCache[updateId]?.let { return it }
+        val obj = fetchJsonWithRetry("$GITHUB_RAW_BASE/uup-db/${URLEncoder.encode(updateId, "UTF-8")}.json", timeoutMs = 8_000)
+            ?: return null
+        val filesObj = obj.optJSONObject("files") ?: return null
+        val files = mutableListOf<DirectSyncFileMeta>()
+        val keys = filesObj.keys()
+        while (keys.hasNext()) {
+            val name = keys.next()
+            if (MicrosoftUupClient.isUnusablePackageName(name)) continue
+            val fObj = filesObj.optJSONObject(name) ?: continue
+            val sz = fObj.optLong("size", 0L)
+            val sha1 = fObj.optString("sha1", "").lowercase()
+            if (sha1.length == 40) files.add(DirectSyncFileMeta(name, sz, sha1))
+        }
+        if (files.isEmpty()) return null
+
+        val langsArr = obj.optJSONArray("langs")
+        val langNames = obj.optJSONObject("langNames") ?: JSONObject()
+        val langs = mutableListOf<WinBuildLangOption>()
+        if (langsArr != null) {
+            for (i in 0 until langsArr.length()) {
+                val c = langsArr.optString(i, "").trim()
+                if (c.isNotEmpty()) langs.add(WinBuildLangOption(c, langNames.optString(c, c)))
+            }
+        }
+        val effectiveLangs = if (langs.isNotEmpty()) langs else MicrosoftUupClient.deriveLangsFromFileNames(files.map { it.name })
+        val pair = effectiveLangs to files
+        uupDbManifestCache[updateId] = pair
+        return pair
+    }
+
+    internal fun filterBuildsToGroups(
+        rawBuilds: List<WindowsChannelBuild>,
         family: WinFamilyFilter,
         featureVer: WinFeatureVersion,
-        archFilter: String = "amd64",
-        customQuery: String = ""
-    ): GroupedWindowsBuilds = withContext(Dispatchers.IO) {
-        val cleanQuery = customQuery.trim()
-        val rawQueries = if (cleanQuery.isNotBlank()) listOf(cleanQuery) else featureVer.searchTerms
-
+        archFilter: String,
+        cleanQuery: String,
+        hideCumulativeUpdates: Boolean
+    ): GroupedWindowsBuilds {
         val collected = mutableListOf<WindowsChannelBuild>()
         val seenUuids = mutableSetOf<String>()
         val seenNormKeys = mutableSetOf<String>()
 
-        for (qTerm in rawQueries) {
-            val encoded = URLEncoder.encode(qTerm, "UTF-8")
-            val root = fetchJsonWithRetry("$API_BASE/listid.php?search=$encoded&sortByDate=1") ?: continue
-            val buildsObj = root.optJSONObject("response")?.optJSONObject("builds") ?: continue
+        for (b in rawBuilds) {
+            if (archFilter != "all" && !b.arch.equals(archFilter, ignoreCase = true)) continue
+            if (isJunkStubTitle(b.title)) continue
+            if (hideCumulativeUpdates && isStandaloneCumulativeUpdate(b.title)) continue
 
-            val keys = buildsObj.keys()
-            while (keys.hasNext()) {
-                val k = keys.next()
-                val b = buildsObj.optJSONObject(k) ?: continue
-                val uuid = b.optString("uuid", "").trim()
-                val title = b.optString("title", "").trim()
-                val build = b.optString("build", "").trim()
-                val arch = b.optString("arch", "amd64").trim()
-                val created = b.optLong("created", 0L)
-                if (uuid.isEmpty() || title.isEmpty()) continue
-                if (archFilter != "all" && !arch.equals(archFilter, ignoreCase = true)) continue
-                if (isJunkStubTitle(title)) continue
-
-                val lowTitle = title.lowercase()
-                val isServerTitle = lowTitle.contains("server") || lowTitle.contains("azure stack")
-                val matchesFamily = when (family) {
-                    WinFamilyFilter.SERVER -> isServerTitle
-                    WinFamilyFilter.WIN10 -> !isServerTitle && (lowTitle.contains("windows 10") || build.startsWith("1904"))
-                    WinFamilyFilter.WIN11 -> !isServerTitle && !lowTitle.contains("windows 10")
-                }
-                if (!matchesFamily) continue
-
-                if (cleanQuery.isBlank()) {
-                    val matchesVersion = featureVer.buildPrefixes.any { pref -> build.startsWith(pref) } ||
-                        lowTitle.contains(featureVer.label.substringBefore(' ').lowercase())
-                    if (!matchesVersion) continue
-                }
-
-                val normKey = cleanNormalizedTitleKey(title, build, arch)
-                if (!seenUuids.add(uuid) || !seenNormKeys.add(normKey)) continue
-
-                val (tier, badge) = classifyBuildTier(title, build)
-                collected.add(
-                    WindowsChannelBuild(
-                        uuid = uuid,
-                        title = title.replace(Regex("""\s*\(\d+\)\s*$"""), "").trim(),
-                        build = build,
-                        arch = arch,
-                        createdEpoch = created,
-                        tier = tier,
-                        channelBadge = badge
-                    )
-                )
+            val lowTitle = b.title.lowercase()
+            val isServerTitle = lowTitle.contains("server") || lowTitle.contains("azure stack")
+            val matchesFamily = when (family) {
+                WinFamilyFilter.SERVER -> isServerTitle
+                WinFamilyFilter.WIN10 -> !isServerTitle && (lowTitle.contains("windows 10") || b.build.startsWith("1904"))
+                WinFamilyFilter.WIN11 -> !isServerTitle && !lowTitle.contains("windows 10")
             }
+            if (!matchesFamily) continue
+
+            if (cleanQuery.isBlank()) {
+                val matchesVersion = featureVer.buildPrefixes.any { pref -> b.build.startsWith(pref) } ||
+                    lowTitle.contains(featureVer.label.substringBefore(' ').lowercase())
+                if (!matchesVersion) continue
+            } else {
+                val qLow = cleanQuery.lowercase()
+                if (!lowTitle.contains(qLow) && !b.build.lowercase().contains(qLow) && !b.uuid.lowercase().contains(qLow)) continue
+            }
+
+            val normKey = cleanNormalizedTitleKey(b.title, b.build, b.arch)
+            if (!seenUuids.add(b.uuid) || !seenNormKeys.add(normKey)) continue
+            collected.add(b)
         }
 
         val sorted = collected.sortedByDescending { it.createdEpoch }
-        GroupedWindowsBuilds(
+        return GroupedWindowsBuilds(
             stable = sorted.filter { it.tier == WinBuildTier.STABLE }.take(15),
             preview = sorted.filter { it.tier == WinBuildTier.PREVIEW }.take(15),
             insider = sorted.filter { it.tier == WinBuildTier.INSIDER }.take(15)
         )
     }
 
-    suspend fun fetchLanguages(updateId: String): List<WinBuildLangOption> = withContext(Dispatchers.IO) {
-        langsCache[updateId]?.let { return@withContext it }
-        val root = fetchJsonWithRetry("$API_BASE/listlangs.php?id=${URLEncoder.encode(updateId, "UTF-8")}")
-            ?: return@withContext emptyList()
-        val resp = root.optJSONObject("response") ?: return@withContext emptyList()
-        val fancy = resp.optJSONObject("langFancyNames") ?: JSONObject()
-        val list = resp.optJSONArray("langList")
-        val out = mutableListOf<WinBuildLangOption>()
-        if (list != null) {
-            for (i in 0 until list.length()) {
-                val code = list.optString(i, "").trim()
-                if (code.isNotEmpty()) {
-                    out.add(WinBuildLangOption(code = code, displayName = fancy.optString(code, code)))
+    /** Direct on-phone Microsoft Windows Update query (zero UUPdump dependency). */
+    suspend fun fetchLatestDirectFromMicrosoft(
+        family: WinFamilyFilter,
+        featureVer: WinFeatureVersion,
+        archFilter: String = "amd64"
+    ): List<WindowsChannelBuild> = withContext(Dispatchers.IO) {
+        val effArch = if (archFilter == "all") "amd64" else archFilter
+        val sku = if (family == WinFamilyFilter.SERVER) 7 else 48
+        val baseline = when (featureVer) {
+            WinFeatureVersion.W11_26H2 -> "10.0.26300.1"
+            WinFeatureVersion.W11_26H1 -> "10.0.28000.1"
+            WinFeatureVersion.W11_25H2 -> "10.0.26200.1"
+            WinFeatureVersion.W11_24H2 -> "10.0.26100.1"
+            WinFeatureVersion.W11_23H2 -> "10.0.22631.1"
+            WinFeatureVersion.W11_22H2 -> "10.0.22621.1"
+            WinFeatureVersion.W11_21H2 -> "10.0.22000.1"
+            WinFeatureVersion.W11_INSIDER -> "10.0.26300.1"
+            WinFeatureVersion.W10_22H2 -> "10.0.19045.1"
+            WinFeatureVersion.W10_21H2 -> "10.0.19044.1"
+            WinFeatureVersion.W10_21H1 -> "10.0.19043.1"
+            WinFeatureVersion.W10_1909 -> "10.0.18363.1"
+            WinFeatureVersion.SRV_2025 -> "10.0.26100.1"
+            WinFeatureVersion.SRV_2022 -> "10.0.20348.1"
+            WinFeatureVersion.SRV_2019 -> "10.0.17763.1"
+            WinFeatureVersion.SRV_2016 -> "10.0.14393.1"
+        }
+        val rings = if (featureVer == WinFeatureVersion.W11_INSIDER) listOf("DEV", "CANARY", "BETA") else listOf("RETAIL", "RP")
+        val found = LinkedHashMap<String, WindowsChannelBuild>()
+        for (ring in rings) {
+            val res = MicrosoftUupClient.syncLatestBuildsDirect(arch = effArch, ring = ring, baselineBuild = baseline, sku = sku)
+            res.forEach { item ->
+                catalogMetaByUuid[item.build.uuid] = Triple(item.ring, item.sku, item.checkBuild)
+                found[item.build.uuid] = item.build
+            }
+        }
+        if (found.isNotEmpty()) _activeSource.value = UupDataSource.DIRECT_MICROSOFT
+        found.values.toList()
+    }
+
+    suspend fun fetchGroupedBuilds(
+        family: WinFamilyFilter,
+        featureVer: WinFeatureVersion,
+        archFilter: String = "amd64",
+        customQuery: String = "",
+        context: Context? = null,
+        cachedCatalogJson: String = "",
+        hideCumulativeUpdates: Boolean = true
+    ): GroupedWindowsBuilds = withContext(Dispatchers.IO) {
+        val cleanQuery = customQuery.trim()
+        val rawQueries = if (cleanQuery.isNotBlank()) listOf(cleanQuery) else featureVer.searchTerms
+
+        // Layer 1: Try configured UUPdump API if enabled and not rate-limited
+        if (shouldUseUupDumpApi()) {
+            val collected = mutableListOf<WindowsChannelBuild>()
+            val seenUuids = mutableSetOf<String>()
+            var anyApiResponse = false
+
+            for (qTerm in rawQueries) {
+                val encoded = URLEncoder.encode(qTerm, "UTF-8")
+                val root = fetchJsonWithRetry("$apiBaseUrl/listid.php?search=$encoded&sortByDate=1") ?: continue
+                anyApiResponse = true
+                val respObj = root.optJSONObject("response") ?: continue
+                val buildEntries = mutableListOf<JSONObject>()
+                respObj.optJSONObject("builds")?.let { bo ->
+                    val keys = bo.keys()
+                    while (keys.hasNext()) bo.optJSONObject(keys.next())?.let { buildEntries.add(it) }
+                } ?: respObj.optJSONArray("builds")?.let { ba ->
+                    for (idx in 0 until ba.length()) ba.optJSONObject(idx)?.let { buildEntries.add(it) }
+                }
+                for (b in buildEntries) {
+                    val uuid = b.optString("uuid", "").trim()
+                    val title = b.optString("title", "").trim()
+                    val build = b.optString("build", "").trim()
+                    val arch = b.optString("arch", "amd64").trim()
+                    val created = b.optLong("created", 0L)
+                    if (uuid.isEmpty() || title.isEmpty() || !seenUuids.add(uuid)) continue
+                    val (tier, badge) = classifyBuildTier(title, build)
+                    val cleanTitle = title.replace(Regex("""\s*\(\d+\)\s*$"""), "").trim()
+                    val ring = when (badge) { "Preview" -> "RP"; "Canary" -> "CANARY"; "Dev" -> "DEV"; "Beta" -> "BETA"; else -> "RETAIL" }
+                    val sku = if (title.contains("server", true)) 7 else 48
+                    catalogMetaByUuid[uuid] = Triple(ring, sku, "10.0.$build")
+                    collected.add(WindowsChannelBuild(uuid, cleanTitle, build, arch, created, tier, badge))
+                }
+            }
+            if (anyApiResponse && collected.isNotEmpty()) {
+                val grouped = filterBuildsToGroups(collected, family, featureVer, archFilter, cleanQuery, hideCumulativeUpdates)
+                if (!grouped.isEmpty) {
+                    _activeSource.value = UupDataSource.UUPDUMP_LIVE
+                    return@withContext grouped
                 }
             }
         }
-        val sorted = out.sortedWith(
-            compareBy<WinBuildLangOption> { !it.code.equals("en-us", true) }
-                .thenBy { !it.displayName.startsWith("English", true) }
-                .thenBy { it.displayName.lowercase() }
-        )
-        if (sorted.isNotEmpty()) langsCache[updateId] = sorted
+
+        // Layer 2: Automatic Failover -> Local/Bundled/GitHub Catalog + Direct Microsoft SyncUpdates
+        val offlineList = loadOfflineCatalogBuilds(context, cachedCatalogJson).toMutableList()
+        var groupedOffline = filterBuildsToGroups(offlineList, family, featureVer, archFilter, cleanQuery, hideCumulativeUpdates)
+
+        if (groupedOffline.isEmpty || preferDirectMicrosoft) {
+            val liveMs = fetchLatestDirectFromMicrosoft(family, featureVer, archFilter)
+            if (liveMs.isNotEmpty()) {
+                offlineList.addAll(0, liveMs)
+                groupedOffline = filterBuildsToGroups(offlineList, family, featureVer, archFilter, cleanQuery, hideCumulativeUpdates)
+                _activeSource.value = UupDataSource.DIRECT_MICROSOFT
+                return@withContext groupedOffline
+            }
+        }
+        _activeSource.value = if (MicrosoftUupClient.syncMetaCache.isNotEmpty()) UupDataSource.DIRECT_MICROSOFT else UupDataSource.OFFLINE_CATALOG
+        groupedOffline
+    }
+
+    suspend fun fetchLanguages(updateId: String): List<WinBuildLangOption> = withContext(Dispatchers.IO) {
+        langsCache[updateId]?.let { return@withContext it }
+
+        if (shouldUseUupDumpApi()) {
+            val root = fetchJsonWithRetry("$apiBaseUrl/listlangs.php?id=${URLEncoder.encode(updateId, "UTF-8")}")
+            val resp = root?.optJSONObject("response")
+            val fancy = resp?.optJSONObject("langFancyNames") ?: JSONObject()
+            val list = resp?.optJSONArray("langList")
+            if (list != null && list.length() > 0) {
+                val out = mutableListOf<WinBuildLangOption>()
+                for (i in 0 until list.length()) {
+                    val code = list.optString(i, "").trim()
+                    if (code.isNotEmpty()) out.add(WinBuildLangOption(code, fancy.optString(code, code)))
+                }
+                val sorted = sortLangOptions(out)
+                if (sorted.isNotEmpty()) {
+                    langsCache[updateId] = sorted
+                    return@withContext sorted
+                }
+            }
+        }
+
+        // Fallback: Direct Microsoft SyncUpdates cache or GitHub uup-db/<uuid>.json
+        val syncFiles = MicrosoftUupClient.syncFilesCache[updateId]
+        val derived = when {
+            !syncFiles.isNullOrEmpty() -> MicrosoftUupClient.deriveLangsFromFileNames(syncFiles.map { it.name })
+            else -> fetchGitHubBuildManifest(updateId)?.first ?: listOf(WinBuildLangOption("en-us", "English (United States)"))
+        }
+        val sorted = sortLangOptions(derived)
+        langsCache[updateId] = sorted
         sorted
     }
 
-    suspend fun fetchEditions(updateId: String, langCode: String): List<WinBuildEditionOption> =
-        withContext(Dispatchers.IO) {
-            val key = "$updateId|$langCode"
-            editionsCache[key]?.let { return@withContext it }
-            val url = "$API_BASE/listeditions.php?id=${URLEncoder.encode(updateId, "UTF-8")}&lang=${URLEncoder.encode(langCode, "UTF-8")}"
-            val root = fetchJsonWithRetry(url) ?: return@withContext emptyList()
-            val resp = root.optJSONObject("response") ?: return@withContext emptyList()
-            val fancy = resp.optJSONObject("editionFancyNames") ?: JSONObject()
-            val list = resp.optJSONArray("editionList")
-            val out = mutableListOf<WinBuildEditionOption>()
-            if (list != null) {
+    private fun sortLangOptions(list: List<WinBuildLangOption>): List<WinBuildLangOption> = list.sortedWith(
+        compareBy<WinBuildLangOption> { !it.code.equals("en-us", true) }
+            .thenBy { !it.displayName.startsWith("English", true) }
+            .thenBy { it.displayName.lowercase() }
+    )
+
+    suspend fun fetchEditions(updateId: String, langCode: String): List<WinBuildEditionOption> = withContext(Dispatchers.IO) {
+        val key = "$updateId|$langCode"
+        editionsCache[key]?.let { return@withContext it }
+
+        if (shouldUseUupDumpApi()) {
+            val url = "$apiBaseUrl/listeditions.php?id=${URLEncoder.encode(updateId, "UTF-8")}&lang=${URLEncoder.encode(langCode, "UTF-8")}"
+            val root = fetchJsonWithRetry(url)
+            val resp = root?.optJSONObject("response")
+            val fancy = resp?.optJSONObject("editionFancyNames") ?: JSONObject()
+            val list = resp?.optJSONArray("editionList")
+            if (list != null && list.length() > 0) {
+                val out = mutableListOf<WinBuildEditionOption>()
                 for (i in 0 until list.length()) {
                     val code = list.optString(i, "").trim()
-                    if (code.isNotEmpty()) {
-                        out.add(WinBuildEditionOption(code = code, displayName = fancy.optString(code, code)))
-                    }
+                    if (code.isNotEmpty()) out.add(WinBuildEditionOption(code, fancy.optString(code, code)))
+                }
+                val sorted = sortEditionOptions(out)
+                if (sorted.isNotEmpty()) {
+                    editionsCache[key] = sorted
+                    return@withContext sorted
                 }
             }
-            val sorted = out.sortedWith(
-                compareBy<WinBuildEditionOption> {
-                    when (it.code.uppercase()) {
-                        "PROFESSIONAL" -> 0
-                        "CORE" -> 1
-                        "ENTERPRISE" -> 2
-                        else -> 3
-                    }
-                }.thenBy { it.displayName.lowercase() }
-            )
-            if (sorted.isNotEmpty()) editionsCache[key] = sorted
-            sorted
         }
+
+        // Fallback: Derive editions directly from SyncUpdates or GitHub uup-db/<uuid>.json
+        val syncFiles = MicrosoftUupClient.syncFilesCache[updateId] ?: fetchGitHubBuildManifest(updateId)?.second
+        val derived = if (!syncFiles.isNullOrEmpty()) {
+            MicrosoftUupClient.deriveEditionsFromFileNames(syncFiles.map { it.name }, langCode)
+        } else {
+            listOf(
+                WinBuildEditionOption("PROFESSIONAL", "Windows Pro"),
+                WinBuildEditionOption("CORE", "Windows Home")
+            )
+        }
+        val sorted = sortEditionOptions(derived)
+        editionsCache[key] = sorted
+        sorted
+    }
+
+    private fun sortEditionOptions(list: List<WinBuildEditionOption>): List<WinBuildEditionOption> = list.sortedWith(
+        compareBy<WinBuildEditionOption> {
+            when (it.code.uppercase()) { "PROFESSIONAL" -> 0; "CORE" -> 1; "ENTERPRISE" -> 2; else -> 3 }
+        }.thenBy { it.displayName.lowercase() }
+    )
 
     private fun isSkippableNonEditionCab(fileName: String): Boolean {
         val low = fileName.lowercase()
@@ -486,7 +710,8 @@ object WindowsBuildEngine {
             low.startsWith("ssu-") || low.contains("-ssu-") ||
             low.contains("desktopdeployment") || low.contains("aggregatedmetadata") ||
             low.contains("baseless") || low.contains("safeos") ||
-            low.contains("dynamicupdate") || low.contains("netfx3-ondemand")
+            low.contains("dynamicupdate") || low.contains("netfx3-ondemand") ||
+            low.contains("-express.cab")
     }
 
     private fun classifyPackageFile(fileName: String): WinPackageKind {
@@ -500,38 +725,70 @@ object WindowsBuildEngine {
         }
     }
 
-    private fun parseDetailedManifest(root: JSONObject, requireUrl: Boolean): WinDetailedManifest {
-        val filesObj = root.optJSONObject("response")?.optJSONObject("files") ?: return WinDetailedManifest()
+    private fun buildDetailedManifestFromEntries(entries: List<WinPackageFileEntry>): WinDetailedManifest {
         val base = mutableListOf<WinPackageFileEntry>(); val updates = mutableListOf<WinPackageFileEntry>()
         val apps = mutableListOf<WinPackageFileEntry>(); val netfx = mutableListOf<WinPackageFileEntry>()
         val all = mutableListOf<WinPackageFileEntry>()
-        val keys = filesObj.keys()
-        while (keys.hasNext()) {
-            val name = keys.next(); val item = filesObj.optJSONObject(name) ?: continue
-            val url = item.optString("url", "")
-            if (requireUrl && url.isBlank()) continue
-            val size = item.optString("size", "0").toLongOrNull() ?: item.optLong("size", 0L)
-            val sha1 = item.optString("sha1", "").lowercase()
-            val kind = classifyPackageFile(name)
-            val entry = WinPackageFileEntry(name, url, size, sha1, kind)
+        entries.forEach { entry ->
+            if (MicrosoftUupClient.isUnusablePackageName(entry.name)) return@forEach
             all.add(entry)
-            when (kind) {
-                WinPackageKind.BASE_OS -> if (name.lowercase().endsWith(".esd") || name.lowercase().endsWith(".cab")) base.add(entry)
+            when (entry.kind) {
+                WinPackageKind.BASE_OS -> if (entry.name.lowercase().endsWith(".esd") || entry.name.lowercase().endsWith(".cab")) base.add(entry)
                 WinPackageKind.UPDATE -> updates.add(entry)
                 WinPackageKind.STORE_APP -> apps.add(entry)
                 WinPackageKind.NETFX3 -> netfx.add(entry)
             }
         }
-        return WinDetailedManifest(base.sortedBy { it.name.lowercase() }, updates.sortedBy { it.name.lowercase() }, apps.sortedBy { it.name.lowercase() }, netfx.sortedBy { it.name.lowercase() }, all.sortedBy { it.name.lowercase() })
+        return WinDetailedManifest(
+            base.sortedBy { it.name.lowercase() },
+            updates.sortedBy { it.name.lowercase() },
+            apps.sortedBy { it.name.lowercase() },
+            netfx.sortedBy { it.name.lowercase() },
+            all.sortedBy { it.name.lowercase() }
+        )
+    }
+
+    private fun parseDetailedManifest(root: JSONObject, requireUrl: Boolean): WinDetailedManifest {
+        val filesObj = root.optJSONObject("response")?.optJSONObject("files") ?: return WinDetailedManifest()
+        val entries = mutableListOf<WinPackageFileEntry>()
+        val keys = filesObj.keys()
+        while (keys.hasNext()) {
+            val name = keys.next()
+            if (MicrosoftUupClient.isUnusablePackageName(name)) continue
+            val item = filesObj.optJSONObject(name) ?: continue
+            val url = item.optString("url", "")
+            if (requireUrl && url.isBlank()) continue
+            val size = item.optString("size", "0").toLongOrNull() ?: item.optLong("size", 0L)
+            val sha1 = item.optString("sha1", "").lowercase()
+            val expFromJson = item.optString("expire", "0").toLongOrNull() ?: item.optLong("expire", 0L)
+            val expSec = if (expFromJson > 0L) expFromJson else MicrosoftUupClient.parseUrlExpiryEpoch(url)
+            entries.add(WinPackageFileEntry(name, url, size, sha1, classifyPackageFile(name), expSec))
+        }
+        return buildDetailedManifestFromEntries(entries)
     }
 
     suspend fun fetchDetailedManifest(updateId: String, langCode: String, editionCodes: List<String>): WinDetailedManifest? = withContext(Dispatchers.IO) {
         val edParam = editionCodes.sorted().joinToString(";") { it.lowercase() }
         val key = "$updateId|$langCode|$edParam"
         detailedManifestCache[key]?.let { return@withContext it }
-        val url = "$API_BASE/get.php?id=${URLEncoder.encode(updateId, "UTF-8")}&lang=${URLEncoder.encode(langCode, "UTF-8")}&edition=${URLEncoder.encode(edParam, "UTF-8")}&noLinks=1"
-        val root = fetchJsonWithRetry(url) ?: return@withContext null
-        val parsed = parseDetailedManifest(root, false)
+
+        if (shouldUseUupDumpApi()) {
+            val url = "$apiBaseUrl/get.php?id=${URLEncoder.encode(updateId, "UTF-8")}&lang=${URLEncoder.encode(langCode, "UTF-8")}&edition=${URLEncoder.encode(edParam, "UTF-8")}&noLinks=1"
+            val root = fetchJsonWithRetry(url)
+            if (root != null) {
+                val parsed = parseDetailedManifest(root, false)
+                if (parsed.allFiles.isNotEmpty()) {
+                    detailedManifestCache[key] = parsed
+                    return@withContext parsed
+                }
+            }
+        }
+
+        // Fallback: Direct Microsoft SyncUpdates cache or GitHub uup-db/<uuid>.json
+        val rawFiles = MicrosoftUupClient.syncFilesCache[updateId] ?: fetchGitHubBuildManifest(updateId)?.second ?: return@withContext null
+        val filtered = MicrosoftUupClient.filterFilesForSelection(rawFiles, langCode, editionCodes)
+        val entries = filtered.map { WinPackageFileEntry(it.name, "", it.sizeBytes, it.sha1Hex, classifyPackageFile(it.name), 0L) }
+        val parsed = buildDetailedManifestFromEntries(entries)
         if (parsed.allFiles.isEmpty()) return@withContext null
         detailedManifestCache[key] = parsed
         parsed
@@ -540,11 +797,65 @@ object WindowsBuildEngine {
     suspend fun fetchManifestEstimate(updateId: String, langCode: String, editionCodes: List<String>): WinManifestEstimate? =
         fetchDetailedManifest(updateId, langCode, editionCodes)?.let { WinManifestEstimate(it.baseFiles.size, it.baseBytes) }
 
-    suspend fun fetchFullDownloadManifest(updateId: String, langCode: String, editionCodes: List<String>): WinDetailedManifest = withContext(Dispatchers.IO) {
-        val edParam = editionCodes.joinToString(";") { it.lowercase() }
-        val url = "$API_BASE/get.php?id=${URLEncoder.encode(updateId, "UTF-8")}&lang=${URLEncoder.encode(langCode, "UTF-8")}&edition=${URLEncoder.encode(edParam, "UTF-8")}"
-        val root = fetchJsonWithRetry(url) ?: return@withContext WinDetailedManifest()
-        parseDetailedManifest(root, true)
+    suspend fun fetchFullDownloadManifest(
+        updateId: String,
+        langCode: String,
+        editionCodes: List<String>,
+        archHint: String = "amd64"
+    ): WinDetailedManifest = withContext(Dispatchers.IO) {
+        // Layer 1: UUPdump API if enabled and healthy
+        if (shouldUseUupDumpApi()) {
+            val edParam = editionCodes.joinToString(";") { it.lowercase() }
+            val url = "$apiBaseUrl/get.php?id=${URLEncoder.encode(updateId, "UTF-8")}&lang=${URLEncoder.encode(langCode, "UTF-8")}&edition=${URLEncoder.encode(edParam, "UTF-8")}"
+            val root = fetchJsonWithRetry(url)
+            if (root != null) {
+                val parsed = parseDetailedManifest(root, true)
+                if (parsed.allFiles.isNotEmpty()) {
+                    _activeSource.value = UupDataSource.UUPDUMP_LIVE
+                    return@withContext parsed
+                }
+            }
+        }
+
+        // Layer 2: Direct Microsoft GetExtendedUpdateInfo2 matched against Extended / SyncUpdates / GitHub uup-db/<uuid>.json by SHA-1
+        val cleanUid = updateId.substringBefore("_rev.")
+        val (ring, sku, checkBuild) = catalogMetaByUuid[updateId] ?: catalogMetaByUuid[cleanUid] ?: Triple("RETAIL", 48, "10.0.19041.1")
+        val rev = MicrosoftUupClient.syncMetaCache[updateId]?.revision ?: MicrosoftUupClient.syncMetaCache[cleanUid]?.revision ?: 1
+        val urlMap = MicrosoftUupClient.fetchFileUrlsForUpdate(
+            updateId = updateId,
+            revision = rev,
+            arch = archHint,
+            ring = ring,
+            checkBuild = checkBuild,
+            sku = sku
+        )
+        if (urlMap.isEmpty()) return@withContext WinDetailedManifest()
+
+        var rawMetaFiles = MicrosoftUupClient.syncFilesCache[updateId]
+            ?: MicrosoftUupClient.syncFilesCache[cleanUid]
+            ?: fetchGitHubBuildManifest(cleanUid)?.second
+        if (rawMetaFiles.isNullOrEmpty()) {
+            // Last-resort live SyncUpdates query to populate filenames for this branch
+            val synced = MicrosoftUupClient.syncLatestBuildsDirect(arch = archHint, ring = ring, baselineBuild = checkBuild, sku = sku)
+            rawMetaFiles = synced.firstOrNull { it.build.uuid.equals(cleanUid, true) }?.files
+                ?: MicrosoftUupClient.syncFilesCache[cleanUid]
+        }
+
+        val matched = if (!rawMetaFiles.isNullOrEmpty()) {
+            val filtered = MicrosoftUupClient.filterFilesForSelection(rawMetaFiles, langCode, editionCodes)
+            filtered.mapNotNull { fm ->
+                val direct = urlMap[fm.sha1Hex.lowercase()] ?: return@mapNotNull null
+                WinPackageFileEntry(fm.name, direct.url, fm.sizeBytes, fm.sha1Hex, classifyPackageFile(fm.name), direct.expireEpochSec)
+            }
+        } else {
+            emptyList()
+        }
+
+        if (matched.isNotEmpty()) {
+            _activeSource.value = UupDataSource.DIRECT_MICROSOFT
+            return@withContext buildDetailedManifestFromEntries(matched)
+        }
+        WinDetailedManifest()
     }
 
     fun buildExternalPageLink(build: WindowsChannelBuild, langCode: String): String =
@@ -576,6 +887,7 @@ object WindowsBuildEngine {
                 put("applySkuSiPolicy", config.experience.applySkuSiPolicy)
                 put("customPostInstallScriptPath", config.experience.customPostInstallScriptPath)
                 put("extraDriversDir", config.extraDriversDir)
+                put("virtualEditions", JSONArray(config.virtualEditions))
                 put("winUtilJson", config.winUtil.toJsonString()); put("totalBytes", totalBytes); put("isCachedReady", isCachedReady)
             }
             val tmp = File(context.applicationContext.cacheDir, "pb_build_meta.json").apply { writeText(obj.toString(), Charsets.UTF_8) }
@@ -624,7 +936,8 @@ object WindowsBuildEngine {
                         applySkuSiPolicy = o.optBoolean("applySkuSiPolicy", false),
                         customPostInstallScriptPath = o.optString("customPostInstallScriptPath", "")
                     )
-                    val cfg = WindowsChannelBuildConfig(bld, lang, eds, comp, mode, method, o.optString("targetDir", baseDir), o.optString("customOutputName", ""), o.optString("targetMultiBootPath", ""), o.optInt("connections", 8), o.optBoolean("autoMount", true), o.optBoolean("includeUpdates", false), o.optBoolean("includeStoreApps", false), o.optBoolean("integrateNetFx3", false), o.optBoolean("runComponentCleanup", false), o.optBoolean("skipWinRe", false), o.optBoolean("eiCfgUnlock", false), o.optBoolean("keepPackagesAfterBuild", false), scheme, exp, WinUtilTweaksConfig.fromJsonString(o.optString("winUtilJson", "")), extraDriversDir = o.optString("extraDriversDir", ""))
+                    val veList = mutableListOf<String>(); o.optJSONArray("virtualEditions")?.let { va -> for (k in 0 until va.length()) va.optString(k, "").trim().takeIf { it.isNotEmpty() }?.let { veList.add(it) } }
+                    val cfg = WindowsChannelBuildConfig(bld, lang, eds, comp, mode, method, o.optString("targetDir", baseDir), o.optString("customOutputName", ""), o.optString("targetMultiBootPath", ""), o.optInt("connections", 8), o.optBoolean("autoMount", true), o.optBoolean("includeUpdates", false), o.optBoolean("includeStoreApps", false), o.optBoolean("integrateNetFx3", false), o.optBoolean("runComponentCleanup", false), o.optBoolean("skipWinRe", false), o.optBoolean("eiCfgUnlock", false), o.optBoolean("keepPackagesAfterBuild", false), scheme, exp, WinUtilTweaksConfig.fromJsonString(o.optString("winUtilJson", "")), extraDriversDir = o.optString("extraDriversDir", ""), virtualEditions = veList)
                     val workPrefix = workRoot.substringAfterLast('/')
                     val pkgBytes = Shell.cmd("du -sb ${shellQuote("$workRoot/PKGS")} 2>/dev/null | awk '{print \$1}'").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
                     val stageBytes = stageCacheDir(context, workPrefix).walkTopDown().filter { it.isFile && it.name.endsWith(".part") }.sumOf { it.length() }
@@ -765,8 +1078,13 @@ object WindowsBuildEngine {
                 pruneOldWorkDirs(config.targetDir, workPrefix)
                 Shell.cmd("mkdir -p ${shellQuote(pkgDir.absolutePath)}").exec()
 
-                val manifest = fetchFullDownloadManifest(config.build.uuid, config.lang.code, config.editions.map { it.code })
-                if (manifest.allFiles.isEmpty()) throw IllegalStateException("Could not load package list from server.")
+                val manifest = fetchFullDownloadManifest(config.build.uuid, config.lang.code, config.editions.map { it.code }, archHint = config.build.arch)
+                if (manifest.allFiles.isEmpty()) throw IllegalStateException("Could not load package list from UUPdump or Microsoft servers.")
+
+                val buildMajor = config.build.build.substringBefore('.').toIntOrNull() ?: 0
+                val autoSecHealthApps = if (buildMajor >= 22621 && !config.includeStoreApps) {
+                    manifest.appFiles.filter { it.name.contains("sechealthui", ignoreCase = true) }
+                } else emptyList()
 
                 val targetFiles = when (config.downloadMethod) {
                     WinDownloadMethod.DOWNLOAD_UPDATES_ONLY -> manifest.updateFiles
@@ -774,9 +1092,12 @@ object WindowsBuildEngine {
                         addAll(manifest.baseFiles)
                         if (config.includeUpdates) addAll(manifest.updateFiles)
                         if (config.includeStoreApps) addAll(manifest.appFiles)
+                        else if (autoSecHealthApps.isNotEmpty()) addAll(autoSecHealthApps)
                         if (config.integrateNetFx3) addAll(manifest.netFx3Files)
                     }
                 }.distinctBy { it.name }
+                val hasEffectiveApps = (config.includeStoreApps && manifest.hasApps) || autoSecHealthApps.isNotEmpty()
+                if (autoSecHealthApps.isNotEmpty()) emitLog("win-dl", "Auto-included ${autoSecHealthApps.size} Windows Security (SecHealthUI) package(s) for Win 11 22H2+")
                 if (targetFiles.isEmpty()) throw IllegalStateException("No downloadable packages matched the selected options.")
 
                 val totalBytes = targetFiles.sumOf { it.sizeBytes }.coerceAtLeast(1L)
@@ -815,9 +1136,13 @@ object WindowsBuildEngine {
                 try {
                     val batchItems = targetFiles.filter { it.name !in alreadyVerified }.map { entry ->
                         val safeName = entry.name.replace(Regex("[^A-Za-z0-9._-]"), "_")
-                        FastIsoDownloader.TurboBatchItem(entry.name, entry.url, File(appStageDir, "$safeName.part"), File(appStageDir, "$safeName.part.pbmeta"), entry.sizeBytes, entry.sha1)
+                        FastIsoDownloader.TurboBatchItem(entry.name, entry.url, File(appStageDir, "$safeName.part"), File(appStageDir, "$safeName.part.pbmeta"), entry.sizeBytes, entry.sha1, entry.expireEpochSec)
                     }
-                    FastIsoDownloader.downloadBatchTurbo(batchItems, maxConns, dlPausedFlag, dlCancelledFlag, downloadedCounter, liveThreadsCounter) { doneItem ->
+                    val refreshCallback: suspend () -> Map<String, Pair<String, Long>> = {
+                        val freshMf = fetchFullDownloadManifest(config.build.uuid, config.lang.code, config.editions.map { it.code }, archHint = config.build.arch)
+                        freshMf.allFiles.associate { it.name to (it.url to it.expireEpochSec) }
+                    }
+                    FastIsoDownloader.downloadBatchTurbo(batchItems, maxConns, dlPausedFlag, dlCancelledFlag, downloadedCounter, liveThreadsCounter, onRefreshUrls = refreshCallback) { doneItem ->
                         val mvRes = Shell.cmd("mv -f ${shellQuote(doneItem.partFile.absolutePath)} ${shellQuote("${pkgDir.absolutePath}/${doneItem.id}")} 2>&1").exec()
                         if (!mvRes.isSuccess) throw IllegalStateException("Move failed for ${doneItem.id}")
                         filesDoneCounter.incrementAndGet()
@@ -844,13 +1169,75 @@ object WindowsBuildEngine {
                     return@launch
                 }
 
-                enqueueConversion(QueuedConversionJob(appCtx, config.copy(autoMount = dlAutoMountLive), workRootPath, workPrefix, jobTitle, totalBytes, config.includeUpdates && manifest.hasUpdates, config.includeStoreApps && manifest.hasApps, config.integrateNetFx3 && manifest.hasNetFx3, onComplete, onError, onLog))
+                enqueueConversion(QueuedConversionJob(appCtx, config.copy(autoMount = dlAutoMountLive), workRootPath, workPrefix, jobTitle, totalBytes, config.includeUpdates && manifest.hasUpdates, hasEffectiveApps, config.integrateNetFx3 && manifest.hasNetFx3, false, "", onComplete, onError, onLog))
             } catch (_: CancellationException) {
                 if (!dlPausedFlag.get()) { _downloadState.value = null; TurboDownloadService.stop(appCtx) }
             } catch (e: Exception) {
                 _downloadState.value = null; TurboDownloadService.stop(appCtx)
                 val msg = "Windows download failed: ${e.message ?: "Unexpected error"}"
                 emitLog("win-dl", msg, true); onError(msg)
+            }
+        }
+    }
+
+    /**
+     * 100% offline Layer-3 builder: compiles an ISO or Direct Bootable USB directly from
+     * any user-selected folder of .esd/.cab files without ever modifying or deleting it.
+     */
+    fun startLocalUupFolderBuild(
+        context: Context,
+        localFolderPath: String,
+        config: WindowsChannelBuildConfig,
+        onComplete: (DownloadCompletionEvent) -> Unit,
+        onError: (String) -> Unit,
+        onLog: (LogEntry) -> Unit
+    ) {
+        val appCtx = context.applicationContext
+        val resolvedFolder = UsbGadgetEngine.resolveDirectPath(localFolderPath).trimEnd('/')
+        scope.launch {
+            try {
+                val tools = inspectTools(appCtx)
+                if (config.outputMode == WinBuildOutputMode.DIRECT_NTFS_USB && !tools.canBuildDirectUsb) {
+                    throw IllegalStateException("Bundled build tools missing.")
+                }
+                if (config.outputMode != WinBuildOutputMode.DIRECT_NTFS_USB && !tools.canConvertIso) {
+                    throw IllegalStateException("Bundled ISO build tools (cabextract/wimlib/chntpw/xorriso) missing.")
+                }
+                val esdCount = Shell.cmd("ls ${shellQuote(resolvedFolder)}/*.esd ${shellQuote(resolvedFolder)}/*.ESD 2>/dev/null | wc -l").exec().out.firstOrNull()?.trim()?.toIntOrNull() ?: 0
+                if (esdCount <= 0) {
+                    throw IllegalStateException("No Windows .esd files found inside ${resolvedFolder.replace("/data/media/0", "/sdcard")}.")
+                }
+                val folderBytes = Shell.cmd("du -sb ${shellQuote(resolvedFolder)} 2>/dev/null | awk '{print \$1}'").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: (4L * 1024L * 1024L * 1024L)
+                val hasUpd = Shell.cmd("ls ${shellQuote(resolvedFolder)}/*.msu ${shellQuote(resolvedFolder)}/*-KB*.cab ${shellQuote(resolvedFolder)}/*SSU*.cab 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
+                val hasApps = Shell.cmd("ls ${shellQuote(resolvedFolder)}/*.msixbundle ${shellQuote(resolvedFolder)}/*.appxbundle ${shellQuote(resolvedFolder)}/*.msix ${shellQuote(resolvedFolder)}/*.appx 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
+                val hasFx3 = Shell.cmd("ls ${shellQuote(resolvedFolder)}/*netfx3-ondemand*.cab ${shellQuote(resolvedFolder)}/*NetFx3*.cab 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
+
+                val prefix = "pb_local_${System.currentTimeMillis().toString().takeLast(6)}"
+                val workRootPath = UsbGadgetEngine.createSafeTempWorkDir(appCtx, config.targetDir, prefix)
+                val title = "Local UUP (${resolvedFolder.substringAfterLast('/')})"
+                onLog(LogEntry(nowTs(), "win-build", "Queued offline Local UUP build from $resolvedFolder (read-only source, $esdCount ESD file(s))"))
+                enqueueConversion(
+                    QueuedConversionJob(
+                        context = appCtx,
+                        config = config.copy(localUupDirPath = resolvedFolder),
+                        workRootPath = workRootPath,
+                        workPrefix = prefix,
+                        jobTitle = title,
+                        totalDownloadBytes = folderBytes,
+                        hasUpdates = config.includeUpdates && hasUpd,
+                        hasApps = hasApps,
+                        hasNetFx3 = config.integrateNetFx3 && hasFx3,
+                        isReadOnlySource = true,
+                        pkgDirOverride = resolvedFolder,
+                        onComplete = onComplete,
+                        onError = onError,
+                        onLog = onLog
+                    )
+                )
+            } catch (e: Exception) {
+                val msg = "Local UUP build failed: ${e.message ?: "Invalid folder"}"
+                onLog(LogEntry(nowTs(), "win-build", msg, true))
+                onError(msg)
             }
         }
     }
@@ -877,7 +1264,8 @@ object WindowsBuildEngine {
 
     private suspend fun executeConversionJob(job: QueuedConversionJob) {
         val appCtx = job.context; val config = job.config; val workRootPath = job.workRootPath
-        val pkgDir = File(workRootPath, "PKGS"); val isoDir = File(workRootPath, "ISODIR"); val tmpDir = File(workRootPath, "TMP")
+        val pkgDir = if (job.pkgDirOverride.isNotBlank()) File(job.pkgDirOverride) else File(workRootPath, "PKGS")
+        val isoDir = File(workRootPath, "ISODIR"); val tmpDir = File(workRootPath, "TMP")
         val safeTargetDir = UsbGadgetEngine.resolveDirectPath(config.targetDir).trimEnd('/')
         val defaultSlug = "Windows_${config.build.build}_${config.build.archDisplay}_${config.lang.code}".replace(Regex("[^A-Za-z0-9._-]"), "_")
         val cleanCustom = config.customOutputName.trim().replace(Regex("[^A-Za-z0-9._ -]"), "_").trim()
@@ -992,7 +1380,8 @@ object WindowsBuildEngine {
             advanceStep(3, "wimlib-imagex")
             val detectedOs = WindowsCustomizationEngine.detectWindowsOsKind(config.build.title)
             val effectiveComp = if (!detectedOs.supportsEsd) WinIsoCompression.WIM else config.compression
-            val useTwoStageSolidEsd = effectiveComp == WinIsoCompression.ESD && !config.skipWinRe
+            val requestedVirtualEds = config.virtualEditions.mapNotNull { VirtualEditionTarget.fromEditionId(it) }
+            val useTwoStageSolidEsd = effectiveComp == WinIsoCompression.ESD && (!config.skipWinRe || requestedVirtualEds.isNotEmpty())
             val stageWimPath = if (useTwoStageSolidEsd) "${tmpDir.absolutePath}/install_stage.wim" else "${isoDir.absolutePath}/sources/install.${effectiveComp.ext}"
             val finalInstallPath = "${isoDir.absolutePath}/sources/install.${effectiveComp.ext}"
             val qStageWim = shellQuote(stageWimPath); val qFinalInstall = shellQuote(finalInstallPath)
@@ -1027,10 +1416,25 @@ object WindowsBuildEngine {
                 Shell.cmd("rm -f $qProgLog 2>/dev/null || true").exec()
             }
 
+            if (requestedVirtualEds.isNotEmpty()) {
+                activeBin = "reged+wimlib"
+                requestedVirtualEds.forEachIndexed { vIdx, veTarget ->
+                    if (convCancelledFlag.get()) return
+                    val veBuildMajor = config.build.build.substringBefore('.').toIntOrNull() ?: 22000
+                    publishConv("Step 3/4 · Virtual Edition ${vIdx + 1}/${requestedVirtualEds.size}...", veTarget.displayNameForBuild(veBuildMajor), 0.58f + (vIdx.toFloat() / requestedVirtualEds.size.toFloat()) * 0.05f)
+                    val ok = VirtualEditionsPlugin.createVirtualEditionInWim(appCtx, tools.wimlib!!, tools.chntpw!!, stageWimPath, veTarget) { msg ->
+                        addConsole(msg)
+                        emitConvLog("win-ve", msg)
+                    }
+                    if (!ok) addConsole("Skipped/unchanged Virtual Edition: ${veTarget.editionId}")
+                }
+            }
+
             if (!config.skipWinRe) {
-                publishConv("Step 3/4 · Injecting Winre.wim (Recovery)...", "Embedding Recovery Environment (${metaList.size} edition(s))", 0.62f)
-                val winreRes = runIsolatedRootScript(appCtx, "winreinj", "set -e\n$pathHeader\nif [ -f \"\$TMP/winre.wim\" ]; then for idx in \$(seq 1 ${metaList.size}); do $qWim update $qStageWim \"\$idx\" --command=\"add '\$TMP/winre.wim' /Windows/System32/Recovery/Winre.wim\"; done; fi")
-                if (winreRes.isSuccess) { addConsole("Injected Winre.wim (${metaList.size} edition(s))"); emitConvLog("win-build", "Injected Winre.wim into /Windows/System32/Recovery/Winre.wim") }
+                val totalWimIndexes = Shell.cmd("$qWim info $qStageWim 2>/dev/null | grep -c '^Index:' || echo ${metaList.size}").exec().out.firstOrNull()?.trim()?.toIntOrNull()?.coerceAtLeast(metaList.size) ?: metaList.size
+                publishConv("Step 3/4 · Injecting Winre.wim (Recovery)...", "Embedding Recovery Environment ($totalWimIndexes edition(s))", 0.63f)
+                val winreRes = runIsolatedRootScript(appCtx, "winreinj", "set -e\n$pathHeader\nif [ -f \"\$TMP/winre.wim\" ]; then for idx in \$(seq 1 $totalWimIndexes); do $qWim update $qStageWim \"\$idx\" --command=\"add '\$TMP/winre.wim' /Windows/System32/Recovery/Winre.wim\"; done; fi")
+                if (winreRes.isSuccess) { addConsole("Injected Winre.wim ($totalWimIndexes edition(s))"); emitConvLog("win-build", "Injected Winre.wim into /Windows/System32/Recovery/Winre.wim ($totalWimIndexes indexes)") }
             }
 
             if (useTwoStageSolidEsd) {
@@ -1091,14 +1495,17 @@ object WindowsBuildEngine {
                 val tmpSpec = File(appCtx.cacheDir, "wb_spec.cmd").apply { writeText(WindowsCustomizationEngine.buildSpecializeScript(config.experience, config.winUtil, job.hasUpdates, job.hasApps, job.hasNetFx3), Charsets.UTF_8) }
                 val customPath = config.experience.customPostInstallScriptPath.trim()
                 val customName = if (customPath.isNotBlank()) customPath.substringAfterLast('/') else ""
-                val tmpComp = File(appCtx.cacheDir, "wb_comp.cmd").apply { writeText(WindowsCustomizationEngine.buildSetupCompleteScript(config.runComponentCleanup, customName.isNotBlank(), customName), Charsets.UTF_8) }
+                val tmpComp = File(appCtx.cacheDir, "wb_comp.cmd").apply { writeText(WindowsCustomizationEngine.buildSetupCompleteScript(config.runComponentCleanup, customName.isNotBlank(), customName, hasOemApps = job.hasApps), Charsets.UTF_8) }
                 val customCopy = if (customPath.isNotBlank()) "mkdir -p ${shellQuote(oemCustom)} && cp -f ${shellQuote(UsbGadgetEngine.resolveDirectPath(customPath))} ${shellQuote(oemCustom)}/ 2>/dev/null || true" else "true"
                 Shell.cmd("mkdir -p ${shellQuote(oemPanther)} ${shellQuote(oemScripts)} && cp -f ${shellQuote(tmpXml.absolutePath)} ${shellQuote("${isoDir.absolutePath}/autounattend.xml")} && cp -f ${shellQuote(tmpXml.absolutePath)} ${shellQuote("$oemPanther/unattend.xml")} && cp -f ${shellQuote(tmpSpec.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_Specialize.cmd")} && cp -f ${shellQuote(tmpComp.absolutePath)} ${shellQuote("$oemScripts/SetupComplete.cmd")} && $customCopy").exec()
                 tmpXml.delete(); tmpSpec.delete(); tmpComp.delete()
                 addConsole("Injected autounattend.xml + unplug-safe \$OEM\$ scripts")
             }
 
-            if (config.keepPackagesAfterBuild) {
+            if (job.isReadOnlySource) {
+                Shell.cmd("rm -rf $qTmp /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive").exec()
+                addConsole("Preserved local UUP source folder untouched (read-only)")
+            } else if (config.keepPackagesAfterBuild) {
                 saveBuildJobJson(appCtx, workRootPath, config, job.totalDownloadBytes, true)
                 Shell.cmd("rm -rf $qTmp /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive").exec()
                 addConsole("Kept base UUP packages for fast rebuilds")
@@ -1138,7 +1545,7 @@ object WindowsBuildEngine {
                 }
             }
 
-            if (config.keepPackagesAfterBuild) Shell.cmd("rm -rf $qIsoDir").exec()
+            if (!job.isReadOnlySource && config.keepPackagesAfterBuild) Shell.cmd("rm -rf $qIsoDir").exec()
             else UsbGadgetEngine.cleanupTempWorkDir(workRootPath)
 
             val finalSize = Shell.cmd("stat -c '%s' ${shellQuote(finalOutputPath)} 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L

@@ -1,0 +1,95 @@
+{
+  "version": 450,
+  "updated": "2026-11-22",
+  "source": "pocketboot-verified-baseline",
+  "builds": [
+    {
+      "uuid": "2ad1d9f3-b3dd-4014-9eb1-152e1ee1dbd9",
+      "title": "Windows 11, version 26H2 (26300.9911)",
+      "build": "26300.9911",
+      "arch": "amd64",
+      "created": 1794441600,
+      "ring": "RETAIL",
+      "sku": 48,
+      "branch": "ge_release",
+      "channel": "Stable"
+    },
+    {
+      "uuid": "bb653e4f-2f06-4aa6-9994-d5c692e24009",
+      "title": "Windows 11, version 25H2 (26200.10075)",
+      "build": "26200.10075",
+      "arch": "amd64",
+      "created": 1795111237,
+      "ring": "RP",
+      "sku": 48,
+      "branch": "ge_release",
+      "channel": "Preview"
+    },
+    {
+      "uuid": "79303ef6-9cb6-4849-9787-0da41d36dab8",
+      "title": "Windows 11, version 24H2 (26100.4188)",
+      "build": "26100.4188",
+      "arch": "amd64",
+      "created": 1747674068,
+      "ring": "RP",
+      "sku": 48,
+      "branch": "ge_release",
+      "channel": "Preview"
+    },
+    {
+      "uuid": "59fd22e9-ef3d-4734-8a78-4354718ad854",
+      "title": "Windows 11, version 23H2 (22631.6936)",
+      "build": "22631.6936",
+      "arch": "amd64",
+      "created": 1776124800,
+      "ring": "RETAIL",
+      "sku": 48,
+      "branch": "ni_release",
+      "channel": "Stable"
+    },
+    {
+      "uuid": "0c36c0e6-8397-424d-b460-26cc0d044c7f",
+      "title": "Windows 11, version 23H2 (22631.4602)",
+      "build": "22631.4602",
+      "arch": "amd64",
+      "created": 1733853647,
+      "ring": "RP",
+      "sku": 48,
+      "branch": "ni_release",
+      "channel": "Preview"
+    },
+    {
+      "uuid": "71b45765-6a0e-4a84-9fab-039f85ad2c82",
+      "title": "Feature update to Windows 10, version 22H2 (19045.6036)",
+      "build": "19045.6036",
+      "arch": "amd64",
+      "created": 1750784446,
+      "ring": "RP",
+      "sku": 48,
+      "branch": "vb_release",
+      "channel": "Preview"
+    },
+    {
+      "uuid": "f2f33f64-14ce-4e4c-9c6e-a71c07276e33",
+      "title": "Feature update to Windows 10, version 22H2 (19045.4894)",
+      "build": "19045.4894",
+      "arch": "amd64",
+      "created": 1725991200,
+      "ring": "RETAIL",
+      "sku": 48,
+      "branch": "vb_release",
+      "channel": "Stable"
+    },
+    {
+      "uuid": "5d8b7dca-51fa-476c-8832-717bd618a211",
+      "title": "Windows Server 2025 (26100.33822)",
+      "build": "26100.33822",
+      "arch": "amd64",
+      "created": 1794334540,
+      "ring": "RETAIL",
+      "sku": 7,
+      "branch": "ge_release",
+      "channel": "Stable"
+    }
+  ]
+}

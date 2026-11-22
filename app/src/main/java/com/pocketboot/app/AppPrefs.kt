@@ -44,12 +44,16 @@ data class AppSettings(
     val distrosCatalogVersion: Int = CURRENT_CATALOG_VERSION,
     val autounattendPresets: List<AutounattendPreset> = emptyList(),
     val downloadConnections: Int = 8,
-    val autoVerifySha256: Boolean = true
+    val autoVerifySha256: Boolean = true,
+    val customUupApiUrl: String = DEFAULT_UUP_API_URL,
+    val preferDirectMicrosoftUup: Boolean = false,
+    val cachedUupBuildsJson: String = ""
 ) {
     companion object {
         const val DEFAULT_ACCENT_HEX = 0xFF15F5ABL
         const val LEGACY_DEFAULT_ACCENT_HEX = 0xFF6366F1L
-        const val CURRENT_CATALOG_VERSION = 440
+        const val DEFAULT_UUP_API_URL = "https://api.uupdump.net"
+        const val CURRENT_CATALOG_VERSION = 450
     }
 }
 
@@ -144,7 +148,12 @@ class AppPrefs(context: Context) {
             distrosCatalogVersion = AppSettings.CURRENT_CATALOG_VERSION,
             autounattendPresets = presets,
             downloadConnections = prefs.getInt("dl_connections", 8).coerceIn(1, 16),
-            autoVerifySha256 = prefs.getBoolean("auto_verify_sha256", true)
+            autoVerifySha256 = prefs.getBoolean("auto_verify_sha256", true),
+            customUupApiUrl = prefs.getString("custom_uup_api_url", AppSettings.DEFAULT_UUP_API_URL)
+                ?.trim()?.trimEnd('/')?.ifBlank { AppSettings.DEFAULT_UUP_API_URL }
+                ?: AppSettings.DEFAULT_UUP_API_URL,
+            preferDirectMicrosoftUup = prefs.getBoolean("prefer_direct_ms_uup", false),
+            cachedUupBuildsJson = prefs.getString("cached_uup_builds_json", "").orEmpty()
         )
     }
 
@@ -187,6 +196,9 @@ class AppPrefs(context: Context) {
             .putString("autounattend_presets_json", presetsArr.toString())
             .putInt("dl_connections", settings.downloadConnections.coerceIn(1, 16))
             .putBoolean("auto_verify_sha256", settings.autoVerifySha256)
+            .putString("custom_uup_api_url", settings.customUupApiUrl.trim().trimEnd('/').ifBlank { AppSettings.DEFAULT_UUP_API_URL })
+            .putBoolean("prefer_direct_ms_uup", settings.preferDirectMicrosoftUup)
+            .putString("cached_uup_builds_json", settings.cachedUupBuildsJson)
             .apply()
     }
 
@@ -215,7 +227,7 @@ class AppPrefs(context: Context) {
                 put("surfaceMode", settings.surfaceMode.name); put("useMonet", settings.useMonet)
                 put("accentHex", settings.accentHex); put("scanDirs", JSONArray(settings.scanDirs))
                 put("useDefaultDistroRepo", settings.useDefaultDistroRepo); put("customRepoUrls", JSONArray(settings.customRepoUrls))
-                put("downloadConnections", settings.downloadConnections); put("autoVerifySha256", settings.autoVerifySha256)
+                put("downloadConnections", settings.downloadConnections); put("autoVerifySha256", settings.autoVerifySha256); put("customUupApiUrl", settings.customUupApiUrl); put("preferDirectMicrosoftUup", settings.preferDirectMicrosoftUup)
                 put("fileModes", modesObj); put("autounattendPresets", presetsArr)
             }.toString(2)
         }
@@ -243,7 +255,7 @@ class AppPrefs(context: Context) {
                 }
             }
             val surfMode = runCatching { SurfaceMode.valueOf(obj.optString("surfaceMode", current.surfaceMode.name)) }.getOrDefault(current.surfaceMode)
-            current.copy(hasCompletedSetup = true, defaultDir = defDir, favoriteQuickMountPath = obj.optString("favoriteQuickMountPath", current.favoriteQuickMountPath), keepAdbActive = obj.optBoolean("keepAdbActive", current.keepAdbActive), autoPatchSelinux = obj.optBoolean("autoPatchSelinux", current.autoPatchSelinux), surfaceMode = surfMode, useMonet = obj.optBoolean("useMonet", current.useMonet), accentHex = obj.optLong("accentHex", current.accentHex), scanDirs = scanDirs, useDefaultDistroRepo = obj.optBoolean("useDefaultDistroRepo", current.useDefaultDistroRepo), customRepoUrls = parsedRepos.distinct(), downloadConnections = obj.optInt("downloadConnections", current.downloadConnections).coerceIn(1, 16), autoVerifySha256 = obj.optBoolean("autoVerifySha256", current.autoVerifySha256), fileModes = modesMap, autounattendPresets = presets)
+            current.copy(hasCompletedSetup = true, defaultDir = defDir, favoriteQuickMountPath = obj.optString("favoriteQuickMountPath", current.favoriteQuickMountPath), keepAdbActive = obj.optBoolean("keepAdbActive", current.keepAdbActive), autoPatchSelinux = obj.optBoolean("autoPatchSelinux", current.autoPatchSelinux), surfaceMode = surfMode, useMonet = obj.optBoolean("useMonet", current.useMonet), accentHex = obj.optLong("accentHex", current.accentHex), scanDirs = scanDirs, useDefaultDistroRepo = obj.optBoolean("useDefaultDistroRepo", current.useDefaultDistroRepo), customRepoUrls = parsedRepos.distinct(), downloadConnections = obj.optInt("downloadConnections", current.downloadConnections).coerceIn(1, 16), autoVerifySha256 = obj.optBoolean("autoVerifySha256", current.autoVerifySha256), customUupApiUrl = obj.optString("customUupApiUrl", current.customUupApiUrl).trim().trimEnd('/').ifBlank { AppSettings.DEFAULT_UUP_API_URL }, preferDirectMicrosoftUup = obj.optBoolean("preferDirectMicrosoftUup", current.preferDirectMicrosoftUup), fileModes = modesMap, autounattendPresets = presets)
         }.getOrNull()
     }
 }

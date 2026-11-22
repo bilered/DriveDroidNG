@@ -69,6 +69,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
@@ -326,7 +327,7 @@ fun SettingsScreen(
                         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
                             Text("Download Engine", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
                             Text(
-                                text = "Turbo · ${settings.downloadConnections}x${if (settings.downloadConnections == 8) " (Rec)" else ""} · SHA-256 ${if (settings.autoVerifySha256) "Auto" else "Manual"}",
+                                text = "Turbo · ${settings.downloadConnections}x · UUP: ${if (settings.preferDirectMicrosoftUup) "Direct MS" else if (settings.customUupApiUrl != AppSettings.DEFAULT_UUP_API_URL) "Custom Mirror" else "Auto + MS Fallback"}",
                                 style = PocketColors.monoStyle,
                                 color = PocketColors.textSecondary
                             )
@@ -804,7 +805,7 @@ fun SettingsScreen(
                             Icon(Icons.Rounded.Usb, null, tint = PocketColors.onAccent, modifier = Modifier.size(22.dp))
                         }
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("PocketBoot v4.4.0", style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary)
+                            Text("PocketBoot v4.5.0", style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary)
                             Text(
                                 text = "${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE}",
                                 style = MaterialTheme.typography.bodySmall,
@@ -815,7 +816,7 @@ fun SettingsScreen(
                         }
                         Surface(
                             modifier = Modifier.bounceClick {
-                                val info = "PocketBoot v4.4.0\nDevice: ${Build.MANUFACTURER} ${Build.MODEL}\nAndroid: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\nRoot: ${status.rootManager}\nSELinux: ${status.selinuxMode}\nUDC: ${status.udcName}\nKernel: ${status.kernelVersion}"
+                                val info = "PocketBoot v4.5.0\nDevice: ${Build.MANUFACTURER} ${Build.MODEL}\nAndroid: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\nRoot: ${status.rootManager}\nSELinux: ${status.selinuxMode}\nUDC: ${status.udcName}\nKernel: ${status.kernelVersion}"
                                 val cm = context.getSystemService(ClipboardManager::class.java)
                                 cm?.setPrimaryClip(ClipData.newPlainText("Device Info", info))
                                 Toast.makeText(context, "Device info copied.", Toast.LENGTH_SHORT).show()
@@ -1161,12 +1162,13 @@ fun SettingsScreen(
     }
 
     if (showDlSpeedDialog) {
+        var uupMirrorDraft by remember(settings.customUupApiUrl) { mutableStateOf(settings.customUupApiUrl) }
         AlertDialog(
             onDismissRequest = { showDlSpeedDialog = false },
             containerColor = PocketColors.surfaceCard,
             title = { Text("Turbo Downloader Settings", color = PocketColors.textPrimary) },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Column(modifier = Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text(
                         text = "Runs in a dedicated background Foreground Service with cross-restart resume (.pbmeta) and automatic single-stream fallback.",
                         style = MaterialTheme.typography.bodySmall,
@@ -1212,10 +1214,65 @@ fun SettingsScreen(
                             activeColor = PocketColors.success
                         )
                     }
+
+                    PocketHairlineDivider()
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Prefer Direct Microsoft UUP", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                            Text("Skip UUPdump API & query Microsoft directly (faster if ISP blocks uupdump)", style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary)
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        PocketSwitch(
+                            checked = settings.preferDirectMicrosoftUup,
+                            onCheckedChange = { onUpdateSettings(settings.copy(preferDirectMicrosoftUup = it)) },
+                            activeColor = PocketColors.accent
+                        )
+                    }
+
+                    Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Text("UUP API Mirror URL", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                            if (uupMirrorDraft.trim().trimEnd('/') != AppSettings.DEFAULT_UUP_API_URL) {
+                                TextButton(
+                                    onClick = { uupMirrorDraft = AppSettings.DEFAULT_UUP_API_URL },
+                                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp)
+                                ) {
+                                    Text("Reset", fontSize = 11.sp, color = PocketColors.accentSoft)
+                                }
+                            }
+                        }
+                        OutlinedTextField(
+                            value = uupMirrorDraft,
+                            onValueChange = { uupMirrorDraft = it },
+                            placeholder = { Text(AppSettings.DEFAULT_UUP_API_URL, fontSize = 12.sp) },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(10.dp),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = PocketColors.accent,
+                                unfocusedBorderColor = PocketColors.border,
+                                focusedTextColor = PocketColors.textPrimary,
+                                unfocusedTextColor = PocketColors.textPrimary
+                            )
+                        )
+                    }
                 }
             },
             confirmButton = {
-                TextButton(onClick = { showDlSpeedDialog = false }) {
+                TextButton(onClick = {
+                    val cleaned = uupMirrorDraft.trim().trimEnd('/').let {
+                        if (it.startsWith("http://") || it.startsWith("https://")) it else AppSettings.DEFAULT_UUP_API_URL
+                    }
+                    if (cleaned != settings.customUupApiUrl) {
+                        onUpdateSettings(settings.copy(customUupApiUrl = cleaned))
+                    }
+                    showDlSpeedDialog = false
+                }) {
                     Text("Done", color = PocketColors.accentSoft)
                 }
             }

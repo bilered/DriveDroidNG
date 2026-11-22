@@ -183,7 +183,7 @@ object PreFlightDiagnostics {
             Settings.Global.getInt(context.contentResolver, Settings.Global.STAY_ON_WHILE_PLUGGED_IN, 0) > 0
         }.getOrDefault(false)
         val winTools = WindowsBuildEngine.inspectTools(context)
-        val winDetail = "cabextract=${if (winTools.cabextract != null) "OK" else "NO"} • wimlib=${if (winTools.wimlib != null) "OK" else "NO"} • chntpw=${if (winTools.chntpw != null) "OK" else "NO"} • xorriso=${if (winTools.xorriso != null) "OK" else "NO"}"
+        val winDetail = "cabextract=${if (winTools.cabextract != null) "OK" else "NO"} • wimlib=${if (winTools.wimlib != null) "OK" else "NO"} • reged/VE=${if (winTools.chntpw != null) "OK" else "NO"} • xorriso=${if (winTools.xorriso != null) "OK" else "NO"}"
         items.add(
             DiagCheckItem(
                 title = "Windows ISO Build Engine",
@@ -226,7 +226,7 @@ object PreFlightDiagnostics {
 
     fun formatReport(items: List<DiagCheckItem>): String {
         val sb = StringBuilder()
-        sb.appendLine("PocketBoot v4.4.0 Pre-Flight Diagnostic Report")
+        sb.appendLine("PocketBoot v4.5.0 Pre-Flight Diagnostic Report")
         sb.appendLine("Device: ${Build.MANUFACTURER} ${Build.MODEL} (Android ${Build.VERSION.RELEASE}, API ${Build.VERSION.SDK_INT}, ABI ${Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"})")
         sb.appendLine("---")
         items.forEach { item ->
