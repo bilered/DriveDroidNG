@@ -377,11 +377,16 @@ jobs:
             sed -i 's/FATAL_ERROR/STATUS/g' wodim/CMakeLists.txt || true
             sed -i 's/icedax//g; s/readom//g; s/libedc//g; s/libparanoia//g; s/netscsid//g; s|3rd-party/dirsplit||g' CMakeLists.txt || true
 
+            # Install qemu-user here (after Sections 1-10 finished) so CMake try_run(BITFIELDS_HTOL) & smoke test work
+            sudo apt-get install -y -qq qemu-user >/dev/null 2>&1 || true
+            QEMU_BIN=$(command -v qemu-aarch64 || command -v qemu-aarch64-static || echo "")
             CC_ABS=$(command -v aarch64-linux-gnu-gcc)
             AR_ABS=$(command -v aarch64-linux-gnu-ar)
             RANLIB_ABS=$(command -v aarch64-linux-gnu-ranlib)
             mkdir -p build
             cd build
+            CMAKE_EMU_ARG=""
+            [ -n "$QEMU_BIN" ] && CMAKE_EMU_ARG="-DCMAKE_CROSSCOMPILING_EMULATOR=${QEMU_BIN};-L;/usr/aarch64-linux-gnu"
 
             cmake .. \
               -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
@@ -394,6 +399,7 @@ jobs:
               -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
               -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
               -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+              $CMAKE_EMU_ARG \
               -DCMAKE_C_FLAGS="-O2 -std=gnu17 -fcommon -D_FILE_OFFSET_BITS=64 -I${SYSROOT}/include -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-format-security" \
               -DCMAKE_EXE_LINKER_FLAGS="-static -L${SYSROOT}/lib" \
               -DUSE_MAGIC=0
@@ -403,8 +409,6 @@ jobs:
             file "$GEN_BIN"
             if ! aarch64-linux-gnu-readelf -l "$GEN_BIN" 2>/dev/null | grep -q INTERP; then
               # Smoke-test UDF 1.02 + Dual BIOS/UEFI El Torito flags under qemu-aarch64
-              sudo apt-get install -y -qq qemu-user >/dev/null 2>&1 || true
-              QEMU_BIN=$(command -v qemu-aarch64 || command -v qemu-aarch64-static || echo "")
               if [ -n "$QEMU_BIN" ]; then
                 mkdir -p /tmp/geniso_test/boot /tmp/geniso_test/efi/microsoft/boot /tmp/geniso_test/sources
                 dd if=/dev/zero of=/tmp/geniso_test/boot/etfsboot.com bs=512 count=8 status=none
