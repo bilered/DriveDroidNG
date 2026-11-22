@@ -1310,9 +1310,20 @@ fun PocketBootApp(initialShortcutPath: String = "") {
             WindowsIsoSlimmerSheet(
                 isoFile = targetIso,
                 defaultDir = settings.defaultDir,
+                presets = settings.autounattendPresets,
                 building = slimmerJob != null,
                 progress = slimmerProgress,
                 onDismiss = { slimmerTargetFile = null },
+                onSavePreset = { preset ->
+                    val updatedPresets = settings.autounattendPresets.filterNot { it.name.equals(preset.name, true) } + preset
+                    updateSettings(settings.copy(autounattendPresets = updatedPresets), rescan = false)
+                    showFeedback("Saved preset \"${preset.name}\".", false)
+                },
+                onDeletePreset = { presetName ->
+                    val updatedPresets = settings.autounattendPresets.filterNot { it.name == presetName }
+                    updateSettings(settings.copy(autounattendPresets = updatedPresets), rescan = false)
+                    showFeedback("Deleted preset \"$presetName\".", false)
+                },
                 onCancel = {
                     slimmerJob?.cancel()
                     slimmerJob = null

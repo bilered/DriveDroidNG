@@ -64,7 +64,11 @@ data class IsoSlimConfig(
     val outputDir: String,
     val outputName: String,
     val keepEditionIndices: List<Int>,
-    val convertToEsd: Boolean
+    val convertToEsd: Boolean,
+    val arch: String = "amd64",
+    val eiCfgUnlock: Boolean = false,
+    val experience: WindowsExperienceConfig = WindowsExperienceConfig(),
+    val winUtil: WinUtilTweaksConfig = WinUtilTweaksConfig()
 )
 
 object WindowsIsoSlimmer {
@@ -146,9 +150,55 @@ object WindowsIsoSlimmer {
             }
 
             // Replace old install.wim/esd with slimmed file
-            Shell.cmd("rm -f $qIsoDir/sources/install.wim $qIsoDir/sources/install.esd $qIsoDir/sources/INSTALL.WIM $qIsoDir/sources/INSTALL.ESD && mv -f $qNewInstall $qIsoDir/sources/install.$dstExt").exec()
+            val finalInstallInIso = "$isoDir/sources/install.$dstExt"
+            Shell.cmd("rm -f $qIsoDir/sources/install.wim $qIsoDir/sources/install.esd $qIsoDir/sources/INSTALL.WIM $qIsoDir/sources/INSTALL.ESD && mv -f $qNewInstall ${shellQuote(finalInstallInIso)}").exec()
 
-            onProgress(WindowsBuildProgress("Rebuilding bootable ISO...", outName, 0.86f, false))
+            // Optional Windows CA 2023 bootloaders, ei.cfg unlock, and Two-Pane Experience/WinUtil tweaks
+            if (config.experience.useCa2023Bootloaders) {
+                onProgress(WindowsBuildProgress("Applying CA 2023 bootloaders...", outName, 0.80f, false))
+                WindowsBuildEngine.runIsolatedRootScript(
+                    context,
+                    "slim_ca2023",
+                    WindowsCustomizationEngine.applyCa2023BootloadersSnippet(qWim, shellQuote(finalInstallInIso), qIsoDir)
+                )
+            }
+            if (config.eiCfgUnlock) {
+                val tmpEi = File(context.cacheDir, "slim_ei.cfg").apply { writeText("[Channel]\r\nRetail\r\n", Charsets.UTF_8) }
+                Shell.cmd("cp -f ${shellQuote(tmpEi.absolutePath)} ${shellQuote("$isoDir/sources/ei.cfg")}").exec()
+                tmpEi.delete()
+            }
+            if (config.experience.hasAnyActive() || config.winUtil.hasAnyActive()) {
+                onProgress(WindowsBuildProgress("Injecting Experience & WinUtil tweaks...", "Writing autounattend.xml & Setup scripts", 0.83f, false))
+                val safeArch = if (config.arch.lowercase() in setOf("x86", "arm64", "amd64")) config.arch.lowercase() else "amd64"
+                val oemScripts = "$isoDir/sources/\$OEM\$/\$\$/Setup/Scripts"
+                val oemCustom = "$isoDir/sources/\$OEM\$/\$\$/Setup/Custom"
+                val oemPanther = "$isoDir/sources/\$OEM\$/\$\$/Panther"
+                val customPath = config.experience.customPostInstallScriptPath.trim()
+                val customName = if (customPath.isNotBlank()) customPath.substringAfterLast('/') else ""
+
+                val tmpXml = File(context.cacheDir, "slim_auto.xml").apply {
+                    writeText(WindowsCustomizationEngine.generateAutounattendXml(config.experience, config.winUtil, safeArch, null, true, false), Charsets.UTF_8)
+                }
+                val tmpSpec = File(context.cacheDir, "slim_spec.cmd").apply {
+                    writeText(WindowsCustomizationEngine.buildSpecializeScript(config.experience, config.winUtil), Charsets.UTF_8)
+                }
+                val tmpComp = File(context.cacheDir, "slim_comp.cmd").apply {
+                    writeText(WindowsCustomizationEngine.buildSetupCompleteScript(false, customName.isNotBlank(), customName), Charsets.UTF_8)
+                }
+                val customCopy = if (customPath.isNotBlank()) {
+                    "mkdir -p ${shellQuote(oemCustom)} && cp -f ${shellQuote(UsbGadgetEngine.resolveDirectPath(customPath))} ${shellQuote(oemCustom)}/ 2>/dev/null || true"
+                } else "true"
+                Shell.cmd(
+                    "mkdir -p ${shellQuote(oemPanther)} ${shellQuote(oemScripts)} && " +
+                        "cp -f ${shellQuote(tmpXml.absolutePath)} ${shellQuote("$isoDir/autounattend.xml")} && " +
+                        "cp -f ${shellQuote(tmpXml.absolutePath)} ${shellQuote("$oemPanther/unattend.xml")} && " +
+                        "cp -f ${shellQuote(tmpSpec.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_Specialize.cmd")} && " +
+                        "cp -f ${shellQuote(tmpComp.absolutePath)} ${shellQuote("$oemScripts/SetupComplete.cmd")} && $customCopy"
+                ).exec()
+                tmpXml.delete(); tmpSpec.delete(); tmpComp.delete()
+            }
+
+            onProgress(WindowsBuildProgress("Rebuilding bootable ISO...", outName, 0.87f, false))
             val xorCmd = """
                 set -e
                 $envPrefix
@@ -204,17 +254,25 @@ object WindowsIsoSlimmer {
 fun WindowsIsoSlimmerSheet(
     isoFile: ImageFile,
     defaultDir: String,
+    presets: List<AutounattendPreset> = emptyList(),
     building: Boolean,
     progress: WindowsBuildProgress,
     onDismiss: () -> Unit,
     onCancel: () -> Unit,
+    onSavePreset: (AutounattendPreset) -> Unit = {},
+    onDeletePreset: (String) -> Unit = {},
     onStartSlim: (IsoSlimConfig) -> Unit
 ) {
     val context = LocalContext.current
+    val detectedOs = remember(isoFile.name) { WindowsCustomizationEngine.detectWindowsOsKind(isoFile.name) }
+    val detectedArch = remember(isoFile.name) { WindowsCustomizationEngine.detectProcessorArchitecture(isoFile.name) }
     var loadingEditions by remember(isoFile.path) { mutableStateOf(true) }
     var editions by remember(isoFile.path) { mutableStateOf<List<WindowsEditionItem>>(emptyList()) }
     val selectedIndices = remember(isoFile.path) { mutableStateListOf<Int>() }
     var convertToEsd by remember { mutableStateOf(true) }
+    var eiCfgUnlock by remember(isoFile.path) { mutableStateOf(false) }
+    var experience by remember(isoFile.path) { mutableStateOf(WindowsExperienceConfig.defaultForOs(detectedOs)) }
+    var winUtil by remember(isoFile.path) { mutableStateOf(WinUtilTweaksConfig()) }
     val defaultOutName = remember(isoFile.name) {
         isoFile.name.substringBeforeLast('.').take(34) + "-Slim.iso"
     }
@@ -336,17 +394,64 @@ fun WindowsIsoSlimmerSheet(
                     }
                 }
 
+                WindowsTwoPaneCustomizer(
+                    osKind = detectedOs,
+                    arch = detectedArch,
+                    experience = experience,
+                    winUtil = winUtil,
+                    presets = presets,
+                    showCa2023Option = true,
+                    showCustomScriptOption = true,
+                    defaultBrowseDir = defaultDir,
+                    onExperienceChange = { experience = it },
+                    onWinUtilChange = { winUtil = it },
+                    onApplyPreset = { p ->
+                        experience = WindowsExperienceConfig(
+                            p.bypassRequirements, p.bypassMicrosoftAccount, p.disableDataCollection, p.disableBitLocker,
+                            p.qolImprovements, p.disableSponsoredApps, p.classicContextMenu, p.skipWifiSetup,
+                            p.createLocalUser, p.localUsername, "", p.skipOobe, p.useCa2023Bootloaders, p.applySkuSiPolicy
+                        )
+                        winUtil = WinUtilTweaksConfig.fromJsonString(p.winUtilJson)
+                    },
+                    onSavePreset = { n ->
+                        onSavePreset(
+                            AutounattendPreset(
+                                n, PartitionScheme.GPT.name, experience.bypassRequirements, experience.bypassMicrosoftAccount,
+                                experience.disableDataCollection, experience.disableBitLocker, experience.disableSponsoredApps,
+                                experience.classicContextMenu, experience.skipWifiSetup, experience.createLocalUser,
+                                experience.localUsername, experience.skipOobe, experience.qolImprovements,
+                                experience.useCa2023Bootloaders, experience.applySkuSiPolicy, winUtil.toJsonString()
+                            )
+                        )
+                    },
+                    onDeletePreset = onDeletePreset
+                )
+
                 Surface(shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().bounceClick { convertToEsd = !convertToEsd }.padding(horizontal = 14.dp, vertical = 11.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Recompress to Compact ESD", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
-                            Text("Saves 1.5–2 GB extra (slower build)", fontSize = 11.sp, color = PocketColors.textSecondary)
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().bounceClick { convertToEsd = !convertToEsd }.padding(horizontal = 14.dp, vertical = 11.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Recompress to Compact ESD", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                                Text("Saves 1.5–2 GB extra (slower build)", fontSize = 11.sp, color = PocketColors.textSecondary)
+                            }
+                            PocketSwitch(checked = convertToEsd, onCheckedChange = { convertToEsd = it }, activeColor = PocketColors.success)
                         }
-                        PocketSwitch(checked = convertToEsd, onCheckedChange = { convertToEsd = it }, activeColor = PocketColors.success)
+                        PocketHairlineDivider()
+                        Row(
+                            modifier = Modifier.fillMaxWidth().clickable { eiCfgUnlock = !eiCfgUnlock }.padding(horizontal = 14.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Unlock All Editions (ei.cfg)", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                                Text("Lets you choose Pro/Edu even on OEM-keyed laptops", fontSize = 11.sp, color = PocketColors.textSecondary)
+                            }
+                            PocketSwitch(checked = eiCfgUnlock, onCheckedChange = { eiCfgUnlock = it }, activeColor = PocketColors.accent)
+                        }
                     }
                 }
 
@@ -387,7 +492,11 @@ fun WindowsIsoSlimmerSheet(
                                 outputDir = defaultDir,
                                 outputName = outputName.ifBlank { defaultOutName },
                                 keepEditionIndices = selectedIndices.sorted(),
-                                convertToEsd = convertToEsd
+                                convertToEsd = convertToEsd,
+                                arch = detectedArch,
+                                eiCfgUnlock = eiCfgUnlock,
+                                experience = experience,
+                                winUtil = winUtil
                             )
                         )
                     },

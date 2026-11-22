@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -223,7 +224,7 @@ fun WindowsDownloadSheet(
     val activeUupSource by WindowsBuildEngine.activeSource.collectAsState()
     var hideCumulativeUpdates by remember { mutableStateOf(true) }
     var hideOlderBuilds by remember { mutableStateOf(true) }
-    var groupByYear by remember { mutableStateOf(true) }
+    var groupByYear by remember { mutableStateOf(false) }
     var selectedYearFilter by remember { mutableStateOf<Int?>(null) }
     var directMsFetching by remember { mutableStateOf(false) }
     var selectedVirtualEditions by remember(family.id) { mutableStateOf<Set<String>>(emptySet()) }
@@ -436,13 +437,13 @@ fun WindowsDownloadSheet(
                             val isSel = activeTab == tab
                             val segBg by animateColorAsState(if (isSel) PocketColors.accentBg else Color.Transparent, tween(180), label = "winTabBg")
                             Surface(
-                                modifier = Modifier.weight(1f).bounceClick { activeTab = tab },
+                                modifier = Modifier.weight(1f).height(40.dp).bounceClick { activeTab = tab },
                                 shape = RoundedCornerShape(9.dp),
                                 color = segBg,
                                 border = if (isSel) BorderStroke(1.dp, PocketColors.accent) else null
                             ) {
                                 Row(
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 9.dp),
+                                    modifier = Modifier.fillMaxSize().padding(horizontal = 8.dp),
                                     horizontalArrangement = Arrangement.Center,
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
@@ -450,7 +451,8 @@ fun WindowsDownloadSheet(
                                         text = tab.label,
                                         style = MaterialTheme.typography.labelMedium,
                                         fontWeight = if (isSel) FontWeight.SemiBold else FontWeight.Medium,
-                                        color = if (isSel) PocketColors.accentSoft else PocketColors.textSecondary
+                                        color = if (isSel) PocketColors.accentSoft else PocketColors.textSecondary,
+                                        maxLines = 1
                                     )
                                     if (tab.badge != null) {
                                         Spacer(modifier = Modifier.width(5.dp))
@@ -459,8 +461,10 @@ fun WindowsDownloadSheet(
                                                 text = tab.badge,
                                                 modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
                                                 fontSize = 9.5.sp,
+                                                lineHeight = 11.sp,
                                                 fontWeight = FontWeight.SemiBold,
-                                                color = PocketColors.success
+                                                color = PocketColors.success,
+                                                maxLines = 1
                                             )
                                         }
                                     }
@@ -767,7 +771,7 @@ fun WindowsDownloadSheet(
                             WinFamilyFilter.entries.forEach { wf ->
                                 val isSel = selectedWinFamily == wf
                                 Surface(
-                                    modifier = Modifier.weight(1f).bounceClick {
+                                    modifier = Modifier.weight(1f).height(36.dp).bounceClick {
                                         if (selectedWinFamily != wf) {
                                             selectedWinFamily = wf
                                             val nextVer = WinFeatureVersion.forFamily(wf).first()
@@ -781,7 +785,7 @@ fun WindowsDownloadSheet(
                                     color = if (isSel) PocketColors.accentBg else PocketColors.surfaceInput,
                                     border = BorderStroke(if (isSel) 1.dp else 0.5.dp, if (isSel) PocketColors.accent else PocketColors.border)
                                 ) {
-                                    Box(modifier = Modifier.padding(vertical = 9.dp, horizontal = 4.dp), contentAlignment = Alignment.Center) {
+                                    Box(modifier = Modifier.fillMaxSize().padding(horizontal = 4.dp), contentAlignment = Alignment.Center) {
                                         Text(
                                             text = wf.label.replace("Windows ", "Win "),
                                             style = MaterialTheme.typography.labelMedium,
@@ -805,7 +809,7 @@ fun WindowsDownloadSheet(
                             featureVersionsForFamily.forEach { fv ->
                                 val isSel = selectedFeatureVer == fv
                                 Surface(
-                                    modifier = Modifier.bounceClick {
+                                    modifier = Modifier.height(34.dp).bounceClick {
                                         selectedFeatureVer = fv
                                         customSearchQuery = ""
                                         loadGroupedBuilds(selectedWinFamily, fv, archFilter, "")
@@ -815,7 +819,7 @@ fun WindowsDownloadSheet(
                                     border = BorderStroke(if (isSel) 1.dp else 0.5.dp, if (isSel) PocketColors.accent else PocketColors.border)
                                 ) {
                                     Row(
-                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                                        modifier = Modifier.padding(horizontal = 12.dp),
                                         verticalAlignment = Alignment.CenterVertically,
                                         horizontalArrangement = Arrangement.spacedBy(4.dp)
                                     ) {
@@ -823,10 +827,11 @@ fun WindowsDownloadSheet(
                                             text = fv.label,
                                             style = MaterialTheme.typography.labelMedium,
                                             fontWeight = if (isSel) FontWeight.SemiBold else FontWeight.Medium,
-                                            color = if (isSel) PocketColors.accentSoft else PocketColors.textSecondary
+                                            color = if (isSel) PocketColors.accentSoft else PocketColors.textSecondary,
+                                            maxLines = 1
                                         )
                                         if (fv.recommended) {
-                                            Text("Rec", fontSize = 9.5.sp, fontWeight = FontWeight.SemiBold, color = PocketColors.success)
+                                            Text("Rec", fontSize = 9.5.sp, lineHeight = 12.sp, fontWeight = FontWeight.SemiBold, color = PocketColors.success, maxLines = 1)
                                         }
                                     }
                                 }
@@ -847,7 +852,7 @@ fun WindowsDownloadSheet(
                             archOptions.forEach { (code, lbl, isRec) ->
                                 val isSel = archFilter == code
                                 Surface(
-                                    modifier = Modifier.weight(1f).bounceClick {
+                                    modifier = Modifier.weight(1f).height(36.dp).bounceClick {
                                         archFilter = code
                                         loadGroupedBuilds(selectedWinFamily, selectedFeatureVer, code, customSearchQuery)
                                     },
@@ -856,14 +861,14 @@ fun WindowsDownloadSheet(
                                     border = BorderStroke(if (isSel) 1.dp else 0.5.dp, if (isSel) PocketColors.infoBlue else PocketColors.border)
                                 ) {
                                     Row(
-                                        modifier = Modifier.padding(vertical = 8.dp),
+                                        modifier = Modifier.fillMaxSize().padding(horizontal = 6.dp),
                                         horizontalArrangement = Arrangement.Center,
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Text(lbl, style = MaterialTheme.typography.labelMedium, color = if (isSel) PocketColors.infoBlue else PocketColors.textSecondary)
+                                        Text(lbl, style = MaterialTheme.typography.labelMedium, color = if (isSel) PocketColors.infoBlue else PocketColors.textSecondary, maxLines = 1)
                                         if (isRec) {
                                             Spacer(modifier = Modifier.width(4.dp))
-                                            Text("Rec", fontSize = 9.5.sp, fontWeight = FontWeight.SemiBold, color = PocketColors.success)
+                                            Text("Rec", fontSize = 9.5.sp, lineHeight = 12.sp, fontWeight = FontWeight.SemiBold, color = PocketColors.success, maxLines = 1)
                                         }
                                     }
                                 }
@@ -1030,6 +1035,7 @@ fun WindowsDownloadSheet(
                             Row(
                                 modifier = Modifier.fillMaxWidth().clickable {
                                     hideOlderBuilds = !hideOlderBuilds
+                                    if (hideOlderBuilds) { groupByYear = false; selectedYearFilter = null }
                                     loadGroupedBuilds(selectedWinFamily, selectedFeatureVer, archFilter, customSearchQuery, hideCumulativeUpdates, hideOlderBuilds)
                                 },
                                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -1050,6 +1056,7 @@ fun WindowsDownloadSheet(
                                     checked = hideOlderBuilds,
                                     onCheckedChange = {
                                         hideOlderBuilds = it
+                                        if (it) { groupByYear = false; selectedYearFilter = null }
                                         loadGroupedBuilds(selectedWinFamily, selectedFeatureVer, archFilter, customSearchQuery, hideCumulativeUpdates, it)
                                     },
                                     activeColor = PocketColors.accent
@@ -1077,30 +1084,33 @@ fun WindowsDownloadSheet(
                                 )
                             }
 
-                            PocketHairlineDivider()
-
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text("Categorize builds", fontSize = 11.5.sp, color = PocketColors.textSecondary)
-                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    listOf(true to "By Year", false to "By Channel").forEach { (isYearMode, lbl) ->
-                                        val isSel = groupByYear == isYearMode
-                                        Surface(
-                                            modifier = Modifier.bounceClick { groupByYear = isYearMode },
-                                            shape = RoundedCornerShape(7.dp),
-                                            color = if (isSel) PocketColors.accentBg else PocketColors.surfaceCard,
-                                            border = BorderStroke(if (isSel) 1.dp else 0.5.dp, if (isSel) PocketColors.accent else PocketColors.border)
-                                        ) {
-                                            Text(
-                                                text = lbl,
-                                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
-                                                fontSize = 11.sp,
-                                                fontWeight = if (isSel) FontWeight.SemiBold else FontWeight.Medium,
-                                                color = if (isSel) PocketColors.accentSoft else PocketColors.textSecondary
-                                            )
+                            AnimatedVisibility(visible = !hideOlderBuilds) {
+                                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    PocketHairlineDivider()
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text("Categorize builds", fontSize = 11.5.sp, color = PocketColors.textSecondary)
+                                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                            listOf(false to "By Channel", true to "By Year").forEach { (isYearMode, lbl) ->
+                                                val isSel = groupByYear == isYearMode
+                                                Surface(
+                                                    modifier = Modifier.bounceClick { groupByYear = isYearMode },
+                                                    shape = RoundedCornerShape(7.dp),
+                                                    color = if (isSel) PocketColors.accentBg else PocketColors.surfaceCard,
+                                                    border = BorderStroke(if (isSel) 1.dp else 0.5.dp, if (isSel) PocketColors.accent else PocketColors.border)
+                                                ) {
+                                                    Text(
+                                                        text = lbl,
+                                                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
+                                                        fontSize = 11.sp,
+                                                        fontWeight = if (isSel) FontWeight.SemiBold else FontWeight.Medium,
+                                                        color = if (isSel) PocketColors.accentSoft else PocketColors.textSecondary
+                                                    )
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -1129,7 +1139,7 @@ fun WindowsDownloadSheet(
                             )
                         }
                     } else {
-                        if (groupByYear) {
+                        if (!hideOlderBuilds && groupByYear) {
                             val yearGroups = remember(groupedBuilds) { groupedBuilds.groupedByYear() }
                             if (yearGroups.size > 1) {
                                 Row(
