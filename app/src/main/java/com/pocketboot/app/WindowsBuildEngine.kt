@@ -1436,10 +1436,8 @@ object WindowsBuildEngine {
                             }
                         }
                         if (batch.isEmpty()) return
-                        val cmdLines = batch.joinToString("
-") { (src, dst) -> "mv -f ${shellQuote(src)} ${shellQuote(dst)}" }
-                        val mvRes = runIsolatedRootScript(appCtx, "mvbatch", "set -e
-$cmdLines")
+                        val cmdLines = batch.joinToString("\n") { (src, dst) -> "mv -f ${shellQuote(src)} ${shellQuote(dst)}" }
+                        val mvRes = runIsolatedRootScript(appCtx, "mvbatch", "set -e\n$cmdLines")
                         if (!mvRes.isSuccess) throw IllegalStateException("Batch move failed for ${batch.size} package(s)")
                     }
                     FastIsoDownloader.downloadBatchTurbo(batchItems, maxConns, dlPausedFlag, dlCancelledFlag, downloadedCounter, liveThreadsCounter, onRefreshUrls = refreshCallback) { doneItem ->
