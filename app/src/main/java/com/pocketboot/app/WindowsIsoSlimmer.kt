@@ -212,16 +212,16 @@ object WindowsIsoSlimmer {
                 [ -f "${'$'}ISODIR/boot/etfsboot.com" ] && BIOS_BOOT="boot/etfsboot.com"
 
                 if [ -n "${'$'}BIOS_BOOT" ] && [ -n "${'$'}EFI_BOOT" ]; then
-                    $qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -volid "POCKETBOOT_SLIM" -udf \
+                    $qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -allow-limited-size -volid "POCKETBOOT_SLIM" -udf \
                       -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -boot-info-table \
                       -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot \
                       -o $qOut "${'$'}ISODIR"
                 elif [ -n "${'$'}EFI_BOOT" ]; then
-                    $qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -volid "POCKETBOOT_SLIM" -udf \
+                    $qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -allow-limited-size -volid "POCKETBOOT_SLIM" -udf \
                       -e "${'$'}EFI_BOOT" -no-emul-boot \
                       -o $qOut "${'$'}ISODIR"
                 else
-                    $qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -volid "POCKETBOOT_SLIM" -udf \
+                    $qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -allow-limited-size -volid "POCKETBOOT_SLIM" -udf \
                       -o $qOut "${'$'}ISODIR"
                 fi
             """.trimIndent()

@@ -179,7 +179,9 @@ data class WindowsConversionJobState(
     val etaSeconds: Long = -1L, val currentOutputBytes: Long = 0L, val freeSpaceBytes: Long = 0L,
     val activeBinary: String = "", val batteryPct: Int = 100, val stepDurationsSec: Map<Int, Long> = emptyMap(),
     val consoleTail: List<String> = emptyList(), val queuedCount: Int = 0, val queuedTitles: List<String> = emptyList(),
-    val autoMount: Boolean = true, val workDirPath: String = ""
+    val autoMount: Boolean = true, val workDirPath: String = "",
+    val keepPackagesAfterBuild: Boolean = false, val isReadOnlySource: Boolean = false,
+    val isFailed: Boolean = false, val errorMessage: String = ""
 )
 
 data class WindowsBuildToolsStatus(val cabextract: String?, val wimlib: String?, val chntpw: String?, val xorriso: String?) {
@@ -244,6 +246,8 @@ object WindowsBuildEngine {
     private var activeConversionJob: Job? = null
     private val convCancelledFlag = AtomicBoolean(false)
     @Volatile private var convAutoMountLive: Boolean = true
+    @Volatile private var convKeepPackagesLive: Boolean = false
+    @Volatile private var lastFailedJob: QueuedConversionJob? = null
     private var convContext: Context? = null
     private var convOnLog: ((LogEntry) -> Unit)? = null
 
@@ -997,6 +1001,20 @@ object WindowsBuildEngine {
 
     fun updateDownloadAutoMount(value: Boolean) { dlAutoMountLive = value; _downloadState.value = _downloadState.value?.copy(autoMount = value) }
     fun updateConversionAutoMount(value: Boolean) { convAutoMountLive = value; _conversionState.value = _conversionState.value?.copy(autoMount = value) }
+    fun updateConversionKeepPackages(value: Boolean) { convKeepPackagesLive = value; _conversionState.value = _conversionState.value?.copy(keepPackagesAfterBuild = value) }
+    fun dismissFailedConversion() {
+        if (_conversionState.value?.isFailed == true) {
+            lastFailedJob = null
+            _conversionState.value = null
+        }
+    }
+    fun retryFailedConversion(): Boolean {
+        val failed = lastFailedJob ?: return false
+        lastFailedJob = null
+        _conversionState.value = null
+        enqueueConversion(failed.copy(config = failed.config.copy(autoMount = convAutoMountLive, keepPackagesAfterBuild = convKeepPackagesLive)))
+        return true
+    }
 
     fun pauseDownload() {
         val cur = _downloadState.value ?: return
@@ -1136,7 +1154,7 @@ object WindowsBuildEngine {
 
                 val totalBytes = targetFiles.sumOf { it.sizeBytes }.coerceAtLeast(1L)
                 val freeNow = UsbGadgetEngine.getFreeSpaceBytes(config.targetDir)
-                val estExtraBuildBytes = if (config.downloadMethod == WinDownloadMethod.DOWNLOAD_AND_BUILD) (totalBytes + (if (config.skipWinRe) 0L else 520L * 1024L * 1024L) + 600L * 1024L * 1024L) else 256L * 1024L * 1024L
+                val estExtraBuildBytes = if (config.downloadMethod == WinDownloadMethod.DOWNLOAD_AND_BUILD) ((totalBytes * 2L) + (if (config.skipWinRe) 0L else 520L * 1024L * 1024L) + 512L * 1024L * 1024L) else 256L * 1024L * 1024L
                 val existingPkgBytes = Shell.cmd("du -sb ${shellQuote(pkgDir.absolutePath)} 2>/dev/null | awk '{print \$1}'").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
                 val neededFree = ((totalBytes - existingPkgBytes).coerceAtLeast(0L)) + estExtraBuildBytes
                 if (freeNow > 0L && freeNow < neededFree) throw IllegalStateException("Not enough free space. Need ~${UsbGadgetEngine.formatBytes(neededFree)}, have ${UsbGadgetEngine.formatBytes(freeNow)} free.")
@@ -1285,13 +1303,29 @@ object WindowsBuildEngine {
 
     private fun startNextConversion() {
         val next = conversionQueue.poll()
-        if (next == null) { _conversionState.value = null; convContext?.let { IsoBuilderService.stop(it) }; return }
-        convCancelledFlag.set(false); convAutoMountLive = next.config.autoMount; convContext = next.context; convOnLog = next.onLog
+        if (next == null) {
+            if (_conversionState.value?.isFailed != true) _conversionState.value = null
+            convContext?.let { IsoBuilderService.stop(it) }
+            return
+        }
+        lastFailedJob = null
+        convCancelledFlag.set(false)
+        convAutoMountLive = next.config.autoMount
+        convKeepPackagesLive = next.config.keepPackagesAfterBuild
+        convContext = next.context
+        convOnLog = next.onLog
         IsoBuilderService.start(next.context)
         activeConversionJob = scope.launch {
             try { executeConversionJob(next) } finally {
-                if (convCancelledFlag.get()) { _conversionState.value = null; IsoBuilderService.stop(next.context) }
-                else startNextConversion()
+                if (convCancelledFlag.get()) {
+                    lastFailedJob = null
+                    _conversionState.value = null
+                    IsoBuilderService.stop(next.context)
+                } else if (_conversionState.value?.isFailed == true && conversionQueue.isEmpty()) {
+                    IsoBuilderService.stop(next.context)
+                } else {
+                    startNextConversion()
+                }
             }
         }
     }
@@ -1314,7 +1348,7 @@ object WindowsBuildEngine {
         val stepDurations = mutableMapOf<Int, Long>(); val consoleLines = mutableListOf<String>()
         var lastMeasuredOutputBytes = 0L; var lastMeasuredMs = startMs; var smoothDiskSpeed = 0L; var activeBin = "init"
 
-        fun addConsole(line: String) { val c = line.trim(); if (c.isNotEmpty()) { consoleLines.add(c.take(120)); if (consoleLines.size > 20) consoleLines.removeAt(0) } }
+        fun addConsole(line: String) { val c = line.replace("\r", "").trim(); if (c.isNotEmpty() && consoleLines.lastOrNull() != c.take(160)) { consoleLines.add(c.take(160)); if (consoleLines.size > 80) consoleLines.removeAt(0) } }
         fun advanceStep(newStep: Int, binName: String) {
             val now = System.currentTimeMillis()
             if (newStep > currentStep) { stepDurations[currentStep] = ((now - stepStartMs) / 1000L).coerceAtLeast(1L); stepStartMs = now; currentStep = newStep }
@@ -1331,7 +1365,7 @@ object WindowsBuildEngine {
             val etaSec = if (clampedPct >= 0.04f && clampedPct < 0.99f) ((elapsedSec.toFloat() / clampedPct) * (1f - clampedPct)).toLong() else -1L
             val (batPct, _) = readBatteryPercent(appCtx)
             val queued = conversionQueue.toList()
-            val st = WindowsConversionJobState(job.jobTitle, finalFileName, config.outputMode, currentStep, stage, detail, clampedPct, smoothDiskSpeed, elapsedSec, etaSec, outBytes, UsbGadgetEngine.getFreeSpaceBytes(config.targetDir), activeBin, batPct, stepDurations.toMap(), consoleLines.toList(), queued.size, queued.map { it.jobTitle }, convAutoMountLive, workRootPath)
+            val st = WindowsConversionJobState(job.jobTitle, finalFileName, config.outputMode, currentStep, stage, detail, clampedPct, smoothDiskSpeed, elapsedSec, etaSec, outBytes, UsbGadgetEngine.getFreeSpaceBytes(config.targetDir), activeBin, batPct, stepDurations.toMap(), consoleLines.toList(), queued.size, queued.map { it.jobTitle }, convAutoMountLive, workRootPath, convKeepPackagesLive, job.isReadOnlySource, false, "")
             _conversionState.value = st
             NotificationHelper.updateIsoBuilderProgress(appCtx, st)
         }
@@ -1430,13 +1464,21 @@ object WindowsBuildEngine {
                 publishConv("Step 3/4 · Exporting edition ${idx + 1}/${metaList.size}...", "${effectiveComp.label} · 0%", sliceBase)
                 val wimPollJob = scope.launch {
                     val pctRegex = Regex("""(\d{1,3})%""")
+                    var lastSeenPct = 0
                     while (isActive && !convCancelledFlag.get()) {
-                        delay(700L)
-                        val tailLines = Shell.cmd("tail -c 384 $qProgLog 2>/dev/null || true").exec().out
-                        val lastPct = pctRegex.findAll(tailLines.joinToString(" ")).lastOrNull()?.groupValues?.get(1)?.toIntOrNull()
+                        delay(800L)
+                        val rawTail = Shell.cmd("tail -c 512 $qProgLog 2>/dev/null | tr '\r' '\n' | tail -n 6 || true").exec().out
+                        val cleanLines = rawTail.map { it.trim() }.filter { it.isNotEmpty() }
+                        val foundPct = pctRegex.findAll(cleanLines.joinToString(" ")).lastOrNull()?.groupValues?.get(1)?.toIntOrNull()
+                        if (foundPct != null && foundPct in 0..100) lastSeenPct = foundPct
                         val curSz = Shell.cmd("stat -c '%s' $qStageWim 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: lastMeasuredOutputBytes
-                        tailLines.lastOrNull()?.trim()?.takeIf { it.isNotBlank() }?.let { addConsole(it) }
-                        if (lastPct != null && lastPct in 0..100) publishConv("Step 3/4 · Exporting edition ${idx + 1}/${metaList.size}...", "${effectiveComp.label} · $lastPct%", sliceBase + (lastPct / 100f) * sliceSpan, curSz)
+                        cleanLines.lastOrNull()?.let { addConsole(it) }
+                        publishConv(
+                            "Step 3/4 · Exporting edition ${idx + 1}/${metaList.size}...",
+                            "${effectiveComp.label} · $lastSeenPct%",
+                            sliceBase + (lastSeenPct / 100f) * sliceSpan,
+                            curSz
+                        )
                     }
                 }
                 val qMeta = shellQuote(metaPath)
@@ -1475,11 +1517,16 @@ object WindowsBuildEngine {
                 publishConv("Step 3/4 · Compressing to Solid ESD (LZMS)...", "0%", 0.66f)
                 val esdPoll = scope.launch {
                     val pctRegex = Regex("""(\d{1,3})%""")
+                    var lastSeenPct = 0
                     while (isActive && !convCancelledFlag.get()) {
-                        delay(800L)
-                        val p = pctRegex.findAll(Shell.cmd("tail -c 256 $qProgLog 2>/dev/null || true").exec().out.joinToString(" ")).lastOrNull()?.groupValues?.get(1)?.toIntOrNull()
+                        delay(850L)
+                        val rawTail = Shell.cmd("tail -c 512 $qProgLog 2>/dev/null | tr '\r' '\n' | tail -n 6 || true").exec().out
+                        val cleanLines = rawTail.map { it.trim() }.filter { it.isNotEmpty() }
+                        val foundPct = pctRegex.findAll(cleanLines.joinToString(" ")).lastOrNull()?.groupValues?.get(1)?.toIntOrNull()
+                        if (foundPct != null && foundPct in 0..100) lastSeenPct = foundPct
                         val curSz = Shell.cmd("stat -c '%s' $qFinalInstall 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: lastMeasuredOutputBytes
-                        if (p != null && p in 0..100) publishConv("Step 3/4 · Compressing to Solid ESD (LZMS)...", "$p%", 0.66f + (p / 100f) * 0.14f, curSz)
+                        cleanLines.lastOrNull()?.let { addConsole(it) }
+                        publishConv("Step 3/4 · Compressing to Solid ESD (LZMS)...", "$lastSeenPct%", 0.66f + (lastSeenPct / 100f) * 0.14f, curSz)
                     }
                 }
                 val esdRes = runIsolatedRootScript(appCtx, "esdconv", "set -e\n$pathHeader\n: > $qProgLog\n$qWim export $qStageWim all $qFinalInstall --compress=LZMS --solid --threads=2 > $qProgLog 2>&1\nrm -f $qStageWim $qProgLog")
@@ -1536,39 +1583,66 @@ object WindowsBuildEngine {
                 addConsole("Injected autounattend.xml + unplug-safe \$OEM\$ scripts")
             }
 
-            if (job.isReadOnlySource) {
-                Shell.cmd("rm -rf $qTmp /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive").exec()
-                addConsole("Preserved local UUP source folder untouched (read-only)")
-            } else if (config.keepPackagesAfterBuild) {
-                saveBuildJobJson(appCtx, workRootPath, config, job.totalDownloadBytes, true)
-                Shell.cmd("rm -rf $qTmp /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive").exec()
-                addConsole("Kept base UUP packages for fast rebuilds")
-            } else {
-                Shell.cmd("rm -rf $qPkg $qTmp /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive").exec()
-            }
+            // Free temporary CAB/WIM staging files now, but KEEP PKGS untouched until final output is verified!
+            Shell.cmd("rm -rf $qTmp /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive").exec()
 
             var injectedMbPath: String? = null
             if (config.outputMode == WinBuildOutputMode.DIRECT_NTFS_USB) {
                 activeBin = "mkfs.ntfs"
+                addConsole("Starting Direct NTFS USB creation (${config.scheme.label})...")
                 publishConv("Step 4/4 · Building Direct Bootable USB...", "${config.scheme.label} · NTFS + UEFI/BIOS Boot", 0.85f)
-                val usbErr = buildDirectNtfsUsbFromDir(appCtx, isoDir.absolutePath, finalOutputPath, config) { stg, det, f, curB -> publishConv(stg, det, 0.85f + f * 0.12f, curB) }
+                val usbErr = buildDirectNtfsUsbFromDir(appCtx, isoDir.absolutePath, finalOutputPath, config) { stg, det, f, curB ->
+                    addConsole("$stg · $det")
+                    publishConv(stg, det, 0.85f + f * 0.12f, curB)
+                }
                 if (usbErr != null) throw IllegalStateException(usbErr)
             } else {
                 activeBin = "xorriso"
                 val qXor = shellQuote(tools.xorriso!!); val qOutIso = shellQuote(finalOutputPath)
                 val volId = "WIN_${config.build.build.substringBefore('.')}".take(28).uppercase()
                 val estIsoBytes = Shell.cmd("du -sb $qIsoDir 2>/dev/null | awk '{print \$1}'").exec().out.firstOrNull()?.trim()?.toLongOrNull()?.coerceAtLeast(1L) ?: (5L * 1024L * 1024L * 1024L)
+                val xorLog = "/data/local/tmp/pb_xorriso_prog.log"
+                val qXorLog = shellQuote(xorLog)
+                addConsole("xorriso: packing ~${UsbGadgetEngine.formatBytes(estIsoBytes)} (-iso-level 3 -udf -allow-limited-size)")
                 publishConv("Step 4/4 · Packing bootable ISO...", finalFileName, 0.86f)
                 val isoPollJob = scope.launch {
                     while (isActive && !convCancelledFlag.get()) {
-                        delay(600L)
-                        val curSz = Shell.cmd("stat -c '%s' $qOutIso 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
-                        if (curSz > 0L) publishConv("Step 4/4 · Packing bootable ISO...", "${UsbGadgetEngine.formatBytes(curSz)} / ~${UsbGadgetEngine.formatBytes(estIsoBytes)}", 0.86f + (curSz.toFloat() / estIsoBytes.toFloat()).coerceIn(0f, 1f) * 0.10f, curSz)
+                        delay(700L)
+                        val curSz = Shell.cmd("stat -c '%s' $qOutIso 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: lastMeasuredOutputBytes
+                        val xorTail = Shell.cmd("tail -c 512 $qXorLog 2>/dev/null | tr '\r' '\n' | tail -n 5 || true").exec().out
+                        xorTail.map { it.trim() }.filter { it.isNotEmpty() }.lastOrNull()?.let { addConsole(it) }
+                        publishConv(
+                            "Step 4/4 · Packing bootable ISO...",
+                            "${UsbGadgetEngine.formatBytes(curSz)} / ~${UsbGadgetEngine.formatBytes(estIsoBytes)}",
+                            0.86f + (curSz.toFloat() / estIsoBytes.toFloat()).coerceIn(0f, 1f) * 0.10f,
+                            curSz
+                        )
                     }
                 }
-                val xorRes = runIsolatedRootScript(appCtx, "xorriso", "set -e\n$pathHeader\nmkdir -p ${shellQuote(safeTargetDir)}\nrm -f $qOutIso\nEFI_BOOT=\"\"\nif [ -f \"\$ISODIR/efi/microsoft/boot/efisys.bin\" ]; then EFI_BOOT=\"efi/microsoft/boot/efisys.bin\"; elif [ -f \"\$ISODIR/EFI/Microsoft/Boot/efisys.bin\" ]; then EFI_BOOT=\"EFI/Microsoft/Boot/efisys.bin\"; fi\nBIOS_BOOT=\"\"\n[ -f \"\$ISODIR/boot/etfsboot.com\" ] && BIOS_BOOT=\"boot/etfsboot.com\"\nif [ -n \"\$BIOS_BOOT\" ] && [ -n \"\$EFI_BOOT\" ]; then $qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -volid \"$volId\" -udf -b \"\$BIOS_BOOT\" -no-emul-boot -boot-load-size 8 -boot-info-table -eltorito-alt-boot -e \"\$EFI_BOOT\" -no-emul-boot -o $qOutIso \"\$ISODIR\"\nelif [ -n \"\$EFI_BOOT\" ]; then $qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -volid \"$volId\" -udf -e \"\$EFI_BOOT\" -no-emul-boot -o $qOutIso \"\$ISODIR\"\nelse $qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -volid \"$volId\" -udf -o $qOutIso \"\$ISODIR\"; fi")
+                val xorRes = runIsolatedRootScript(
+                    appCtx,
+                    "xorriso",
+                    "set -e\n$pathHeader\nmkdir -p ${shellQuote(safeTargetDir)}\nrm -f $qOutIso\n: > $qXorLog\n" +
+                        "EFI_BOOT=\"\"\n" +
+                        "if [ -f \"\$ISODIR/efi/microsoft/boot/efisys.bin\" ]; then EFI_BOOT=\"efi/microsoft/boot/efisys.bin\"; " +
+                        "elif [ -f \"\$ISODIR/EFI/Microsoft/Boot/efisys.bin\" ]; then EFI_BOOT=\"EFI/Microsoft/Boot/efisys.bin\"; fi\n" +
+                        "BIOS_BOOT=\"\"\n[ -f \"\$ISODIR/boot/etfsboot.com\" ] && BIOS_BOOT=\"boot/etfsboot.com\"\n" +
+                        "if [ -n \"\$BIOS_BOOT\" ] && [ -n \"\$EFI_BOOT\" ]; then " +
+                        "$qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -allow-limited-size -volid \"$volId\" -udf -b \"\$BIOS_BOOT\" -no-emul-boot -boot-load-size 8 -boot-info-table -eltorito-alt-boot -e \"\$EFI_BOOT\" -no-emul-boot -o $qOutIso \"\$ISODIR\" > $qXorLog 2>&1\n" +
+                        "elif [ -n \"\$EFI_BOOT\" ]; then " +
+                        "$qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -allow-limited-size -volid \"$volId\" -udf -e \"\$EFI_BOOT\" -no-emul-boot -o $qOutIso \"\$ISODIR\" > $qXorLog 2>&1\n" +
+                        "else " +
+                        "$qXor -as mkisofs -iso-level 3 -full-iso9660-filenames -allow-limited-size -volid \"$volId\" -udf -o $qOutIso \"\$ISODIR\" > $qXorLog 2>&1; fi"
+                )
                 isoPollJob.cancel()
-                if (!xorRes.isSuccess) throw IllegalStateException("ISO packing failed: ${(xorRes.out + xorRes.err).takeLast(4).joinToString(" ").take(240)}")
+                val xorLastLines = Shell.cmd("tail -n 8 $qXorLog 2>/dev/null | tr '\r' '\n' | tail -n 6 || true").exec().out.map { it.trim() }.filter { it.isNotEmpty() }
+                xorLastLines.forEach { addConsole(it) }
+                Shell.cmd("rm -f $qXorLog 2>/dev/null || true").exec()
+                if (!xorRes.isSuccess) {
+                    Shell.cmd("rm -f $qOutIso 2>/dev/null || true").exec()
+                    val errDetail = xorLastLines.takeLast(3).joinToString(" | ").ifBlank { (xorRes.out + xorRes.err).takeLast(3).joinToString(" ") }
+                    throw IllegalStateException("xorriso failed (exit ${xorRes.code}): ${errDetail.take(260)}")
+                }
                 UsbGadgetEngine.fixUserStoragePermissions(appCtx, safeTargetDir, isDir = true)
                 UsbGadgetEngine.fixUserStoragePermissions(appCtx, finalOutputPath, isDir = false)
                 if (config.outputMode == WinBuildOutputMode.DIRECT_MULTIBOOT && config.targetMultiBootPath.isNotBlank()) {
@@ -1579,10 +1653,17 @@ object WindowsBuildEngine {
                 }
             }
 
-            if (!job.isReadOnlySource && config.keepPackagesAfterBuild) Shell.cmd("rm -rf $qIsoDir").exec()
-            else UsbGadgetEngine.cleanupTempWorkDir(workRootPath)
+            // Post-build verification BEFORE cleaning up PKGS or workRootPath!
+            val finalSize = if (injectedMbPath != null) {
+                Shell.cmd("stat -c '%s' ${shellQuote(injectedMbPath)} 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+            } else {
+                Shell.cmd("stat -c '%s' ${shellQuote(finalOutputPath)} 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+            }
+            if (injectedMbPath == null && finalSize < 50L * 1024L * 1024L) {
+                Shell.cmd("rm -f ${shellQuote(finalOutputPath)} 2>/dev/null || true").exec()
+                throw IllegalStateException("Output file missing or truncated (${UsbGadgetEngine.formatBytes(finalSize)}). Downloaded UUP packages were preserved for retry.")
+            }
 
-            val finalSize = Shell.cmd("stat -c '%s' ${shellQuote(finalOutputPath)} 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
             val totalSec = ((System.currentTimeMillis() - startMs) / 1000L).coerceAtLeast(1L)
             val avgSpeed = if (finalSize > 0L) finalSize / totalSec else smoothDiskSpeed
             val benchStr = "Built in ${formatDurationShort(totalSec)} · Avg ${FastIsoDownloader.formatSpeed(avgSpeed)} · ${UsbGadgetEngine.formatBytes(finalSize)}"
@@ -1590,6 +1671,18 @@ object WindowsBuildEngine {
                 val rpt = IsoInspector.inspectBootReadiness(appCtx, finalOutputPath, finalSize)
                 when { rpt.hasUefiX64 && rpt.hasLegacyBios -> "✓ UEFI + BIOS Verified"; rpt.hasUefiX64 -> "✓ UEFI x64 Verified"; rpt.hasUefiArm64 -> "✓ UEFI ARM64 Verified"; rpt.hasLegacyBios -> "✓ Legacy BIOS Verified"; else -> null }
             } else null
+
+            // Output verified — now clean up according to read-only / keepPackagesAfterBuild
+            if (job.isReadOnlySource) {
+                addConsole("Preserved local UUP source folder untouched (read-only)")
+                UsbGadgetEngine.cleanupTempWorkDir(workRootPath)
+            } else if (convKeepPackagesLive) {
+                saveBuildJobJson(appCtx, workRootPath, config.copy(keepPackagesAfterBuild = true), job.totalDownloadBytes, true)
+                Shell.cmd("rm -rf $qIsoDir $qTmp").exec()
+                addConsole("Kept base UUP packages for fast rebuilds")
+            } else {
+                UsbGadgetEngine.cleanupTempWorkDir(workRootPath)
+            }
 
             emitConvLog("win-build", "Completed $finalFileName ($benchStr${if (bootLabel != null) " · $bootLabel" else ""})")
             val completion = DownloadCompletionEvent(job.jobTitle, finalFileName, finalOutputPath, injectedMbPath, null, null, ChecksumVerifyStatus.NONE, convAutoMountLive, benchStr, bootLabel)
@@ -1599,9 +1692,46 @@ object WindowsBuildEngine {
         } catch (_: CancellationException) {
             Shell.cmd("rm -rf ${shellQuote(isoDir.absolutePath)} ${shellQuote(tmpDir.absolutePath)} 2>/dev/null || true").exec()
         } catch (e: Exception) {
+            // Preserve PKGS & save pb_job.json so user never loses downloaded files and can retry with one tap!
             Shell.cmd("rm -rf ${shellQuote(isoDir.absolutePath)} ${shellQuote(tmpDir.absolutePath)} 2>/dev/null || true").exec()
-            val msg = "Windows build failed: ${e.message ?: "Unexpected error"}"
-            emitConvLog("win-build", msg, true); job.onError(msg)
+            if (!job.isReadOnlySource) {
+                saveBuildJobJson(appCtx, workRootPath, config.copy(keepPackagesAfterBuild = true), job.totalDownloadBytes, true)
+            }
+            val msg = e.message ?: "Unexpected build error"
+            addConsole("ERROR: $msg")
+            if (!job.isReadOnlySource) addConsole("Saved downloaded UUP packages for instant Retry.")
+            lastFailedJob = job
+            val elapsedSec = ((System.currentTimeMillis() - startMs) / 1000L).coerceAtLeast(1L)
+            val (batPct, _) = readBatteryPercent(appCtx)
+            _conversionState.value = WindowsConversionJobState(
+                title = job.jobTitle,
+                outputFileName = finalFileName,
+                outputMode = config.outputMode,
+                currentStep = currentStep,
+                stageLabel = "Build Failed at Step $currentStep/4",
+                detailText = msg,
+                overallProgress = _conversionState.value?.overallProgress ?: 0f,
+                diskSpeedBytesPerSec = 0L,
+                elapsedSeconds = elapsedSec,
+                etaSeconds = -1L,
+                currentOutputBytes = lastMeasuredOutputBytes,
+                freeSpaceBytes = UsbGadgetEngine.getFreeSpaceBytes(config.targetDir),
+                activeBinary = activeBin,
+                batteryPct = batPct,
+                stepDurationsSec = stepDurations.toMap(),
+                consoleTail = consoleLines.toList(),
+                queuedCount = conversionQueue.size,
+                queuedTitles = conversionQueue.map { it.jobTitle },
+                autoMount = convAutoMountLive,
+                workDirPath = workRootPath,
+                keepPackagesAfterBuild = true,
+                isReadOnlySource = job.isReadOnlySource,
+                isFailed = true,
+                errorMessage = msg
+            )
+            NotificationHelper.showBuildFailed(appCtx, job.jobTitle, msg)
+            emitConvLog("win-build", "Windows build failed: $msg", true)
+            job.onError("Windows build failed: $msg")
         }
     }
 

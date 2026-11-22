@@ -1262,7 +1262,7 @@ fun WindowsDownloadSheet(
                             (if (integrateNetFx3) detailedManifest?.netFx3Bytes ?: 0L else 0L)
                     }
                     val estBuildOutBytes = if (downloadMethod == WinDownloadMethod.DOWNLOAD_AND_BUILD) {
-                        selDlBytes + (if (skipWinRe) 0L else 520L * 1024L * 1024L) + 512L * 1024L * 1024L
+                        (selDlBytes * 2L) + (if (skipWinRe) 0L else 520L * 1024L * 1024L) + 512L * 1024L * 1024L
                     } else 256L * 1024L * 1024L
                     val minNeededBytes = selDlBytes + estBuildOutBytes
                     val lowSpace = freeBytes in 1L until minNeededBytes

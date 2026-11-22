@@ -80,7 +80,7 @@ object MicrosoftUupClient {
     )
 
     private val EXCLUDED_FILE_PATTERNS = listOf(
-        "-express.cab", "aggregatedmetadata", "desktopdeployment"
+        "-express.cab"
     )
 
     fun isUnusablePackageName(fileName: String): Boolean {

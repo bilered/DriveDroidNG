@@ -74,8 +74,6 @@ jobs:
               return (
                   low.startswith("baseless_")
                   or "-express.cab" in low
-                  or "aggregatedmetadata" in low
-                  or "desktopdeployment" in low
                   or low.endswith(".psf")
               )
 

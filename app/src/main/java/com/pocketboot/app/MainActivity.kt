@@ -238,7 +238,7 @@ fun PocketBootApp(initialShortcutPath: String = "") {
     val isLightSurface = settings.surfaceMode == SurfaceMode.LIGHT
     val keepScreenAwake = windowsBuildJob != null || linuxBuildJob != null ||
         ventoyBuildJob != null || slimmerJob != null ||
-        (winChannelDlState != null && winChannelDlState?.isPaused != true) || winChannelConvState != null
+        (winChannelDlState != null && winChannelDlState?.isPaused != true) || (winChannelConvState != null && winChannelConvState?.isFailed != true)
 
     SideEffect {
         val window = (view.context as? Activity)?.window ?: return@SideEffect

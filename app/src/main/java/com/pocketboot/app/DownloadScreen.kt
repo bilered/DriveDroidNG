@@ -1345,18 +1345,22 @@ fun DownloadScreen(
         ) {
             winConvState?.let { conv ->
                 val pctStr = String.format(Locale.US, "%.1f%%", (conv.overallProgress * 100f).coerceIn(0f, 100f))
+                val cardBorder = if (conv.isFailed) PocketColors.danger else PocketColors.accent
+                val cardGradTop = if (conv.isFailed) PocketColors.dangerBg.copy(alpha = 0.55f) else PocketColors.accentBg.copy(alpha = 0.55f)
                 Surface(
                     modifier = Modifier.fillMaxWidth().bounceClick { showBuildMonitorSheet = true },
-                    shape = RoundedCornerShape(16.dp), color = PocketColors.surfaceCard, border = BorderStroke(1.5.dp, PocketColors.accent)
+                    shape = RoundedCornerShape(16.dp), color = PocketColors.surfaceCard, border = BorderStroke(1.5.dp, cardBorder)
                 ) {
                     Column(
-                        modifier = Modifier.fillMaxWidth().background(Brush.verticalGradient(listOf(PocketColors.accentBg.copy(alpha = 0.55f), PocketColors.surfaceCard))).padding(14.dp),
+                        modifier = Modifier.fillMaxWidth().background(Brush.verticalGradient(listOf(cardGradTop, PocketColors.surfaceCard))).padding(14.dp),
                         verticalArrangement = Arrangement.spacedBy(9.dp)
                     ) {
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    Surface(shape = RoundedCornerShape(5.dp), color = PocketColors.accentBg) { Text("BUILD", modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, color = PocketColors.accentSoft) }
+                                    Surface(shape = RoundedCornerShape(5.dp), color = if (conv.isFailed) PocketColors.dangerBg else PocketColors.accentBg) {
+                                        Text(if (conv.isFailed) "FAILED" else "BUILD", modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, color = if (conv.isFailed) PocketColors.danger else PocketColors.accentSoft)
+                                    }
                                     Text(conv.title, style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
                                     if (conv.queuedCount > 0) Surface(shape = RoundedCornerShape(5.dp), color = PocketColors.infoBlueBg) { Text("+${conv.queuedCount} queued", modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, color = PocketColors.infoBlue) }
                                 }
@@ -1965,6 +1969,13 @@ fun DownloadScreen(
             state = winConvState!!,
             onDismiss = { showBuildMonitorSheet = false },
             onToggleAutoMount = { WindowsBuildEngine.updateConversionAutoMount(it) },
+            onToggleKeepPackages = { WindowsBuildEngine.updateConversionKeepPackages(it) },
+            onRetryBuild = {
+                if (WindowsBuildEngine.retryFailedConversion()) {
+                    onMessage("Retrying Windows build from cached packages...", false)
+                }
+            },
+            onDismissFailed = { WindowsBuildEngine.dismissFailedConversion() },
             onCancelBuild = {
                 WindowsBuildEngine.cancelConversion()
                 onMessage("Cancelled active ISO/USB build.", false)

@@ -119,6 +119,22 @@ object NotificationHelper {
         }
     }
 
+    fun showBuildFailed(context: Context, title: String, reason: String) {
+        if (!hasNotifPerm(context)) return
+        runCatching {
+            ensureChannel(context)
+            val notif = NotificationCompat.Builder(context, BUILD_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_usb)
+                .setContentTitle("Build Failed: $title")
+                .setContentText(reason)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(reason))
+                .setAutoCancel(true)
+                .setContentIntent(openAppPending(context, 23))
+                .build()
+            context.getSystemService(NotificationManager::class.java)?.notify(BUILD_DONE_NOTIF_ID, notif)
+        }
+    }
+
     fun cancelBuildNotification(context: Context) { runCatching { context.getSystemService(NotificationManager::class.java)?.cancel(BUILD_NOTIF_ID) } }
 
     fun showMounted(context: Context, fileName: String, modeLabel: String, extraText: String? = null) {
