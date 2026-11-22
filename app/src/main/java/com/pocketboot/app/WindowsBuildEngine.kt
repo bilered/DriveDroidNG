@@ -1290,7 +1290,25 @@ object WindowsBuildEngine {
                     return@launch
                 }
 
-                enqueueConversion(QueuedConversionJob(appCtx, config.copy(autoMount = dlAutoMountLive), workRootPath, workPrefix, jobTitle, totalBytes, config.includeUpdates && manifest.hasUpdates, hasEffectiveApps, config.integrateNetFx3 && manifest.hasNetFx3, false, "", onComplete, onError, onLog))
+                enqueueConversion(
+                    QueuedConversionJob(
+                        context = appCtx,
+                        config = config.copy(autoMount = dlAutoMountLive),
+                        workRootPath = workRootPath,
+                        workPrefix = workPrefix,
+                        jobTitle = jobTitle,
+                        totalDownloadBytes = totalBytes,
+                        hasUpdates = config.includeUpdates && manifest.hasUpdates,
+                        hasApps = hasEffectiveApps,
+                        hasNetFx3 = config.integrateNetFx3 && manifest.hasNetFx3,
+                        isReadOnlySource = false,
+                        pkgDirOverride = "",
+                        resumeFromStep4 = false,
+                        onComplete = onComplete,
+                        onError = onError,
+                        onLog = onLog
+                    )
+                )
             } catch (_: CancellationException) {
                 if (!dlPausedFlag.get()) { _downloadState.value = null; TurboDownloadService.stop(appCtx) }
             } catch (e: Exception) {
