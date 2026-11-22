@@ -84,8 +84,11 @@ object WindowsIsoSlimmer {
             ?: return@withContext ActionResult(false, "Bundled 7-Zip extractor not found.")
         val wimlib = WindowsImageBuilder.findBundledBinary(context, "libwimlib_imagex.so", listOf("wimlib-imagex"))
             ?: return@withContext ActionResult(false, "Bundled wimlib-imagex not found.")
+        val genisoimage = WindowsImageBuilder.findBundledBinary(context, "libgenisoimage.so", listOf("genisoimage", "mkisofs"))
         val xorriso = WindowsImageBuilder.findBundledBinary(context, "libxorriso.so", listOf("xorriso"))
-            ?: return@withContext ActionResult(false, "Bundled xorriso not found.")
+        if (genisoimage == null && xorriso == null) {
+            return@withContext ActionResult(false, "Bundled ISO packer (genisoimage/xorriso) not found.")
+        }
 
         val srcPath = UsbGadgetEngine.resolveDirectPath(config.sourceIso.path)
         val outDir = UsbGadgetEngine.resolveDirectPath(config.outputDir).trimEnd('/')
@@ -101,8 +104,9 @@ object WindowsIsoSlimmer {
         val qOut = shellQuote(outPath)
         val q7z = shellQuote(sevenZip)
         val qWim = shellQuote(wimlib)
-        val qXor = shellQuote(xorriso)
-        val envPrefix = "export TMPDIR=$qTmp HOME=$qTmp"
+        val qGenIso = genisoimage?.let { shellQuote(it) }
+        val qXor = xorriso?.let { shellQuote(it) }
+        val envPrefix = "export TMPDIR=$qTmp HOME=$qTmp WIMLIB_IMAGEX_IGNORE_CASE=1"
 
         return@withContext runCatching {
             onProgress(WindowsBuildProgress("Extracting source Windows ISO...", config.sourceIso.name, 0.14f, true))
@@ -201,11 +205,22 @@ object WindowsIsoSlimmer {
                 tmpXml.delete(); tmpSpec.delete(); tmpComp.delete()
             }
 
-            onProgress(WindowsBuildProgress("Rebuilding bootable ISO...", outName, 0.87f, false))
+            if (qGenIso == null && !config.convertToEsd) {
+                val slimWimSz = Shell.cmd("stat -c '%s' ${shellQuote(finalInstallInIso)} 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                if (slimWimSz > 3_950_000_000L) {
+                    onProgress(WindowsBuildProgress("Auto-splitting >4GB install.wim...", "cdfs.sys compatibility (3.5 GB chunks)", 0.85f, false))
+                    val swmDst = "$isoDir/sources/install.swm"
+                    WindowsBuildEngine.runIsolatedRootScript(context, "slim_swm", "set -e\n$envPrefix\n$qWim split ${shellQuote(finalInstallInIso)} ${shellQuote(swmDst)} 3500 >/dev/null 2>&1\nrm -f ${shellQuote(finalInstallInIso)}")
+                }
+            }
+
+            onProgress(WindowsBuildProgress(if (qGenIso != null) "Rebuilding UDF 1.02 ISO..." else "Rebuilding bootable ISO...", outName, 0.87f, false))
             val preferNoPrompt = config.experience.hasAnyActive() || config.winUtil.hasAnyActive()
-            val xorCmd = """
+            val packCmd = if (qGenIso != null) {
+                """
                 set -e
                 $envPrefix
+                ${WindowsBuildEngine.thermalExecPrefix(slimProf)}
                 mkdir -p ${shellQuote(outDir)}
                 rm -f $qOut
                 ISODIR=$qIsoDir
@@ -220,20 +235,41 @@ object WindowsIsoSlimmer {
                 BIOS_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'etfsboot.com' 2>/dev/null | head -n 1 | sed 's|^\./||')
 
                 if [ -n "${'$'}BIOS_BOOT" ] && [ -n "${'$'}EFI_BOOT" ]; then
-                    $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "POCKETBOOT_SLIM" \
-                      -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 \
-                      -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot \
-                      -o $qOut "${'$'}ISODIR"
+                    ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -J -joliet-long -D -N -relaxed-filenames -V "POCKETBOOT_SLIM" -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOut .
                 elif [ -n "${'$'}EFI_BOOT" ]; then
-                    $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "POCKETBOOT_SLIM" \
-                      -e "${'$'}EFI_BOOT" -no-emul-boot \
-                      -o $qOut "${'$'}ISODIR"
+                    ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -J -joliet-long -D -N -relaxed-filenames -V "POCKETBOOT_SLIM" -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOut .
                 else
-                    $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "POCKETBOOT_SLIM" \
-                      -o $qOut "${'$'}ISODIR"
+                    ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -J -joliet-long -D -N -relaxed-filenames -V "POCKETBOOT_SLIM" -o $qOut .
                 fi
-            """.trimIndent()
-            val xorRes = WindowsBuildEngine.runIsolatedRootScript(context, "slim_iso", xorCmd)
+                """.trimIndent()
+            } else {
+                """
+                set -e
+                $envPrefix
+                ${WindowsBuildEngine.thermalExecPrefix(slimProf)}
+                mkdir -p ${shellQuote(outDir)}
+                rm -f $qOut
+                ISODIR=$qIsoDir
+                cd "${'$'}ISODIR"
+                EFI_BOOT=""
+                if [ "${if (preferNoPrompt) "1" else "0"}" = "1" ]; then
+                    EFI_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'efisys_noprompt.bin' 2>/dev/null | head -n 1 | sed 's|^\./||')
+                fi
+                if [ -z "${'$'}EFI_BOOT" ]; then
+                    EFI_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'efisys.bin' 2>/dev/null | head -n 1 | sed 's|^\./||')
+                fi
+                BIOS_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'etfsboot.com' 2>/dev/null | head -n 1 | sed 's|^\./||')
+
+                if [ -n "${'$'}BIOS_BOOT" ] && [ -n "${'$'}EFI_BOOT" ]; then
+                    ${'$'}THERM_PFX ${qXor!!} -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "POCKETBOOT_SLIM" -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOut "${'$'}ISODIR"
+                elif [ -n "${'$'}EFI_BOOT" ]; then
+                    ${'$'}THERM_PFX ${qXor!!} -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "POCKETBOOT_SLIM" -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOut "${'$'}ISODIR"
+                else
+                    ${'$'}THERM_PFX ${qXor!!} -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "POCKETBOOT_SLIM" -o $qOut "${'$'}ISODIR"
+                fi
+                """.trimIndent()
+            }
+            val xorRes = WindowsBuildEngine.runIsolatedRootScript(context, "slim_iso", packCmd)
             if (!xorRes.isSuccess) {
                 throw IllegalStateException("ISO rebuild failed: ${(xorRes.out + xorRes.err).takeLast(3).joinToString(" ").take(180)}")
             }

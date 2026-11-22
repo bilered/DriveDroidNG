@@ -215,8 +215,14 @@ data class WindowsConversionJobState(
     val isCoolingDown: Boolean = false
 )
 
-data class WindowsBuildToolsStatus(val cabextract: String?, val wimlib: String?, val chntpw: String?, val xorriso: String?) {
-    val canConvertIso: Boolean get() = cabextract != null && wimlib != null && chntpw != null && xorriso != null
+data class WindowsBuildToolsStatus(
+    val cabextract: String?,
+    val wimlib: String?,
+    val chntpw: String?,
+    val xorriso: String?,
+    val genisoimage: String? = null
+) {
+    val canConvertIso: Boolean get() = cabextract != null && wimlib != null && chntpw != null && (genisoimage != null || xorriso != null)
     val canBuildDirectUsb: Boolean get() = cabextract != null && wimlib != null && chntpw != null
 }
 
@@ -448,7 +454,8 @@ object WindowsBuildEngine {
         cabextract = WindowsImageBuilder.findBundledBinary(context, "libcabextract.so", listOf("cabextract")),
         wimlib = WindowsImageBuilder.findBundledBinary(context, "libwimlib_imagex.so", listOf("wimlib-imagex")),
         chntpw = WindowsImageBuilder.findBundledBinary(context, "libchntpw.so", listOf("chntpw", "reged")),
-        xorriso = WindowsImageBuilder.findBundledBinary(context, "libxorriso.so", listOf("xorriso", "mkisofs", "genisoimage"))
+        xorriso = WindowsImageBuilder.findBundledBinary(context, "libxorriso.so", listOf("xorriso")),
+        genisoimage = WindowsImageBuilder.findBundledBinary(context, "libgenisoimage.so", listOf("genisoimage", "mkisofs"))
     )
 
     fun readBatteryPercent(context: Context): Pair<Int, Boolean> {
@@ -1466,7 +1473,7 @@ object WindowsBuildEngine {
         _conversionState.value = null
         convContext?.let { IsoBuilderService.stop(it) }
         scope.launch {
-            Shell.cmd("PID=\$(cat $ACTIVE_PID_FILE 2>/dev/null | tr -dc '0-9'); [ -n \"\$PID\" ] && kill -CONT \"\$PID\" 2>/dev/null || true; pkill -CONT -f 'libwimlib_imagex|libxorriso|libcabextract' 2>/dev/null || true; [ -n \"\$PID\" ] && kill -TERM \"\$PID\" 2>/dev/null || true; pkill -f 'libwimlib_imagex|libxorriso|libcabextract' 2>/dev/null || true; rm -rf $ACTIVE_PID_FILE /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive /data/local/tmp/pb_wim_prog.log /data/local/tmp/pb_cab_prog.log /data/local/tmp/pb_ca2023 /data/local/tmp/pb_win7_efi 2>/dev/null || true").exec()
+            Shell.cmd("PID=\$(cat $ACTIVE_PID_FILE 2>/dev/null | tr -dc '0-9'); [ -n \"\$PID\" ] && kill -CONT \"\$PID\" 2>/dev/null || true; pkill -CONT -f 'libwimlib_imagex|libgenisoimage|libxorriso|libcabextract' 2>/dev/null || true; [ -n \"\$PID\" ] && kill -TERM \"\$PID\" 2>/dev/null || true; pkill -f 'libwimlib_imagex|libgenisoimage|libxorriso|libcabextract' 2>/dev/null || true; rm -rf $ACTIVE_PID_FILE /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive /data/local/tmp/pb_wim_prog.log /data/local/tmp/pb_cab_prog.log /data/local/tmp/pb_ca2023 /data/local/tmp/pb_win7_efi 2>/dev/null || true").exec()
             if (curWork.isNotBlank()) Shell.cmd("rm -rf ${shellQuote("$curWork/ISODIR")} ${shellQuote("$curWork/TMP")} 2>/dev/null || true").exec()
         }
         emitConvLog("win-build", "Cancelled active ISO/USB build and cleared scratch files.", true)
@@ -1904,7 +1911,7 @@ object WindowsBuildEngine {
             val tools = inspectTools(appCtx)
             val qCab = shellQuote(tools.cabextract!!); val qWim = shellQuote(tools.wimlib!!); val qChntpw = shellQuote(tools.chntpw!!)
             val qPkg = shellQuote(pkgDir.absolutePath); val qIsoDir = shellQuote(isoDir.absolutePath); val qTmp = shellQuote(tmpDir.absolutePath)
-            val pathHeader = "PKG=$qPkg\nISODIR=$qIsoDir\nTMP=$qTmp\nexport TMPDIR=\"\$TMP\" HOME=\"\$TMP\""
+            val pathHeader = "PKG=$qPkg\nISODIR=$qIsoDir\nTMP=$qTmp\nexport TMPDIR=\"\$TMP\" HOME=\"\$TMP\" WIMLIB_IMAGEX_IGNORE_CASE=1"
 
             val isoReadyMarker = "$workRootPath/.pb_isodir_ready"
             val qIsoReadyMarker = shellQuote(isoReadyMarker)
@@ -1915,7 +1922,7 @@ object WindowsBuildEngine {
             if (canSkipToStep4Pack) {
                 addConsole("Fast-Retry: Reusing completed ISODIR staging folder (skipping Steps 1–3)")
                 currentStep = 4
-                activeBin = if (config.outputMode == WinBuildOutputMode.DIRECT_NTFS_USB) "mkfs.ntfs" else "xorriso"
+                activeBin = if (config.outputMode == WinBuildOutputMode.DIRECT_NTFS_USB) "mkfs.ntfs" else if (tools.genisoimage != null) "genisoimage (UDF)" else "xorriso"
                 publishConv("Step 4/4 · Fast-Retry from staged ISODIR...", finalFileName, 0.84f)
             } else {
             publishConv("Step 1/4 · Checking build tools...", "Verifying native ARM64 binaries", 0.02f)
@@ -2407,15 +2414,36 @@ object WindowsBuildEngine {
                 }
                 if (usbErr != null) throw IllegalStateException(usbErr)
             } else {
-                activeBin = "xorriso"
-                val qXor = shellQuote(tools.xorriso!!); val qOutIso = shellQuote(finalOutputPath)
+                val useUdfGenIso = tools.genisoimage != null
+                activeBin = if (useUdfGenIso) "genisoimage (UDF)" else "xorriso"
+                val qOutIso = shellQuote(finalOutputPath)
                 val volId = "WIN_${config.build.build.substringBefore('.')}".take(28).uppercase()
+
+                // Safety guard: WinPE's ISO-9660 driver (cdfs.sys) cannot read >4 GiB files if UDF is absent.
+                // When falling back to xorriso without UDF, auto-split any >3.9 GiB install.wim into 3,500 MB .swm chunks.
+                if (!useUdfGenIso) {
+                    val wimCheckPath = "${isoDir.absolutePath}/sources/install.wim"
+                    val wimCheckSz = Shell.cmd("stat -c '%s' ${shellQuote(wimCheckPath)} 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                    if (wimCheckSz > 3_950_000_000L) {
+                        addConsole("UDF writer unavailable & install.wim > 3.9 GiB (${UsbGadgetEngine.formatBytes(wimCheckSz)}) — auto-splitting to install*.swm for cdfs.sys compatibility...")
+                        publishConv("Step 4/4 · Auto-splitting >4GB WIM...", "3,500 MB chunks (cdfs.sys safety)", 0.85f, wimCheckSz)
+                        val autoSwm = "${isoDir.absolutePath}/sources/install.swm"
+                        val autoSplitRes = runIsolatedRootScript(appCtx, "autoswm", "set -e\n$pathHeader\n${thermalExecPrefix(convThermalProfileLive)}\n\$THERM_PFX $qWim split ${shellQuote(wimCheckPath)} ${shellQuote(autoSwm)} 3500 >/dev/null 2>&1\nrm -f ${shellQuote(wimCheckPath)}")
+                        if (autoSplitRes.isSuccess) addConsole("Auto-split complete: sources/install*.swm ready")
+                        else addConsole("Warning: auto-split failed (proceeding with single install.wim)")
+                    }
+                }
+
                 val estIsoBytes = Shell.cmd("du -sb $qIsoDir 2>/dev/null | awk '{print \$1}'").exec().out.firstOrNull()?.trim()?.toLongOrNull()?.coerceAtLeast(1L) ?: (5L * 1024L * 1024L * 1024L)
                 val xorLog = "/data/local/tmp/pb_xorriso_prog.log"
                 val qXorLog = shellQuote(xorLog)
                 val preferNoPrompt = config.experience.hasAnyActive() || config.winUtil.hasAnyActive()
-                addConsole("xorriso: packing ~${UsbGadgetEngine.formatBytes(estIsoBytes)} (-iso-level 3 -J -joliet-long --stdio_sync 16m)")
-                publishConv("Step 4/4 · Packing bootable ISO...", finalFileName, 0.86f)
+                if (useUdfGenIso) {
+                    addConsole("genisoimage (UDF 1.02): packing ~${UsbGadgetEngine.formatBytes(estIsoBytes)} (-udf -allow-limited-size -iso-level 3 -J -joliet-long)")
+                } else {
+                    addConsole("xorriso: packing ~${UsbGadgetEngine.formatBytes(estIsoBytes)} (-iso-level 3 -J -joliet-long --stdio_sync 16m)")
+                }
+                publishConv(if (useUdfGenIso) "Step 4/4 · Packing UDF 1.02 ISO..." else "Step 4/4 · Packing bootable ISO...", finalFileName, 0.86f)
                 val xorTherm = thermalExecPrefix(convThermalProfileLive)
                 val isoPollJob = scope.launch {
                     while (isActive && !convCancelledFlag.get()) {
@@ -2425,14 +2453,16 @@ object WindowsBuildEngine {
                         val curSz = pollOut.firstOrNull { it.startsWith("SZ|") }?.substringAfter('|')?.trim()?.toLongOrNull() ?: lastMeasuredOutputBytes
                         pollOut.filterNot { it.startsWith("SZ|") }.map { it.trim() }.filter { it.isNotEmpty() }.lastOrNull()?.let { addConsole(it) }
                         publishConv(
-                            "Step 4/4 · Packing bootable ISO...",
+                            if (useUdfGenIso) "Step 4/4 · Packing UDF 1.02 ISO..." else "Step 4/4 · Packing bootable ISO...",
                             "${UsbGadgetEngine.formatBytes(curSz)} / ~${UsbGadgetEngine.formatBytes(estIsoBytes)}",
                             0.86f + (curSz.toFloat() / estIsoBytes.toFloat()).coerceIn(0f, 1f) * 0.10f,
                             curSz
                         )
                     }
                 }
-                val xorScript = """
+                val isoPackScript = if (useUdfGenIso) {
+                    val qGenIso = shellQuote(tools.genisoimage!!)
+                    """
                     set -e
                     $pathHeader
                     $xorTherm
@@ -2449,7 +2479,37 @@ object WindowsBuildEngine {
                         EFI_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'efisys.bin' 2>/dev/null | head -n 1 | sed 's|^\./||')
                     fi
                     BIOS_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'etfsboot.com' 2>/dev/null | head -n 1 | sed 's|^\./||')
-                    echo "Bootloaders: BIOS=${'$'}{BIOS_BOOT:-none} | EFI=${'$'}{EFI_BOOT:-none}" >> $qXorLog
+                    echo "UDF 1.02 Bootloaders: BIOS=${'$'}{BIOS_BOOT:-none} | EFI=${'$'}{EFI_BOOT:-none}" >> $qXorLog
+                    if [ -n "${'$'}BIOS_BOOT" ] && [ -n "${'$'}EFI_BOOT" ]; then
+                        ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -J -joliet-long -D -N -relaxed-filenames -V "$volId" -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOutIso . >> $qXorLog 2>&1 &
+                    elif [ -n "${'$'}EFI_BOOT" ]; then
+                        ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -J -joliet-long -D -N -relaxed-filenames -V "$volId" -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOutIso . >> $qXorLog 2>&1 &
+                    else
+                        ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -J -joliet-long -D -N -relaxed-filenames -V "$volId" -o $qOutIso . >> $qXorLog 2>&1 &
+                    fi
+                    XPID=${'$'}!; echo "${'$'}XPID" > $ACTIVE_PID_FILE; wait "${'$'}XPID"
+                    rm -f $ACTIVE_PID_FILE
+                    """.trimIndent()
+                } else {
+                    val qXor = shellQuote(tools.xorriso!!)
+                    """
+                    set -e
+                    $pathHeader
+                    $xorTherm
+                    mkdir -p ${shellQuote(safeTargetDir)}
+                    rm -f $qOutIso
+                    : > $qXorLog
+                    trap 'rm -f $ACTIVE_PID_FILE' EXIT
+                    cd "${'$'}ISODIR"
+                    EFI_BOOT=""
+                    if [ "${if (preferNoPrompt) "1" else "0"}" = "1" ]; then
+                        EFI_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'efisys_noprompt.bin' 2>/dev/null | head -n 1 | sed 's|^\./||')
+                    fi
+                    if [ -z "${'$'}EFI_BOOT" ]; then
+                        EFI_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'efisys.bin' 2>/dev/null | head -n 1 | sed 's|^\./||')
+                    fi
+                    BIOS_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'etfsboot.com' 2>/dev/null | head -n 1 | sed 's|^\./||')
+                    echo "ISO-9660 Bootloaders: BIOS=${'$'}{BIOS_BOOT:-none} | EFI=${'$'}{EFI_BOOT:-none}" >> $qXorLog
                     if [ -n "${'$'}BIOS_BOOT" ] && [ -n "${'$'}EFI_BOOT" ]; then
                         ${'$'}THERM_PFX $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "$volId" -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOutIso "${'$'}ISODIR" >> $qXorLog 2>&1 &
                     elif [ -n "${'$'}EFI_BOOT" ]; then
@@ -2459,8 +2519,9 @@ object WindowsBuildEngine {
                     fi
                     XPID=${'$'}!; echo "${'$'}XPID" > $ACTIVE_PID_FILE; wait "${'$'}XPID"
                     rm -f $ACTIVE_PID_FILE
-                """.trimIndent()
-                val xorRes = runIsolatedRootScript(appCtx, "xorriso", xorScript)
+                    """.trimIndent()
+                }
+                val xorRes = runIsolatedRootScript(appCtx, if (useUdfGenIso) "genisoimage" else "xorriso", isoPackScript)
                 isoPollJob.cancel()
                 val xorLastLines = Shell.cmd("tail -n 8 $qXorLog 2>/dev/null | tr '\r' '\n' | tail -n 6 || true").exec().out.map { it.trim() }.filter { it.isNotEmpty() }
                 xorLastLines.forEach { addConsole(it) }
@@ -2468,7 +2529,7 @@ object WindowsBuildEngine {
                 if (!xorRes.isSuccess) {
                     Shell.cmd("rm -f $qOutIso 2>/dev/null || true").exec()
                     val errDetail = xorLastLines.takeLast(3).joinToString(" | ").ifBlank { (xorRes.out + xorRes.err).takeLast(3).joinToString(" ") }
-                    throw IllegalStateException("xorriso failed (exit ${xorRes.code}): ${errDetail.take(260)}")
+                    throw IllegalStateException("${if (useUdfGenIso) "genisoimage (UDF)" else "xorriso"} failed (exit ${xorRes.code}): ${errDetail.take(260)}")
                 }
                 UsbGadgetEngine.fixUserStoragePermissions(appCtx, safeTargetDir, isDir = true)
                 UsbGadgetEngine.fixUserStoragePermissions(appCtx, finalOutputPath, isDir = false)

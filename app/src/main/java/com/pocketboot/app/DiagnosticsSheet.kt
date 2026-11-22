@@ -183,7 +183,7 @@ object PreFlightDiagnostics {
             Settings.Global.getInt(context.contentResolver, Settings.Global.STAY_ON_WHILE_PLUGGED_IN, 0) > 0
         }.getOrDefault(false)
         val winTools = WindowsBuildEngine.inspectTools(context)
-        val winDetail = "cabextract=${if (winTools.cabextract != null) "OK" else "NO"} • wimlib=${if (winTools.wimlib != null) "OK" else "NO"} • reged/VE=${if (winTools.chntpw != null) "OK" else "NO"} • xorriso=${if (winTools.xorriso != null) "OK" else "NO"}"
+        val winDetail = "cabextract=${if (winTools.cabextract != null) "OK" else "NO"} • wimlib=${if (winTools.wimlib != null) "OK" else "NO"} • reged/VE=${if (winTools.chntpw != null) "OK" else "NO"} • genisoimage(UDF)=${if (winTools.genisoimage != null) "OK" else "NO"} • xorriso=${if (winTools.xorriso != null) "OK" else "NO"}"
         items.add(
             DiagCheckItem(
                 title = "Windows ISO Build Engine",
