@@ -221,9 +221,9 @@ data class WindowsBuildToolsStatus(
     val wimlib: String?,
     val chntpw: String?,
     val xorriso: String?,
-    val genisoimage: String? = null
+    val sevenZip: String? = null
 ) {
-    val canConvertIso: Boolean get() = cabextract != null && wimlib != null && chntpw != null && (genisoimage != null || xorriso != null)
+    val canConvertIso: Boolean get() = cabextract != null && wimlib != null && chntpw != null && xorriso != null
     val canBuildDirectUsb: Boolean get() = cabextract != null && wimlib != null && chntpw != null
 }
 
@@ -238,6 +238,7 @@ object WindowsBuildEngine {
     private const val DEFAULT_API_BASE = "https://api.uupdump.net"
     private const val GITHUB_RAW_BASE = "https://raw.githubusercontent.com/bilered/PocketBoot/main"
     private const val UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.5.0"
+    private const val STAGE_SCHEMA_VERSION = "PB_STAGE_V20"
 
     @Volatile private var apiBaseUrl: String = DEFAULT_API_BASE
     @Volatile private var preferDirectMicrosoft: Boolean = false
@@ -457,7 +458,7 @@ object WindowsBuildEngine {
         wimlib = WindowsImageBuilder.findBundledBinary(context, "libwimlib_imagex.so", listOf("wimlib-imagex")),
         chntpw = WindowsImageBuilder.findBundledBinary(context, "libchntpw.so", listOf("chntpw", "reged")),
         xorriso = WindowsImageBuilder.findBundledBinary(context, "libxorriso.so", listOf("xorriso")),
-        genisoimage = WindowsImageBuilder.findBundledBinary(context, "libgenisoimage.so", listOf("genisoimage", "mkisofs"))
+        sevenZip = WindowsImageBuilder.findBundledBinary(context, "lib7zzs.so", listOf("7zzs", "7zz", "7z"))
     )
 
     fun readBatteryPercent(context: Context): Pair<Int, Boolean> {
@@ -1302,9 +1303,7 @@ object WindowsBuildEngine {
                     val stageBytes = stageCacheDir(context, workPrefix).walkTopDown().filter { it.isFile && it.name.endsWith(".part") }.sumOf { it.length() }
                     val totalBytes = o.optLong("totalBytes", 0L).coerceAtLeast(pkgBytes)
                     if (pkgBytes > 0L || stageBytes > 0L) {
-                        val stagedReady = Shell.cmd(
-                            "[ -f ${shellQuote("$workRoot/.pb_isodir_ready")} ] && [ -f ${shellQuote("$workRoot/ISODIR/sources/boot.wim")} ] && echo OK || true"
-                        ).exec().out.any { it.trim() == "OK" }
+                        val stagedReady = isStageMarkerValid(workRoot)
                         results.add(PendingWindowsBuild(workRoot, workPrefix, "Win ${bld.build} (${bld.archDisplay})", cfg.customOutputName.ifBlank { "Win_${bld.build}_${bld.archDisplay}_${lang.code}${if (mode == WinBuildOutputMode.DIRECT_NTFS_USB) "_USB.img" else ".iso"}" }, (pkgBytes + stageBytes).coerceAtMost(totalBytes.coerceAtLeast(pkgBytes + stageBytes)), totalBytes, o.optBoolean("isCachedReady", false), cfg, hasStagedIsoDir = stagedReady))
                     }
                 }
@@ -1409,6 +1408,7 @@ object WindowsBuildEngine {
                     throw IllegalStateException("Bundled ISO build tools (cabextract/wimlib/chntpw/xorriso) missing.")
                 }
                 val stagingOptionsChanged = config.compression != prevConfig.compression ||
+                    (config.outputMode == WinBuildOutputMode.DIRECT_NTFS_USB) != (prevConfig.outputMode == WinBuildOutputMode.DIRECT_NTFS_USB) ||
                     config.includeUpdates != prevConfig.includeUpdates ||
                     config.integrateNetFx3 != prevConfig.integrateNetFx3 ||
                     config.runComponentCleanup != prevConfig.runComponentCleanup ||
@@ -1418,9 +1418,7 @@ object WindowsBuildEngine {
                     config.virtualEditions != prevConfig.virtualEditions ||
                     config.experience != prevConfig.experience ||
                     config.winUtil != prevConfig.winUtil
-                val rawReadyIsoDir = Shell.cmd(
-                    "[ -f ${shellQuote("$workRootPath/.pb_isodir_ready")} ] && [ -f ${shellQuote("$workRootPath/ISODIR/sources/boot.wim")} ] && echo OK || true"
-                ).exec().out.any { it.trim() == "OK" }
+                val rawReadyIsoDir = isStageMarkerValid(workRootPath)
                 val canFastStep4 = rawReadyIsoDir && !forceFullRebuild && !stagingOptionsChanged
                 if (rawReadyIsoDir && !canFastStep4) {
                     Shell.cmd("rm -f ${shellQuote("$workRootPath/.pb_isodir_ready")} 2>/dev/null || true").exec()
@@ -1499,7 +1497,7 @@ object WindowsBuildEngine {
         _conversionState.value = null
         convContext?.let { IsoBuilderService.stop(it) }
         scope.launch {
-            Shell.cmd("PID=\$(cat $ACTIVE_PID_FILE 2>/dev/null | tr -dc '0-9'); [ -n \"\$PID\" ] && kill -CONT \"\$PID\" 2>/dev/null || true; pkill -CONT -f 'libwimlib_imagex|libgenisoimage|libxorriso|libcabextract' 2>/dev/null || true; [ -n \"\$PID\" ] && kill -TERM \"\$PID\" 2>/dev/null || true; pkill -f 'libwimlib_imagex|libgenisoimage|libxorriso|libcabextract' 2>/dev/null || true; rm -rf $ACTIVE_PID_FILE /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive /data/local/tmp/pb_wim_prog.log /data/local/tmp/pb_cab_prog.log /data/local/tmp/pb_ca2023 /data/local/tmp/pb_win7_efi 2>/dev/null || true").exec()
+            Shell.cmd("PID=\$(cat $ACTIVE_PID_FILE 2>/dev/null | tr -dc '0-9'); [ -n \"\$PID\" ] && kill -CONT \"\$PID\" 2>/dev/null || true; pkill -CONT -f 'libwimlib_imagex|liblibxorriso|libcabextract' 2>/dev/null || true; [ -n \"\$PID\" ] && kill -TERM \"\$PID\" 2>/dev/null || true; pkill -f 'libwimlib_imagex|liblibxorriso|libcabextract' 2>/dev/null || true; rm -rf $ACTIVE_PID_FILE /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive /data/local/tmp/pb_wim_prog.log /data/local/tmp/pb_cab_prog.log /data/local/tmp/pb_ca2023 /data/local/tmp/pb_win7_efi 2>/dev/null || true").exec()
             if (curWork.isNotBlank()) Shell.cmd("rm -rf ${shellQuote("$curWork/ISODIR")} ${shellQuote("$curWork/TMP")} 2>/dev/null || true").exec()
         }
         emitConvLog("win-build", "Cancelled active ISO/USB build and cleared scratch files.", true)
@@ -1549,6 +1547,63 @@ object WindowsBuildEngine {
             Shell.cmd("rm -f $rmArgs 2>/dev/null || true").exec()
         }
         return verified
+    }
+
+    private fun savePackageManifest(context: Context, workRootPath: String, files: List<WinPackageFileEntry>) {
+        runCatching {
+            val arr = JSONArray()
+            files.forEach { f ->
+                arr.put(JSONObject().apply {
+                    put("name", f.name)
+                    put("size", f.sizeBytes)
+                    put("sha1", f.sha1.trim().lowercase())
+                })
+            }
+            val tmp = File(context.cacheDir, "pb_manifest_tmp.json")
+            tmp.writeText(arr.toString(), Charsets.UTF_8)
+            Shell.cmd("mkdir -p ${shellQuote(workRootPath)} && cp -f ${shellQuote(tmp.absolutePath)} ${shellQuote("$workRootPath/pb_manifest.json")}").exec()
+            tmp.delete()
+        }
+    }
+
+    private fun loadPackageManifest(workRootPath: String): List<WinPackageFileEntry> {
+        val raw = Shell.cmd("cat ${shellQuote("$workRootPath/pb_manifest.json")} 2>/dev/null || true").exec().out.joinToString("
+").trim()
+        if (raw.isBlank()) return emptyList()
+        return runCatching {
+            val arr = JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val name = o.optString("name", "").trim()
+                    if (name.isEmpty()) continue
+                    add(WinPackageFileEntry(name, "", o.optLong("size", 0L), o.optString("sha1", "").trim().lowercase()))
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun computePkgDirFingerprint(pkgDirPath: String): String {
+        val qPkg = shellQuote(pkgDirPath)
+        return Shell.cmd(
+            "if [ -d $qPkg ]; then find $qPkg -maxdepth 1 -type f -exec stat -c '%n|%s|%Y' {} + 2>/dev/null | sort | sha1sum | awk '{print \$1}'; fi"
+        ).exec().out.firstOrNull().orEmpty().trim()
+    }
+
+    private fun savePkgVerifiedFingerprint(workRootPath: String, fingerprint: String) {
+        if (fingerprint.isBlank()) return
+        Shell.cmd("printf '%s\n' ${shellQuote(fingerprint)} > ${shellQuote("$workRootPath/.pb_pkgs_verified")} 2>/dev/null || true").exec()
+    }
+
+    private fun readPkgVerifiedFingerprint(workRootPath: String): String {
+        return Shell.cmd("cat ${shellQuote("$workRootPath/.pb_pkgs_verified")} 2>/dev/null || true").exec().out.firstOrNull().orEmpty().trim()
+    }
+
+    private fun isStageMarkerValid(workRootPath: String): Boolean {
+        val qMarker = shellQuote("$workRootPath/.pb_isodir_ready")
+        val qBoot = shellQuote("$workRootPath/ISODIR/sources/boot.wim")
+        return Shell.cmd("[ -f $qMarker ] && grep -qx '$STAGE_SCHEMA_VERSION' $qMarker 2>/dev/null && [ -f $qBoot ] && echo OK || true")
+            .exec().out.any { it.trim() == "OK" }
     }
 
     fun startBuild(context: Context, config: WindowsChannelBuildConfig, onComplete: (DownloadCompletionEvent) -> Unit, onError: (String) -> Unit, onLog: (LogEntry) -> Unit) {
@@ -1613,6 +1668,7 @@ object WindowsBuildEngine {
                 if (freeNow > 0L && freeNow < neededFree) throw IllegalStateException("Not enough free space. Need ~${UsbGadgetEngine.formatBytes(neededFree)}, have ${UsbGadgetEngine.formatBytes(freeNow)} free.")
 
                 saveBuildJobJson(appCtx, workRootPath, config, totalBytes, false)
+                savePackageManifest(appCtx, workRootPath, targetFiles)
                 emitLog("win-dl", "Found ${targetFiles.size} package(s) (${UsbGadgetEngine.formatBytes(totalBytes)}) · Method=${config.downloadMethod.name}")
 
                 _downloadState.value = WindowsBuildJobState(jobTitle, "Checking cached packages...", "Verifying SHA-1 hashes", 0.03f, 0L, totalBytes, activeThreads = maxConns, filesTotal = targetFiles.size, autoMount = dlAutoMountLive, workDirPath = workRootPath)
@@ -1674,8 +1730,24 @@ object WindowsBuildEngine {
                 } finally { meterJob.cancel() }
 
                 if (dlPausedFlag.get() || dlCancelledFlag.get()) return@launch
+                // Gate 0A post-move audit: verify every expected package landed in PKGS/ with exact non-zero size
+                val landedMap = Shell.cmd(
+                    "for f in ${shellQuote(pkgDir.absolutePath)}/*; do if [ ! -f "\$f" ]; then continue; fi; printf '%s|%s\n' "\$(basename "\$f")" "\$(stat -c '%s' "\$f" 2>/dev/null || echo 0)"; done"
+                ).exec().out.mapNotNull { line ->
+                    val p = line.split("|", limit = 2)
+                    if (p.size == 2) p[0] to (p[1].trim().toLongOrNull() ?: 0L) else null
+                }.toMap()
+                val missingOrBad = targetFiles.filter { entry ->
+                    val sz = landedMap[entry.name] ?: -1L
+                    sz <= 0L || (entry.sizeBytes > 0L && sz != entry.sizeBytes)
+                }
+                if (missingOrBad.isNotEmpty()) {
+                    val sample = missingOrBad.take(3).joinToString(", ") { it.name }
+                    throw IllegalStateException("Download integrity check failed: ${missingOrBad.size} file(s) missing or truncated ($sample). Tap Resume to re-download.")
+                }
+                savePkgVerifiedFingerprint(workRootPath, computePkgDirFingerprint(pkgDir.absolutePath))
                 runCatching { appStageDir.deleteRecursively() }
-                emitLog("win-dl", "Downloaded & SHA-1 verified all ${targetFiles.size} packages")
+                emitLog("win-dl", "Gate 0A passed: downloaded & SHA-1 verified all ${targetFiles.size} packages")
 
                 dlWorkRootPath = ""; dlWorkPrefix = ""; _downloadState.value = null; TurboDownloadService.stop(appCtx)
 
@@ -1859,7 +1931,7 @@ object WindowsBuildEngine {
         var lastPublishedDetail = ""
         var lastPublishedPct = 0f
 
-        fun addConsole(line: String) { val c = line.replace("\r", "").trim(); if (c.isNotEmpty() && consoleLines.lastOrNull() != c.take(160)) { consoleLines.add(c.take(160)); if (consoleLines.size > 80) consoleLines.removeAt(0) } }
+        fun addConsole(line: String) { val c = line.replace("\r", "").trim(); if (c.isNotEmpty() && consoleLines.lastOrNull() != c.take(160)) { consoleLines.add(c.take(160)); if (consoleLines.size > 250) consoleLines.removeAt(0) } }
         fun advanceStep(newStep: Int, binName: String) {
             val now = System.currentTimeMillis()
             if (newStep > currentStep) { stepDurations[currentStep] = ((now - stepStartMs) / 1000L).coerceAtLeast(1L); stepStartMs = now; currentStep = newStep }
@@ -1941,23 +2013,78 @@ object WindowsBuildEngine {
 
             val isoReadyMarker = "$workRootPath/.pb_isodir_ready"
             val qIsoReadyMarker = shellQuote(isoReadyMarker)
-            val canSkipToStep4Pack = job.resumeFromStep4 && Shell.cmd(
-                "[ -f $qIsoReadyMarker ] && [ -f ${shellQuote("${isoDir.absolutePath}/sources/boot.wim")} ] && ( [ -f ${shellQuote("${isoDir.absolutePath}/sources/install.wim")} ] || [ -f ${shellQuote("${isoDir.absolutePath}/sources/install.esd")} ] || [ -f ${shellQuote("${isoDir.absolutePath}/sources/install.swm")} ] ) && echo OK || true"
+            val canSkipToStep4Pack = job.resumeFromStep4 && isStageMarkerValid(workRootPath) && Shell.cmd(
+                "[ -f ${shellQuote("${isoDir.absolutePath}/sources/install.wim")} ] || [ -f ${shellQuote("${isoDir.absolutePath}/sources/install.esd")} ] || [ -f ${shellQuote("${isoDir.absolutePath}/sources/install.swm")} ] && echo OK || true"
             ).exec().out.any { it.trim() == "OK" }
 
             if (canSkipToStep4Pack) {
-                addConsole("Fast-Retry: Reusing completed ISODIR staging folder (skipping Steps 1–3)")
+                addConsole("Fast-Retry: Reusing completed v20 ISODIR staging folder (skipping Steps 1–3)")
                 currentStep = 4
-                activeBin = if (config.outputMode == WinBuildOutputMode.DIRECT_NTFS_USB) "mkfs.ntfs" else if (tools.genisoimage != null) "genisoimage (UDF)" else "xorriso"
+                activeBin = if (config.outputMode == WinBuildOutputMode.DIRECT_NTFS_USB) "mkfs.ntfs" else "xorriso"
                 publishConv("Step 4/4 · Fast-Retry from staged ISODIR...", finalFileName, 0.84f)
             } else {
-            publishConv("Step 1/4 · Checking build tools...", "Verifying native ARM64 binaries", 0.02f)
+            publishConv("Step 1/4 · Checking build tools & source integrity...", "Gate 0B: verifying source UUP packages", 0.02f)
             if (!runIsolatedRootScript(appCtx, "toolcheck", "set -e\n$pathHeader\nrm -rf $qIsoReadyMarker \"\$ISODIR\" \"\$TMP\" /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive\nmkdir -p \"\$ISODIR\" \"\$TMP\"\n$qCab --version >/dev/null\n$qWim --version >/dev/null").isSuccess) {
                 throw IllegalStateException("Build tool check failed")
             }
 
+            // Gate 0B: Pre-build source package integrity audit (SHA-1 via pb_manifest.json or archive header verification)
+            val savedManifest = if (!job.isReadOnlySource) loadPackageManifest(workRootPath) else emptyList()
+            if (savedManifest.isNotEmpty()) {
+                val curFp = computePkgDirFingerprint(pkgDir.absolutePath)
+                val prevFp = readPkgVerifiedFingerprint(workRootPath)
+                if (curFp.isNotBlank() && curFp == prevFp) {
+                    addConsole("Gate 0B passed: ${savedManifest.size} cached packages match verified SHA-1 fingerprint")
+                } else {
+                    addConsole("Gate 0B: Verifying SHA-1 hashes of ${savedManifest.size} cached packages...")
+                    publishConv("Step 1/4 · Verifying source SHA-1...", "${savedManifest.size} cached packages", 0.025f)
+                    val verifiedSet = batchVerifyExistingPackages(pkgDir.absolutePath, savedManifest)
+                    val missing = savedManifest.filter { it.name !in verifiedSet }
+                    if (missing.isNotEmpty()) {
+                        val sample = missing.take(3).joinToString(", ") { it.name }
+                        throw IllegalStateException("Gate 0B failed: ${missing.size} cached package(s) missing or failed SHA-1 ($sample). Corrupt file(s) removed — tap Resume to re-download.")
+                    }
+                    savePkgVerifiedFingerprint(workRootPath, computePkgDirFingerprint(pkgDir.absolutePath))
+                    addConsole("Gate 0B passed: all ${savedManifest.size} packages SHA-1 verified")
+                }
+            } else {
+                val q7zOpt = tools.sevenZip?.let { shellQuote(it) }.orEmpty()
+                val msu7zCheckCmd = if (q7zOpt.isNotBlank()) "$q7zOpt l \"\$f\" >/dev/null 2>&1" else "true"
+                val structAudit = runIsolatedRootScript(appCtx, "gate0b_struct", """
+                    set -e
+                    $pathHeader
+                    ESD_C=0; CAB_C=0; MSU_C=0
+                    for f in "${'$'}PKG"/*.esd "${'$'}PKG"/*.ESD; do
+                        if [ ! -f "${'$'}f" ]; then continue; fi
+                        if [ ! -s "${'$'}f" ]; then echo "BAD|0-byte ESD: ${'$'}(basename "${'$'}f")"; exit 1; fi
+                        if ! $qWim info "${'$'}f" >/dev/null 2>&1; then echo "BAD|Corrupt ESD header: ${'$'}(basename "${'$'}f")"; exit 1; fi
+                        ESD_C=${'$'}((ESD_C + 1))
+                    done
+                    for f in "${'$'}PKG"/*.cab "${'$'}PKG"/*.CAB; do
+                        if [ ! -f "${'$'}f" ]; then continue; fi
+                        if [ ! -s "${'$'}f" ]; then echo "BAD|0-byte CAB: ${'$'}(basename "${'$'}f")"; exit 1; fi
+                        if ! $qCab -l "${'$'}f" >/dev/null 2>&1; then echo "BAD|Corrupt CAB archive: ${'$'}(basename "${'$'}f")"; exit 1; fi
+                        CAB_C=${'$'}((CAB_C + 1))
+                    done
+                    for f in "${'$'}PKG"/*.msu "${'$'}PKG"/*.MSU; do
+                        if [ ! -f "${'$'}f" ]; then continue; fi
+                        if [ ! -s "${'$'}f" ]; then echo "BAD|0-byte MSU: ${'$'}(basename "${'$'}f")"; exit 1; fi
+                        if ! $msu7zCheckCmd; then echo "BAD|Corrupt MSU archive: ${'$'}(basename "${'$'}f")"; exit 1; fi
+                        MSU_C=${'$'}((MSU_C + 1))
+                    done
+                    echo "OK|${'$'}ESD_C ESD, ${'$'}CAB_C CAB, ${'$'}MSU_C MSU"
+                """.trimIndent())
+                if (!structAudit.isSuccess) {
+                    val bad = (structAudit.out + structAudit.err).firstOrNull { it.startsWith("BAD|") }?.substringAfter('|')
+                        ?: (structAudit.out + structAudit.err).takeLast(2).joinToString(" ")
+                    throw IllegalStateException("Gate 0B source integrity failed: ${bad.take(220)}")
+                }
+                val summary = structAudit.out.firstOrNull { it.startsWith("OK|") }?.substringAfter('|') ?: "source archives"
+                addConsole("Gate 0B passed: $summary verified (0 corrupt)")
+            }
+
             advanceStep(1, "cabextract")
-            val allCabPaths = runIsolatedRootScript(appCtx, "listcabs", "$pathHeader\nfor c in \"\$PKG\"/*.cab \"\$PKG\"/*.CAB; do [ -f \"\$c\" ] && echo \"\$c\"; done").out.map { it.trim() }.filter { it.startsWith("/") && it.lowercase().endsWith(".cab") }
+            val allCabPaths = runIsolatedRootScript(appCtx, "listcabs", "$pathHeader\nfor c in \"\$PKG\"/*.cab \"\$PKG\"/*.CAB; do if [ -f \"\$c\" ]; then echo \"\$c\"; fi; done").out.map { it.trim() }.filter { it.startsWith("/") && it.lowercase().endsWith(".cab") }
             val editionCabs = allCabPaths.filter { !isSkippableNonEditionCab(it.substringAfterLast('/')) }
             addConsole("Step 1/4: ${editionCabs.size} edition CAB(s) (${allCabPaths.size - editionCabs.size} non-edition skipped) · Thermal: ${convThermalProfileLive.label}")
             if (editionCabs.isNotEmpty()) {
@@ -1967,6 +2094,8 @@ object WindowsBuildEngine {
                     writeText(editionCabs.joinToString("\n"), Charsets.UTF_8)
                 }
                 val qCabList = shellQuote(cabListFile.absolutePath)
+                val cabCacheDir = if (!job.isReadOnlySource) "$workRootPath/CAB_CACHE" else ""
+                val qCabCache = shellQuote(cabCacheDir)
                 val thermSetup1 = thermalExecPrefix(convThermalProfileLive)
                 val cabPollJob = scope.launch {
                     var lastCount = 0
@@ -1995,12 +2124,23 @@ object WindowsBuildEngine {
                     : > $qCabProg
                     trap 'rm -f $ACTIVE_PID_FILE' EXIT
                     EXTDIR="/data/local/tmp/pb_uup_ext"
+                    CABCACHE=$qCabCache
+                    if [ -n "${'$'}CABCACHE" ]; then mkdir -p "${'$'}CABCACHE"; fi
                     TOTAL=${editionCabs.size}
                     IDX=0
                     while IFS= read -r CABPATH || [ -n "${'$'}CABPATH" ]; do
                         if [ ! -f "${'$'}CABPATH" ]; then continue; fi
                         IDX=${'$'}((IDX + 1))
                         BN=${'$'}(basename "${'$'}CABPATH")
+                        CAB_SZ=${'$'}(stat -c '%s' "${'$'}CABPATH" 2>/dev/null || echo 0)
+                        if [ -n "${'$'}CABCACHE" ]; then
+                            CACHED_ESD="${'$'}CABCACHE/${'$'}BN.${'$'}CAB_SZ.esd"
+                            if [ -s "${'$'}CACHED_ESD" ] && $qWim info "${'$'}CACHED_ESD" >/dev/null 2>&1; then
+                                (ln -f "${'$'}CACHED_ESD" "${'$'}TMP/${'$'}BN.esd" 2>/dev/null || cp -f "${'$'}CACHED_ESD" "${'$'}TMP/${'$'}BN.esd")
+                                echo "CAB_DONE|${'$'}IDX|${'$'}TOTAL|${'$'}BN (cached)" >> $qCabProg
+                                continue
+                            fi
+                        fi
                         if ! $qCab -l "${'$'}CABPATH" 2>/dev/null | grep -qi 'update\.mum'; then
                             echo "CAB_DONE|${'$'}IDX|${'$'}TOTAL|${'$'}BN (skipped)" >> $qCabProg
                             continue
@@ -2015,8 +2155,13 @@ object WindowsBuildEngine {
                             echo "CAB_DONE|${'$'}IDX|${'$'}TOTAL|${'$'}BN" >> $qCabProg
                             continue
                         fi
-                        ${'$'}THERM_PFX $qWim capture "${'$'}EXTDIR" "${'$'}TMP/${'$'}BN.esd" "Edition Package" "Edition Package" --compress=none --no-acls --norpfix >/dev/null 2>&1 &
+                        rm -f "${'$'}TMP/${'$'}BN.tmp.esd"
+                        ${'$'}THERM_PFX $qWim capture "${'$'}EXTDIR" "${'$'}TMP/${'$'}BN.tmp.esd" "Edition Package" "Edition Package" --compress=none --no-acls --norpfix >/dev/null 2>&1 &
                         WPID=${'$'}!; echo "${'$'}WPID" > $ACTIVE_PID_FILE; wait "${'$'}WPID"
+                        mv -f "${'$'}TMP/${'$'}BN.tmp.esd" "${'$'}TMP/${'$'}BN.esd"
+                        if [ -n "${'$'}CABCACHE" ]; then
+                            (ln -f "${'$'}TMP/${'$'}BN.esd" "${'$'}CABCACHE/${'$'}BN.${'$'}CAB_SZ.esd" 2>/dev/null || cp -f "${'$'}TMP/${'$'}BN.esd" "${'$'}CABCACHE/${'$'}BN.${'$'}CAB_SZ.esd" 2>/dev/null || true)
+                        fi
                         rm -rf "${'$'}EXTDIR"
                         echo "CAB_DONE|${'$'}IDX|${'$'}TOTAL|${'$'}BN" >> $qCabProg
                     done < $qCabList
@@ -2110,6 +2255,13 @@ object WindowsBuildEngine {
                                         dirpart="${'$'}{rel%/*}"
                                         basepart="${'$'}{rel##*/}"
                                         if [ "${'$'}dirpart" != "${'$'}rel" ]; then
+                                            first_seg="${'$'}{dirpart%%/*}"
+                                            low_seg=${'$'}(printf '%s' "${'$'}first_seg" | tr 'A-Z' 'a-z')
+                                            if printf '%s' "${'$'}low_seg" | grep -qE '^[a-z]{2,3}(-[a-z0-9]{2,4}){1,2}$'; then
+                                                if ! find "${'$'}ISODIR/sources" -maxdepth 1 -mindepth 1 -type d -iname "${'$'}low_seg" 2>/dev/null | grep -q .; then
+                                                    continue
+                                                fi
+                                            fi
                                             OLDIFS="${'$'}IFS"; IFS="/"
                                             for seg in ${'$'}dirpart; do
                                                 if [ -z "${'$'}seg" ]; then continue; fi
@@ -2449,11 +2601,13 @@ object WindowsBuildEngine {
             }
             if (job.hasApps) {
                 addConsole("Staging Inbox Store Apps into sources/\$OEM\$/\$\$/Setup/Apps/")
-                runIsolatedRootScript(appCtx, "oemapp", "$pathHeader\nmkdir -p ${shellQuote(oemApps)}\nfor f in \"\$PKG\"/*.msixbundle \"\$PKG\"/*.appxbundle \"\$PKG\"/*.msix \"\$PKG\"/*.appx \"\$PKG\"/*License*.xml \"\$PKG\"/*license*.xml; do [ -f \"\$f\" ] && bn=\$(basename \"\$f\") && (ln -f \"\$f\" ${shellQuote(oemApps)}/\"\$bn\" 2>/dev/null || cp -f \"\$f\" ${shellQuote(oemApps)}/\"\$bn\") 2>/dev/null || true; done")
+                val appRes = runIsolatedRootScript(appCtx, "oemapp", "set -e\n$pathHeader\nmkdir -p ${shellQuote(oemApps)}\nfor f in \"\$PKG\"/*.msixbundle \"\$PKG\"/*.appxbundle \"\$PKG\"/*.msix \"\$PKG\"/*.appx \"\$PKG\"/*License*.xml \"\$PKG\"/*license*.xml; do if [ ! -f \"\$f\" ]; then continue; fi; bn=\$(basename \"\$f\"); ln -f \"\$f\" ${shellQuote(oemApps)}/\"\$bn\" 2>/dev/null || cp -f \"\$f\" ${shellQuote(oemApps)}/\"\$bn\"; done")
+                if (!appRes.isSuccess) throw IllegalStateException("Failed staging Store Apps into \$OEM\$: ${(appRes.out + appRes.err).takeLast(2).joinToString(" ").take(180)}")
             }
             if (job.hasNetFx3) {
                 addConsole("Staging .NET Framework 3.5 into sources/\$OEM\$/\$\$/Setup/sxs/")
-                runIsolatedRootScript(appCtx, "oemfx3", "$pathHeader\nmkdir -p ${shellQuote(oemSxs)}\nfor f in \"\$PKG\"/*netfx3-ondemand*.cab \"\$PKG\"/*NetFx3*.cab; do [ -f \"\$f\" ] && bn=\$(basename \"\$f\") && (ln -f \"\$f\" ${shellQuote(oemSxs)}/\"\$bn\" 2>/dev/null || cp -f \"\$f\" ${shellQuote(oemSxs)}/\"\$bn\") 2>/dev/null || true; done")
+                val fxRes = runIsolatedRootScript(appCtx, "oemfx3", "set -e\n$pathHeader\nmkdir -p ${shellQuote(oemSxs)}\nfor f in \"\$PKG\"/*netfx3-ondemand*.cab \"\$PKG\"/*NetFx3*.cab; do if [ ! -f \"\$f\" ]; then continue; fi; bn=\$(basename \"\$f\"); ln -f \"\$f\" ${shellQuote(oemSxs)}/\"\$bn\" 2>/dev/null || cp -f \"\$f\" ${shellQuote(oemSxs)}/\"\$bn\"; done")
+                if (!fxRes.isSuccess) throw IllegalStateException("Failed staging .NET 3.5 into \$OEM\$: ${(fxRes.out + fxRes.err).takeLast(2).joinToString(" ").take(180)}")
             }
             runIsolatedRootScript(appCtx, "w7efi", WindowsCustomizationEngine.applyWin7UefiFixSnippet(qWim, qFinalInstall, qIsoDir))
             if (config.experience.useCa2023Bootloaders) {
@@ -2474,7 +2628,8 @@ object WindowsBuildEngine {
                 Shell.cmd("rm -rf ${shellQuote("${isoDir.absolutePath}/sources/\$OEM\$")} 2>/dev/null || true").exec()
             } else {
                 val arch = if (config.build.arch.lowercase() in setOf("x86", "arm64", "amd64")) config.build.arch.lowercase() else "amd64"
-                val tmpXml = File(appCtx.cacheDir, "wb_auto.xml").apply { writeText(WindowsCustomizationEngine.generateAutounattendXml(config.experience, config.winUtil, arch, null, true, hasStagedOemUpdates, includeWindowsPePass = true), Charsets.UTF_8) }
+                val detectedLang = Shell.cmd("grep -iE '^[a-z]{2,3}(-[a-z0-9]{2,4}){1,2}[[:space:]]*=' ${shellQuote("${isoDir.absolutePath}/sources/lang.ini")} 2>/dev/null | head -n 1 | cut -d= -f1 | tr -d ' \r\n'").exec().out.firstOrNull().orEmpty().trim().ifBlank { config.lang.code }
+                val tmpXml = File(appCtx.cacheDir, "wb_auto.xml").apply { writeText(WindowsCustomizationEngine.generateAutounattendXml(config.experience, config.winUtil, arch, null, true, hasStagedOemUpdates, includeWindowsPePass = true, uiLang = detectedLang), Charsets.UTF_8) }
                 val tmpPantherXml = File(appCtx.cacheDir, "wb_panther.xml").apply { writeText(WindowsCustomizationEngine.generateAutounattendXml(config.experience, config.winUtil, arch, null, true, hasStagedOemUpdates, includeWindowsPePass = false), Charsets.UTF_8) }
                 val tmpSpec = File(appCtx.cacheDir, "wb_spec.cmd").apply { writeText(WindowsCustomizationEngine.buildSpecializeScript(config.experience, config.winUtil, hasStagedOemUpdates, hasStagedOemApps, hasStagedOemNetFx3), Charsets.UTF_8) }
                 val customPath = config.experience.customPostInstallScriptPath.trim()
@@ -2486,22 +2641,174 @@ object WindowsBuildEngine {
                 addConsole("Injected autounattend.xml + unplug-safe \$OEM\$ scripts")
             }
 
-            if (config.splitWimForFat32 && effectiveComp != WinIsoCompression.ESD && config.outputMode != WinBuildOutputMode.DIRECT_NTFS_USB) {
-                val wimSz = Shell.cmd("stat -c '%s' $qFinalInstall 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
-                if (wimSz > 4_000_000_000L) {
+            // In ISO mode (xorriso ISO-9660 + Joliet), WinPE's cdfs.sys requires every single file <= 4 GiB.
+            // Automatically split any >3.95 GiB install.wim -> install*.swm AND any >3.95 GiB .msu -> .pbpart01/.pbpart02!
+            if (config.outputMode != WinBuildOutputMode.DIRECT_NTFS_USB) {
+                val wimCheckPath = "${isoDir.absolutePath}/sources/install.wim"
+                val wimCheckSz = Shell.cmd("stat -c '%s' ${shellQuote(wimCheckPath)} 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                if (wimCheckSz > 3_950_000_000L) {
                     activeBin = "wimlib-imagex"
-                    addConsole("Splitting install.wim (${UsbGadgetEngine.formatBytes(wimSz)}) into FAT32-safe install*.swm (3,500 MB chunks)...")
-                    publishConv("Step 4/4 · Splitting install.wim (FAT32)...", "3,500 MB chunks (install*.swm)", 0.84f, wimSz)
+                    addConsole("Auto-splitting install.wim (${UsbGadgetEngine.formatBytes(wimCheckSz)}) into 3,500 MB install*.swm chunks (cdfs.sys + FAT32 safe)...")
+                    publishConv("Step 4/4 · Splitting >4GB install.wim...", "3,500 MB chunks (install*.swm)", 0.83f, wimCheckSz)
                     val swmPath = "${isoDir.absolutePath}/sources/install.swm"
-                    val swmRes = runIsolatedRootScript(appCtx, "wimsplit", "set -e\n$pathHeader\n$qWim split $qFinalInstall ${shellQuote(swmPath)} 3500 >/dev/null 2>&1\nrm -f $qFinalInstall")
-                    if (swmRes.isSuccess) addConsole("Split complete: sources/install*.swm ready for FAT32")
-                    else addConsole("WIM split failed (kept single install.wim)")
+                    val swmRes = runIsolatedRootScript(appCtx, "wimsplit", """
+                        set -e
+                        $pathHeader
+                        ${thermalExecPrefix(convThermalProfileLive)}
+                        ${'$'}THERM_PFX $qWim split ${shellQuote(wimCheckPath)} ${shellQuote(swmPath)} 3500 >/dev/null 2>&1
+                        if [ ! -s ${shellQuote(swmPath)} ] || [ ! -s ${shellQuote("${isoDir.absolutePath}/sources/install2.swm")} ]; then
+                            echo "WIM split output missing" >&2; exit 1
+                        fi
+                        rm -f ${shellQuote(wimCheckPath)}
+                    """.trimIndent())
+                    if (!swmRes.isSuccess) throw IllegalStateException("Failed to split >4 GiB install.wim: ${(swmRes.out + swmRes.err).takeLast(3).joinToString(" ").take(200)}")
+                    addConsole("Split complete: sources/install*.swm ready (all chunks <= 3.5 GB)")
+                }
+
+                // Split any >3.95 GiB .msu cumulative update in $OEM$/$$/Setup/Updates into 3,500 MiB .pbpart01/.pbpart02 chunks
+                val bigMsus = Shell.cmd("if [ -d ${shellQuote(oemUpdates)} ]; then for f in ${shellQuote(oemUpdates)}/*.msu ${shellQuote(oemUpdates)}/*.MSU; do if [ ! -f "\$f" ]; then continue; fi; sz=\$(stat -c '%s' "\$f" 2>/dev/null || echo 0); if [ "\$sz" -gt 3950000000 ]; then printf '%s|%s\n' "\$f" "\$sz"; fi; done; fi").exec().out
+                bigMsus.forEach { line ->
+                    val parts = line.split("|", limit = 2)
+                    if (parts.size == 2) {
+                        val msuPath = parts[0].trim()
+                        val msuSz = parts[1].trim().toLongOrNull() ?: 0L
+                        val msuName = msuPath.substringAfterLast('/')
+                        val freeBeforeSplit = UsbGadgetEngine.getFreeSpaceBytes(config.targetDir)
+                        if (freeBeforeSplit > 0L && freeBeforeSplit < msuSz + 256L * 1024L * 1024L) {
+                            throw IllegalStateException("Not enough free space to split $msuName (${UsbGadgetEngine.formatBytes(msuSz)}). Free: ${UsbGadgetEngine.formatBytes(freeBeforeSplit)}")
+                        }
+                        addConsole("Splitting >4 GiB update $msuName (${UsbGadgetEngine.formatBytes(msuSz)}) into 3,500 MiB .pbpart chunks (auto-rejoined during Windows Specialize)...")
+                        publishConv("Step 4/4 · Splitting >4GB update...", "$msuName (.pbpart01/.pbpart02)", 0.84f, msuSz)
+                        val msuSplitRes = runIsolatedRootScript(appCtx, "msusplit", """
+                            set -e
+                            $pathHeader
+                            SRC=${shellQuote(msuPath)}
+                            ORIG_SZ=${'$'}(stat -c '%s' "${'$'}SRC")
+                            BS=4194304
+                            CHUNK_BLKS=875
+                            SKIP=0
+                            IDX=1
+                            SUM=0
+                            rm -f "${'$'}SRC".pbpart*
+                            while [ "${'$'}SUM" -lt "${'$'}ORIG_SZ" ]; do
+                                TAG=${'$'}(printf '%02d' "${'$'}IDX")
+                                OUTP="${'$'}SRC.pbpart${'$'}TAG"
+                                dd if="${'$'}SRC" of="${'$'}OUTP" bs="${'$'}BS" count="${'$'}CHUNK_BLKS" skip="${'$'}SKIP" 2>/dev/null
+                                PSZ=${'$'}(stat -c '%s' "${'$'}OUTP" 2>/dev/null || echo 0)
+                                if [ "${'$'}PSZ" -le 0 ]; then rm -f "${'$'}OUTP"; break; fi
+                                SUM=${'$'}((SUM + PSZ))
+                                SKIP=${'$'}((SKIP + CHUNK_BLKS))
+                                IDX=${'$'}((IDX + 1))
+                            done
+                            if [ "${'$'}SUM" -ne "${'$'}ORIG_SZ" ]; then
+                                rm -f "${'$'}SRC".pbpart*
+                                echo "MSU split byte mismatch (${'$'}SUM != ${'$'}ORIG_SZ)" >&2
+                                exit 1
+                            fi
+                            rm -f "${'$'}SRC"
+                            echo "MSU_SPLIT_OK|${'$'}((IDX - 1)) parts|${'$'}SUM bytes"
+                        """.trimIndent())
+                        if (!msuSplitRes.isSuccess) {
+                            throw IllegalStateException("Failed splitting >4 GiB update $msuName: ${(msuSplitRes.out + msuSplitRes.err).takeLast(2).joinToString(" ").take(200)}")
+                        }
+                        val okInfo = msuSplitRes.out.firstOrNull { it.startsWith("MSU_SPLIT_OK|") }?.substringAfter('|') ?: "split"
+                        addConsole("Split complete: $msuName -> $okInfo (verified byte-exact)")
+                    }
                 }
             }
 
-            // Free temporary CAB/WIM staging files and mark ISODIR complete for instant Step-4 retry if packing fails!
-            Shell.cmd("rm -rf $qTmp /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive && touch $qIsoReadyMarker").exec()
+            // Free temporary CAB/WIM staging files and stamp PB_STAGE_V20 marker for safe Fast Step-4 retry!
+            Shell.cmd("rm -rf $qTmp /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive && printf '%s\n' '$STAGE_SCHEMA_VERSION' > $qIsoReadyMarker").exec()
             }
+
+            // Gate 1: Pre-Pack Full Staging Integrity Audit (checks ALL files in ISODIR before packing ISO or USB)
+            publishConv("Step 4/4 · Gate 1: Auditing all staged files...", "Zero-byte, WIM, SetupHost & size checks", 0.85f)
+            val isIsoOutput = config.outputMode != WinBuildOutputMode.DIRECT_NTFS_USB
+            val gate1Res = runIsolatedRootScript(appCtx, "gate1_audit", """
+                set -e
+                $pathHeader
+                # 1. Scan ALL files in ISODIR for 0-byte critical files + count total & 0-byte files
+                TOTAL_FILES=0
+                ZERO_ALL=0
+                BAD_ZERO=""
+                BAD_BIG=""
+                G1_LIST="/data/local/tmp/pb_g1_files.txt"
+                find "${'$'}ISODIR" -type f > "${'$'}G1_LIST"
+                while IFS= read -r f; do
+                    if [ ! -f "${'$'}f" ]; then continue; fi
+                    TOTAL_FILES=${'$'}((TOTAL_FILES + 1))
+                    sz=${'$'}(stat -c '%s' "${'$'}f" 2>/dev/null || echo 0)
+                    bn=${'$'}(basename "${'$'}f")
+                    low=${'$'}(printf '%s' "${'$'}bn" | tr 'A-Z' 'a-z')
+                    if [ "${'$'}sz" -eq 0 ]; then
+                        ZERO_ALL=${'$'}((ZERO_ALL + 1))
+                        case "${'$'}low" in
+                            *.wim|*.swm|*.esd|*.msu|*.cab|*.efi|*.dll|*.exe|*.mui|*.xml|*.cmd|*.bat|*.ini|*.cfg|*.sys|*.man|*.vbs|*.com|*.bin|*.pbpart*|bootmgr)
+                                BAD_ZERO="${'$'}f"
+                                break
+                                ;;
+                        esac
+                    fi
+                    if [ "${if (isIsoOutput) "1" else "0"}" = "1" ] && [ "${'$'}sz" -gt 3950000000 ]; then
+                        BAD_BIG="${'$'}f (${'$'}sz bytes)"
+                        break
+                    fi
+                done < "${'$'}G1_LIST"
+                rm -f "${'$'}G1_LIST"
+                if [ -n "${'$'}BAD_ZERO" ]; then echo "FAIL|0-byte critical file in ISODIR: ${'$'}BAD_ZERO"; exit 1; fi
+                if [ -n "${'$'}BAD_BIG" ]; then echo "FAIL|File exceeds 3.95 GiB ISO limit: ${'$'}BAD_BIG"; exit 1; fi
+                if [ "${'$'}TOTAL_FILES" -lt 20 ]; then echo "FAIL|ISODIR incomplete (only ${'$'}TOTAL_FILES files)"; exit 1; fi
+
+                # 2. Verify boot.wim (2+ indexes, index 2 bootable) and install.* WIM header
+                BOOT_INFO=${'$'}($qWim info "${'$'}ISODIR/sources/boot.wim" 2>/dev/null || true)
+                BOOT_CNT=${'$'}(printf '%s\n' "${'$'}BOOT_INFO" | grep -c '^Index:' || true)
+                if [ "${'$'}BOOT_CNT" -lt 2 ]; then echo "FAIL|boot.wim invalid (found ${'$'}BOOT_CNT index(es), need 2)"; exit 1; fi
+                INST_FILE=""
+                for cand in "${'$'}ISODIR/sources/install.wim" "${'$'}ISODIR/sources/install.swm" "${'$'}ISODIR/sources/install.esd"; do
+                    if [ -s "${'$'}cand" ]; then INST_FILE="${'$'}cand"; break; fi
+                done
+                if [ -z "${'$'}INST_FILE" ]; then echo "FAIL|Missing install.wim / install.swm / install.esd in ISODIR/sources/"; exit 1; fi
+                INST_CNT=${'$'}($qWim info "${'$'}INST_FILE" 2>/dev/null | grep -c '^Index:' || true)
+                if [ "${'$'}INST_CNT" -lt 1 ]; then echo "FAIL|Unreadable WIM header in ${'$'}(basename "${'$'}INST_FILE")"; exit 1; fi
+
+                # 3. Verify SetupHost.exe SHA-1 sync between ISODIR/sources/ and boot.wim Index 2 (prevents "Install driver to show hardware")
+                ISO_SH=${'$'}(find "${'$'}ISODIR/sources" -maxdepth 1 -type f -iname 'setuphost.exe' 2>/dev/null | head -n 1)
+                SH_SYNC="n/a"
+                if [ -n "${'$'}ISO_SH" ]; then
+                    SH_TMP="/data/local/tmp/pb_gate1_sh"
+                    rm -rf "${'$'}SH_TMP" && mkdir -p "${'$'}SH_TMP"
+                    $qWim extract "${'$'}ISODIR/sources/boot.wim" 2 "/sources/SetupHost.exe" --dest-dir="${'$'}SH_TMP" --no-acls --no-attributes >/dev/null 2>&1 ||                       $qWim extract "${'$'}ISODIR/sources/boot.wim" 2 "/sources/setuphost.exe" --dest-dir="${'$'}SH_TMP" --no-acls --no-attributes >/dev/null 2>&1 || true
+                    BOOT_SH=${'$'}(find "${'$'}SH_TMP" -maxdepth 1 -type f -iname 'setuphost.exe' 2>/dev/null | head -n 1)
+                    if [ -z "${'$'}BOOT_SH" ]; then
+                        rm -rf "${'$'}SH_TMP"; echo "FAIL|SetupHost.exe missing inside boot.wim Index 2"; exit 1
+                    fi
+                    H_ISO=${'$'}(sha1sum "${'$'}ISO_SH" | awk '{print ${'$'}1}')
+                    H_BOOT=${'$'}(sha1sum "${'$'}BOOT_SH" | awk '{print ${'$'}1}')
+                    rm -rf "${'$'}SH_TMP"
+                    if [ "${'$'}H_ISO" != "${'$'}H_BOOT" ]; then
+                        echo "FAIL|SetupHost.exe SHA-1 mismatch (ISODIR=${'$'}H_ISO vs boot.wim=${'$'}H_BOOT)"
+                        exit 1
+                    fi
+                    SH_SYNC="SHA-1 synced"
+                fi
+
+                # 4. Verify at least one bootloader exists
+                HAS_BL=${'$'}(find "${'$'}ISODIR" -maxdepth 4 -type f \( -iname 'etfsboot.com' -o -iname 'efisys*.bin' -o -iname 'bootx64.efi' -o -iname 'bootaa64.efi' \) 2>/dev/null | head -n 1)
+                if [ -z "${'$'}HAS_BL" ]; then echo "FAIL|No BIOS/UEFI bootloaders found in ISODIR"; exit 1; fi
+                echo "GATE1_OK|${'$'}TOTAL_FILES|${'$'}ZERO_ALL|${'$'}INST_CNT|${'$'}SH_SYNC"
+            """.trimIndent())
+            if (!gate1Res.isSuccess) {
+                val g1Err = (gate1Res.out + gate1Res.err).firstOrNull { it.startsWith("FAIL|") }?.substringAfter('|')
+                    ?: (gate1Res.out + gate1Res.err).takeLast(3).joinToString(" ")
+                Shell.cmd("rm -f $qIsoReadyMarker 2>/dev/null || true").exec()
+                throw IllegalStateException("Gate 1 pre-pack integrity audit failed: ${g1Err.take(240)}")
+            }
+            val g1Parts = gate1Res.out.firstOrNull { it.startsWith("GATE1_OK|") }?.split('|').orEmpty()
+            val isoDirFileCount = g1Parts.getOrNull(1)?.toIntOrNull() ?: 0
+            val isoDirZeroCount = g1Parts.getOrNull(2)?.toIntOrNull() ?: 0
+            val g1EdCnt = g1Parts.getOrNull(3)?.toIntOrNull() ?: 1
+            val g1ShSync = g1Parts.getOrNull(4).orEmpty().ifBlank { "OK" }
+            addConsole("Gate 1 passed: $isoDirFileCount staged files verified (0 corrupt, $g1EdCnt edition(s), SetupHost $g1ShSync)")
 
             var injectedMbPath: String? = null
             if (config.outputMode == WinBuildOutputMode.DIRECT_NTFS_USB) {
@@ -2514,36 +2821,20 @@ object WindowsBuildEngine {
                 }
                 if (usbErr != null) throw IllegalStateException(usbErr)
             } else {
-                val useUdfGenIso = tools.genisoimage != null
-                activeBin = if (useUdfGenIso) "genisoimage (UDF)" else "xorriso"
+                activeBin = "xorriso"
                 val qOutIso = shellQuote(finalOutputPath)
                 val volId = "WIN_${config.build.build.substringBefore('.')}".take(28).uppercase()
-
-                // Safety guard: WinPE's ISO-9660 driver (cdfs.sys) cannot read >4 GiB files if UDF is absent.
-                // When falling back to xorriso without UDF, auto-split any >3.9 GiB install.wim into 3,500 MB .swm chunks.
-                if (!useUdfGenIso) {
-                    val wimCheckPath = "${isoDir.absolutePath}/sources/install.wim"
-                    val wimCheckSz = Shell.cmd("stat -c '%s' ${shellQuote(wimCheckPath)} 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
-                    if (wimCheckSz > 3_950_000_000L) {
-                        addConsole("UDF writer unavailable & install.wim > 3.9 GiB (${UsbGadgetEngine.formatBytes(wimCheckSz)}) — auto-splitting to install*.swm for cdfs.sys compatibility...")
-                        publishConv("Step 4/4 · Auto-splitting >4GB WIM...", "3,500 MB chunks (cdfs.sys safety)", 0.85f, wimCheckSz)
-                        val autoSwm = "${isoDir.absolutePath}/sources/install.swm"
-                        val autoSplitRes = runIsolatedRootScript(appCtx, "autoswm", "set -e\n$pathHeader\n${thermalExecPrefix(convThermalProfileLive)}\n\$THERM_PFX $qWim split ${shellQuote(wimCheckPath)} ${shellQuote(autoSwm)} 3500 >/dev/null 2>&1\nrm -f ${shellQuote(wimCheckPath)}")
-                        if (autoSplitRes.isSuccess) addConsole("Auto-split complete: sources/install*.swm ready")
-                        else addConsole("Warning: auto-split failed (proceeding with single install.wim)")
-                    }
+                val estIsoBytes = Shell.cmd("du -sb $qIsoDir 2>/dev/null | awk '{print \$1}'").exec().out.firstOrNull()?.trim()?.toLongOrNull()?.coerceAtLeast(1L) ?: (5L * 1024L * 1024L * 1024L)
+                val freeForIso = UsbGadgetEngine.getFreeSpaceBytes(config.targetDir)
+                if (freeForIso > 0L && freeForIso < estIsoBytes + 256L * 1024L * 1024L) {
+                    throw IllegalStateException("Not enough free space to pack ISO. Need ~${UsbGadgetEngine.formatBytes(estIsoBytes + 256L * 1024L * 1024L)}, have ${UsbGadgetEngine.formatBytes(freeForIso)} free.")
                 }
 
-                val estIsoBytes = Shell.cmd("du -sb $qIsoDir 2>/dev/null | awk '{print \$1}'").exec().out.firstOrNull()?.trim()?.toLongOrNull()?.coerceAtLeast(1L) ?: (5L * 1024L * 1024L * 1024L)
                 val xorLog = "/data/local/tmp/pb_xorriso_prog.log"
                 val qXorLog = shellQuote(xorLog)
                 val preferNoPrompt = config.experience.hasAnyActive() || config.winUtil.hasAnyActive()
-                if (useUdfGenIso) {
-                    addConsole("genisoimage (UDF 1.02): packing ~${UsbGadgetEngine.formatBytes(estIsoBytes)} (-udf -allow-limited-size -iso-level 3 -hide * -c boot/boot.cat)")
-                } else {
-                    addConsole("xorriso: packing ~${UsbGadgetEngine.formatBytes(estIsoBytes)} (-iso-level 3 -J -joliet-long --stdio_sync 16m)")
-                }
-                publishConv(if (useUdfGenIso) "Step 4/4 · Packing UDF 1.02 ISO..." else "Step 4/4 · Packing bootable ISO...", finalFileName, 0.86f)
+                addConsole("xorriso: packing ~${UsbGadgetEngine.formatBytes(estIsoBytes)} (-iso-level 3 -J -joliet-long -c boot/boot.cat --stdio_sync 16m)")
+                publishConv("Step 4/4 · Packing bootable ISO (xorriso)...", finalFileName, 0.86f)
                 val xorTherm = thermalExecPrefix(convThermalProfileLive)
                 val isoPollJob = scope.launch {
                     while (isActive && !convCancelledFlag.get()) {
@@ -2553,16 +2844,15 @@ object WindowsBuildEngine {
                         val curSz = pollOut.firstOrNull { it.startsWith("SZ|") }?.substringAfter('|')?.trim()?.toLongOrNull() ?: lastMeasuredOutputBytes
                         pollOut.filterNot { it.startsWith("SZ|") }.map { it.trim() }.filter { it.isNotEmpty() }.lastOrNull()?.let { addConsole(it) }
                         publishConv(
-                            if (useUdfGenIso) "Step 4/4 · Packing UDF 1.02 ISO..." else "Step 4/4 · Packing bootable ISO...",
+                            "Step 4/4 · Packing bootable ISO (xorriso)...",
                             "${UsbGadgetEngine.formatBytes(curSz)} / ~${UsbGadgetEngine.formatBytes(estIsoBytes)}",
-                            0.86f + (curSz.toFloat() / estIsoBytes.toFloat()).coerceIn(0f, 1f) * 0.10f,
+                            0.86f + (curSz.toFloat() / estIsoBytes.toFloat()).coerceIn(0f, 1f) * 0.09f,
                             curSz
                         )
                     }
                 }
-                val isoPackScript = if (useUdfGenIso) {
-                    val qGenIso = shellQuote(tools.genisoimage!!)
-                    """
+                val qXor = shellQuote(tools.xorriso!!)
+                val isoPackScript = """
                     set -e
                     $pathHeader
                     $xorTherm
@@ -2581,49 +2871,18 @@ object WindowsBuildEngine {
                     fi
                     BIOS_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'etfsboot.com' 2>/dev/null | head -n 1 | sed 's|^\./||')
                     if [ -n "${'$'}BIOS_BOOT" ] || [ -n "${'$'}EFI_BOOT" ]; then mkdir -p boot; fi
-                    echo "UDF 1.02 Bootloaders: BIOS=${'$'}{BIOS_BOOT:-none} | EFI=${'$'}{EFI_BOOT:-none}" >> $qXorLog
+                    echo "ISO-9660/Joliet Bootloaders: BIOS=${'$'}{BIOS_BOOT:-none} | EFI=${'$'}{EFI_BOOT:-none}" >> $qXorLog
                     if [ -n "${'$'}BIOS_BOOT" ] && [ -n "${'$'}EFI_BOOT" ]; then
-                        ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -hide "*" -c boot/boot.cat -V "$volId" -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOutIso . >> $qXorLog 2>&1 &
+                        ${'$'}THERM_PFX $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -c boot/boot.cat -volid "$volId" -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOutIso . >> $qXorLog 2>&1 &
                     elif [ -n "${'$'}EFI_BOOT" ]; then
-                        ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -hide "*" -c boot/boot.cat -V "$volId" -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOutIso . >> $qXorLog 2>&1 &
+                        ${'$'}THERM_PFX $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -c boot/boot.cat -volid "$volId" -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOutIso . >> $qXorLog 2>&1 &
                     else
-                        ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -hide "*" -V "$volId" -o $qOutIso . >> $qXorLog 2>&1 &
+                        ${'$'}THERM_PFX $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "$volId" -o $qOutIso . >> $qXorLog 2>&1 &
                     fi
                     XPID=${'$'}!; echo "${'$'}XPID" > $ACTIVE_PID_FILE; wait "${'$'}XPID"
                     rm -f $ACTIVE_PID_FILE
-                    """.trimIndent()
-                } else {
-                    val qXor = shellQuote(tools.xorriso!!)
-                    """
-                    set -e
-                    $pathHeader
-                    $xorTherm
-                    mkdir -p ${shellQuote(safeTargetDir)}
-                    rm -f $qOutIso
-                    : > $qXorLog
-                    trap 'rm -f $ACTIVE_PID_FILE' EXIT
-                    cd "${'$'}ISODIR"
-                    EFI_BOOT=""
-                    if [ "${if (preferNoPrompt) "1" else "0"}" = "1" ]; then
-                        EFI_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'efisys_noprompt.bin' 2>/dev/null | head -n 1 | sed 's|^\./||')
-                    fi
-                    if [ -z "${'$'}EFI_BOOT" ]; then
-                        EFI_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'efisys.bin' 2>/dev/null | head -n 1 | sed 's|^\./||')
-                    fi
-                    BIOS_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'etfsboot.com' 2>/dev/null | head -n 1 | sed 's|^\./||')
-                    echo "ISO-9660 Bootloaders: BIOS=${'$'}{BIOS_BOOT:-none} | EFI=${'$'}{EFI_BOOT:-none}" >> $qXorLog
-                    if [ -n "${'$'}BIOS_BOOT" ] && [ -n "${'$'}EFI_BOOT" ]; then
-                        ${'$'}THERM_PFX $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "$volId" -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOutIso "${'$'}ISODIR" >> $qXorLog 2>&1 &
-                    elif [ -n "${'$'}EFI_BOOT" ]; then
-                        ${'$'}THERM_PFX $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "$volId" -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOutIso "${'$'}ISODIR" >> $qXorLog 2>&1 &
-                    else
-                        ${'$'}THERM_PFX $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "$volId" -o $qOutIso "${'$'}ISODIR" >> $qXorLog 2>&1 &
-                    fi
-                    XPID=${'$'}!; echo "${'$'}XPID" > $ACTIVE_PID_FILE; wait "${'$'}XPID"
-                    rm -f $ACTIVE_PID_FILE
-                    """.trimIndent()
-                }
-                val xorRes = runIsolatedRootScript(appCtx, if (useUdfGenIso) "genisoimage" else "xorriso", isoPackScript)
+                """.trimIndent()
+                val xorRes = runIsolatedRootScript(appCtx, "xorriso", isoPackScript)
                 isoPollJob.cancel()
                 val xorLastLines = Shell.cmd("tail -n 8 $qXorLog 2>/dev/null | tr '\r' '\n' | tail -n 6 || true").exec().out.map { it.trim() }.filter { it.isNotEmpty() }
                 xorLastLines.forEach { addConsole(it) }
@@ -2631,7 +2890,55 @@ object WindowsBuildEngine {
                 if (!xorRes.isSuccess) {
                     Shell.cmd("rm -f $qOutIso 2>/dev/null || true").exec()
                     val errDetail = xorLastLines.takeLast(3).joinToString(" | ").ifBlank { (xorRes.out + xorRes.err).takeLast(3).joinToString(" ") }
-                    throw IllegalStateException("${if (useUdfGenIso) "genisoimage (UDF)" else "xorriso"} failed (exit ${xorRes.code}): ${errDetail.take(260)}")
+                    throw IllegalStateException("xorriso failed (exit ${xorRes.code}): ${errDetail.take(260)}")
+                }
+
+                // Gate 2: Post-Pack Full ISO Audit via bundled 7zzs (catches any 0-byte truncation or dropped files!)
+                val q7zBin = tools.sevenZip?.let { shellQuote(it) }
+                if (q7zBin != null) {
+                    activeBin = "7zzs"
+                    publishConv("Step 4/4 · Gate 2: Verifying final ISO...", "Scanning all ISO entries for corruption", 0.96f)
+                    val gate2Res = runIsolatedRootScript(appCtx, "gate2_iso", """
+                        set -e
+                        $q7zBin l -slt $qOutIso 2>/dev/null | awk '
+                            BEGIN { path=""; folder=""; sz=-1; files=0; zeros=0; bad=""; seen=0 }
+                            function flush_rec() {
+                                if (!seen) return
+                                if (folder != "+") {
+                                    lp = tolower(path)
+                                    if (lp !~ /(^|[\/\\])boot\.cat(alog)?$/ && lp !~ /^\[boot\]/) {
+                                        files++
+                                        if (sz == 0) {
+                                            zeros++
+                                            if (bad == "" && lp ~ /\.(wim|swm|esd|msu|cab|efi|dll|exe|mui|xml|cmd|bat|ini|cfg|sys|man|vbs|com|bin|pbpart[0-9]+)$|(^|[\/\\])bootmgr$/) {
+                                                bad = path
+                                            }
+                                        }
+                                    }
+                                }
+                                path=""; folder=""; sz=-1; seen=0
+                            }
+                            /^Path = / { flush_rec(); path=substr(${'$'}0, 8); seen=1; next }
+                            /^Folder = / { folder=substr(${'$'}0, 10); next }
+                            /^Size = / { sz=substr(${'$'}0, 8)+0; next }
+                            /^$/ { flush_rec(); next }
+                            END { flush_rec(); printf "G2|%d|%d|%s\n", files, zeros, bad }
+                        '
+                    """.trimIndent())
+                    val g2Line = gate2Res.out.firstOrNull { it.startsWith("G2|") }
+                    if (!gate2Res.isSuccess || g2Line == null) {
+                        Shell.cmd("rm -f $qOutIso 2>/dev/null || true").exec()
+                        throw IllegalStateException("Gate 2 ISO audit failed: 7zzs could not read the finished ISO.")
+                    }
+                    val g2 = g2Line.split('|', limit = 4)
+                    val isoFiles = g2.getOrNull(1)?.toIntOrNull() ?: 0
+                    val isoZeros = g2.getOrNull(2)?.toIntOrNull() ?: 0
+                    val isoBad = g2.getOrNull(3).orEmpty().trim()
+                    if (isoBad.isNotEmpty() || isoZeros > isoDirZeroCount || (isoDirFileCount > 0 && isoFiles < isoDirFileCount)) {
+                        Shell.cmd("rm -f $qOutIso 2>/dev/null || true").exec()
+                        throw IllegalStateException("Gate 2 ISO integrity failed (files=$isoFiles/$isoDirFileCount, zeros=$isoZeros/$isoDirZeroCount${if (isoBad.isNotEmpty()) ", corrupt=$isoBad" else ""}). Staged ISODIR preserved for retry.")
+                    }
+                    addConsole("Gate 2 passed: $isoFiles/$isoDirFileCount ISO files verified via 7zzs (0 corrupt)")
                 }
                 UsbGadgetEngine.fixUserStoragePermissions(appCtx, safeTargetDir, isDir = true)
                 UsbGadgetEngine.fixUserStoragePermissions(appCtx, finalOutputPath, isDir = false)
@@ -2683,7 +2990,7 @@ object WindowsBuildEngine {
             Shell.cmd("rm -rf ${shellQuote(isoDir.absolutePath)} ${shellQuote(tmpDir.absolutePath)} 2>/dev/null || true").exec()
         } catch (e: Exception) {
             // Preserve PKGS & (if Step 4 already staged) preserve ISODIR so Retry jumps straight to Step 4 packing!
-            val keepIsoDir = currentStep == 4 && Shell.cmd("[ -f ${shellQuote("$workRootPath/.pb_isodir_ready")} ] && echo OK || true").exec().out.any { it.trim() == "OK" }
+            val keepIsoDir = currentStep == 4 && isStageMarkerValid(workRootPath)
             if (keepIsoDir) {
                 Shell.cmd("rm -rf ${shellQuote(tmpDir.absolutePath)} 2>/dev/null || true").exec()
             } else {
@@ -2694,6 +3001,14 @@ object WindowsBuildEngine {
             }
             val msg = e.message ?: "Unexpected build error"
             addConsole("ERROR: $msg")
+            runCatching {
+                val failLogTmp = File(appCtx.cacheDir, "pb_failed_build.log")
+                failLogTmp.writeText("PocketBoot v4.5.0 Build Failure Log (${nowTs()})\nBuild: ${job.jobTitle}\nOutput: $finalFileName\nStep: $currentStep/4\nError: $msg\n\n--- Console Log ---\n${consoleLines.joinToString("\n")}\n", Charsets.UTF_8)
+                val failDst = "$safeTargetDir/PocketBoot_FailedBuild.log"
+                Shell.cmd("mkdir -p ${shellQuote(safeTargetDir)} && cp -f ${shellQuote(failLogTmp.absolutePath)} ${shellQuote(failDst)}").exec()
+                UsbGadgetEngine.fixUserStoragePermissions(appCtx, failDst, isDir = false)
+                failLogTmp.delete()
+            }
             if (keepIsoDir) addConsole("Preserved staged ISODIR + packages — Retry will jump straight to Step 4 packing!")
             else if (!job.isReadOnlySource) addConsole("Saved downloaded UUP packages for instant Retry.")
             lastFailedJob = job

@@ -84,11 +84,8 @@ object WindowsIsoSlimmer {
             ?: return@withContext ActionResult(false, "Bundled 7-Zip extractor not found.")
         val wimlib = WindowsImageBuilder.findBundledBinary(context, "libwimlib_imagex.so", listOf("wimlib-imagex"))
             ?: return@withContext ActionResult(false, "Bundled wimlib-imagex not found.")
-        val genisoimage = WindowsImageBuilder.findBundledBinary(context, "libgenisoimage.so", listOf("genisoimage", "mkisofs"))
         val xorriso = WindowsImageBuilder.findBundledBinary(context, "libxorriso.so", listOf("xorriso"))
-        if (genisoimage == null && xorriso == null) {
-            return@withContext ActionResult(false, "Bundled ISO packer (genisoimage/xorriso) not found.")
-        }
+            ?: return@withContext ActionResult(false, "Bundled ISO packer (xorriso) not found.")
 
         val srcPath = UsbGadgetEngine.resolveDirectPath(config.sourceIso.path)
         val outDir = UsbGadgetEngine.resolveDirectPath(config.outputDir).trimEnd('/')
@@ -104,8 +101,7 @@ object WindowsIsoSlimmer {
         val qOut = shellQuote(outPath)
         val q7z = shellQuote(sevenZip)
         val qWim = shellQuote(wimlib)
-        val qGenIso = genisoimage?.let { shellQuote(it) }
-        val qXor = xorriso?.let { shellQuote(it) }
+        val qXor = shellQuote(xorriso)
         val envPrefix = "export TMPDIR=$qTmp HOME=$qTmp WIMLIB_IMAGEX_IGNORE_CASE=1"
 
         return@withContext runCatching {
@@ -208,19 +204,19 @@ object WindowsIsoSlimmer {
                 tmpXml.delete(); tmpPantherXml.delete(); tmpSpec.delete(); tmpComp.delete()
             }
 
-            if (qGenIso == null && !config.convertToEsd) {
+            if (!config.convertToEsd) {
                 val slimWimSz = Shell.cmd("stat -c '%s' ${shellQuote(finalInstallInIso)} 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
                 if (slimWimSz > 3_950_000_000L) {
                     onProgress(WindowsBuildProgress("Auto-splitting >4GB install.wim...", "cdfs.sys compatibility (3.5 GB chunks)", 0.85f, false))
                     val swmDst = "$isoDir/sources/install.swm"
-                    WindowsBuildEngine.runIsolatedRootScript(context, "slim_swm", "set -e\n$envPrefix\n$qWim split ${shellQuote(finalInstallInIso)} ${shellQuote(swmDst)} 3500 >/dev/null 2>&1\nrm -f ${shellQuote(finalInstallInIso)}")
+                    val swmRes = WindowsBuildEngine.runIsolatedRootScript(context, "slim_swm", "set -e\n$envPrefix\n$qWim split ${shellQuote(finalInstallInIso)} ${shellQuote(swmDst)} 3500 >/dev/null 2>&1\nrm -f ${shellQuote(finalInstallInIso)}")
+                    if (!swmRes.isSuccess) throw IllegalStateException("Failed to split >4 GiB install.wim")
                 }
             }
 
-            onProgress(WindowsBuildProgress(if (qGenIso != null) "Rebuilding UDF 1.02 ISO..." else "Rebuilding bootable ISO...", outName, 0.87f, false))
+            onProgress(WindowsBuildProgress("Rebuilding bootable ISO (xorriso)...", outName, 0.87f, false))
             val preferNoPrompt = config.experience.hasAnyActive() || config.winUtil.hasAnyActive()
-            val packCmd = if (qGenIso != null) {
-                """
+            val packCmd = """
                 set -e
                 $envPrefix
                 ${WindowsBuildEngine.thermalExecPrefix(slimProf)}
@@ -228,34 +224,7 @@ object WindowsIsoSlimmer {
                 rm -f $qOut
                 ISODIR=$qIsoDir
                 cd "${'$'}ISODIR"
-                EFI_BOOT=""
-                if [ "${if (preferNoPrompt) "1" else "0"}" = "1" ]; then
-                    EFI_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'efisys_noprompt.bin' 2>/dev/null | head -n 1 | sed 's|^\./||')
-                fi
-                if [ -z "${'$'}EFI_BOOT" ]; then
-                    EFI_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'efisys.bin' 2>/dev/null | head -n 1 | sed 's|^\./||')
-                fi
-                BIOS_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'etfsboot.com' 2>/dev/null | head -n 1 | sed 's|^\./||')
-
                 find . -exec touch {} + 2>/dev/null || true
-                if [ -n "${'$'}BIOS_BOOT" ] || [ -n "${'$'}EFI_BOOT" ]; then mkdir -p boot; fi
-                if [ -n "${'$'}BIOS_BOOT" ] && [ -n "${'$'}EFI_BOOT" ]; then
-                    ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -hide "*" -c boot/boot.cat -V "POCKETBOOT_SLIM" -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOut .
-                elif [ -n "${'$'}EFI_BOOT" ]; then
-                    ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -hide "*" -c boot/boot.cat -V "POCKETBOOT_SLIM" -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOut .
-                else
-                    ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -hide "*" -V "POCKETBOOT_SLIM" -o $qOut .
-                fi
-                """.trimIndent()
-            } else {
-                """
-                set -e
-                $envPrefix
-                ${WindowsBuildEngine.thermalExecPrefix(slimProf)}
-                mkdir -p ${shellQuote(outDir)}
-                rm -f $qOut
-                ISODIR=$qIsoDir
-                cd "${'$'}ISODIR"
                 EFI_BOOT=""
                 if [ "${if (preferNoPrompt) "1" else "0"}" = "1" ]; then
                     EFI_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'efisys_noprompt.bin' 2>/dev/null | head -n 1 | sed 's|^\./||')
@@ -264,19 +233,44 @@ object WindowsIsoSlimmer {
                     EFI_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'efisys.bin' 2>/dev/null | head -n 1 | sed 's|^\./||')
                 fi
                 BIOS_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'etfsboot.com' 2>/dev/null | head -n 1 | sed 's|^\./||')
+                if [ -n "${'$'}BIOS_BOOT" ] || [ -n "${'$'}EFI_BOOT" ]; then mkdir -p boot; fi
 
                 if [ -n "${'$'}BIOS_BOOT" ] && [ -n "${'$'}EFI_BOOT" ]; then
-                    ${'$'}THERM_PFX ${qXor!!} -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "POCKETBOOT_SLIM" -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOut "${'$'}ISODIR"
+                    ${'$'}THERM_PFX $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -c boot/boot.cat -volid "POCKETBOOT_SLIM" -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOut .
                 elif [ -n "${'$'}EFI_BOOT" ]; then
-                    ${'$'}THERM_PFX ${qXor!!} -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "POCKETBOOT_SLIM" -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOut "${'$'}ISODIR"
+                    ${'$'}THERM_PFX $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -c boot/boot.cat -volid "POCKETBOOT_SLIM" -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOut .
                 else
-                    ${'$'}THERM_PFX ${qXor!!} -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "POCKETBOOT_SLIM" -o $qOut "${'$'}ISODIR"
+                    ${'$'}THERM_PFX $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "POCKETBOOT_SLIM" -o $qOut .
                 fi
-                """.trimIndent()
-            }
+            """.trimIndent()
             val xorRes = WindowsBuildEngine.runIsolatedRootScript(context, "slim_iso", packCmd)
             if (!xorRes.isSuccess) {
                 throw IllegalStateException("ISO rebuild failed: ${(xorRes.out + xorRes.err).takeLast(3).joinToString(" ").take(180)}")
+            }
+            onProgress(WindowsBuildProgress("Verifying rebuilt ISO...", outName, 0.96f, false))
+            val slimVerify = WindowsBuildEngine.runIsolatedRootScript(context, "slim_verify", """
+                set -e
+                $q7z l -slt $qOut 2>/dev/null | awk '
+                    BEGIN { path=""; folder=""; sz=-1; bad=""; seen=0 }
+                    function flush_rec() {
+                        if (!seen) return
+                        if (folder != "+") {
+                            lp = tolower(path)
+                            if (sz == 0 && lp ~ /\.(wim|swm|esd|efi|dll|exe|mui|xml|cmd|bat|ini|cfg|sys|man|vbs|com|bin)$|(^|[\/\\])bootmgr$/) bad = path
+                        }
+                        path=""; folder=""; sz=-1; seen=0
+                    }
+                    /^Path = / { flush_rec(); path=substr(${'$'}0, 8); seen=1; next }
+                    /^Folder = / { folder=substr(${'$'}0, 10); next }
+                    /^Size = / { sz=substr(${'$'}0, 8)+0; next }
+                    /^$/ { flush_rec(); next }
+                    END { flush_rec(); if (bad != "") { print "BAD|" bad; exit 1 } else print "OK" }
+                '
+            """.trimIndent())
+            if (!slimVerify.isSuccess) {
+                Shell.cmd("rm -f $qOut 2>/dev/null || true").exec()
+                val bad = slimVerify.out.firstOrNull { it.startsWith("BAD|") }?.substringAfter('|') ?: "unreadable ISO"
+                throw IllegalStateException("Slimmed ISO integrity check failed: $bad")
             }
 
             UsbGadgetEngine.fixUserStoragePermissions(context, outDir, isDir = true)

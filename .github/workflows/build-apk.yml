@@ -321,113 +321,53 @@ jobs:
             fi
           ) || echo "::warning::Could not bundle static xorriso"
 
-          # 11. Cross-compile STATIC ARM64 genisoimage (cdrkit + Debian EFI patch + UDF 1.02) -> libgenisoimage.so
-          #     Matches UUPdump Windows (cdimage -udfver102) & Linux (convert.sh) so >4 GiB install.wim mounts via udfs.sys!
+          # 11. Smoke-test bundled static ARM64 xorriso + 7zzs under qemu-aarch64 (verifies zero 0-byte corruption!)
           (
             set -e
-            SYSROOT="/tmp/arm64-sysroot"
-            mkdir -p "$SYSROOT/include" "$SYSROOT/lib" /tmp/zlib-src /tmp/bzip2-src /tmp/cdrkit-src
-
-            # 11a. Static ARM64 zlib (libz.a)
-            curl -fSL "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz" -o /tmp/zlib.tar.gz || \
-              curl -fSL "https://zlib.net/zlib-1.3.1.tar.gz" -o /tmp/zlib.tar.gz
-            tar -xzf /tmp/zlib.tar.gz --strip-components=1 -C /tmp/zlib-src
-            (
-              cd /tmp/zlib-src
-              CC=aarch64-linux-gnu-gcc AR=aarch64-linux-gnu-ar RANLIB=aarch64-linux-gnu-ranlib \
-                CFLAGS="-O2" ./configure --prefix="$SYSROOT" --static
-              make -j"$(nproc)" install
-            )
-
-            # 11b. Static ARM64 bzip2 (libbz2.a)
-            curl -fSL "https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz" -o /tmp/bzip2.tar.gz || \
-              curl -fSL "https://deb.debian.org/debian/pool/main/b/bzip2/bzip2_1.0.8.orig.tar.gz" -o /tmp/bzip2.tar.gz
-            tar -xzf /tmp/bzip2.tar.gz --strip-components=1 -C /tmp/bzip2-src
-            (
-              cd /tmp/bzip2-src
-              make -j"$(nproc)" CC=aarch64-linux-gnu-gcc AR=aarch64-linux-gnu-ar RANLIB=aarch64-linux-gnu-ranlib CFLAGS="-O2 -D_FILE_OFFSET_BITS=64" libbz2.a
-              cp libbz2.a "$SYSROOT/lib/"
-              cp bzlib.h "$SYSROOT/include/"
-            )
-
-            # 11c. Fetch cdrkit 1.1.11 + Debian patches (includes add-efi-boot.patch for -e / EL_TORITO_ARCH_EFI, gcc10, cmake-4)
-            if curl -fSL "https://deb.debian.org/debian/pool/main/c/cdrkit/cdrkit_1.1.11.orig.tar.gz" -o /tmp/cdrkit.orig.tar.gz; then
-              tar -xzf /tmp/cdrkit.orig.tar.gz --strip-components=1 -C /tmp/cdrkit-src
-              for debver in 5 4 3.4; do
-                if curl -fSL "https://deb.debian.org/debian/pool/main/c/cdrkit/cdrkit_1.1.11-${debver}.debian.tar.xz" -o /tmp/cdrkit.debian.tar.xz 2>/dev/null; then
-                  tar -xf /tmp/cdrkit.debian.tar.xz -C /tmp/cdrkit-src
-                  break
-                fi
-              done
-            else
-              git clone --depth 1 https://salsa.debian.org/debian/cdrkit.git /tmp/cdrkit-src
-            fi
-
-            cd /tmp/cdrkit-src
-            if [ -f debian/patches/series ]; then
-              while IFS= read -r p; do
-                case "$p" in ""|\#*) continue ;; esac
-                [ -f "debian/patches/$p" ] && patch -p1 --batch --forward < "debian/patches/$p" || true
-              done < debian/patches/series
-            fi
-
-            # Avoid host libmagic & wodim's Linux libcap FATAL_ERROR (genisoimage does not use libcap or icedax/readom)
-            sed -i 's/CHECK_INCLUDE_FILES("magic.h" USE_MAGIC)/SET(USE_MAGIC 0)/g' genisoimage/CMakeLists.txt || true
-            sed -i 's/CHECK_INCLUDE_FILES(magic.h USE_MAGIC)/SET(USE_MAGIC 0)/g' genisoimage/CMakeLists.txt || true
-            sed -i 's/FATAL_ERROR/STATUS/g' wodim/CMakeLists.txt || true
-            sed -i 's/icedax//g; s/readom//g; s/libedc//g; s/libparanoia//g; s/netscsid//g; s|3rd-party/dirsplit||g' CMakeLists.txt || true
-
-            # Install qemu-user here (after Sections 1-10 finished) so CMake try_run(BITFIELDS_HTOL) & smoke test work
+            test -x "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libxorriso.so"
+            test -x "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/lib7zzs.so"
             sudo apt-get install -y -qq qemu-user >/dev/null 2>&1 || true
             QEMU_BIN=$(command -v qemu-aarch64 || command -v qemu-aarch64-static || echo "")
-            CC_ABS=$(command -v aarch64-linux-gnu-gcc)
-            AR_ABS=$(command -v aarch64-linux-gnu-ar)
-            RANLIB_ABS=$(command -v aarch64-linux-gnu-ranlib)
-            mkdir -p build
-            cd build
-            CMAKE_EMU_ARG=""
-            [ -n "$QEMU_BIN" ] && CMAKE_EMU_ARG="-DCMAKE_CROSSCOMPILING_EMULATOR=${QEMU_BIN};-L;/usr/aarch64-linux-gnu"
-
-            cmake .. \
-              -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-              -DCMAKE_SYSTEM_NAME=Linux \
-              -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
-              -DCMAKE_C_COMPILER="$CC_ABS" \
-              -DCMAKE_AR="$AR_ABS" \
-              -DCMAKE_RANLIB="$RANLIB_ABS" \
-              -DCMAKE_FIND_ROOT_PATH="$SYSROOT;/usr/aarch64-linux-gnu" \
-              -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
-              -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
-              -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
-              $CMAKE_EMU_ARG \
-              -DCMAKE_C_FLAGS="-O2 -std=gnu17 -fcommon -D_FILE_OFFSET_BITS=64 -I${SYSROOT}/include -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-format-security" \
-              -DCMAKE_EXE_LINKER_FLAGS="-static -L${SYSROOT}/lib" \
-              -DUSE_MAGIC=0
-
-            cmake --build . --target genisoimage -j"$(nproc)"
-            GEN_BIN="genisoimage/genisoimage"
-            file "$GEN_BIN"
-            if ! aarch64-linux-gnu-readelf -l "$GEN_BIN" 2>/dev/null | grep -q INTERP; then
-              # Smoke-test UDF 1.02 + Dual BIOS/UEFI El Torito flags under qemu-aarch64
-              if [ -n "$QEMU_BIN" ]; then
-                mkdir -p /tmp/geniso_test/boot /tmp/geniso_test/efi/microsoft/boot /tmp/geniso_test/sources
-                dd if=/dev/zero of=/tmp/geniso_test/boot/etfsboot.com bs=512 count=8 status=none
-                dd if=/dev/zero of=/tmp/geniso_test/efi/microsoft/boot/efisys.bin bs=1024 count=16 status=none
-                echo "test" > /tmp/geniso_test/sources/install.wim
-                "$QEMU_BIN" "$GEN_BIN" -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -hide "*" -c boot/boot.cat -V "PB_UDF_TEST" \
-                  -b "boot/etfsboot.com" -no-emul-boot -boot-load-size 8 \
-                  -eltorito-alt-boot -e "efi/microsoft/boot/efisys.bin" -no-emul-boot \
-                  -o /tmp/geniso_test.iso /tmp/geniso_test
-                file /tmp/geniso_test.iso
-                ls -lh /tmp/geniso_test.iso
-                rm -rf /tmp/geniso_test /tmp/geniso_test.iso
-              fi
-              aarch64-linux-gnu-strip "$GEN_BIN"
-              cp "$GEN_BIN" "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libgenisoimage.so"
-              chmod 755 "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libgenisoimage.so"
+            if [ -n "$QEMU_BIN" ]; then
+              TDIR="/tmp/pb_xor_smoke"
+              rm -rf "$TDIR" /tmp/pb_xor_smoke.iso
+              mkdir -p "$TDIR/boot" "$TDIR/efi/microsoft/boot" "$TDIR/sources/\$OEM\$/\$\$/Setup/Scripts" "$TDIR/support/logging/en-us"
+              dd if=/dev/zero of="$TDIR/boot/etfsboot.com" bs=512 count=8 status=none
+              dd if=/dev/zero of="$TDIR/efi/microsoft/boot/efisys.bin" bs=1024 count=16 status=none
+              printf 'WIM_HEADER_TEST_DATA\n' > "$TDIR/sources/install.wim"
+              printf '@echo off\r\necho ok\r\n' > "$TDIR/sources/\$OEM\$/\$\$/Setup/Scripts/PocketBoot_Specialize.cmd"
+              printf 'ETW_MANIFEST_DATA\n' > "$TDIR/support/logging/en-us/actionqueueetw.dll.mui"
+              (
+                cd "$TDIR"
+                "$QEMU_BIN" "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libxorriso.so" -as mkisofs                   --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -c boot/boot.cat                   -volid "PB_XOR_TEST"                   -b "boot/etfsboot.com" -no-emul-boot -boot-load-size 8                   -eltorito-alt-boot -e "efi/microsoft/boot/efisys.bin" -no-emul-boot                   -o /tmp/pb_xor_smoke.iso .
+              )
+              file /tmp/pb_xor_smoke.iso
+              "$QEMU_BIN" "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/lib7zzs.so" l -slt /tmp/pb_xor_smoke.iso | awk '
+                BEGIN { path=""; folder=""; sz=-1; files=0; zeros=0; seen=0 }
+                function flush_rec() {
+                  if (!seen) return
+                  if (folder != "+") {
+                    lp = tolower(path)
+                    if (lp !~ /(^|[\/\\])boot\.cat(alog)?$/ && lp !~ /^\[boot\]/) {
+                      files++
+                      if (sz == 0) zeros++
+                    }
+                  }
+                  path=""; folder=""; sz=-1; seen=0
+                }
+                /^Path = / { flush_rec(); path=substr($0, 8); seen=1; next }
+                /^Folder = / { folder=substr($0, 10); next }
+                /^Size = / { sz=substr($0, 8)+0; next }
+                /^$/ { flush_rec(); next }
+                END {
+                  flush_rec()
+                  printf "XOR_SMOKE|files=%d|zeros=%d\n", files, zeros
+                  if (files < 5 || zeros > 0) exit 1
+                }
+              '
+              rm -rf "$TDIR" /tmp/pb_xor_smoke.iso
             fi
           )
-          test -x app/src/main/jniLibs/arm64-v8a/libgenisoimage.so
 
           ls -lh app/src/main/assets/uefi-ntfs.img app/src/main/jniLibs/arm64-v8a/
           file app/src/main/jniLibs/arm64-v8a/*.so

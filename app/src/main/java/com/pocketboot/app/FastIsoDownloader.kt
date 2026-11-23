@@ -883,6 +883,9 @@ object FastIsoDownloader {
                 val conn = openFollowingRedirects(cachedFinalUrl, "GET", rangeHeader = "bytes=$startPos-$end")
                 try {
                     val code = conn.responseCode
+                    if (startPos > 0L && code == 200) {
+                        throw IllegalStateException("Server ignored Range header (HTTP 200 at offset $startPos) on chunk $idx")
+                    }
                     if (code != 206 && code != 200) {
                         throw IllegalStateException("HTTP $code on chunk $idx")
                     }
@@ -917,12 +920,14 @@ object FastIsoDownloader {
     private fun downloadSingleStream(file: File, totalCounter: AtomicLong) {
         val buf = ByteArray(262_144)
         val conn = openFollowingRedirects(cachedFinalUrl, "GET")
+        var written = 0L
+        var expectedLen = -1L
         try {
             val code = conn.responseCode
             if (code !in 200..299) throw IllegalStateException("HTTP $code")
-            val len = conn.contentLengthLong
-            if (len > 0L) {
-                _state.value = _state.value?.copy(totalBytes = len)
+            expectedLen = conn.contentLengthLong
+            if (expectedLen > 0L) {
+                _state.value = _state.value?.copy(totalBytes = expectedLen)
             }
             RandomAccessFile(file, "rw").use { raf ->
                 raf.setLength(0L)
@@ -931,12 +936,19 @@ object FastIsoDownloader {
                         val read = input.read(buf)
                         if (read <= 0) break
                         raf.write(buf, 0, read)
+                        written += read.toLong()
                         totalCounter.addAndGet(read.toLong())
                     }
                 }
             }
         } finally {
             conn.disconnect()
+        }
+        if (!pausedFlag.get() && !cancelledFlag.get()) {
+            if (written <= 0L) throw IllegalStateException("Download stream returned 0 bytes")
+            if (expectedLen > 0L && written != expectedLen) {
+                throw IllegalStateException("Truncated download ($written / $expectedLen bytes)")
+            }
         }
     }
 
@@ -1292,6 +1304,7 @@ object FastIsoDownloader {
             val remainingSlices = AtomicInteger(sliceCount)
             val fallbackSingleStream = AtomicBoolean(false)
             val finalized = AtomicBoolean(false)
+            val verifyRetries = AtomicInteger(0)
             val lock = Any()
 
             fun persistMeta() {
@@ -1359,8 +1372,25 @@ object FastIsoDownloader {
                 }
 
                 if (tracker.remainingSlices.get() == 0) {
-                    verifyAndFinalize(tracker.item, bufSize)
-                    onFileVerified(tracker.item)
+                    val resumeErr = runCatching { verifyAndFinalize(tracker.item, bufSize) }.exceptionOrNull()
+                    if (resumeErr == null) {
+                        onFileVerified(tracker.item)
+                    } else {
+                        logDl("Cached partial ${item.id} failed verification (${resumeErr.message}) — re-downloading cleanly")
+                        totalCounter.addAndGet(-sz)
+                        item.partFile.delete()
+                        item.metaFile.delete()
+                        tracker.completedSlices.clear()
+                        tracker.remainingSlices.set(count)
+                        trackers.add(tracker)
+                        item.partFile.parentFile?.mkdirs()
+                        RandomAccessFile(item.partFile, "rw").use { it.setLength(sz) }
+                        for (idx in 0 until count) {
+                            val s = idx.toLong() * sliceSize
+                            val e = minOf(sz - 1L, s + sliceSize - 1L)
+                            queue.add(WorkSlice(tracker, idx, s, e, isRanged = true))
+                        }
+                    }
                 } else {
                     trackers.add(tracker)
                     for (idx in 0 until count) {
@@ -1443,14 +1473,6 @@ object FastIsoDownloader {
                                             break
                                         }
                                         sliceDone = true
-                                        tracker.completedSlices.add(task.sliceIndex)
-                                        val left = tracker.remainingSlices.decrementAndGet()
-                                        if (left > 0) {
-                                            if (tracker.completedSlices.size % 2 == 0) tracker.persistMeta()
-                                        } else if (tracker.finalized.compareAndSet(false, true)) {
-                                            verifyAndFinalize(item, bufSize)
-                                            onFileVerified(item)
-                                        }
                                     } catch (e: CancellationException) {
                                         if (writtenThisAttempt > 0L) totalCounter.addAndGet(-writtenThisAttempt)
                                         throw e
@@ -1467,6 +1489,32 @@ object FastIsoDownloader {
                                             val isThrottle = e.message?.startsWith("THROTTLE_") == true
                                             val jitter = (System.nanoTime() and 0xFFL)
                                             delay((if (isThrottle) 700L * attempt else 500L * attempt) + jitter)
+                                        }
+                                    }
+                                }
+                                if (sliceDone && !tracker.fallbackSingleStream.get() && !pausedFlag.get() && !cancelledFlag.get()) {
+                                    tracker.completedSlices.add(task.sliceIndex)
+                                    val left = tracker.remainingSlices.decrementAndGet()
+                                    if (left > 0) {
+                                        if (tracker.completedSlices.size % 2 == 0) tracker.persistMeta()
+                                    } else if (tracker.finalized.compareAndSet(false, true)) {
+                                        val verifyErr = runCatching { verifyAndFinalize(item, bufSize) }.exceptionOrNull()
+                                        if (verifyErr == null) {
+                                            onFileVerified(item)
+                                        } else {
+                                            val retryNum = tracker.verifyRetries.incrementAndGet()
+                                            if (retryNum > 2) {
+                                                throw IllegalStateException("${item.id}: ${verifyErr.message ?: "Integrity check failed"} (after $retryNum retries)")
+                                            }
+                                            logDl("Integrity mismatch on ${item.id} (${verifyErr.message}) — retrying clean single-stream download ($retryNum/2)")
+                                            totalCounter.addAndGet(-item.expectedSize.coerceAtLeast(0L))
+                                            item.partFile.delete()
+                                            item.metaFile.delete()
+                                            tracker.completedSlices.clear()
+                                            tracker.remainingSlices.set(1)
+                                            tracker.finalized.set(false)
+                                            tracker.fallbackSingleStream.set(true)
+                                            queue.add(WorkSlice(tracker, 0, 0L, (item.expectedSize - 1L).coerceAtLeast(0L), isRanged = false))
                                         }
                                     }
                                 }
@@ -1535,6 +1583,12 @@ object FastIsoDownloader {
                     totalCounter.addAndGet(-written)
                     return false
                 }
+                if (written <= 0L) {
+                    throw IllegalStateException("Empty download (0 bytes)")
+                }
+                if (item.expectedSize > 0L && written != item.expectedSize) {
+                    throw IllegalStateException("Size mismatch ($written/${item.expectedSize})")
+                }
                 if (md != null) {
                     val hex = md.digest().joinToString("") { "%02x".format(it) }
                     if (!hex.equals(cleanSha1, ignoreCase = true)) {
@@ -1566,6 +1620,12 @@ object FastIsoDownloader {
     }
 
     private fun verifyAndFinalize(item: TurboBatchItem, bufSize: Int) {
+        val actualLen = if (item.partFile.exists()) item.partFile.length() else -1L
+        if (actualLen <= 0L || (item.expectedSize > 0L && actualLen != item.expectedSize)) {
+            item.partFile.delete()
+            item.metaFile.delete()
+            throw IllegalStateException("Size mismatch on ${item.partFile.name} ($actualLen/${item.expectedSize})")
+        }
         val cleanSha1 = item.expectedSha1.trim().lowercase()
         if (cleanSha1.length == 40) {
             val md = MessageDigest.getInstance("SHA-1")

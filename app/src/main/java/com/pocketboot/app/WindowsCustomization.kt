@@ -349,12 +349,27 @@ object WindowsCustomizationEngine {
         }
         if (hasOemUpdates) {
             sb.appendLine("if exist \"C:\\Windows\\Setup\\Updates\" (")
-            sb.appendLine("  echo [PocketBoot v4.5.0] Pass 1/3: Installing Servicing Stack Updates (SSU)... >> \"%PB_LOG%\"")
+            sb.appendLine("  echo [PocketBoot v4.5.0] Pass 1/3: Installing Servicing Stack Updates [SSU]... >> \"%PB_LOG%\"")
             sb.appendLine("  for %%F in (\"C:\\Windows\\Setup\\Updates\\1_*.cab\" \"C:\\Windows\\Setup\\Updates\\SSU-*.cab\") do if exist \"%%~fF\" (echo Installing SSU: %%~nxF >> \"%PB_LOG%\" & dism /Online /Add-Package /PackagePath:\"%%~fF\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 3010 set \"PB_REBOOT_REQ=1\")")
             sb.appendLine("  echo [PocketBoot v4.5.0] Pass 2/3: Installing Enablement, .NET & General CAB Updates... >> \"%PB_LOG%\"")
             sb.appendLine("  for %%F in (\"C:\\Windows\\Setup\\Updates\\2_*.cab\") do if exist \"%%~fF\" (echo Installing UPD: %%~nxF >> \"%PB_LOG%\" & dism /Online /Add-Package /PackagePath:\"%%~fF\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 3010 set \"PB_REBOOT_REQ=1\")")
             sb.appendLine("  for %%F in (\"C:\\Windows\\Setup\\Updates\\*.cab\") do if exist \"%%~fF\" (echo %%~nxF | findstr /i /b \"1_ 2_ 3_ SSU-\" >nul || (echo Installing CAB: %%~nxF >> \"%PB_LOG%\" & dism /Online /Add-Package /PackagePath:\"%%~fF\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 3010 set \"PB_REBOOT_REQ=1\"))")
-            sb.appendLine("  echo [PocketBoot v4.5.0] Pass 3/3: Installing Cumulative Updates (LCU MSU)... >> \"%PB_LOG%\"")
+            sb.appendLine("  for %%P in (\"C:\\Windows\\Setup\\Updates\\*.msu.pbpart01\") do if exist \"%%~fP\" (")
+            sb.appendLine("    set \"PB_MSU=%%~dpnP\"")
+            sb.appendLine("    echo [PocketBoot v4.5.0] Rejoining split MSU update: !PB_MSU! >> \"%PB_LOG%\"")
+            sb.appendLine("    copy /b \"%%~dpnP.pbpart*\" \"!PB_MSU!\" >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("    if !ERRORLEVEL! EQU 0 (")
+            sb.appendLine("      if exist \"!PB_MSU!\" (")
+            sb.appendLine("        for %%Z in (\"!PB_MSU!\") do if %%~zZ GTR 0 (")
+            sb.appendLine("          echo Rejoined !PB_MSU! [%%~zZ bytes] >> \"%PB_LOG%\"")
+            sb.appendLine("          del /f /q \"%%~dpnP.pbpart*\" >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("        )")
+            sb.appendLine("      )")
+            sb.appendLine("    ) else (")
+            sb.appendLine("      echo [ERROR] Failed to rejoin !PB_MSU! exit !ERRORLEVEL! >> \"%PB_LOG%\"")
+            sb.appendLine("    )")
+            sb.appendLine("  )")
+            sb.appendLine("  echo [PocketBoot v4.5.0] Pass 3/3: Installing Cumulative Updates [LCU MSU]... >> \"%PB_LOG%\"")
             sb.appendLine("  for %%F in (\"C:\\Windows\\Setup\\Updates\\3_*.msu\") do if exist \"%%~fF\" (echo Installing LCU: %%~nxF >> \"%PB_LOG%\" & dism /Online /Add-Package /PackagePath:\"%%~fF\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 3010 set \"PB_REBOOT_REQ=1\")")
             sb.appendLine("  for %%F in (\"C:\\Windows\\Setup\\Updates\\*.msu\") do if exist \"%%~fF\" (echo %%~nxF | findstr /i /b \"3_\" >nul || (echo Installing MSU: %%~nxF >> \"%PB_LOG%\" & dism /Online /Add-Package /PackagePath:\"%%~fF\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 3010 set \"PB_REBOOT_REQ=1\"))")
             sb.appendLine("  rmdir /s /q \"C:\\Windows\\Setup\\Updates\" >> \"%PB_LOG%\" 2>&1")
@@ -382,7 +397,7 @@ object WindowsCustomizationEngine {
             sb.appendLine("    echo Provisioning Framework: %%~nxA >> \"%PB_LOG%\"")
             sb.appendLine("    dism /Online /Add-ProvisionedAppxPackage /PackagePath:\"%%~fA\" /SkipLicense >> \"%PB_LOG%\" 2>&1")
             sb.appendLine("  )")
-            sb.appendLine("  echo [PocketBoot v4.5.0] Pass 2/3: Provisioning Windows Security (SecHealthUI)... >> \"%PB_LOG%\"")
+            sb.appendLine("  echo [PocketBoot v4.5.0] Pass 2/3: Provisioning Windows Security [SecHealthUI]... >> \"%PB_LOG%\"")
             sb.appendLine("  for %%A in (\"C:\\Windows\\Setup\\Apps\\*SecHealthUI*.appx*\" \"C:\\Windows\\Setup\\Apps\\*SecHealthUI*.msix*\") do if exist \"%%~fA\" (")
             sb.appendLine("    echo Provisioning Security App: %%~nxA >> \"%PB_LOG%\"")
             sb.appendLine("    dism /Online /Add-ProvisionedAppxPackage /PackagePath:\"%%~fA\" /SkipLicense >> \"%PB_LOG%\" 2>&1")
@@ -404,7 +419,7 @@ object WindowsCustomizationEngine {
         return sb.toString()
     }
 
-    fun generateAutounattendXml(experience: WindowsExperienceConfig, winUtil: WinUtilTweaksConfig, arch: String = "amd64", selectedEditionIndex: Int? = null, hasSpecializeScript: Boolean = false, hasOemUpdates: Boolean = false, includeWindowsPePass: Boolean = true): String {
+    fun generateAutounattendXml(experience: WindowsExperienceConfig, winUtil: WinUtilTweaksConfig, arch: String = "amd64", selectedEditionIndex: Int? = null, hasSpecializeScript: Boolean = false, hasOemUpdates: Boolean = false, includeWindowsPePass: Boolean = true, uiLang: String = ""): String {
         val safeArch = if (arch.lowercase() in setOf("x86", "arm64", "amd64")) arch.lowercase() else "amd64"
         val peCommands = mutableListOf<Pair<String, String>>()
         if (experience.bypassRequirements) {
@@ -428,19 +443,29 @@ object WindowsCustomizationEngine {
         val sb = StringBuilder()
         sb.appendLine("""<?xml version="1.0" encoding="utf-8"?>""")
         sb.appendLine("""<unattend xmlns="urn:schemas-microsoft-com:unattend">""")
-        if (includeWindowsPePass && (peCommands.isNotEmpty() || selectedEditionIndex != null)) {
+        val cleanUiLang = uiLang.trim().takeIf { it.matches(Regex("^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{2,4}){1,2}$")) }.orEmpty()
+        val addIntlPe = experience.skipOobe && cleanUiLang.isNotEmpty()
+        if (includeWindowsPePass && (peCommands.isNotEmpty() || selectedEditionIndex != null || addIntlPe)) {
             sb.appendLine("""  <settings pass="windowsPE">""")
-            sb.appendLine("""    <component name="Microsoft-Windows-Setup" processorArchitecture="$safeArch" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">""")
-            if (selectedEditionIndex != null) {
-                sb.appendLine("""      <ImageInstall><OSImage><InstallFrom><MetaData wcm:action="add"><Key>/IMAGE/INDEX</Key><Value>$selectedEditionIndex</Value></MetaData></InstallFrom></OSImage></ImageInstall>""")
-                sb.appendLine("""      <UserData><AcceptEula>true</AcceptEula><ProductKey><Key></Key><WillShowUI>Never</WillShowUI></ProductKey></UserData>""")
+            if (addIntlPe) {
+                sb.appendLine("""    <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="$safeArch" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">""")
+                sb.appendLine("""      <SetupUILanguage><UILanguage>$cleanUiLang</UILanguage></SetupUILanguage>""")
+                sb.appendLine("""      <UILanguage>$cleanUiLang</UILanguage>""")
+                sb.appendLine("""    </component>""")
             }
-            if (peCommands.isNotEmpty()) {
-                sb.appendLine("""      <RunSynchronous>""")
-                peCommands.forEachIndexed { idx, (desc, cmd) -> sb.appendLine("""        <RunSynchronousCommand wcm:action="add"><Order>${idx + 1}</Order><Description>${xmlEscape(desc)}</Description><Path>${xmlEscape(cmd)}</Path></RunSynchronousCommand>""") }
-                sb.appendLine("""      </RunSynchronous>""")
+            if (peCommands.isNotEmpty() || selectedEditionIndex != null) {
+                sb.appendLine("""    <component name="Microsoft-Windows-Setup" processorArchitecture="$safeArch" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">""")
+                if (selectedEditionIndex != null) {
+                    sb.appendLine("""      <ImageInstall><OSImage><InstallFrom><MetaData wcm:action="add"><Key>/IMAGE/INDEX</Key><Value>$selectedEditionIndex</Value></MetaData></InstallFrom></OSImage></ImageInstall>""")
+                    sb.appendLine("""      <UserData><AcceptEula>true</AcceptEula><ProductKey><Key></Key><WillShowUI>Never</WillShowUI></ProductKey></UserData>""")
+                }
+                if (peCommands.isNotEmpty()) {
+                    sb.appendLine("""      <RunSynchronous>""")
+                    peCommands.forEachIndexed { idx, (desc, cmd) -> sb.appendLine("""        <RunSynchronousCommand wcm:action="add"><Order>${idx + 1}</Order><Description>${xmlEscape(desc)}</Description><Path>${xmlEscape(cmd)}</Path></RunSynchronousCommand>""") }
+                    sb.appendLine("""      </RunSynchronous>""")
+                }
+                sb.appendLine("""    </component>""")
             }
-            sb.appendLine("""    </component>""")
             sb.appendLine("""  </settings>""")
         }
         if (specCommands.isNotEmpty()) {
@@ -462,7 +487,7 @@ object WindowsCustomizationEngine {
             if (experience.disableDataCollection || experience.skipOobe) sb.appendLine("""        <HideEULAPage>true</HideEULAPage><HideOEMRegistrationScreen>true</HideOEMRegistrationScreen><ProtectYourPC>3</ProtectYourPC>""")
             if (experience.bypassMicrosoftAccount || experience.skipOobe) sb.appendLine("""        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>""")
             if (experience.skipWifiSetup || experience.bypassMicrosoftAccount || experience.skipOobe) sb.appendLine("""        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>""")
-            if (experience.skipOobe) sb.appendLine("""        <SkipMachineOOBE>true</SkipMachineOOBE><SkipUserOOBE>true</SkipUserOOBE>""")
+            if (experience.skipOobe && cleanUser.isNotEmpty()) sb.appendLine("""        <SkipMachineOOBE>true</SkipMachineOOBE><SkipUserOOBE>true</SkipUserOOBE>""")
             sb.appendLine("""      </OOBE>""")
             if (cleanUser.isNotEmpty()) {
                 val safeUser = xmlEscape(cleanUser); val safePass = xmlEscape(experience.localPassword.take(32))
@@ -488,14 +513,35 @@ object WindowsCustomizationEngine {
     fun applyCa2023BootloadersSnippet(qWimBin: String, qInstallFile: String, qIsoRoot: String): String = """
         CA_TMP="/data/local/tmp/pb_ca2023"
         rm -rf "${'$'}CA_TMP" && mkdir -p "${'$'}CA_TMP"
-        if $qWimBin extract $qInstallFile 1 /Windows/Boot/EFI_EX/bootmgfw_EX.efi --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null; then
-            if [ -f "${'$'}CA_TMP/bootmgfw_EX.efi" ]; then
-                mkdir -p $qIsoRoot/efi/boot $qIsoRoot/efi/microsoft/boot
-                if [ -f $qIsoRoot/efi/boot/bootaa64.efi ] && [ ! -f $qIsoRoot/efi/boot/bootx64.efi ]; then cp -f "${'$'}CA_TMP/bootmgfw_EX.efi" $qIsoRoot/efi/boot/bootaa64.efi
-                else cp -f "${'$'}CA_TMP/bootmgfw_EX.efi" $qIsoRoot/efi/boot/bootx64.efi; fi
-                echo "LOG|ca2023|Applied Windows CA 2023 signed EFI bootloader (bootmgfw_EX.efi)"
+        CA_APPLIED=""
+        if $qWimBin extract $qInstallFile 1 /Windows/Boot/EFI_EX/bootmgfw_EX.efi --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null && [ -s "${'$'}CA_TMP/bootmgfw_EX.efi" ]; then
+            mkdir -p $qIsoRoot/efi/boot $qIsoRoot/efi/microsoft/boot
+            if [ -f $qIsoRoot/efi/boot/bootaa64.efi ] && [ ! -f $qIsoRoot/efi/boot/bootx64.efi ]; then
+                cp -f "${'$'}CA_TMP/bootmgfw_EX.efi" $qIsoRoot/efi/boot/bootaa64.efi
+            else
+                cp -f "${'$'}CA_TMP/bootmgfw_EX.efi" $qIsoRoot/efi/boot/bootx64.efi
             fi
-        else echo "LOG|ca2023|Source image lacks EFI_EX CA 2023 bootloaders; kept standard bootloaders"; fi
+            CA_APPLIED="bootmgfw_EX.efi"
+        fi
+        if $qWimBin extract $qInstallFile 1 /Windows/Boot/EFI_EX/bootmgr_EX.efi --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null && [ -s "${'$'}CA_TMP/bootmgr_EX.efi" ]; then
+            cp -f "${'$'}CA_TMP/bootmgr_EX.efi" $qIsoRoot/bootmgr.efi
+            CA_APPLIED="${'$'}{CA_APPLIED:+${'$'}CA_APPLIED + }bootmgr_EX.efi"
+        fi
+        if $qWimBin extract $qInstallFile 1 /Windows/Boot/DVD/EFI/efisys_ex.bin --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null && [ -s "${'$'}CA_TMP/efisys_ex.bin" ]; then
+            mkdir -p $qIsoRoot/efi/microsoft/boot
+            cp -f "${'$'}CA_TMP/efisys_ex.bin" $qIsoRoot/efi/microsoft/boot/efisys.bin
+            CA_APPLIED="${'$'}{CA_APPLIED:+${'$'}CA_APPLIED + }efisys_ex.bin"
+        fi
+        if $qWimBin extract $qInstallFile 1 /Windows/Boot/DVD/EFI/efisys_noprompt_ex.bin --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null && [ -s "${'$'}CA_TMP/efisys_noprompt_ex.bin" ]; then
+            mkdir -p $qIsoRoot/efi/microsoft/boot
+            cp -f "${'$'}CA_TMP/efisys_noprompt_ex.bin" $qIsoRoot/efi/microsoft/boot/efisys_noprompt.bin
+            CA_APPLIED="${'$'}{CA_APPLIED:+${'$'}CA_APPLIED + }efisys_noprompt_ex.bin"
+        fi
+        if [ -n "${'$'}CA_APPLIED" ]; then
+            echo "LOG|ca2023|Applied Windows CA 2023 bootloaders (${'$'}CA_APPLIED)"
+        else
+            echo "LOG|ca2023|Source image lacks EFI_EX CA 2023 bootloaders; kept standard bootloaders"
+        fi
         rm -rf "${'$'}CA_TMP"
     """.trimIndent()
 
