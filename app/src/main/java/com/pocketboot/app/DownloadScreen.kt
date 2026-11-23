@@ -2110,7 +2110,7 @@ fun DownloadScreen(
                             border = BorderStroke(0.75.dp, PocketColors.warning)
                         ) {
                             Text(
-                                "Local User "${rbExperience.localUsername.ifBlank { "User" }}" has a blank password (cached builds don't store passwords). Re-enter it in Customizer below if you want a password.",
+                                "Local User \"${rbExperience.localUsername.ifBlank { "User" }}\" has a blank password (cached builds don't store passwords). Re-enter it in Customizer below if you want a password.",
                                 modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp),
                                 fontSize = 10.5.sp,
                                 color = PocketColors.textPrimary
