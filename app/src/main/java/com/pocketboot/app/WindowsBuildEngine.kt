@@ -135,9 +135,10 @@ data class WinBuildLangOption(val code: String, val displayName: String)
 data class WinBuildEditionOption(val code: String, val displayName: String)
 enum class UupDataSource(val label: String) { UUPDUMP_LIVE("UUPdump Live"), DIRECT_MICROSOFT("Direct Microsoft"), OFFLINE_CATALOG("Offline Catalog") }
 enum class WinStoreAppLevel(val label: String, val shortLabel: String, val subtitle: String) {
-    SECURITY_ONLY("Security Only (Default)", "Security", "Auto-stages SecHealthUI on Win 11 22H2+ (~25 MB)"),
+    NONE("No Store Apps", "None", "Skip all inbox Store apps (smallest ISO)"),
+    SECURITY_ONLY("Security Only", "Security", "Windows Security [SecHealthUI] + Frameworks (~25 MB)"),
     ESSENTIAL("Essential Apps", "Essential", "Store, Security, Terminal, Notepad, Photos, Paint + Frameworks"),
-    ALL_INBOX("All Inbox Apps", "All Apps", "Full filtered inbox Store apps + Frameworks")
+    ALL_INBOX("All Inbox Apps (Official Default)", "All Apps", "Matches official UUPdump: full filtered inbox Store apps + Frameworks")
 }
 enum class WinPackageKind(val badge: String) { BASE_OS("Base OS"), UPDATE("Update"), STORE_APP("Store App"), NETFX3(".NET 3.5") }
 data class WinPackageFileEntry(val name: String, val url: String, val sizeBytes: Long, val sha1: String, val kind: WinPackageKind = WinPackageKind.BASE_OS, val expireEpochSec: Long = 0L)
@@ -179,7 +180,7 @@ data class WindowsChannelBuildConfig(
     val extraDriversDir: String = "",
     val virtualEditions: List<String> = emptyList(),
     val localUupDirPath: String = "",
-    val storeAppLevel: WinStoreAppLevel = if (includeStoreApps) WinStoreAppLevel.ALL_INBOX else WinStoreAppLevel.SECURITY_ONLY,
+    val storeAppLevel: WinStoreAppLevel = if (includeStoreApps) WinStoreAppLevel.ALL_INBOX else WinStoreAppLevel.NONE,
     val splitWimForFat32: Boolean = false,
     val thermalProfile: BuildThermalProfile = BuildThermalProfile.BALANCED,
     val autoThermalCooldown: Boolean = true
@@ -188,7 +189,9 @@ data class WindowsChannelBuildConfig(
 data class PendingWindowsBuild(
     val workRootPath: String, val workPrefix: String, val title: String, val outputName: String,
     val cachedBytes: Long, val totalBytes: Long, val isCachedReady: Boolean = false, val config: WindowsChannelBuildConfig,
-    val hasStagedIsoDir: Boolean = false
+    val hasStagedIsoDir: Boolean = false,
+    val cachedAppsCount: Int = 0,
+    val cabCacheBytes: Long = 0L
 ) {
     val progress: Float get() = if (totalBytes > 0L) (cachedBytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f) else 0f
 }
@@ -210,6 +213,8 @@ data class WindowsConversionJobState(
     val autoMount: Boolean = true, val workDirPath: String = "",
     val keepPackagesAfterBuild: Boolean = false, val isReadOnlySource: Boolean = false,
     val isFailed: Boolean = false, val errorMessage: String = "",
+    val isCompleted: Boolean = false, val completionSummary: String = "",
+    val bootVerifiedLabel: String = "", val outputSavedPath: String = "",
     val batteryTempC: Float = 0f,
     val thermalProfile: BuildThermalProfile = BuildThermalProfile.BALANCED,
     val autoThermalCooldown: Boolean = true,
@@ -238,7 +243,7 @@ object WindowsBuildEngine {
     private const val DEFAULT_API_BASE = "https://api.uupdump.net"
     private const val GITHUB_RAW_BASE = "https://raw.githubusercontent.com/bilered/PocketBoot/main"
     private const val UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.5.0"
-    private const val STAGE_SCHEMA_VERSION = "PB_STAGE_V23"
+    private const val STAGE_SCHEMA_VERSION = "PB_STAGE_V24"
 
     @Volatile private var apiBaseUrl: String = DEFAULT_API_BASE
     @Volatile private var preferDirectMicrosoft: Boolean = false
@@ -976,7 +981,10 @@ object WindowsBuildEngine {
         return buildDetailedManifestFromEntries(entries)
     }
 
-    private val FRAMEWORK_APP_TOKENS = listOf("vclibs", "ui.xaml", "windowsappruntime", "net.native", "directx")
+    private val FRAMEWORK_APP_TOKENS = listOf(
+        "vclibs", "ui.xaml", "windowsappruntime", "net.native", "directx",
+        "services.store.engagement", "advertising.xaml"
+    )
     private val ESSENTIAL_APP_TOKENS = listOf(
         "sechealthui", "windowsstore", "storepurchaseapp", "desktopappinstaller",
         "startexperiencesapp", "applicationcompatibilityenhancements",
@@ -984,10 +992,21 @@ object WindowsBuildEngine {
         "screensketch", "windowscalculator", "windowscamera"
     )
 
+    fun isServerBuild(title: String, editionCodes: List<String> = emptyList()): Boolean {
+        val low = title.lowercase()
+        if (low.contains("server") || low.contains("azure stack")) return true
+        return editionCodes.isNotEmpty() && editionCodes.all { it.lowercase().startsWith("server") }
+    }
+
+    fun isFrameworkAppName(fileName: String): Boolean {
+        val low = fileName.lowercase()
+        return FRAMEWORK_APP_TOKENS.any { low.contains(it) }
+    }
+
     /**
      * Cleans raw UUPdump `edition=app` file lists (which can contain ~2,800 items including foreign
      * `_language-*.msix`, `qps-ploc*` pseudo-locales, mismatched architectures, and ~8 KB stub bundles)
-     * down to clean, installable packages matching the chosen architecture, language, and app level.
+     * down to clean, installable packages + matching License XMLs for the chosen architecture, language, and app level.
      */
     fun filterStoreApps(
         rawApps: List<WinPackageFileEntry>,
@@ -995,26 +1014,27 @@ object WindowsBuildEngine {
         arch: String,
         level: WinStoreAppLevel = WinStoreAppLevel.ALL_INBOX
     ): List<WinPackageFileEntry> {
-        if (rawApps.isEmpty()) return emptyList()
+        if (rawApps.isEmpty() || level == WinStoreAppLevel.NONE) return emptyList()
         val langFull = langCode.lowercase()
         val langShort = langFull.substringBefore('-')
         val archLow = arch.lowercase()
         val langSatRegex = Regex("""_language-([a-z0-9-]+)(?:[._]|$)""", RegexOption.IGNORE_CASE)
 
+        val licenseFiles = rawApps.filter { f ->
+            val low = f.name.lowercase()
+            low.endsWith(".xml") && low.contains("license")
+        }
+
         val cleaned = rawApps.filter { f ->
             val low = f.name.lowercase()
-            // Keep only real installable appx/msix packages (skip loose xml/blockmap/etc.)
             if (!(low.endsWith(".msixbundle") || low.endsWith(".appxbundle") || low.endsWith(".msix") || low.endsWith(".appx"))) return@filter false
-            // Drop pseudo-locales, stubs, and LanguageExperiencePack bloat
             if (low.contains("qps-ploc") || low.contains("stub.") || low.contains("stub_") || low.contains("languageexperiencepack")) return@filter false
-            // Filter foreign `_language-<xx>` satellite packages
             val satMatch = langSatRegex.find(low)
             if (satMatch != null) {
                 val tag = satMatch.groupValues[1]
                 if (tag != langFull && tag != langShort && !tag.startsWith("$langShort-")) return@filter false
             }
-            // Filter mismatched architecture packages (keep neutral & x86 frameworks on amd64)
-            val isFw = FRAMEWORK_APP_TOKENS.any { low.contains(it) }
+            val isFw = isFrameworkAppName(low)
             when (archLow) {
                 "amd64", "x64" -> if (low.contains("_arm64_") || low.contains("_arm_")) return@filter false
                 "arm64" -> if (low.contains("_x64_") || low.contains("_amd64_")) return@filter false
@@ -1024,46 +1044,106 @@ object WindowsBuildEngine {
             true
         }
 
-        // Deduplicate ~8 KB stub bundles (e.g., `Microsoft.WindowsStore_8wekyb3d8bbwe.msixbundle`)
-        // whenever a larger full versioned package exists for the same app family prefix.
+        // Deduplicate ~8 KB stub bundles AND keep latest version per (framework family + arch) per Microsoft DISM docs
         val byFamily = cleaned.groupBy { f -> f.name.substringBefore('_').lowercase() }
         val deduped = buildList {
-            byFamily.values.forEach { group ->
-                val hasFullBundle = group.any { it.sizeBytes >= 65_536L }
-                group.forEach { item ->
-                    if (hasFullBundle && item.sizeBytes in 1L until 65_536L && (item.name.endsWith(".msixbundle", true) || item.name.endsWith(".appxbundle", true))) {
-                        // Drop ~8 KB stub wrapper in favor of the full bundle (StubAppsFull=1 parity)
-                    } else {
-                        add(item)
+            byFamily.forEach { (_, group) ->
+                val isFwGroup = group.any { isFrameworkAppName(it.name) }
+                if (isFwGroup) {
+                    val byArch = group.groupBy { item ->
+                        val l = item.name.lowercase()
+                        when {
+                            l.contains("_x64_") -> "x64"
+                            l.contains("_x86_") -> "x86"
+                            l.contains("_arm64_") -> "arm64"
+                            else -> "neutral"
+                        }
+                    }
+                    byArch.values.forEach { archGroup ->
+                        archGroup.maxWithOrNull(compareBy<WinPackageFileEntry> { it.name.lowercase() }.thenBy { it.sizeBytes })?.let { add(it) }
+                    }
+                } else {
+                    val hasFullBundle = group.any { it.sizeBytes >= 65_536L }
+                    group.forEach { item ->
+                        if (hasFullBundle && item.sizeBytes in 1L until 65_536L && (item.name.endsWith(".msixbundle", true) || item.name.endsWith(".appxbundle", true))) {
+                            // Drop ~8 KB stub wrapper in favor of the full bundle (StubAppsFull=1 parity)
+                        } else {
+                            add(item)
+                        }
                     }
                 }
             }
         }
 
-        return when (level) {
+        val selectedPkgs = when (level) {
+            WinStoreAppLevel.NONE -> emptyList()
             WinStoreAppLevel.ALL_INBOX -> deduped
             WinStoreAppLevel.SECURITY_ONLY -> deduped.filter { f ->
                 val low = f.name.lowercase()
-                low.contains("sechealthui")
+                low.contains("sechealthui") || isFrameworkAppName(low)
             }
             WinStoreAppLevel.ESSENTIAL -> deduped.filter { f ->
                 val low = f.name.lowercase()
-                FRAMEWORK_APP_TOKENS.any { low.contains(it) } || ESSENTIAL_APP_TOKENS.any { low.contains(it) }
+                isFrameworkAppName(low) || ESSENTIAL_APP_TOKENS.any { low.contains(it) }
             }
-        }.sortedBy { it.name.lowercase() }
+        }
+
+        val selectedFamilies = selectedPkgs.filterNot { isFrameworkAppName(it.name) }.map { it.name.substringBefore('_').lowercase() }.toSet()
+        val matchedLicenses = licenseFiles.filter { lic ->
+            val lFam = lic.name.substringBefore('_').lowercase()
+            lFam in selectedFamilies
+        }
+
+        return (selectedPkgs + matchedLicenses).distinctBy { it.name.lowercase() }.sortedBy { it.name.lowercase() }
     }
 
     private fun fetchSeparateStoreAppsFromApi(
         updateId: String,
         langCode: String,
         archHint: String,
-        requireUrl: Boolean
+        requireUrl: Boolean,
+        allowFallbackReplacement: Boolean = true
     ): List<WinPackageFileEntry> {
         val noLinksParam = if (requireUrl) "" else "&noLinks=1"
         val appUrl = "$apiBaseUrl/get.php?id=${URLEncoder.encode(updateId, "UTF-8")}&lang=neutral&edition=app$noLinksParam"
-        val appRoot = fetchJsonWithRetry(appUrl, timeoutMs = 12_000) ?: return emptyList()
-        val parsedApps = parseDetailedManifest(appRoot, requireUrl).appFiles
-        return filterStoreApps(parsedApps, langCode, archHint, WinStoreAppLevel.ALL_INBOX)
+        val appRoot = fetchJsonWithRetry(appUrl, timeoutMs = 12_000)
+        val directApps = appRoot?.let { parseDetailedManifest(it, requireUrl).appFiles }.orEmpty()
+        val filteredDirect = filterStoreApps(directApps, langCode, archHint, WinStoreAppLevel.ALL_INBOX)
+        if (filteredDirect.isNotEmpty() || !allowFallbackReplacement) return filteredDirect
+
+        // Missing AppX Replacement (UUPdump parity): Cumulative Update builds often omit `edition=app`.
+        // Automatically query the newest matching Windows 11 non-Server build UUID for the same arch.
+        val archQ = if (archHint.equals("arm64", true)) "arm64" else "amd64"
+        val candidates = LinkedHashSet<String>()
+        catalogMetaByUuid.entries
+            .filter { (_, meta) -> meta.second != 7 && (meta.third.substringAfter("10.0.").substringBefore('.').toIntOrNull() ?: 0) >= 22621 }
+            .forEach { (uid, _) -> if (!uid.equals(updateId, true)) candidates.add(uid) }
+        val searchRoot = fetchJsonWithRetry("$apiBaseUrl/listid.php?search=${URLEncoder.encode("Windows 11 $archQ", "UTF-8")}&sortByDate=1", timeoutMs = 10_000)
+        val buildsObj = searchRoot?.optJSONObject("response")?.optJSONObject("builds")
+        if (buildsObj != null) {
+            val keys = buildsObj.keys()
+            var added = 0
+            while (keys.hasNext() && added < 8) {
+                val k = keys.next()
+                val bo = buildsObj.optJSONObject(k) ?: continue
+                val uid = bo.optString("uuid", k).trim()
+                val title = bo.optString("title", "").lowercase()
+                val bArch = bo.optString("arch", "").lowercase()
+                val bMajor = bo.optString("build", "").substringBefore('.').toIntOrNull() ?: 0
+                if (uid.isNotBlank() && !uid.equals(updateId, true) && bArch == archQ && bMajor >= 22621 && !title.contains("server") && !title.contains("cumulative")) {
+                    candidates.add(uid)
+                    added++
+                }
+            }
+        }
+        for (fallbackUid in candidates.take(6)) {
+            val fbUrl = "$apiBaseUrl/get.php?id=${URLEncoder.encode(fallbackUid, "UTF-8")}&lang=neutral&edition=app$noLinksParam"
+            val fbRoot = fetchJsonWithRetry(fbUrl, timeoutMs = 12_000) ?: continue
+            val fbApps = parseDetailedManifest(fbRoot, requireUrl).appFiles
+            val fbFiltered = filterStoreApps(fbApps, langCode, archHint, WinStoreAppLevel.ALL_INBOX)
+            if (fbFiltered.size >= 4) return fbFiltered
+        }
+        return emptyList()
     }
 
     private fun mergeAppsIntoManifest(baseManifest: WinDetailedManifest, extraApps: List<WinPackageFileEntry>): WinDetailedManifest {
@@ -1087,7 +1167,10 @@ object WindowsBuildEngine {
         detailedManifestCache[key]?.let { return@withContext it }
 
         val buildMajor = buildHint.substringBefore('.').toIntOrNull() ?: 0
-        val supportsInboxApps = buildMajor == 0 || buildMajor >= 22563
+        val isSrv = isServerBuild(buildHint, editionCodes) ||
+            (catalogMetaByUuid[updateId]?.second == 7) ||
+            (catalogMetaByUuid[updateId.substringBefore("_rev.")]?.second == 7)
+        val supportsInboxApps = !isSrv && (buildMajor == 0 || buildMajor >= 22563)
 
         if (shouldUseUupDumpApi()) {
             val url = "$apiBaseUrl/get.php?id=${URLEncoder.encode(updateId, "UTF-8")}&lang=${URLEncoder.encode(langCode, "UTF-8")}&edition=${URLEncoder.encode(edParam, "UTF-8")}&noLinks=1"
@@ -1117,8 +1200,11 @@ object WindowsBuildEngine {
         val filtered = MicrosoftUupClient.filterFilesForSelection(rawFiles, langCode, editionCodes)
         val entries = filtered.map { WinPackageFileEntry(it.name, "", it.sizeBytes, it.sha1Hex, classifyPackageFile(it.name), 0L) }
         var parsed = buildDetailedManifestFromEntries(entries)
-        if (parsed.appFiles.isNotEmpty()) {
-            val cleanApps = filterStoreApps(parsed.appFiles, langCode, archHint, WinStoreAppLevel.ALL_INBOX)
+        if (supportsInboxApps && parsed.appFiles.isEmpty()) {
+            val extraApps = fetchSeparateStoreAppsFromApi(updateId, langCode, archHint, requireUrl = false)
+            parsed = mergeAppsIntoManifest(parsed, extraApps)
+        } else if (parsed.appFiles.isNotEmpty()) {
+            val cleanApps = if (supportsInboxApps) filterStoreApps(parsed.appFiles, langCode, archHint, WinStoreAppLevel.ALL_INBOX) else emptyList()
             parsed = parsed.copy(
                 appFiles = cleanApps,
                 allFiles = (parsed.baseFiles + parsed.updateFiles + cleanApps + parsed.netFx3Files).sortedBy { it.name.lowercase() }
@@ -1140,7 +1226,10 @@ object WindowsBuildEngine {
         buildHint: String = ""
     ): WinDetailedManifest = withContext(Dispatchers.IO) {
         val buildMajor = buildHint.substringBefore('.').toIntOrNull() ?: 0
-        val supportsInboxApps = buildMajor == 0 || buildMajor >= 22563
+        val isSrv = isServerBuild(buildHint, editionCodes) ||
+            (catalogMetaByUuid[updateId]?.second == 7) ||
+            (catalogMetaByUuid[updateId.substringBefore("_rev.")]?.second == 7)
+        val supportsInboxApps = !isSrv && (buildMajor == 0 || buildMajor >= 22563)
 
         // Layer 1: UUPdump API if enabled and healthy
         if (shouldUseUupDumpApi()) {
@@ -1202,8 +1291,11 @@ object WindowsBuildEngine {
         if (matched.isNotEmpty()) {
             _activeSource.value = UupDataSource.DIRECT_MICROSOFT
             var built = buildDetailedManifestFromEntries(matched)
-            if (built.appFiles.isNotEmpty()) {
-                val cleanApps = filterStoreApps(built.appFiles, langCode, archHint, WinStoreAppLevel.ALL_INBOX)
+            if (supportsInboxApps && built.appFiles.isEmpty()) {
+                val extraApps = fetchSeparateStoreAppsFromApi(updateId, langCode, archHint, requireUrl = true)
+                built = mergeAppsIntoManifest(built, extraApps)
+            } else if (built.appFiles.isNotEmpty()) {
+                val cleanApps = if (supportsInboxApps) filterStoreApps(built.appFiles, langCode, archHint, WinStoreAppLevel.ALL_INBOX) else emptyList()
                 built = built.copy(
                     appFiles = cleanApps,
                     allFiles = (built.baseFiles + built.updateFiles + cleanApps + built.netFx3Files).sortedBy { it.name.lowercase() }
@@ -1258,7 +1350,7 @@ object WindowsBuildEngine {
 
     suspend fun scanPendingBuilds(context: Context, scanDirs: List<String>): List<PendingWindowsBuild> = withContext(Dispatchers.IO) {
         val results = mutableListOf<PendingWindowsBuild>()
-        val activeDl = dlWorkRootPath; val activeConv = _conversionState.value?.workDirPath.orEmpty()
+        val activeDl = dlWorkRootPath; val activeConv = _conversionState.value?.takeIf { !it.isFailed && !it.isCompleted }?.workDirPath.orEmpty()
         scanDirs.map { UsbGadgetEngine.resolveDirectPath(it).trimEnd('/') }.distinct().forEach { baseDir ->
             val found = Shell.cmd("ls -d ${shellQuote("$baseDir/.pocketboot_tmp")}/pb_uup_*/pb_build.json 2>/dev/null || true").exec().out
             found.forEach { metaPath ->
@@ -1297,14 +1389,16 @@ object WindowsBuildEngine {
                         customPostInstallScriptPath = o.optString("customPostInstallScriptPath", "")
                     )
                     val veList = mutableListOf<String>(); o.optJSONArray("virtualEditions")?.let { va -> for (k in 0 until va.length()) va.optString(k, "").trim().takeIf { it.isNotEmpty() }?.let { veList.add(it) } }
-                    val cfg = WindowsChannelBuildConfig(bld, lang, eds, comp, mode, method, o.optString("targetDir", baseDir), o.optString("customOutputName", ""), o.optString("targetMultiBootPath", ""), o.optInt("connections", 8), o.optBoolean("autoMount", true), o.optBoolean("includeUpdates", false), o.optBoolean("includeStoreApps", false), o.optBoolean("integrateNetFx3", false), o.optBoolean("runComponentCleanup", false), o.optBoolean("skipWinRe", false), o.optBoolean("eiCfgUnlock", false), o.optBoolean("keepPackagesAfterBuild", false), scheme, exp, WinUtilTweaksConfig.fromJsonString(o.optString("winUtilJson", "")), extraDriversDir = o.optString("extraDriversDir", ""), virtualEditions = veList, storeAppLevel = runCatching { WinStoreAppLevel.valueOf(o.optString("storeAppLevel", if (o.optBoolean("includeStoreApps", false)) "ALL_INBOX" else "SECURITY_ONLY")) }.getOrDefault(WinStoreAppLevel.SECURITY_ONLY), splitWimForFat32 = o.optBoolean("splitWimForFat32", false), thermalProfile = runCatching { BuildThermalProfile.valueOf(o.optString("thermalProfile", defaultThermalProfile.name)) }.getOrDefault(defaultThermalProfile), autoThermalCooldown = o.optBoolean("autoThermalCooldown", defaultAutoCooldown))
+                    val cfg = WindowsChannelBuildConfig(bld, lang, eds, comp, mode, method, o.optString("targetDir", baseDir), o.optString("customOutputName", ""), o.optString("targetMultiBootPath", ""), o.optInt("connections", 8), o.optBoolean("autoMount", true), o.optBoolean("includeUpdates", false), o.optBoolean("includeStoreApps", false), o.optBoolean("integrateNetFx3", false), o.optBoolean("runComponentCleanup", false), o.optBoolean("skipWinRe", false), o.optBoolean("eiCfgUnlock", false), o.optBoolean("keepPackagesAfterBuild", false), scheme, exp, WinUtilTweaksConfig.fromJsonString(o.optString("winUtilJson", "")), extraDriversDir = o.optString("extraDriversDir", ""), virtualEditions = veList, storeAppLevel = runCatching { WinStoreAppLevel.valueOf(o.optString("storeAppLevel", if (o.optBoolean("includeStoreApps", false)) "ALL_INBOX" else "NONE")) }.getOrDefault(WinStoreAppLevel.NONE), splitWimForFat32 = o.optBoolean("splitWimForFat32", false), thermalProfile = runCatching { BuildThermalProfile.valueOf(o.optString("thermalProfile", defaultThermalProfile.name)) }.getOrDefault(defaultThermalProfile), autoThermalCooldown = o.optBoolean("autoThermalCooldown", defaultAutoCooldown))
                     val workPrefix = workRoot.substringAfterLast('/')
                     val pkgBytes = Shell.cmd("du -sb ${shellQuote("$workRoot/PKGS")} 2>/dev/null | awk '{print \$1}'").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
                     val stageBytes = stageCacheDir(context, workPrefix).walkTopDown().filter { it.isFile && it.name.endsWith(".part") }.sumOf { it.length() }
                     val totalBytes = o.optLong("totalBytes", 0L).coerceAtLeast(pkgBytes)
                     if (pkgBytes > 0L || stageBytes > 0L) {
                         val stagedReady = isStageMarkerValid(workRoot)
-                        results.add(PendingWindowsBuild(workRoot, workPrefix, "Win ${bld.build} (${bld.archDisplay})", cfg.customOutputName.ifBlank { "Win_${bld.build}_${bld.archDisplay}_${lang.code}${if (mode == WinBuildOutputMode.DIRECT_NTFS_USB) "_USB.img" else ".iso"}" }, (pkgBytes + stageBytes).coerceAtMost(totalBytes.coerceAtLeast(pkgBytes + stageBytes)), totalBytes, o.optBoolean("isCachedReady", false), cfg, hasStagedIsoDir = stagedReady))
+                        val cachedAppsCnt = Shell.cmd("find ${shellQuote("$workRoot/PKGS")} -maxdepth 1 -type f \\( -iname '*.msixbundle' -o -iname '*.appxbundle' -o -iname '*.msix' -o -iname '*.appx' \\) 2>/dev/null | wc -l").exec().out.firstOrNull()?.trim()?.toIntOrNull() ?: 0
+                        val cabCacheSz = Shell.cmd("if [ -d ${shellQuote("$workRoot/CAB_CACHE")} ]; then du -sb ${shellQuote("$workRoot/CAB_CACHE")} 2>/dev/null | awk '{print \$1}'; else echo 0; fi").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                        results.add(PendingWindowsBuild(workRoot, workPrefix, "Win ${bld.build} (${bld.archDisplay})", cfg.customOutputName.ifBlank { "Win_${bld.build}_${bld.archDisplay}_${lang.code}${if (mode == WinBuildOutputMode.DIRECT_NTFS_USB) "_USB.img" else ".iso"}" }, (pkgBytes + stageBytes).coerceAtMost(totalBytes.coerceAtLeast(pkgBytes + stageBytes)), totalBytes, o.optBoolean("isCachedReady", false), cfg, hasStagedIsoDir = stagedReady, cachedAppsCount = cachedAppsCnt, cabCacheBytes = cabCacheSz))
                     }
                 }
             }
@@ -1360,10 +1454,19 @@ object WindowsBuildEngine {
             scope.launch { signalActivePid("CONT") }
         }
     }
-    fun dismissFailedConversion() {
-        if (_conversionState.value?.isFailed == true) {
+    fun dismissFinishedConversion() {
+        val cur = _conversionState.value
+        if (cur != null && (cur.isFailed || cur.isCompleted)) {
             lastFailedJob = null
             _conversionState.value = null
+        }
+    }
+    fun dismissFailedConversion() {
+        dismissFinishedConversion()
+    }
+    fun clearCabCache(pending: PendingWindowsBuild) {
+        scope.launch {
+            Shell.cmd("rm -rf ${shellQuote("${pending.workRootPath}/CAB_CACHE")} 2>/dev/null || true").exec()
         }
     }
     fun retryFailedConversion(): Boolean {
@@ -1407,9 +1510,14 @@ object WindowsBuildEngine {
                 if (config.outputMode != WinBuildOutputMode.DIRECT_NTFS_USB && !tools.canConvertIso) {
                     throw IllegalStateException("Bundled ISO build tools (cabextract/wimlib/chntpw/xorriso) missing.")
                 }
+                val isSrv = isServerBuild(config.build.title, config.editions.map { it.code })
+                val wantApps = !isSrv && config.storeAppLevel != WinStoreAppLevel.NONE
                 val stagingOptionsChanged = config.compression != prevConfig.compression ||
                     (config.outputMode == WinBuildOutputMode.DIRECT_NTFS_USB) != (prevConfig.outputMode == WinBuildOutputMode.DIRECT_NTFS_USB) ||
                     config.includeUpdates != prevConfig.includeUpdates ||
+                    config.storeAppLevel != prevConfig.storeAppLevel ||
+                    config.includeStoreApps != prevConfig.includeStoreApps ||
+                    config.extraDriversDir != prevConfig.extraDriversDir ||
                     config.integrateNetFx3 != prevConfig.integrateNetFx3 ||
                     config.runComponentCleanup != prevConfig.runComponentCleanup ||
                     config.skipWinRe != prevConfig.skipWinRe ||
@@ -1427,15 +1535,87 @@ object WindowsBuildEngine {
                 if (!canFastStep4 && esdCount <= 0) {
                     throw IllegalStateException("Cached packages are incomplete or missing. Please tap Resume to verify/download.")
                 }
+
+                // Smart Store Apps Top-Up: if user wants inbox Store apps on a cached Win 11 build that lacks them,
+                // download ONLY the missing Store app packages into PKGS/ (never re-downloads the 8 GB base OS!).
+                var existingAppCount = Shell.cmd("find ${shellQuote(pkgPath)} -maxdepth 1 -type f \\( -iname '*.msixbundle' -o -iname '*.appxbundle' -o -iname '*.msix' -o -iname '*.appx' \\) 2>/dev/null | wc -l").exec().out.firstOrNull()?.trim()?.toIntOrNull() ?: 0
+                val buildMajor = config.build.build.substringBefore('.').toIntOrNull() ?: 0
+                val needsAppTopUp = wantApps && (buildMajor == 0 || buildMajor >= 22563) &&
+                    (existingAppCount == 0 ||
+                        (config.storeAppLevel == WinStoreAppLevel.ALL_INBOX && (prevConfig.storeAppLevel != WinStoreAppLevel.ALL_INBOX || existingAppCount < 10)) ||
+                        (config.storeAppLevel == WinStoreAppLevel.ESSENTIAL && ((prevConfig.storeAppLevel != WinStoreAppLevel.ESSENTIAL && prevConfig.storeAppLevel != WinStoreAppLevel.ALL_INBOX) || existingAppCount < 5)))
+                if (needsAppTopUp) {
+                    val topUpTitle = "${pending.title} · Store Apps"
+                    _downloadState.value = WindowsBuildJobState(topUpTitle, "Fetching Inbox Store Apps list...", "${config.storeAppLevel.label} (keeping cached OS)", 0.02f, autoMount = config.autoMount, workDirPath = workRootPath)
+                    TurboDownloadService.start(appCtx)
+                    try {
+                        val allApps = fetchSeparateStoreAppsFromApi(config.build.uuid, config.lang.code, config.build.arch, requireUrl = true, allowFallbackReplacement = true)
+                        val desiredApps = filterStoreApps(allApps, config.lang.code, config.build.arch, config.storeAppLevel)
+                        if (desiredApps.isNotEmpty()) {
+                            val alreadyHave = batchVerifyExistingPackages(pkgPath, desiredApps)
+                            val missingApps = desiredApps.filter { it.name !in alreadyHave }
+                            if (missingApps.isNotEmpty()) {
+                                val appStageDir = stageCacheDir(appCtx, "${pending.workPrefix}_apps")
+                                val totalAppBytes = missingApps.sumOf { it.sizeBytes }.coerceAtLeast(1L)
+                                val appDlCounter = AtomicLong(0L)
+                                val appDoneCounter = AtomicInteger(0)
+                                val appThreads = AtomicInteger(0)
+                                val dlPaused = AtomicBoolean(false); val dlCancelled = AtomicBoolean(false)
+                                val appMeter = launch {
+                                    while (isActive) {
+                                        delay(450L)
+                                        val cur = appDlCounter.get()
+                                        _downloadState.value = WindowsBuildJobState(topUpTitle, "Downloading Store Apps (${appDoneCounter.get()}/${missingApps.size})", "${UsbGadgetEngine.formatBytes(cur)} / ${UsbGadgetEngine.formatBytes(totalAppBytes)}", (cur.toFloat() / totalAppBytes.toFloat()).coerceIn(0.03f, 0.99f), cur, totalAppBytes, 0L, -1L, appThreads.get().coerceAtLeast(1), appDoneCounter.get(), missingApps.size, false, false, config.autoMount, workRootPath)
+                                    }
+                                }
+                                try {
+                                    val batchItems = missingApps.map { entry ->
+                                        val safeName = entry.name.replace(Regex("[^A-Za-z0-9._-]"), "_")
+                                        FastIsoDownloader.TurboBatchItem(entry.name, entry.url, File(appStageDir, "$safeName.part"), File(appStageDir, "$safeName.part.pbmeta"), entry.sizeBytes, entry.sha1, entry.expireEpochSec)
+                                    }
+                                    val movedList = ConcurrentLinkedQueue<Pair<String, String>>()
+                                    FastIsoDownloader.downloadBatchTurbo(batchItems, config.connections.coerceIn(1, 12), dlPaused, dlCancelled, appDlCounter, appThreads) { doneItem ->
+                                        movedList.add(doneItem.partFile.absolutePath to "$pkgPath/${doneItem.id}")
+                                        appDoneCounter.incrementAndGet()
+                                    }
+                                    val mvCmds = buildList { while (true) { val p = movedList.poll() ?: break; add("mv -f ${shellQuote(p.first)} ${shellQuote(p.second)}") } }
+                                    if (mvCmds.isNotEmpty()) {
+                                        val mvRes = runIsolatedRootScript(appCtx, "mvapps", "set -e\n${mvCmds.joinToString("\n")}")
+                                        if (!mvRes.isSuccess) throw IllegalStateException("Failed moving downloaded Store Apps into PKGS/")
+                                    }
+                                } finally {
+                                    appMeter.cancel()
+                                    runCatching { appStageDir.deleteRecursively() }
+                                }
+                                val prevMf = loadPackageManifest(workRootPath)
+                                if (prevMf.isNotEmpty()) {
+                                    val mergedMf = (prevMf + missingApps).distinctBy { it.name.lowercase() }
+                                    savePackageManifest(appCtx, workRootPath, mergedMf)
+                                    savePkgVerifiedFingerprint(workRootPath, computePkgDirFingerprint(pkgPath))
+                                }
+                                onLog(LogEntry(nowTs(), "win-dl", "Topped up ${missingApps.size} Inbox Store App package(s) into cached build (${UsbGadgetEngine.formatBytes(totalAppBytes)})"))
+                            }
+                            existingAppCount = Shell.cmd("find ${shellQuote(pkgPath)} -maxdepth 1 -type f \\( -iname '*.msixbundle' -o -iname '*.appxbundle' -o -iname '*.msix' -o -iname '*.appx' \\) 2>/dev/null | wc -l").exec().out.firstOrNull()?.trim()?.toIntOrNull() ?: 0
+                        } else {
+                            onLog(LogEntry(nowTs(), "win-dl", "No Store App packages returned by API for ${pending.title}; continuing offline rebuild"))
+                        }
+                    } catch (appEx: Exception) {
+                        onLog(LogEntry(nowTs(), "win-dl", "Store Apps top-up skipped (${appEx.message ?: "network unavailable"}); continuing offline rebuild", true))
+                    } finally {
+                        _downloadState.value = null
+                        TurboDownloadService.stop(appCtx)
+                    }
+                }
+
                 val hasUpd = Shell.cmd("find ${shellQuote(pkgPath)} -maxdepth 1 -type f \\( -iname '*.msu' -o -iname '*-kb*.cab' -o -iname '*ssu*.cab' -o -iname '*ndp*.cab' -o -iname '*dynamicupdate*.cab' \\) 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
-                val hasApps = Shell.cmd("find ${shellQuote(pkgPath)} -maxdepth 1 -type f \\( -iname '*.msixbundle' -o -iname '*.appxbundle' -o -iname '*.msix' -o -iname '*.appx' \\) 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
+                val hasApps = wantApps && existingAppCount > 0
                 val hasFx3 = Shell.cmd("find ${shellQuote(pkgPath)} -maxdepth 1 -type f -iname '*netfx3*.cab' 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
 
                 if (configOverride != null) {
                     saveBuildJobJson(appCtx, workRootPath, config, pending.totalBytes.coerceAtLeast(pending.cachedBytes), isCachedReady = true)
                 }
-                val modeDesc = if (canFastStep4) "Fast Step-4 pack (${config.compression.shortLabel})" else "${config.compression.shortLabel} · $esdCount cached ESDs"
-                onLog(LogEntry(nowTs(), "win-build", "Queued 100% offline rebuild for ${pending.title} ($modeDesc)"))
+                val modeDesc = if (canFastStep4) "Fast Step-4 pack (${config.compression.shortLabel})" else "${config.compression.shortLabel} · $esdCount cached ESDs${if (hasApps) " · $existingAppCount Store Apps" else ""}"
+                onLog(LogEntry(nowTs(), "win-build", "Queued rebuild for ${pending.title} ($modeDesc)"))
                 enqueueConversion(
                     QueuedConversionJob(
                         context = appCtx,
@@ -1637,10 +1817,9 @@ object WindowsBuildEngine {
                 if (manifest.allFiles.isEmpty()) throw IllegalStateException("Could not load package list from UUPdump or Microsoft servers.")
 
                 val buildMajor = config.build.build.substringBefore('.').toIntOrNull() ?: 0
-                val effectiveAppLevel = if (config.includeStoreApps && config.storeAppLevel == WinStoreAppLevel.SECURITY_ONLY) {
-                    WinStoreAppLevel.ALL_INBOX
-                } else config.storeAppLevel
-                val selectedApps = if (manifest.hasApps && (buildMajor == 0 || buildMajor >= 22563)) {
+                val isSrvBuild = isServerBuild(config.build.title, config.editions.map { it.code })
+                val effectiveAppLevel = if (isSrvBuild) WinStoreAppLevel.NONE else config.storeAppLevel
+                val selectedApps = if (!isSrvBuild && manifest.hasApps && effectiveAppLevel != WinStoreAppLevel.NONE && (buildMajor == 0 || buildMajor >= 22563)) {
                     filterStoreApps(manifest.appFiles, config.lang.code, config.build.arch, effectiveAppLevel)
                 } else emptyList()
 
@@ -1865,7 +2044,8 @@ object WindowsBuildEngine {
     private fun startNextConversion() {
         val next = conversionQueue.poll()
         if (next == null) {
-            if (_conversionState.value?.isFailed != true) _conversionState.value = null
+            val cur = _conversionState.value
+            if (cur?.isFailed != true && cur?.isCompleted != true) _conversionState.value = null
             convContext?.let { IsoBuilderService.stop(it) }
             return
         }
@@ -1881,11 +2061,12 @@ object WindowsBuildEngine {
         IsoBuilderService.start(next.context)
         activeConversionJob = scope.launch {
             try { executeConversionJob(next) } finally {
+                val endState = _conversionState.value
                 if (convCancelledFlag.get()) {
                     lastFailedJob = null
                     _conversionState.value = null
                     IsoBuilderService.stop(next.context)
-                } else if (_conversionState.value?.isFailed == true && conversionQueue.isEmpty()) {
+                } else if ((endState?.isFailed == true || endState?.isCompleted == true) && conversionQueue.isEmpty()) {
                     IsoBuilderService.stop(next.context)
                 } else {
                     startNextConversion()
@@ -1911,6 +2092,7 @@ object WindowsBuildEngine {
         val pkgDir = if (job.pkgDirOverride.isNotBlank()) File(job.pkgDirOverride) else File(workRootPath, "PKGS")
         val isoDir = File(workRootPath, "ISODIR"); val tmpDir = File(workRootPath, "TMP")
         val safeTargetDir = UsbGadgetEngine.resolveDirectPath(config.targetDir).trimEnd('/')
+        Shell.cmd("rm -f ${shellQuote("$safeTargetDir/PocketBoot_FailedBuild.log")} 2>/dev/null || true").exec()
         val defaultSlug = "Windows_${config.build.build}_${config.build.archDisplay}_${config.lang.code}".replace(Regex("[^A-Za-z0-9._-]"), "_")
         val cleanCustom = config.customOutputName.trim().replace(Regex("[^A-Za-z0-9._ -]"), "_").trim()
         val finalFileName = if (config.outputMode == WinBuildOutputMode.DIRECT_NTFS_USB) {
@@ -2522,22 +2704,36 @@ object WindowsBuildEngine {
             val oemCustom = "${isoDir.absolutePath}/sources/\$OEM\$/\$\$/Setup/Custom"
             val oemPanther = "${isoDir.absolutePath}/sources/\$OEM\$/\$\$/Panther"
 
+            val oemUpdatesMsu = "$oemUpdates/MSU"
+            val oemUpdatesNdp = "$oemUpdates/NDP"
             if (job.hasUpdates) {
-                addConsole("Classifying updates: Setup DU -> sources/, OS Updates -> 1_SSU / 2_UPD / 3_LCU")
+                addConsole("Classifying updates: 1_SSU -> MSU/ [Checkpoint-safe] -> 2_UPD/NDP -> 4_Enablement")
                 val updRes = runIsolatedRootScript(appCtx, "oemupd", """
                     set -e
                     $pathHeader
                     mkdir -p ${shellQuote(oemUpdates)}
                     MUM_TMP="/data/local/tmp/pb_upd_mum"
-                    DU_TMP="/data/local/tmp/pb_upd_du"
-                    rm -rf "${'$'}MUM_TMP" "${'$'}DU_TMP"
+                    rm -rf "${'$'}MUM_TMP"
 
-                    # 1. Stage unified .msu cumulative updates as 3_<name>
+                    # 1. Stage .msu files with ORIGINAL Microsoft filenames:
+                    #    - OS Checkpoint + Target LCU MSUs go into Updates/MSU/ (solely OS MSUs so DISM chains checkpoints cleanly!)
+                    #    - .NET MSUs (*ndp*.msu) go into Updates/NDP/
                     for f in "${'$'}PKG"/*.msu "${'$'}PKG"/*.MSU; do
                         if [ ! -f "${'$'}f" ]; then continue; fi
                         bn=${'$'}(basename "${'$'}f")
-                        (ln -f "${'$'}f" ${shellQuote(oemUpdates)}/"3_${'$'}bn" 2>/dev/null || cp -f "${'$'}f" ${shellQuote(oemUpdates)}/"3_${'$'}bn")
-                        echo "UPD_LOG|LCU MSU -> 3_${'$'}bn"
+                        low=${'$'}(printf '%s' "${'$'}bn" | tr 'A-Z' 'a-z')
+                        case "${'$'}low" in
+                            *ndp*)
+                                mkdir -p ${shellQuote(oemUpdatesNdp)}
+                                (ln -f "${'$'}f" ${shellQuote(oemUpdatesNdp)}/"${'$'}bn" 2>/dev/null || cp -f "${'$'}f" ${shellQuote(oemUpdatesNdp)}/"${'$'}bn")
+                                echo "UPD_LOG|.NET MSU -> NDP/${'$'}bn"
+                                ;;
+                            *)
+                                mkdir -p ${shellQuote(oemUpdatesMsu)}
+                                (ln -f "${'$'}f" ${shellQuote(oemUpdatesMsu)}/"${'$'}bn" 2>/dev/null || cp -f "${'$'}f" ${shellQuote(oemUpdatesMsu)}/"${'$'}bn")
+                                echo "UPD_LOG|OS LCU MSU -> MSU/${'$'}bn"
+                                ;;
+                        esac
                     done
 
                     # 2. Classify & stage .cab updates (Setup DU already synced in Step 2; skip SafeOS/WinPE-only & MSU-duplicated KBs)
@@ -2552,25 +2748,23 @@ object WindowsBuildEngine {
                         case "${'$'}low" in
                             *desktopdeployment*|*aggregatedmetadata*|*baseless*|*-express.cab|*netfx3-ondemand*|*safeos*) continue ;;
                         esac
-                        # Skip CAB if a combined .msu with the same KB number already exists
                         kb_num=${'$'}(printf '%s' "${'$'}bn" | grep -oiE 'KB[0-9]{6,8}' | head -n 1 || true)
                         if [ -n "${'$'}kb_num" ] && find "${'$'}PKG" -maxdepth 1 -type f -iname "*${'$'}kb_num*.msu" 2>/dev/null | grep -q .; then
                             echo "UPD_LOG|Skipped duplicate CAB (superseded by MSU): ${'$'}bn"
                             continue
                         fi
 
-                        # Setup Dynamic Updates (no update.mum) were already merged into ISODIR/sources/ + boot.wim in Step 2
                         if ! $qCab -l "${'$'}f" 2>/dev/null | grep -qi 'update\.mum'; then
                             echo "UPD_LOG|Setup DU already synced into boot.wim & sources/: ${'$'}bn"
                             continue
                         fi
 
-                        # Extract update.mum to skip SafeOS/WinPE-only CABs and detect SSU accurately
                         rm -rf "${'$'}MUM_TMP" && mkdir -p "${'$'}MUM_TMP"
                         set +e
                         $qCab -q -F 'update.mum' -d "${'$'}MUM_TMP" "${'$'}f" >/dev/null 2>&1
                         set -e
                         MUM_F=${'$'}(find "${'$'}MUM_TMP" -maxdepth 2 -type f -iname 'update.mum' | head -n 1)
+                        IS_EP=0
                         if [ -n "${'$'}MUM_F" ]; then
                             if grep -qi 'Package_for_SafeOSDU' "${'$'}MUM_F" 2>/dev/null; then
                                 echo "UPD_LOG|Skipped SafeOS WinRE-only CAB: ${'$'}bn"
@@ -2580,28 +2774,72 @@ object WindowsBuildEngine {
                                 echo "UPD_LOG|Skipped WinPE-only CAB: ${'$'}bn"
                                 rm -rf "${'$'}MUM_TMP"; continue
                             fi
+                            if grep -qiE 'Enablement|Product-onecore__.*Enablement|24H2Enablement|25H2Enablement|26H2Enablement|23H2Enablement|22H2Enablement' "${'$'}MUM_F" 2>/dev/null; then
+                                IS_EP=1
+                            fi
                         fi
 
+                        CAB_SZ=${'$'}(stat -c '%s' "${'$'}f" 2>/dev/null || echo 0)
                         if printf '%s' "${'$'}low" | grep -qiE '^ssu-|-ssu-' || $qCab -l "${'$'}f" 2>/dev/null | grep -qi 'microsoft-windows-servicingstack_'; then
                             (ln -f "${'$'}f" ${shellQuote(oemUpdates)}/"1_${'$'}bn" 2>/dev/null || cp -f "${'$'}f" ${shellQuote(oemUpdates)}/"1_${'$'}bn")
                             echo "UPD_LOG|SSU -> 1_${'$'}bn"
+                        elif [ "${'$'}IS_EP" = "1" ] || ( [ "${'$'}CAB_SZ" -gt 0 ] && [ "${'$'}CAB_SZ" -lt 524288 ] && ! printf '%s' "${'$'}low" | grep -qi 'ndp' ); then
+                            (ln -f "${'$'}f" ${shellQuote(oemUpdates)}/"4_${'$'}bn" 2>/dev/null || cp -f "${'$'}f" ${shellQuote(oemUpdates)}/"4_${'$'}bn")
+                            echo "UPD_LOG|Enablement Package -> 4_${'$'}bn (installed after LCU)"
                         else
                             (ln -f "${'$'}f" ${shellQuote(oemUpdates)}/"2_${'$'}bn" 2>/dev/null || cp -f "${'$'}f" ${shellQuote(oemUpdates)}/"2_${'$'}bn")
                             echo "UPD_LOG|Update CAB -> 2_${'$'}bn"
                         fi
                         rm -rf "${'$'}MUM_TMP"
                     done
-                    # Remove Updates dir if everything was Setup DU / skipped
                     if [ -z "${'$'}(ls -A ${shellQuote(oemUpdates)} 2>/dev/null)" ]; then
                         rmdir ${shellQuote(oemUpdates)} 2>/dev/null || true
                     fi
                 """.trimIndent())
                 updRes.out.filter { it.startsWith("UPD_LOG|") }.forEach { addConsole(it.substringAfter('|')) }
+
+                val stagedOsMsus = Shell.cmd("if [ -d ${shellQuote(oemUpdatesMsu)} ]; then for f in ${shellQuote(oemUpdatesMsu)}/*.msu ${shellQuote(oemUpdatesMsu)}/*.MSU; do if [ ! -f \"\$f\" ]; then continue; fi; printf '%s|%s\\n' \"\$(basename \"\$f\")\" \"\$(stat -c '%s' \"\$f\" 2>/dev/null || echo 0)\"; done; fi").exec().out
+                val targetMsu = stagedOsMsus.mapNotNull { line ->
+                    val pp = line.split("|", limit = 2)
+                    if (pp.size == 2) pp[0].trim() to (pp[1].trim().toLongOrNull() ?: 0L) else null
+                }.maxWithOrNull(compareBy<Pair<String, Long>> { it.second }.thenBy { it.first.lowercase() })
+                if (targetMsu != null) {
+                    Shell.cmd("printf '%s\\r\\n' ${shellQuote(targetMsu.first)} > ${shellQuote("$oemUpdatesMsu/pb_target_msu.txt")}").exec()
+                    addConsole("Checkpoint LCU target: ${targetMsu.first} (${UsbGadgetEngine.formatBytes(targetMsu.second)}) · ${stagedOsMsus.size} MSU(s) in Updates/MSU/")
+                }
             }
-            if (job.hasApps) {
-                addConsole("Staging Inbox Store Apps into sources/\$OEM\$/\$\$/Setup/Apps/")
-                val appRes = runIsolatedRootScript(appCtx, "oemapp", "set -e\n$pathHeader\nmkdir -p ${shellQuote(oemApps)}\nfor f in \"\$PKG\"/*.msixbundle \"\$PKG\"/*.appxbundle \"\$PKG\"/*.msix \"\$PKG\"/*.appx \"\$PKG\"/*License*.xml \"\$PKG\"/*license*.xml; do if [ ! -f \"\$f\" ]; then continue; fi; bn=\$(basename \"\$f\"); ln -f \"\$f\" ${shellQuote(oemApps)}/\"\$bn\" 2>/dev/null || cp -f \"\$f\" ${shellQuote(oemApps)}/\"\$bn\"; done")
-                if (!appRes.isSuccess) throw IllegalStateException("Failed staging Store Apps into \$OEM\$: ${(appRes.out + appRes.err).takeLast(2).joinToString(" ").take(180)}")
+            val isSrvNow = isServerBuild(config.build.title, config.editions.map { it.code })
+            if (job.hasApps && !isSrvNow && config.storeAppLevel != WinStoreAppLevel.NONE) {
+                addConsole("Staging Offline Store Apps (${config.storeAppLevel.shortLabel}) into sources/\$OEM\$/\$\$/Setup/Apps/...")
+                val rawPkgApps = Shell.cmd("for f in ${shellQuote(pkgDir.absolutePath)}/*.msixbundle ${shellQuote(pkgDir.absolutePath)}/*.appxbundle ${shellQuote(pkgDir.absolutePath)}/*.msix ${shellQuote(pkgDir.absolutePath)}/*.appx ${shellQuote(pkgDir.absolutePath)}/*License*.xml ${shellQuote(pkgDir.absolutePath)}/*license*.xml; do if [ ! -f \"\$f\" ]; then continue; fi; printf '%s|%s\\n' \"\$(basename \"\$f\")\" \"\$(stat -c '%s' \"\$f\" 2>/dev/null || echo 0)\"; done").exec().out
+                    .mapNotNull { line ->
+                        val pp = line.split("|", limit = 2)
+                        if (pp.size == 2) WinPackageFileEntry(pp[0].trim(), "", pp[1].trim().toLongOrNull() ?: 0L, "", WinPackageKind.STORE_APP) else null
+                    }
+                val chosenApps = filterStoreApps(rawPkgApps, config.lang.code, config.build.arch, config.storeAppLevel)
+                val oemAppsFw = "$oemApps/Frameworks"
+                val oemAppsLic = "$oemApps/Licenses"
+                if (chosenApps.isNotEmpty()) {
+                    val stageCmds = buildList {
+                        add("set -e")
+                        add("mkdir -p ${shellQuote(oemApps)} ${shellQuote(oemAppsFw)} ${shellQuote(oemAppsLic)}")
+                        chosenApps.forEach { app ->
+                            val src = "${pkgDir.absolutePath}/${app.name}"
+                            val dstDir = when {
+                                app.name.lowercase().endsWith(".xml") -> oemAppsLic
+                                isFrameworkAppName(app.name) -> oemAppsFw
+                                else -> oemApps
+                            }
+                            add("(ln -f ${shellQuote(src)} ${shellQuote("$dstDir/${app.name}")} 2>/dev/null || cp -f ${shellQuote(src)} ${shellQuote("$dstDir/${app.name}")})")
+                        }
+                    }.joinToString("\n")
+                    val appRes = runIsolatedRootScript(appCtx, "oemapp", stageCmds)
+                    if (!appRes.isSuccess) throw IllegalStateException("Failed staging Store Apps into \$OEM\$: ${(appRes.out + appRes.err).takeLast(2).joinToString(" ").take(180)}")
+                    val fwCnt = chosenApps.count { isFrameworkAppName(it.name) && !it.name.endsWith(".xml", true) }
+                    val licCnt = chosenApps.count { it.name.endsWith(".xml", true) }
+                    val mainCnt = chosenApps.size - fwCnt - licCnt
+                    addConsole("Staged $mainCnt Store App(s) + $fwCnt Framework(s) + $licCnt License(s) (offline DISM ready)")
+                }
             }
             if (job.hasNetFx3) {
                 addConsole("Staging .NET Framework 3.5 into sources/\$OEM\$/\$\$/Setup/sxs/")
@@ -2666,7 +2904,7 @@ object WindowsBuildEngine {
 
                 // Split any >3.95 GiB .msu cumulative update in $OEM$/$$/Setup/Updates into 3,500 MiB .pbpart01/.pbpart02 chunks.
                 // IMPORTANT: Do ALL 64-bit size comparisons & math in Kotlin Long (Android mksh uses 32-bit signed int32_t!).
-                val allStagedMsus = Shell.cmd("if [ -d ${shellQuote(oemUpdates)} ]; then for f in ${shellQuote(oemUpdates)}/*.msu ${shellQuote(oemUpdates)}/*.MSU; do if [ ! -f \"\$f\" ]; then continue; fi; printf '%s|%s\\n' \"\$f\" \"\$(stat -c '%s' \"\$f\" 2>/dev/null || echo 0)\"; done; fi").exec().out
+                val allStagedMsus = Shell.cmd("if [ -d ${shellQuote(oemUpdates)} ]; then find ${shellQuote(oemUpdates)} -maxdepth 2 -type f \\( -iname '*.msu' \\) -exec stat -c '%n|%s' {} + 2>/dev/null; fi").exec().out
                 val bigMsus = allStagedMsus.mapNotNull { line ->
                     val parts = line.split("|", limit = 2)
                     if (parts.size == 2) {
@@ -2713,8 +2951,8 @@ object WindowsBuildEngine {
                         Shell.cmd("rm -f ${shellQuote(msuPath)}.pbpart* 2>/dev/null || true").exec()
                         throw IllegalStateException("Failed splitting >4 GiB update $msuName (parts=${partSizes.size}/$totalParts, sum=$sumBytes/$msuSz)")
                     }
-                    Shell.cmd("rm -f ${shellQuote(msuPath)}").exec()
-                    addConsole("Split complete: $msuName -> $totalParts parts ($sumBytes bytes, verified byte-exact)")
+                    Shell.cmd("printf '%s\\r\\n' '$msuSz' > ${shellQuote("$msuPath.pbsize")} && rm -f ${shellQuote(msuPath)}").exec()
+                    addConsole("Split complete: $msuName -> $totalParts parts ($sumBytes bytes, .pbsize written, verified byte-exact)")
                 }
             }
 
@@ -2741,7 +2979,7 @@ object WindowsBuildEngine {
                         low = tolower(parts[n])
                         if (sz == 0) {
                             zeros++
-                            if (bad_zero == "" && low ~ /\.(wim|swm|esd|msu|cab|efi|dll|exe|mui|xml|cmd|bat|ini|cfg|sys|man|vbs|com|bin|pbpart[0-9]+)$|^bootmgr$/) {
+                            if (bad_zero == "" && low ~ /\.(wim|swm|esd|msu|cab|efi|dll|exe|mui|xml|cmd|bat|ini|cfg|sys|man|vbs|com|bin|pbpart[0-9]+|pbsize)$|^bootmgr$/) {
                                 bad_zero = f
                             }
                         }
@@ -2910,7 +3148,7 @@ object WindowsBuildEngine {
                                         files++
                                         if (sz == 0) {
                                             zeros++
-                                            if (bad == "" && lp ~ /\.(wim|swm|esd|msu|cab|efi|dll|exe|mui|xml|cmd|bat|ini|cfg|sys|man|vbs|com|bin|pbpart[0-9]+)$|(^|[\/\\])bootmgr$/) {
+                                            if (bad == "" && lp ~ /\.(wim|swm|esd|msu|cab|efi|dll|exe|mui|xml|cmd|bat|ini|cfg|sys|man|vbs|com|bin|pbpart[0-9]+|pbsize)$|(^|[\/\\])bootmgr$/) {
                                                 bad = path
                                             }
                                         }
@@ -2981,7 +3219,46 @@ object WindowsBuildEngine {
                 UsbGadgetEngine.cleanupTempWorkDir(workRootPath)
             }
 
+            Shell.cmd("rm -f ${shellQuote("$safeTargetDir/PocketBoot_FailedBuild.log")} 2>/dev/null || true").exec()
+            val step4Dur = ((System.currentTimeMillis() - stepStartMs) / 1000L).coerceAtLeast(1L)
+            stepDurations[4] = step4Dur
+            addConsole("SUCCESS: $finalFileName ($benchStr${if (bootLabel != null) " · $bootLabel" else ""})")
             emitConvLog("win-build", "Completed $finalFileName ($benchStr${if (bootLabel != null) " · $bootLabel" else ""})")
+            val (doneBatPct, _) = readBatteryPercent(appCtx)
+            _conversionState.value = WindowsConversionJobState(
+                title = job.jobTitle,
+                outputFileName = finalFileName,
+                outputMode = config.outputMode,
+                currentStep = 4,
+                stageLabel = "Build Complete · Verified",
+                detailText = benchStr,
+                overallProgress = 1f,
+                diskSpeedBytesPerSec = 0L,
+                elapsedSeconds = totalSec,
+                etaSeconds = 0L,
+                currentOutputBytes = finalSize,
+                freeSpaceBytes = UsbGadgetEngine.getFreeSpaceBytes(config.targetDir),
+                activeBinary = "Verified",
+                batteryPct = doneBatPct,
+                stepDurationsSec = stepDurations.toMap(),
+                consoleTail = consoleLines.toList(),
+                queuedCount = conversionQueue.size,
+                queuedTitles = conversionQueue.map { it.jobTitle },
+                autoMount = convAutoMountLive,
+                workDirPath = workRootPath,
+                keepPackagesAfterBuild = convKeepPackagesLive,
+                isReadOnlySource = job.isReadOnlySource,
+                isFailed = false,
+                errorMessage = "",
+                isCompleted = true,
+                completionSummary = benchStr,
+                bootVerifiedLabel = bootLabel.orEmpty(),
+                outputSavedPath = injectedMbPath ?: finalOutputPath,
+                batteryTempC = readBatteryTempC(appCtx),
+                thermalProfile = convThermalProfileLive,
+                autoThermalCooldown = convAutoCooldownLive,
+                isCoolingDown = false
+            )
             val completion = DownloadCompletionEvent(job.jobTitle, finalFileName, finalOutputPath, injectedMbPath, null, null, ChecksumVerifyStatus.NONE, convAutoMountLive, benchStr, bootLabel)
             FastIsoDownloader.publishExternalCompletion(completion)
             NotificationHelper.showBuildComplete(appCtx, job.jobTitle, "$finalFileName · $benchStr")
@@ -3127,7 +3404,14 @@ object WindowsBuildEngine {
                 Shell.cmd("if [ -d ${shellQuote(drvSrc)} ]; then mkdir -p $mntDir/Drivers && cp -rf ${shellQuote(drvSrc)}/. $mntDir/Drivers/ 2>&1; fi").exec()
             }
 
-            onSubProgress("Step 4/4 · Syncing bootable USB...", outImgPath.substringAfterLast('/'), 0.95f, dirBytes + extraDrvBytes)
+            onSubProgress("Step 4/4 · Verifying NTFS USB integrity...", outImgPath.substringAfterLast('/'), 0.92f, dirBytes + extraDrvBytes)
+            val usbVerify = Shell.cmd(
+                "[ -s $mntDir/sources/boot.wim ] && ( [ -s $mntDir/sources/install.wim ] || [ -s $mntDir/sources/install.esd ] || [ -s $mntDir/sources/install.swm ] ) && ( [ -s $mntDir/bootmgr ] || [ -s $mntDir/bootmgr.efi ] || [ -s $mntDir/efi/boot/bootx64.efi ] || [ -s $mntDir/efi/boot/bootaa64.efi ] ) && echo USB_OK || echo USB_BAD"
+            ).exec().out
+            if (!usbVerify.any { it.trim() == "USB_OK" }) {
+                return "Direct NTFS USB verification failed: critical boot or install files missing/0-byte on NTFS partition."
+            }
+            onSubProgress("Step 4/4 · Syncing bootable USB...", outImgPath.substringAfterLast('/'), 0.96f, dirBytes + extraDrvBytes)
             Shell.cmd("sync; umount $mntDir 2>/dev/null || umount -l $mntDir 2>/dev/null; sleep 0.3; [ -n ${shellQuote(loopDev)} ] && losetup -d ${shellQuote(loopDev)} 2>/dev/null; rm -rf $mntDir").exec()
             loopDev = ""
 

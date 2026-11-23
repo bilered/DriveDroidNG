@@ -200,7 +200,7 @@ fun WindowsDownloadSheet(
     var customOutputName by remember { mutableStateOf("") }
 
     var includeUpdates by remember { mutableStateOf(false) }
-    var storeAppLevel by remember { mutableStateOf(WinStoreAppLevel.SECURITY_ONLY) }
+    var storeAppLevel by remember { mutableStateOf(WinStoreAppLevel.ALL_INBOX) }
     var splitWimForFat32 by remember { mutableStateOf(false) }
     var selectedThermalProfile by remember(defaultThermalProfile) { mutableStateOf(defaultThermalProfile) }
     var integrateNetFx3 by remember { mutableStateOf(false) }
@@ -1713,7 +1713,7 @@ fun WindowsDownloadSheet(
                                     WindowsChannelBuildConfig(
                                         build = b, lang = lang, editions = chosenEds, compression = buildCompression, outputMode = buildOutputMode, downloadMethod = downloadMethod,
                                         targetDir = targetDir, customOutputName = customOutputName.trim(), targetMultiBootPath = mbPath, connections = turboConnections, autoMount = true,
-                                        includeUpdates = includeUpdates, includeStoreApps = storeAppLevel != WinStoreAppLevel.SECURITY_ONLY, integrateNetFx3 = integrateNetFx3, runComponentCleanup = runComponentCleanup,
+                                        includeUpdates = includeUpdates, includeStoreApps = storeAppLevel != WinStoreAppLevel.NONE, integrateNetFx3 = integrateNetFx3, runComponentCleanup = runComponentCleanup,
                                         skipWinRe = skipWinRe, eiCfgUnlock = eiCfgUnlock, keepPackagesAfterBuild = keepPackagesAfterBuild, scheme = usbScheme, experience = experience, winUtil = winUtil, extraDriversDir = usbExtraDriversDir.trim(), virtualEditions = selectedVirtualEditions.filter { id -> availableVirtualEds.any { it.editionId == id } }, storeAppLevel = storeAppLevel, splitWimForFat32 = splitWimForFat32, thermalProfile = selectedThermalProfile, autoThermalCooldown = defaultAutoThermalCooldown
                                     )
                                 )

@@ -1437,10 +1437,19 @@ object FastIsoDownloader {
                                             if (code == 429 || code == 503) throw IllegalStateException("THROTTLE_$code")
                                             if (code == 200 && task.start > 0L) {
                                                 if (tracker.fallbackSingleStream.compareAndSet(false, true)) {
-                                                    val okSingle = downloadSingleKeepAlive(item, buf, pausedFlag, cancelledFlag, totalCounter, ::resolveFreshUrl)
+                                                    val isolatedPart = File(item.partFile.parentFile, "${item.partFile.name}.single")
+                                                    val isolatedItem = item.copy(partFile = isolatedPart)
+                                                    val okSingle = downloadSingleKeepAlive(isolatedItem, buf, pausedFlag, cancelledFlag, totalCounter, ::resolveFreshUrl)
                                                     if (okSingle && tracker.finalized.compareAndSet(false, true)) {
+                                                        item.partFile.delete()
+                                                        if (!isolatedPart.renameTo(item.partFile)) {
+                                                            isolatedPart.copyTo(item.partFile, overwrite = true)
+                                                            isolatedPart.delete()
+                                                        }
                                                         item.metaFile.delete()
                                                         onFileVerified(item)
+                                                    } else {
+                                                        isolatedPart.delete()
                                                     }
                                                 }
                                                 sliceDone = true

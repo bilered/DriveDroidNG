@@ -644,7 +644,8 @@ fun DownloadScreen(
     val winDlPaused = winDlState?.isPaused == true
     val winConvActive = winConvState != null
     val winConvFailed = winConvState?.isFailed == true
-    LaunchedEffect(turboActive, winDlActive, winDlPaused, winConvActive, winConvFailed, settings.defaultDir) {
+    val winConvCompleted = winConvState?.isCompleted == true
+    LaunchedEffect(turboActive, winDlActive, winDlPaused, winConvActive, winConvFailed, winConvCompleted, settings.defaultDir) {
         pendingResumables = FastIsoDownloader.scanPendingResumableDownloads(context)
         pendingWinBuilds = WindowsBuildEngine.scanPendingBuilds(context, settings.scanDirs + settings.defaultDir)
     }
@@ -1363,8 +1364,8 @@ fun DownloadScreen(
         ) {
             winConvState?.let { conv ->
                 val pctStr = String.format(Locale.US, "%.1f%%", (conv.overallProgress * 100f).coerceIn(0f, 100f))
-                val cardBorder = if (conv.isFailed) PocketColors.danger else PocketColors.accent
-                val cardGradTop = if (conv.isFailed) PocketColors.dangerBg.copy(alpha = 0.55f) else PocketColors.accentBg.copy(alpha = 0.55f)
+                val cardBorder = when { conv.isFailed -> PocketColors.danger; conv.isCompleted -> PocketColors.success; else -> PocketColors.accent }
+                val cardGradTop = when { conv.isFailed -> PocketColors.dangerBg.copy(alpha = 0.55f); conv.isCompleted -> PocketColors.successBg.copy(alpha = 0.55f); else -> PocketColors.accentBg.copy(alpha = 0.55f) }
                 Surface(
                     modifier = Modifier.fillMaxWidth().bounceClick { showBuildMonitorSheet = true },
                     shape = RoundedCornerShape(16.dp), color = PocketColors.surfaceCard, border = BorderStroke(1.5.dp, cardBorder)
@@ -1376,20 +1377,29 @@ fun DownloadScreen(
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    Surface(shape = RoundedCornerShape(5.dp), color = when { conv.isFailed -> PocketColors.dangerBg; conv.isCoolingDown -> PocketColors.warningBg; else -> PocketColors.accentBg }) {
-                                        Text(when { conv.isFailed -> "FAILED"; conv.isCoolingDown -> "COOLING"; else -> "BUILD" }, modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, color = when { conv.isFailed -> PocketColors.danger; conv.isCoolingDown -> PocketColors.warning; else -> PocketColors.accentSoft })
+                                    Surface(shape = RoundedCornerShape(5.dp), color = when { conv.isFailed -> PocketColors.dangerBg; conv.isCompleted -> PocketColors.successBg; conv.isCoolingDown -> PocketColors.warningBg; else -> PocketColors.accentBg }) {
+                                        Text(when { conv.isFailed -> "FAILED"; conv.isCompleted -> "DONE"; conv.isCoolingDown -> "COOLING"; else -> "BUILD" }, modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, color = when { conv.isFailed -> PocketColors.danger; conv.isCompleted -> PocketColors.success; conv.isCoolingDown -> PocketColors.warning; else -> PocketColors.accentSoft })
                                     }
                                     Text(conv.title, style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
                                     if (conv.queuedCount > 0) Surface(shape = RoundedCornerShape(5.dp), color = PocketColors.infoBlueBg) { Text("+${conv.queuedCount} queued", modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, color = PocketColors.infoBlue) }
                                 }
-                                Text(conv.stageLabel, style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(if (conv.isCompleted) conv.completionSummary.ifBlank { conv.stageLabel } else conv.stageLabel, style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             }
-                            Text("Tap for details ›", style = MaterialTheme.typography.labelSmall, color = PocketColors.accentSoft)
+                            if (conv.isCompleted || conv.isFailed) {
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Text("Log ›", style = MaterialTheme.typography.labelSmall, color = if (conv.isCompleted) PocketColors.success else PocketColors.danger)
+                                    IconButton(onClick = { WindowsBuildEngine.dismissFinishedConversion() }, modifier = Modifier.size(30.dp)) {
+                                        Icon(Icons.Rounded.Close, "Dismiss", tint = PocketColors.textSecondary, modifier = Modifier.size(16.dp))
+                                    }
+                                }
+                            } else {
+                                Text("Tap for details ›", style = MaterialTheme.typography.labelSmall, color = PocketColors.accentSoft)
+                            }
                         }
-                        LinearProgressIndicator(progress = { conv.overallProgress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(999.dp)), color = PocketColors.accent, trackColor = PocketColors.surfaceSubtle)
+                        LinearProgressIndicator(progress = { if (conv.isCompleted) 1f else conv.overallProgress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(999.dp)), color = if (conv.isCompleted) PocketColors.success else if (conv.isFailed) PocketColors.danger else PocketColors.accent, trackColor = PocketColors.surfaceSubtle)
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text("$pctStr · ${formatDurationShort(conv.elapsedSeconds)}${if (conv.etaSeconds > 0L) " · ETA ${FastIsoDownloader.formatEta(conv.etaSeconds)}" else ""}", style = PocketColors.monoStyle, color = PocketColors.accentSoft)
-                            Text(buildString { append(if (conv.isCoolingDown) "Cooling" else if (conv.diskSpeedBytesPerSec >= 1024L) FastIsoDownloader.formatSpeed(conv.diskSpeedBytesPerSec) else conv.activeBinary); if (conv.batteryTempC > 0f) append(" · ${String.format(java.util.Locale.US, "%.1f°C", conv.batteryTempC)}") }, style = PocketColors.monoStyle, color = if (conv.batteryTempC >= 42f) PocketColors.danger else if (conv.batteryTempC >= 38f) PocketColors.warning else PocketColors.success)
+                            Text(if (conv.isCompleted) "100% · ${formatDurationShort(conv.elapsedSeconds)}${if (conv.bootVerifiedLabel.isNotBlank()) " · ${conv.bootVerifiedLabel}" else ""}" else "$pctStr · ${formatDurationShort(conv.elapsedSeconds)}${if (conv.etaSeconds > 0L) " · ETA ${FastIsoDownloader.formatEta(conv.etaSeconds)}" else ""}", style = PocketColors.monoStyle, color = if (conv.isCompleted) PocketColors.success else PocketColors.accentSoft)
+                            Text(buildString { append(if (conv.isCompleted) "Tap × to dismiss" else if (conv.isCoolingDown) "Cooling" else if (conv.diskSpeedBytesPerSec >= 1024L) FastIsoDownloader.formatSpeed(conv.diskSpeedBytesPerSec) else conv.activeBinary); if (!conv.isCompleted && conv.batteryTempC > 0f) append(" · ${String.format(java.util.Locale.US, "%.1f°C", conv.batteryTempC)}") }, style = PocketColors.monoStyle, color = if (conv.isCompleted) PocketColors.textSecondary else if (conv.batteryTempC >= 42f) PocketColors.danger else if (conv.batteryTempC >= 38f) PocketColors.warning else PocketColors.success)
                         }
                     }
                 }
@@ -1797,6 +1807,13 @@ fun DownloadScreen(
         var rbThermal by remember(pb.workRootPath) { mutableStateOf(orig.thermalProfile) }
         var rbAutoCooldown by remember(pb.workRootPath) { mutableStateOf(orig.autoThermalCooldown) }
         var rbOutName by remember(pb.workRootPath) { mutableStateOf(orig.customOutputName.ifBlank { pb.outputName }) }
+        val rbIsServer = remember(orig.build.title, orig.editions) { WindowsBuildEngine.isServerBuild(orig.build.title, orig.editions.map { it.code }) }
+        val rbBuildMajor = remember(orig.build.build) { orig.build.build.substringBefore('.').toIntOrNull() ?: 0 }
+        val rbSupportsApps = !rbIsServer && (rbBuildMajor == 0 || rbBuildMajor >= 22563)
+        var rbStoreAppLevel by remember(pb.workRootPath) {
+            mutableStateOf(if (!rbSupportsApps) WinStoreAppLevel.NONE else orig.storeAppLevel)
+        }
+        var rbCabCacheBytes by remember(pb.workRootPath) { mutableStateOf(pb.cabCacheBytes) }
         var rbIncludeUpdates by remember(pb.workRootPath) { mutableStateOf(orig.includeUpdates) }
         var rbNetFx3 by remember(pb.workRootPath) { mutableStateOf(orig.integrateNetFx3) }
         var rbCleanup by remember(pb.workRootPath) { mutableStateOf(orig.runComponentCleanup) }
@@ -1818,7 +1835,9 @@ fun DownloadScreen(
         }
 
         val stagingChanged = rbCompression != orig.compression ||
+            (rbOutputMode == WinBuildOutputMode.DIRECT_NTFS_USB) != (orig.outputMode == WinBuildOutputMode.DIRECT_NTFS_USB) ||
             rbIncludeUpdates != orig.includeUpdates ||
+            rbStoreAppLevel != orig.storeAppLevel ||
             rbNetFx3 != orig.integrateNetFx3 ||
             rbCleanup != orig.runComponentCleanup ||
             rbSkipWinRe != orig.skipWinRe ||
@@ -2011,6 +2030,94 @@ fun DownloadScreen(
                         }
                     }
 
+                    // Inbox Store Apps 4-Way Selector (for Win 11 22H2+ non-Server builds)
+                    if (rbSupportsApps) {
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = PocketColors.surfaceInput,
+                            border = BorderStroke(0.5.dp, PocketColors.border)
+                        ) {
+                            Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                    Text("Inbox Store Apps", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                                    Text(
+                                        if (pb.cachedAppsCount > 0) "${pb.cachedAppsCount} cached" else "0 cached",
+                                        style = PocketColors.monoStyle,
+                                        fontSize = 10.5.sp,
+                                        color = if (pb.cachedAppsCount > 0) PocketColors.success else PocketColors.warning
+                                    )
+                                }
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                                    WinStoreAppLevel.entries.forEach { lvl ->
+                                        val sel = rbStoreAppLevel == lvl
+                                        Surface(
+                                            modifier = Modifier.weight(1f).height(34.dp).bounceClick { rbStoreAppLevel = lvl },
+                                            shape = RoundedCornerShape(8.dp),
+                                            color = if (sel) PocketColors.accentBg else PocketColors.surfaceCard,
+                                            border = BorderStroke(if (sel) 1.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                                        ) {
+                                            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                                Text(lvl.shortLabel, style = MaterialTheme.typography.labelSmall, fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Medium, color = if (sel) PocketColors.accentSoft else PocketColors.textSecondary, maxLines = 1)
+                                            }
+                                        }
+                                    }
+                                }
+                                Text(
+                                    if (rbStoreAppLevel != WinStoreAppLevel.NONE && pb.cachedAppsCount == 0) {
+                                        "${rbStoreAppLevel.subtitle} · Will top-up only missing Store Apps before rebuilding (keeps cached 8 GB OS)."
+                                    } else {
+                                        rbStoreAppLevel.subtitle
+                                    },
+                                    fontSize = 10.5.sp,
+                                    color = if (rbStoreAppLevel != WinStoreAppLevel.NONE && pb.cachedAppsCount == 0) PocketColors.infoBlue else PocketColors.textSecondary
+                                )
+                            }
+                        }
+                    }
+
+                    // CAB Cache Size & One-Tap Clear
+                    if (rbCabCacheBytes > 0L) {
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = PocketColors.surfaceInput,
+                            border = BorderStroke(0.5.dp, PocketColors.border)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 9.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text("Reusable CAB Cache (${UsbGadgetEngine.formatBytes(rbCabCacheBytes)})", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                                    Text("Speeds up Step 1 on future offline rebuilds", fontSize = 10.5.sp, color = PocketColors.textSecondary)
+                                }
+                                TextButton(onClick = {
+                                    WindowsBuildEngine.clearCabCache(pb)
+                                    rbCabCacheBytes = 0L
+                                    onMessage("Cleared reusable CAB cache.", false)
+                                }) {
+                                    Text("Clear", color = PocketColors.danger, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                                }
+                            }
+                        }
+                    }
+
+                    // Local User Password Reminder (passwords are never stored in plaintext in pb_build.json)
+                    if (rbExperience.createLocalUser && rbExperience.localPassword.isBlank()) {
+                        Surface(
+                            shape = RoundedCornerShape(11.dp),
+                            color = PocketColors.warningBg.copy(alpha = 0.5f),
+                            border = BorderStroke(0.75.dp, PocketColors.warning)
+                        ) {
+                            Text(
+                                "Local User "${rbExperience.localUsername.ifBlank { "User" }}" has a blank password (cached builds don't store passwords). Re-enter it in Customizer below if you want a password.",
+                                modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp),
+                                fontSize = 10.5.sp,
+                                color = PocketColors.textPrimary
+                            )
+                        }
+                    }
+
                     // Build Options Toggles
                     Surface(
                         shape = RoundedCornerShape(12.dp),
@@ -2152,6 +2259,8 @@ fun DownloadScreen(
                                 customOutputName = rbOutName.trim(),
                                 autoMount = rbAutoMount,
                                 includeUpdates = rbIncludeUpdates,
+                                includeStoreApps = rbStoreAppLevel != WinStoreAppLevel.NONE,
+                                storeAppLevel = rbStoreAppLevel,
                                 integrateNetFx3 = rbNetFx3,
                                 runComponentCleanup = rbCleanup,
                                 skipWinRe = rbSkipWinRe,
@@ -2408,7 +2517,7 @@ fun DownloadScreen(
                     onMessage("Retrying Windows build from cached packages...", false)
                 }
             },
-            onDismissFailed = { WindowsBuildEngine.dismissFailedConversion() },
+            onDismissFailed = { WindowsBuildEngine.dismissFinishedConversion() },
             onCancelBuild = {
                 WindowsBuildEngine.cancelConversion()
                 onMessage("Cancelled active ISO/USB build.", false)

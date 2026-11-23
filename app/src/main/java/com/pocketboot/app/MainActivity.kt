@@ -228,6 +228,7 @@ fun PocketBootApp(initialShortcutPath: String = "") {
     var slimmerTargetFile by remember { mutableStateOf<ImageFile?>(null) }
     var slimmerJob by remember { mutableStateOf<Job?>(null) }
     var slimmerProgress by remember { mutableStateOf(WindowsBuildProgress()) }
+    var slimmerCompletedMsg by remember { mutableStateOf<String?>(null) }
     var handledShortcut by remember { mutableStateOf(false) }
     val winChannelDlState by WindowsBuildEngine.downloadState.collectAsState()
     val winChannelConvState by WindowsBuildEngine.conversionState.collectAsState()
@@ -239,9 +240,10 @@ fun PocketBootApp(initialShortcutPath: String = "") {
     val winDlActive = winChannelDlState != null
     val winConvActive = winChannelConvState != null
     val winConvFailed = winChannelConvState?.isFailed == true
+    val winConvCompleted = winChannelConvState?.isCompleted == true
     val anyBuildOrDlActive = windowsBuildJob != null || linuxBuildJob != null ||
         ventoyBuildJob != null || slimmerJob != null ||
-        (winDlActive && winChannelDlState?.isPaused != true) || (winConvActive && !winConvFailed)
+        (winDlActive && winChannelDlState?.isPaused != true) || (winConvActive && !winConvFailed && !winConvCompleted)
     val keepScreenAwake = settings.keepScreenAwakeDuringBuilds && anyBuildOrDlActive
 
     SideEffect {
@@ -264,7 +266,7 @@ fun PocketBootApp(initialShortcutPath: String = "") {
         WindowsBuildEngine.configureThermal(settings.buildThermalProfile, settings.autoThermalCooldown)
     }
 
-    LaunchedEffect(images.size, settings.defaultDir, winDlActive, winConvActive, winConvFailed, windowsBuildJob != null, ventoyBuildJob != null) {
+    LaunchedEffect(images.size, settings.defaultDir, winDlActive, winConvActive, winConvFailed, winConvCompleted, windowsBuildJob != null, ventoyBuildJob != null) {
         withContext(Dispatchers.IO) {
             drivesFreeBytes = UsbGadgetEngine.getFreeSpaceBytes(settings.defaultDir)
             tempCacheBytes = UsbGadgetEngine.getTempStorageStats(context, settings.scanDirs + settings.defaultDir).totalBytes
@@ -1321,7 +1323,8 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                 presets = settings.autounattendPresets,
                 building = slimmerJob != null,
                 progress = slimmerProgress,
-                onDismiss = { slimmerTargetFile = null },
+                completedMessage = slimmerCompletedMsg,
+                onDismiss = { slimmerTargetFile = null; slimmerCompletedMsg = null },
                 onSavePreset = { preset ->
                     val updatedPresets = settings.autounattendPresets.filterNot { it.name.equals(preset.name, true) } + preset
                     updateSettings(settings.copy(autounattendPresets = updatedPresets), rescan = false)
@@ -1338,12 +1341,13 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                     showFeedback("Cancelled Windows ISO Slimmer.")
                 },
                 onStartSlim = { cfg ->
+                    slimmerCompletedMsg = null
                     slimmerProgress = WindowsBuildProgress("Preparing...", cfg.sourceIso.name, 0.04f, true)
                     slimmerJob = scope.launch {
                         val res = WindowsIsoSlimmer.slimWindowsIso(context, cfg) { p -> slimmerProgress = p }
                         slimmerJob = null
                         if (res.success && res.createdPath != null) {
-                            slimmerTargetFile = null
+                            slimmerCompletedMsg = res.userMessage
                             val updated = settings.copy(
                                 pinnedFiles = (settings.pinnedFiles + res.createdPath).distinct(),
                                 hiddenFiles = settings.hiddenFiles - res.createdPath

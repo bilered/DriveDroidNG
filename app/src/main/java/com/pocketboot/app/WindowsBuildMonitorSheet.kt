@@ -142,9 +142,21 @@ fun WindowsBuildMonitorSheet(
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             PocketSheetHeader(
-                icon = if (state.isFailed) Icons.Rounded.ErrorOutline else Icons.Rounded.Build,
-                tint = if (state.isFailed) PocketColors.danger else PocketColors.accentSoft,
-                iconBg = if (state.isFailed) PocketColors.dangerBg else PocketColors.accentBg,
+                icon = when {
+                    state.isFailed -> Icons.Rounded.ErrorOutline
+                    state.isCompleted -> Icons.Rounded.CheckCircle
+                    else -> Icons.Rounded.Build
+                },
+                tint = when {
+                    state.isFailed -> PocketColors.danger
+                    state.isCompleted -> PocketColors.success
+                    else -> PocketColors.accentSoft
+                },
+                iconBg = when {
+                    state.isFailed -> PocketColors.dangerBg
+                    state.isCompleted -> PocketColors.successBg
+                    else -> PocketColors.accentBg
+                },
                 title = state.title,
                 subtitle = "${state.outputFileName} · ${state.outputMode.label}",
                 subtitleMono = true
@@ -152,31 +164,67 @@ fun WindowsBuildMonitorSheet(
 
             Surface(
                 shape = RoundedCornerShape(14.dp),
-                color = if (state.isFailed) PocketColors.dangerBg.copy(alpha = 0.55f) else PocketColors.surfaceInput,
-                border = BorderStroke(1.dp, if (state.isFailed) PocketColors.danger else PocketColors.accent.copy(alpha = 0.65f))
+                color = when {
+                    state.isFailed -> PocketColors.dangerBg.copy(alpha = 0.55f)
+                    state.isCompleted -> PocketColors.successBg.copy(alpha = 0.55f)
+                    else -> PocketColors.surfaceInput
+                },
+                border = BorderStroke(
+                    1.dp,
+                    when {
+                        state.isFailed -> PocketColors.danger
+                        state.isCompleted -> PocketColors.success
+                        else -> PocketColors.accent.copy(alpha = 0.65f)
+                    }
+                )
             ) {
                 Column(modifier = Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Text(state.stageLabel, style = MaterialTheme.typography.labelLarge, color = if (state.isFailed) PocketColors.danger else PocketColors.textPrimary)
                             Text(
-                                text = if (state.isFailed) state.errorMessage.ifBlank { state.detailText } else state.detailText,
+                                state.stageLabel,
+                                style = MaterialTheme.typography.labelLarge,
+                                color = when {
+                                    state.isFailed -> PocketColors.danger
+                                    state.isCompleted -> PocketColors.success
+                                    else -> PocketColors.textPrimary
+                                }
+                            )
+                            Text(
+                                text = when {
+                                    state.isFailed -> state.errorMessage.ifBlank { state.detailText }
+                                    state.isCompleted -> state.completionSummary.ifBlank { state.detailText }
+                                    else -> state.detailText
+                                },
                                 style = MaterialTheme.typography.bodySmall,
-                                color = if (state.isFailed) PocketColors.textPrimary else PocketColors.textSecondary,
-                                maxLines = if (state.isFailed) 4 else 1,
+                                color = if (state.isFailed || state.isCompleted) PocketColors.textPrimary else PocketColors.textSecondary,
+                                maxLines = if (state.isFailed || state.isCompleted) 4 else 1,
                                 overflow = TextOverflow.Ellipsis
                             )
+                            if (state.isCompleted && state.bootVerifiedLabel.isNotBlank()) {
+                                Text(
+                                    text = state.bootVerifiedLabel,
+                                    style = PocketColors.monoStyle,
+                                    fontSize = 11.sp,
+                                    color = PocketColors.success
+                                )
+                            }
                         }
                         if (!state.isFailed) {
                             Spacer(modifier = Modifier.width(8.dp))
-                            Text(pctFormatted, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, color = PocketColors.accentSoft)
+                            Text(
+                                if (state.isCompleted) "100%" else pctFormatted,
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = if (state.isCompleted) PocketColors.success else PocketColors.accentSoft
+                            )
                         }
                     }
                     if (!state.isFailed) {
                         LinearProgressIndicator(
-                            progress = { state.overallProgress.coerceIn(0f, 1f) },
+                            progress = { if (state.isCompleted) 1f else state.overallProgress.coerceIn(0f, 1f) },
                             modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(999.dp)),
-                            color = PocketColors.accent,
+                            color = if (state.isCompleted) PocketColors.success else PocketColors.accent,
                             trackColor = PocketColors.surfaceSubtle
                         )
                     } else if (!state.isReadOnlySource) {
@@ -239,14 +287,14 @@ fun WindowsBuildMonitorSheet(
                     MonitorMetricBox(
                         Icons.Rounded.Speed,
                         "Disk Speed",
-                        if (state.isCoolingDown) "Cooling..." else if (state.diskSpeedBytesPerSec >= 1024L) FastIsoDownloader.formatSpeed(state.diskSpeedBytesPerSec) else if (state.isFailed) "Stopped" else "Active...",
+                        if (state.isCompleted) "Complete" else if (state.isCoolingDown) "Cooling..." else if (state.diskSpeedBytesPerSec >= 1024L) FastIsoDownloader.formatSpeed(state.diskSpeedBytesPerSec) else if (state.isFailed) "Stopped" else "Active...",
                         if (state.isCoolingDown) PocketColors.warning else PocketColors.accentSoft,
                         Modifier.weight(1f)
                     )
                     MonitorMetricBox(
                         Icons.Rounded.Schedule,
                         "Elapsed / ETA",
-                        "${formatDurationShort(state.elapsedSeconds)} · ${if (state.etaSeconds > 0L && !state.isFailed) FastIsoDownloader.formatEta(state.etaSeconds) else if (state.isFailed) "Failed" else "est..."}",
+                        "${formatDurationShort(state.elapsedSeconds)} · ${if (state.isCompleted) "Done" else if (state.etaSeconds > 0L && !state.isFailed) FastIsoDownloader.formatEta(state.etaSeconds) else if (state.isFailed) "Failed" else "est..."}",
                         PocketColors.textPrimary,
                         Modifier.weight(1f)
                     )
@@ -273,8 +321,8 @@ fun WindowsBuildMonitorSheet(
                 Column(modifier = Modifier.fillMaxWidth().padding(13.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
                     Text("PIPELINE TIMELINE", fontSize = 10.5.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.8.sp, color = PocketColors.textMuted)
                     stepTitles.forEach { (stepNum, label) ->
-                        val isDone = state.currentStep > stepNum
-                        val isCurrent = state.currentStep == stepNum
+                        val isDone = state.isCompleted || state.currentStep > stepNum
+                        val isCurrent = !state.isCompleted && state.currentStep == stepNum
                         val isErrStep = state.isFailed && isCurrent
                         val stepDur = state.stepDurationsSec[stepNum]
                         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -382,7 +430,7 @@ fun WindowsBuildMonitorSheet(
                 }
             }
 
-            if (!state.isFailed) {
+            if (!state.isFailed && !state.isCompleted) {
                 Surface(shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
                     Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Row(
@@ -472,7 +520,32 @@ fun WindowsBuildMonitorSheet(
             }
 
             Row(modifier = Modifier.fillMaxWidth().padding(bottom = 22.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (state.isFailed) {
+                if (state.isCompleted) {
+                    OutlinedButton(
+                        onClick = {
+                            val text = state.consoleTail.joinToString("\n").ifBlank { state.completionSummary }
+                            context.getSystemService(ClipboardManager::class.java)?.setPrimaryClip(ClipData.newPlainText("PocketBoot Build Log", text))
+                            Toast.makeText(context, "Copied build log.", Toast.LENGTH_SHORT).show()
+                        },
+                        modifier = Modifier.weight(0.9f).height(48.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, PocketColors.border)
+                    ) {
+                        Icon(Icons.Rounded.ContentCopy, null, tint = PocketColors.accentSoft, modifier = Modifier.size(17.dp))
+                        Spacer(modifier = Modifier.width(5.dp))
+                        Text("Copy Log", color = PocketColors.textPrimary, fontWeight = FontWeight.SemiBold)
+                    }
+                    Button(
+                        onClick = { onDismissFailed(); onDismiss() },
+                        modifier = Modifier.weight(1.2f).height(48.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = PocketColors.success, contentColor = Color.White)
+                    ) {
+                        Icon(Icons.Rounded.CheckCircle, null, modifier = Modifier.size(17.dp))
+                        Spacer(modifier = Modifier.width(5.dp))
+                        Text("Done & Dismiss", fontWeight = FontWeight.SemiBold)
+                    }
+                } else if (state.isFailed) {
                     OutlinedButton(
                         onClick = { onDismissFailed(); onDismiss() },
                         modifier = Modifier.weight(1f).height(48.dp),

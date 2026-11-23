@@ -20,6 +20,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.CheckBox
 import androidx.compose.material.icons.rounded.CheckBoxOutlineBlank
+import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Compress
 import androidx.compose.material.icons.rounded.Info
@@ -154,7 +155,7 @@ object WindowsIsoSlimmer {
 
             // Replace old install.wim/esd with slimmed file
             val finalInstallInIso = "$isoDir/sources/install.$dstExt"
-            Shell.cmd("rm -f $qIsoDir/sources/install.wim $qIsoDir/sources/install.esd $qIsoDir/sources/INSTALL.WIM $qIsoDir/sources/INSTALL.ESD && mv -f $qNewInstall ${shellQuote(finalInstallInIso)}").exec()
+            Shell.cmd("rm -f $qIsoDir/sources/install.wim $qIsoDir/sources/install.esd $qIsoDir/sources/install*.swm $qIsoDir/sources/INSTALL.WIM $qIsoDir/sources/INSTALL.ESD $qIsoDir/sources/INSTALL*.SWM && mv -f $qNewInstall ${shellQuote(finalInstallInIso)}").exec()
 
             // Optional Windows CA 2023 bootloaders, ei.cfg unlock, and Two-Pane Experience/WinUtil tweaks
             if (config.experience.useCa2023Bootloaders) {
@@ -300,6 +301,7 @@ fun WindowsIsoSlimmerSheet(
     presets: List<AutounattendPreset> = emptyList(),
     building: Boolean,
     progress: WindowsBuildProgress,
+    completedMessage: String? = null,
     onDismiss: () -> Unit,
     onCancel: () -> Unit,
     onSavePreset: (AutounattendPreset) -> Unit = {},
@@ -360,7 +362,35 @@ fun WindowsIsoSlimmerSheet(
                 }
             }
 
-            if (building) {
+            if (!building && !completedMessage.isNullOrBlank()) {
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = PocketColors.successBg.copy(alpha = 0.55f),
+                    border = BorderStroke(1.dp, PocketColors.success)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(15.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Icon(Icons.Rounded.CheckCircle, null, tint = PocketColors.success, modifier = Modifier.size(24.dp))
+                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                            Text("Custom Slim ISO Ready", style = MaterialTheme.typography.titleMedium, color = PocketColors.success)
+                            Text(completedMessage, style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
+                        }
+                    }
+                }
+                Button(
+                    onClick = onDismiss,
+                    modifier = Modifier.fillMaxWidth().height(PocketTokens.PrimaryButtonHeight),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = PocketColors.success, contentColor = PocketColors.onAccent)
+                ) {
+                    Icon(Icons.Rounded.CheckCircle, null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Done & Dismiss", fontWeight = FontWeight.SemiBold)
+                }
+            } else if (building) {
                 Surface(
                     shape = RoundedCornerShape(14.dp),
                     color = PocketColors.surfaceInput,
