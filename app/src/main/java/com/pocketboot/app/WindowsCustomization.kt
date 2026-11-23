@@ -350,12 +350,12 @@ object WindowsCustomizationEngine {
         if (hasOemUpdates) {
             sb.appendLine("if exist \"C:\\Windows\\Setup\\Updates\" (")
             sb.appendLine("  echo [PocketBoot v4.5.0] Pass 1/3: Installing Servicing Stack Updates (SSU)... >> \"%PB_LOG%\"")
-            sb.appendLine("  for %%F in (\"C:\\Windows\\Setup\\Updates\\1_*.cab\" \"C:\\Windows\\Setup\\Updates\\SSU-*.cab\" \"C:\\Windows\\Setup\\Updates\\ssu-*.cab\") do if exist \"%%~fF\" (echo Installing SSU: %%~nxF >> \"%PB_LOG%\" & dism /Online /Add-Package /PackagePath:\"%%~fF\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 3010 set \"PB_REBOOT_REQ=1\")")
+            sb.appendLine("  for %%F in (\"C:\\Windows\\Setup\\Updates\\1_*.cab\" \"C:\\Windows\\Setup\\Updates\\SSU-*.cab\") do if exist \"%%~fF\" (echo Installing SSU: %%~nxF >> \"%PB_LOG%\" & dism /Online /Add-Package /PackagePath:\"%%~fF\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 3010 set \"PB_REBOOT_REQ=1\")")
             sb.appendLine("  echo [PocketBoot v4.5.0] Pass 2/3: Installing Enablement, .NET & General CAB Updates... >> \"%PB_LOG%\"")
             sb.appendLine("  for %%F in (\"C:\\Windows\\Setup\\Updates\\2_*.cab\") do if exist \"%%~fF\" (echo Installing UPD: %%~nxF >> \"%PB_LOG%\" & dism /Online /Add-Package /PackagePath:\"%%~fF\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 3010 set \"PB_REBOOT_REQ=1\")")
             sb.appendLine("  for %%F in (\"C:\\Windows\\Setup\\Updates\\*.cab\") do if exist \"%%~fF\" (echo %%~nxF | findstr /i /b \"1_ 2_ 3_ SSU-\" >nul || (echo Installing CAB: %%~nxF >> \"%PB_LOG%\" & dism /Online /Add-Package /PackagePath:\"%%~fF\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 3010 set \"PB_REBOOT_REQ=1\"))")
             sb.appendLine("  echo [PocketBoot v4.5.0] Pass 3/3: Installing Cumulative Updates (LCU MSU)... >> \"%PB_LOG%\"")
-            sb.appendLine("  for %%F in (\"C:\\Windows\\Setup\\Updates\\3_*.msu\" \"C:\\Windows\\Setup\\Updates\\*.msu\") do if exist \"%%~fF\" (echo %%~nxF | findstr /i /b \"3_\" >nul && (echo Installing LCU: %%~nxF >> \"%PB_LOG%\" & dism /Online /Add-Package /PackagePath:\"%%~fF\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 3010 set \"PB_REBOOT_REQ=1\"))")
+            sb.appendLine("  for %%F in (\"C:\\Windows\\Setup\\Updates\\3_*.msu\") do if exist \"%%~fF\" (echo Installing LCU: %%~nxF >> \"%PB_LOG%\" & dism /Online /Add-Package /PackagePath:\"%%~fF\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 3010 set \"PB_REBOOT_REQ=1\")")
             sb.appendLine("  for %%F in (\"C:\\Windows\\Setup\\Updates\\*.msu\") do if exist \"%%~fF\" (echo %%~nxF | findstr /i /b \"3_\" >nul || (echo Installing MSU: %%~nxF >> \"%PB_LOG%\" & dism /Online /Add-Package /PackagePath:\"%%~fF\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 3010 set \"PB_REBOOT_REQ=1\"))")
             sb.appendLine("  rmdir /s /q \"C:\\Windows\\Setup\\Updates\" >> \"%PB_LOG%\" 2>&1")
             sb.appendLine(")")
@@ -404,7 +404,7 @@ object WindowsCustomizationEngine {
         return sb.toString()
     }
 
-    fun generateAutounattendXml(experience: WindowsExperienceConfig, winUtil: WinUtilTweaksConfig, arch: String = "amd64", selectedEditionIndex: Int? = null, hasSpecializeScript: Boolean = false, hasOemUpdates: Boolean = false): String {
+    fun generateAutounattendXml(experience: WindowsExperienceConfig, winUtil: WinUtilTweaksConfig, arch: String = "amd64", selectedEditionIndex: Int? = null, hasSpecializeScript: Boolean = false, hasOemUpdates: Boolean = false, includeWindowsPePass: Boolean = true): String {
         val safeArch = if (arch.lowercase() in setOf("x86", "arm64", "amd64")) arch.lowercase() else "amd64"
         val peCommands = mutableListOf<Pair<String, String>>()
         if (experience.bypassRequirements) {
@@ -428,7 +428,7 @@ object WindowsCustomizationEngine {
         val sb = StringBuilder()
         sb.appendLine("""<?xml version="1.0" encoding="utf-8"?>""")
         sb.appendLine("""<unattend xmlns="urn:schemas-microsoft-com:unattend">""")
-        if (peCommands.isNotEmpty() || selectedEditionIndex != null) {
+        if (includeWindowsPePass && (peCommands.isNotEmpty() || selectedEditionIndex != null)) {
             sb.appendLine("""  <settings pass="windowsPE">""")
             sb.appendLine("""    <component name="Microsoft-Windows-Setup" processorArchitecture="$safeArch" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">""")
             if (selectedEditionIndex != null) {

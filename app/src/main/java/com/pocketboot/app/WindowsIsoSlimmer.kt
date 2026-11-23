@@ -184,7 +184,10 @@ object WindowsIsoSlimmer {
                 val customName = if (customPath.isNotBlank()) customPath.substringAfterLast('/') else ""
 
                 val tmpXml = File(context.cacheDir, "slim_auto.xml").apply {
-                    writeText(WindowsCustomizationEngine.generateAutounattendXml(config.experience, config.winUtil, safeArch, null, true, false), Charsets.UTF_8)
+                    writeText(WindowsCustomizationEngine.generateAutounattendXml(config.experience, config.winUtil, safeArch, null, true, false, includeWindowsPePass = true), Charsets.UTF_8)
+                }
+                val tmpPantherXml = File(context.cacheDir, "slim_panther.xml").apply {
+                    writeText(WindowsCustomizationEngine.generateAutounattendXml(config.experience, config.winUtil, safeArch, null, true, false, includeWindowsPePass = false), Charsets.UTF_8)
                 }
                 val tmpSpec = File(context.cacheDir, "slim_spec.cmd").apply {
                     writeText(WindowsCustomizationEngine.buildSpecializeScript(config.experience, config.winUtil), Charsets.UTF_8)
@@ -198,11 +201,11 @@ object WindowsIsoSlimmer {
                 Shell.cmd(
                     "mkdir -p ${shellQuote(oemPanther)} ${shellQuote(oemScripts)} && " +
                         "cp -f ${shellQuote(tmpXml.absolutePath)} ${shellQuote("$isoDir/autounattend.xml")} && " +
-                        "cp -f ${shellQuote(tmpXml.absolutePath)} ${shellQuote("$oemPanther/unattend.xml")} && " +
+                        "cp -f ${shellQuote(tmpPantherXml.absolutePath)} ${shellQuote("$oemPanther/unattend.xml")} && " +
                         "cp -f ${shellQuote(tmpSpec.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_Specialize.cmd")} && " +
                         "cp -f ${shellQuote(tmpComp.absolutePath)} ${shellQuote("$oemScripts/SetupComplete.cmd")} && $customCopy"
                 ).exec()
-                tmpXml.delete(); tmpSpec.delete(); tmpComp.delete()
+                tmpXml.delete(); tmpPantherXml.delete(); tmpSpec.delete(); tmpComp.delete()
             }
 
             if (qGenIso == null && !config.convertToEsd) {
@@ -235,11 +238,11 @@ object WindowsIsoSlimmer {
                 BIOS_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'etfsboot.com' 2>/dev/null | head -n 1 | sed 's|^\./||')
 
                 if [ -n "${'$'}BIOS_BOOT" ] && [ -n "${'$'}EFI_BOOT" ]; then
-                    ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -V "POCKETBOOT_SLIM" -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOut .
+                    ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -hide "*" -hide-udf boot.catalog -V "POCKETBOOT_SLIM" -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOut .
                 elif [ -n "${'$'}EFI_BOOT" ]; then
-                    ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -V "POCKETBOOT_SLIM" -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOut .
+                    ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -hide "*" -hide-udf boot.catalog -V "POCKETBOOT_SLIM" -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOut .
                 else
-                    ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -V "POCKETBOOT_SLIM" -o $qOut .
+                    ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -hide "*" -V "POCKETBOOT_SLIM" -o $qOut .
                 fi
                 """.trimIndent()
             } else {

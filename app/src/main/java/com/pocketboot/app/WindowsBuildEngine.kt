@@ -1408,9 +1408,9 @@ object WindowsBuildEngine {
                 if (!hasReadyIsoDir && esdCount <= 0) {
                     throw IllegalStateException("Cached packages are incomplete or missing. Please tap Resume to verify/download.")
                 }
-                val hasUpd = Shell.cmd("ls ${shellQuote(pkgPath)}/*.msu ${shellQuote(pkgPath)}/*-KB*.cab ${shellQuote(pkgPath)}/*SSU*.cab 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
-                val hasApps = Shell.cmd("ls ${shellQuote(pkgPath)}/*.msixbundle ${shellQuote(pkgPath)}/*.appxbundle ${shellQuote(pkgPath)}/*.msix ${shellQuote(pkgPath)}/*.appx 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
-                val hasFx3 = Shell.cmd("ls ${shellQuote(pkgPath)}/*netfx3-ondemand*.cab ${shellQuote(pkgPath)}/*NetFx3*.cab 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
+                val hasUpd = Shell.cmd("find ${shellQuote(pkgPath)} -maxdepth 1 -type f \\( -iname '*.msu' -o -iname '*-kb*.cab' -o -iname '*ssu*.cab' -o -iname '*ndp*.cab' -o -iname '*dynamicupdate*.cab' \\) 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
+                val hasApps = Shell.cmd("find ${shellQuote(pkgPath)} -maxdepth 1 -type f \\( -iname '*.msixbundle' -o -iname '*.appxbundle' -o -iname '*.msix' -o -iname '*.appx' \\) 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
+                val hasFx3 = Shell.cmd("find ${shellQuote(pkgPath)} -maxdepth 1 -type f -iname '*netfx3*.cab' 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
 
                 onLog(LogEntry(nowTs(), "win-build", "Queued 100% offline rebuild for ${pending.title}${if (hasReadyIsoDir) " (Fast Step-4 resume)" else " ($esdCount cached ESDs)"}"))
                 enqueueConversion(
@@ -1725,9 +1725,9 @@ object WindowsBuildEngine {
                     throw IllegalStateException("No Windows .esd files found inside ${resolvedFolder.replace("/data/media/0", "/sdcard")}.")
                 }
                 val folderBytes = Shell.cmd("du -sb ${shellQuote(resolvedFolder)} 2>/dev/null | awk '{print \$1}'").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: (4L * 1024L * 1024L * 1024L)
-                val hasUpd = Shell.cmd("ls ${shellQuote(resolvedFolder)}/*.msu ${shellQuote(resolvedFolder)}/*-KB*.cab ${shellQuote(resolvedFolder)}/*SSU*.cab 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
-                val hasApps = Shell.cmd("ls ${shellQuote(resolvedFolder)}/*.msixbundle ${shellQuote(resolvedFolder)}/*.appxbundle ${shellQuote(resolvedFolder)}/*.msix ${shellQuote(resolvedFolder)}/*.appx 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
-                val hasFx3 = Shell.cmd("ls ${shellQuote(resolvedFolder)}/*netfx3-ondemand*.cab ${shellQuote(resolvedFolder)}/*NetFx3*.cab 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
+                val hasUpd = Shell.cmd("find ${shellQuote(resolvedFolder)} -maxdepth 1 -type f \\( -iname '*.msu' -o -iname '*-kb*.cab' -o -iname '*ssu*.cab' -o -iname '*ndp*.cab' -o -iname '*dynamicupdate*.cab' \\) 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
+                val hasApps = Shell.cmd("find ${shellQuote(resolvedFolder)} -maxdepth 1 -type f \\( -iname '*.msixbundle' -o -iname '*.appxbundle' -o -iname '*.msix' -o -iname '*.appx' \\) 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
+                val hasFx3 = Shell.cmd("find ${shellQuote(resolvedFolder)} -maxdepth 1 -type f -iname '*netfx3*.cab' 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
 
                 val prefix = "pb_local_${System.currentTimeMillis().toString().takeLast(6)}"
                 val workRootPath = UsbGadgetEngine.createSafeTempWorkDir(appCtx, config.targetDir, prefix)
@@ -1973,7 +1973,7 @@ object WindowsBuildEngine {
                     TOTAL=${editionCabs.size}
                     IDX=0
                     while IFS= read -r CABPATH || [ -n "${'$'}CABPATH" ]; do
-                        [ -f "${'$'}CABPATH" ] || continue
+                        if [ ! -f "${'$'}CABPATH" ]; then continue; fi
                         IDX=${'$'}((IDX + 1))
                         BN=${'$'}(basename "${'$'}CABPATH")
                         if ! $qCab -l "${'$'}CABPATH" 2>/dev/null | grep -qi 'update\.mum'; then
@@ -1982,7 +1982,7 @@ object WindowsBuildEngine {
                         fi
                         rm -rf "${'$'}EXTDIR" && mkdir -p "${'$'}EXTDIR"
                         set +e
-                        ${'$'}THERM_PFX $qCab -q -d "${'$'}EXTDIR" "${'$'}CABPATH" &
+                        ${'$'}THERM_PFX $qCab -q -k -d "${'$'}EXTDIR" "${'$'}CABPATH" &
                         CPID=${'$'}!; echo "${'$'}CPID" > $ACTIVE_PID_FILE; wait "${'$'}CPID"
                         set -e
                         if [ -z "${'$'}(ls -A "${'$'}EXTDIR" 2>/dev/null)" ]; then
@@ -2019,9 +2019,9 @@ object WindowsBuildEngine {
                 writeText(
                     "REGEDIT4\r\n\r\n" +
                         "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion]\r\n" +
-                        "\"SystemRoot\"=\"X:\\\\${'$'}windows.~bt\\\\Windows\"\r\n\r\n" +
+                        "\"SystemRoot\"=\"X:\\\\${'$'}Windows.~bt\\\\Windows\"\r\n\r\n" +
                         "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\WinPE]\r\n" +
-                        "\"InstRoot\"=\"X:\\\\${'$'}windows.~bt\\\\\"\r\n" +
+                        "\"InstRoot\"=\"X:\\\\${'$'}Windows.~bt\"\r\n" +
                         "\"CustomBackground\"=hex(2):$bgWinreHex\r\n" +
                         "\"CustomShell\"=-\r\n\r\n",
                     Charsets.US_ASCII
@@ -2050,6 +2050,62 @@ object WindowsBuildEngine {
                     $qWim apply $firstMeta 1 "${'$'}ISODIR" --no-acls --no-attributes
                     rm -f "${'$'}ISODIR/MediaMeta.xml" "${'$'}ISODIR/mediameta.xml" 2>/dev/null || true
                     mkdir -p "${'$'}ISODIR/sources"
+                    if [ "${if (job.hasUpdates) "1" else "0"}" = "1" ]; then
+                        DU_TMP="/data/local/tmp/pb_step2_du"
+                        rm -rf "${'$'}DU_TMP"
+                        for f in "${'$'}PKG"/*.cab "${'$'}PKG"/*.CAB; do
+                            if [ ! -f "${'$'}f" ]; then continue; fi
+                            bn=${'$'}(basename "${'$'}f")
+                            low=${'$'}(printf '%s' "${'$'}bn" | tr 'A-Z' 'a-z')
+                            case "${'$'}low" in
+                                *-kb*.cab|ssu-*.cab|*-ssu-*.cab|*ndp*.cab|*dynamicupdate*.cab) ;;
+                                *) continue ;;
+                            esac
+                            case "${'$'}low" in
+                                *desktopdeployment*|*aggregatedmetadata*|*baseless*|*-express.cab|*netfx3-ondemand*|*safeos*) continue ;;
+                            esac
+                            kb_num=${'$'}(printf '%s' "${'$'}bn" | grep -oiE 'KB[0-9]{6,8}' | head -n 1 || true)
+                            if [ -n "${'$'}kb_num" ] && find "${'$'}PKG" -maxdepth 1 -type f -iname "*${'$'}kb_num*.msu" 2>/dev/null | grep -q .; then
+                                continue
+                            fi
+                            if $qCab -l "${'$'}f" 2>/dev/null | grep -qi 'update\.mum'; then
+                                continue
+                            fi
+                            rm -rf "${'$'}DU_TMP" && mkdir -p "${'$'}DU_TMP"
+                            set +e
+                            $qCab -q -k -d "${'$'}DU_TMP" "${'$'}f" >/dev/null 2>&1
+                            set -e
+                            if [ -n "${'$'}(ls -A "${'$'}DU_TMP" 2>/dev/null)" ]; then
+                                (
+                                    set -f
+                                    cd "${'$'}DU_TMP"
+                                    find . -type f | while IFS= read -r rel; do
+                                        rel="${'$'}{rel#./}"
+                                        cur="${'$'}ISODIR/sources"
+                                        dirpart="${'$'}{rel%/*}"
+                                        basepart="${'$'}{rel##*/}"
+                                        if [ "${'$'}dirpart" != "${'$'}rel" ]; then
+                                            OLDIFS="${'$'}IFS"; IFS="/"
+                                            for seg in ${'$'}dirpart; do
+                                                if [ -z "${'$'}seg" ]; then continue; fi
+                                                match=${'$'}(find "${'$'}cur" -maxdepth 1 -mindepth 1 -type d -iname "${'$'}seg" 2>/dev/null | head -n 1)
+                                                if [ -n "${'$'}match" ]; then cur="${'$'}match"; else cur="${'$'}cur/${'$'}seg"; mkdir -p "${'$'}cur"; fi
+                                            done
+                                            IFS="${'$'}OLDIFS"
+                                        fi
+                                        existing=${'$'}(find "${'$'}cur" -maxdepth 1 -mindepth 1 -type f -iname "${'$'}basepart" 2>/dev/null | head -n 1)
+                                        if [ -n "${'$'}existing" ]; then
+                                            cp -f "${'$'}DU_TMP/${'$'}rel" "${'$'}existing"
+                                        else
+                                            cp -f "${'$'}DU_TMP/${'$'}rel" "${'$'}cur/${'$'}basepart"
+                                        fi
+                                    done
+                                )
+                                echo "DU_LOG|Applied Setup DU to sources/ (synced into boot.wim): ${'$'}bn"
+                            fi
+                            rm -rf "${'$'}DU_TMP"
+                        done
+                    fi
                     if [ "${if (wantBootFonts) "1" else "0"}" = "1" ]; then
                         mkdir -p "${'$'}ISODIR/boot/fonts" "${'$'}ISODIR/efi/microsoft/boot/fonts"
                         $qWim extract $firstMeta 3 "/Windows/Boot/Fonts" --dest-dir="${'$'}TMP/bootfonts" --no-acls --no-attributes >/dev/null 2>&1 || true
@@ -2111,12 +2167,17 @@ object WindowsBuildEngine {
                         set -e
                     fi
 
-                    $qWim extract $firstMeta 3 "/Windows/System32/xmllite.dll" --dest-dir="${'$'}ISODIR/sources" --no-acls --no-attributes >/dev/null 2>&1 || true
+                    XML_TMP=""
+                    if ! find "${'$'}ISODIR/sources" -maxdepth 1 -type f -iname 'xmllite.dll' 2>/dev/null | grep -q .; then
+                        $qWim extract $firstMeta 3 "/Windows/System32/xmllite.dll" --dest-dir="${'$'}TMP" --no-acls --no-attributes >/dev/null 2>&1 || true
+                        XML_TMP=${'$'}(find "${'$'}TMP" -maxdepth 1 -type f -iname 'xmllite.dll' 2>/dev/null | head -n 1)
+                    fi
                     UPD_TXT="/data/local/tmp/pb_boot_update.txt"; : > "${'$'}UPD_TXT"
                     echo "delete --force /Windows/System32/winpeshl.ini" >> "${'$'}UPD_TXT"
                     if [ -n "${'$'}HIVE2" ]; then echo "add '${'$'}HIVE2' /Windows/System32/config/SOFTWARE" >> "${'$'}UPD_TXT"; fi
                     if [ -f "${'$'}ISODIR/setup.exe" ]; then echo "add '${'$'}ISODIR/setup.exe' /setup.exe" >> "${'$'}UPD_TXT"; fi
                     if [ -f "${'$'}ISODIR/sources/inf/setup.cfg" ]; then echo "add '${'$'}ISODIR/sources/inf/setup.cfg' /sources/inf/setup.cfg" >> "${'$'}UPD_TXT"; fi
+                    if [ -n "${'$'}XML_TMP" ]; then echo "add '${'$'}XML_TMP' /sources/xmllite.dll" >> "${'$'}UPD_TXT"; fi
                     if [ -n "${'$'}BG_FILE" ]; then
                         echo "add '${'$'}BG_FILE' /sources/background.bmp" >> "${'$'}UPD_TXT"
                         echo "add '${'$'}BG_FILE' /Windows/system32/setup.bmp" >> "${'$'}UPD_TXT"
@@ -2124,19 +2185,20 @@ object WindowsBuildEngine {
                         echo "add '${'$'}BG_FILE' /Windows/system32/winre.jpg" >> "${'$'}UPD_TXT"
                     fi
                     for sf in "${'$'}ISODIR"/sources/*; do
-                        [ -e "${'$'}sf" ] || continue; sbn=${'$'}(basename "${'$'}sf")
-                        case "${'$'}sbn" in boot.wim|install.wim|install.esd|install*.swm|sxs|SXS|uup|UUP) continue ;; esac
+                        if [ ! -e "${'$'}sf" ]; then continue; fi; sbn=${'$'}(basename "${'$'}sf")
+                        case "${'$'}sbn" in boot.wim|BOOT.WIM|install.wim|INSTALL.WIM|install.esd|INSTALL.ESD|install*.swm|INSTALL*.SWM|sxs|SXS|uup|UUP|ei.cfg|EI.CFG|pid.txt|PID.TXT|'${'$'}OEM${'$'}') continue ;; esac
                         echo "add '${'$'}sf' '/sources/${'$'}sbn'" >> "${'$'}UPD_TXT"
                     done
                     $qWim update "${'$'}ISODIR/sources/boot.wim" 2 < "${'$'}UPD_TXT"
                     $qWim optimize "${'$'}ISODIR/sources/boot.wim"
-                    rm -rf "${'$'}HIVEDIR" "${'$'}ISODIR/sources/xmllite.dll" "${'$'}UPD_TXT"
+                    rm -rf "${'$'}HIVEDIR" "${'$'}XML_TMP" "${'$'}UPD_TXT"
                 """.trimIndent())
             } finally {
                 boot1RegFile.delete()
                 boot2RegFile.delete()
             }
             if (!bootWimRes.isSuccess) throw IllegalStateException("boot.wim assembly failed: ${(bootWimRes.out + bootWimRes.err).takeLast(4).joinToString(" ").take(240)}")
+            bootWimRes.out.filter { it.startsWith("DU_LOG|") }.forEach { addConsole(it.substringAfter('|')) }
             addConsole("Step 2/4 complete: boot.wim assembled + winre.wim kept")
 
             advanceStep(3, "wimlib-imagex")
@@ -2197,7 +2259,7 @@ object WindowsBuildEngine {
                     for ref in "${'$'}PKG"/*.esd "${'$'}PKG"/*.ESD "${'$'}TMP"/*.esd; do
                         if [ -f "${'$'}ref" ]; then set -- "${'$'}@" --ref="${'$'}ref"; fi
                     done
-                    ${'$'}THERM_PFX $qWim export $qMeta 3 $qStageWim "${'$'}ED_NAME" $baseExportArg $threadArg "${'$'}@" > $qProgLog 2>&1 &
+                    ${'$'}THERM_PFX $qWim export $qMeta 3 $qStageWim "${'$'}ED_NAME" "${'$'}ED_DESC" $baseExportArg $threadArg "${'$'}@" > $qProgLog 2>&1 &
                     WPID=${'$'}!; echo "${'$'}WPID" > $ACTIVE_PID_FILE; wait "${'$'}WPID"
                     rm -f $ACTIVE_PID_FILE
                     NEW_IDX=${'$'}($qWim info $qStageWim 2>/dev/null | grep -c '^Index:' || echo 1)
@@ -2269,8 +2331,9 @@ object WindowsBuildEngine {
                     throw IllegalStateException("Solid ESD compression failed: ${esdDetail.ifBlank { "code ${esdRes.code}" }}")
                 }
                 addConsole("Converted install.wim + Winre.wim -> Solid install.esd")
-            } else if (requestedVirtualEds.isNotEmpty()) {
-                addConsole("Optimizing install.wim after Virtual Editions...")
+            } else if (effectiveComp != WinIsoCompression.ESD && (!config.skipWinRe || requestedVirtualEds.isNotEmpty())) {
+                addConsole("Optimizing install.wim (deduplicating & finalizing WIM header)...")
+                publishConv("Step 3/4 · Optimizing install.wim...", "Finalizing WIM integrity & size", 0.77f)
                 runIsolatedRootScript(appCtx, "wimopt", "$pathHeader\n${thermalExecPrefix(convThermalProfileLive)}\n\$THERM_PFX $qWim optimize $qFinalInstall >/dev/null 2>&1 || true")
             }
 
@@ -2295,39 +2358,34 @@ object WindowsBuildEngine {
 
                     # 1. Stage unified .msu cumulative updates as 3_<name>
                     for f in "${'$'}PKG"/*.msu "${'$'}PKG"/*.MSU; do
-                        [ -f "${'$'}f" ] || continue
+                        if [ ! -f "${'$'}f" ]; then continue; fi
                         bn=${'$'}(basename "${'$'}f")
                         (ln -f "${'$'}f" ${shellQuote(oemUpdates)}/"3_${'$'}bn" 2>/dev/null || cp -f "${'$'}f" ${shellQuote(oemUpdates)}/"3_${'$'}bn")
                         echo "UPD_LOG|LCU MSU -> 3_${'$'}bn"
                     done
 
-                    # 2. Classify & stage .cab updates (Setup DU -> ISODIR/sources, skip SafeOS/WinPE-only & MSU-duplicated KBs)
-                    for f in "${'$'}PKG"/*-KB*.cab "${'$'}PKG"/*-kb*.cab "${'$'}PKG"/*SSU*.cab "${'$'}PKG"/*ssu*.cab "${'$'}PKG"/*NDP*.cab; do
-                        [ -f "${'$'}f" ] || continue
+                    # 2. Classify & stage .cab updates (Setup DU already synced in Step 2; skip SafeOS/WinPE-only & MSU-duplicated KBs)
+                    for f in "${'$'}PKG"/*.cab "${'$'}PKG"/*.CAB; do
+                        if [ ! -f "${'$'}f" ]; then continue; fi
                         bn=${'$'}(basename "${'$'}f")
                         low=${'$'}(printf '%s' "${'$'}bn" | tr 'A-Z' 'a-z')
                         case "${'$'}low" in
-                            *desktopdeployment*|*aggregatedmetadata*|*baseless*|*-express.cab|*netfx3-ondemand*) continue ;;
+                            *-kb*.cab|ssu-*.cab|*-ssu-*.cab|*ndp*.cab|*dynamicupdate*.cab) ;;
+                            *) continue ;;
+                        esac
+                        case "${'$'}low" in
+                            *desktopdeployment*|*aggregatedmetadata*|*baseless*|*-express.cab|*netfx3-ondemand*|*safeos*) continue ;;
                         esac
                         # Skip CAB if a combined .msu with the same KB number already exists
                         kb_num=${'$'}(printf '%s' "${'$'}bn" | grep -oiE 'KB[0-9]{6,8}' | head -n 1 || true)
-                        if [ -n "${'$'}kb_num" ] && ls "${'$'}PKG"/*${'$'}kb_num*.msu "${'$'}PKG"/*${'$'}kb_num*.MSU >/dev/null 2>&1; then
+                        if [ -n "${'$'}kb_num" ] && find "${'$'}PKG" -maxdepth 1 -type f -iname "*${'$'}kb_num*.msu" 2>/dev/null | grep -q .; then
                             echo "UPD_LOG|Skipped duplicate CAB (superseded by MSU): ${'$'}bn"
                             continue
                         fi
 
-                        # Check for update.mum inside CAB
+                        # Setup Dynamic Updates (no update.mum) were already merged into ISODIR/sources/ + boot.wim in Step 2
                         if ! $qCab -l "${'$'}f" 2>/dev/null | grep -qi 'update\.mum'; then
-                            # No update.mum -> Setup Dynamic Update! Extract directly into ISODIR/sources/ (:addDU parity)
-                            rm -rf "${'$'}DU_TMP" && mkdir -p "${'$'}DU_TMP"
-                            set +e
-                            $qCab -q -d "${'$'}DU_TMP" "${'$'}f" >/dev/null 2>&1
-                            set -e
-                            if [ -n "${'$'}(ls -A "${'$'}DU_TMP" 2>/dev/null)" ]; then
-                                cp -rf "${'$'}DU_TMP"/* "${'$'}ISODIR/sources/" 2>/dev/null || true
-                                echo "UPD_LOG|Applied Setup DU directly to sources/: ${'$'}bn"
-                            fi
-                            rm -rf "${'$'}DU_TMP"
+                            echo "UPD_LOG|Setup DU already synced into boot.wim & sources/: ${'$'}bn"
                             continue
                         fi
 
@@ -2386,14 +2444,15 @@ object WindowsBuildEngine {
             val needUnattendOrOem = config.experience.hasAnyActive() || config.winUtil.hasAnyActive() || job.hasUpdates || job.hasApps || job.hasNetFx3 || config.runComponentCleanup
             if (needUnattendOrOem) {
                 val arch = if (config.build.arch.lowercase() in setOf("x86", "arm64", "amd64")) config.build.arch.lowercase() else "amd64"
-                val tmpXml = File(appCtx.cacheDir, "wb_auto.xml").apply { writeText(WindowsCustomizationEngine.generateAutounattendXml(config.experience, config.winUtil, arch, null, true, job.hasUpdates), Charsets.UTF_8) }
+                val tmpXml = File(appCtx.cacheDir, "wb_auto.xml").apply { writeText(WindowsCustomizationEngine.generateAutounattendXml(config.experience, config.winUtil, arch, null, true, job.hasUpdates, includeWindowsPePass = true), Charsets.UTF_8) }
+                val tmpPantherXml = File(appCtx.cacheDir, "wb_panther.xml").apply { writeText(WindowsCustomizationEngine.generateAutounattendXml(config.experience, config.winUtil, arch, null, true, job.hasUpdates, includeWindowsPePass = false), Charsets.UTF_8) }
                 val tmpSpec = File(appCtx.cacheDir, "wb_spec.cmd").apply { writeText(WindowsCustomizationEngine.buildSpecializeScript(config.experience, config.winUtil, job.hasUpdates, job.hasApps, job.hasNetFx3), Charsets.UTF_8) }
                 val customPath = config.experience.customPostInstallScriptPath.trim()
                 val customName = if (customPath.isNotBlank()) customPath.substringAfterLast('/') else ""
                 val tmpComp = File(appCtx.cacheDir, "wb_comp.cmd").apply { writeText(WindowsCustomizationEngine.buildSetupCompleteScript(config.runComponentCleanup, customName.isNotBlank(), customName, hasOemApps = job.hasApps), Charsets.UTF_8) }
                 val customCopy = if (customPath.isNotBlank()) "mkdir -p ${shellQuote(oemCustom)} && cp -f ${shellQuote(UsbGadgetEngine.resolveDirectPath(customPath))} ${shellQuote(oemCustom)}/ 2>/dev/null || true" else "true"
-                Shell.cmd("mkdir -p ${shellQuote(oemPanther)} ${shellQuote(oemScripts)} && cp -f ${shellQuote(tmpXml.absolutePath)} ${shellQuote("${isoDir.absolutePath}/autounattend.xml")} && cp -f ${shellQuote(tmpXml.absolutePath)} ${shellQuote("$oemPanther/unattend.xml")} && cp -f ${shellQuote(tmpSpec.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_Specialize.cmd")} && cp -f ${shellQuote(tmpComp.absolutePath)} ${shellQuote("$oemScripts/SetupComplete.cmd")} && $customCopy").exec()
-                tmpXml.delete(); tmpSpec.delete(); tmpComp.delete()
+                Shell.cmd("mkdir -p ${shellQuote(oemPanther)} ${shellQuote(oemScripts)} && cp -f ${shellQuote(tmpXml.absolutePath)} ${shellQuote("${isoDir.absolutePath}/autounattend.xml")} && cp -f ${shellQuote(tmpPantherXml.absolutePath)} ${shellQuote("$oemPanther/unattend.xml")} && cp -f ${shellQuote(tmpSpec.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_Specialize.cmd")} && cp -f ${shellQuote(tmpComp.absolutePath)} ${shellQuote("$oemScripts/SetupComplete.cmd")} && $customCopy").exec()
+                tmpXml.delete(); tmpPantherXml.delete(); tmpSpec.delete(); tmpComp.delete()
                 addConsole("Injected autounattend.xml + unplug-safe \$OEM\$ scripts")
             }
 
@@ -2450,7 +2509,7 @@ object WindowsBuildEngine {
                 val qXorLog = shellQuote(xorLog)
                 val preferNoPrompt = config.experience.hasAnyActive() || config.winUtil.hasAnyActive()
                 if (useUdfGenIso) {
-                    addConsole("genisoimage (UDF 1.02): packing ~${UsbGadgetEngine.formatBytes(estIsoBytes)} (-udf -allow-limited-size -iso-level 3)")
+                    addConsole("genisoimage (UDF 1.02): packing ~${UsbGadgetEngine.formatBytes(estIsoBytes)} (-udf -allow-limited-size -iso-level 3 -hide * -hide-udf boot.catalog)")
                 } else {
                     addConsole("xorriso: packing ~${UsbGadgetEngine.formatBytes(estIsoBytes)} (-iso-level 3 -J -joliet-long --stdio_sync 16m)")
                 }
@@ -2492,11 +2551,11 @@ object WindowsBuildEngine {
                     BIOS_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'etfsboot.com' 2>/dev/null | head -n 1 | sed 's|^\./||')
                     echo "UDF 1.02 Bootloaders: BIOS=${'$'}{BIOS_BOOT:-none} | EFI=${'$'}{EFI_BOOT:-none}" >> $qXorLog
                     if [ -n "${'$'}BIOS_BOOT" ] && [ -n "${'$'}EFI_BOOT" ]; then
-                        ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -V "$volId" -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOutIso . >> $qXorLog 2>&1 &
+                        ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -hide "*" -hide-udf boot.catalog -V "$volId" -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOutIso . >> $qXorLog 2>&1 &
                     elif [ -n "${'$'}EFI_BOOT" ]; then
-                        ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -V "$volId" -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOutIso . >> $qXorLog 2>&1 &
+                        ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -hide "*" -hide-udf boot.catalog -V "$volId" -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOutIso . >> $qXorLog 2>&1 &
                     else
-                        ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -V "$volId" -o $qOutIso . >> $qXorLog 2>&1 &
+                        ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -hide "*" -V "$volId" -o $qOutIso . >> $qXorLog 2>&1 &
                     fi
                     XPID=${'$'}!; echo "${'$'}XPID" > $ACTIVE_PID_FILE; wait "${'$'}XPID"
                     rm -f $ACTIVE_PID_FILE
