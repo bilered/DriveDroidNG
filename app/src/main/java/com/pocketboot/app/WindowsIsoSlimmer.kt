@@ -237,10 +237,12 @@ object WindowsIsoSlimmer {
                 fi
                 BIOS_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'etfsboot.com' 2>/dev/null | head -n 1 | sed 's|^\./||')
 
+                find . -exec touch {} + 2>/dev/null || true
+                if [ -n "${'$'}BIOS_BOOT" ] || [ -n "${'$'}EFI_BOOT" ]; then mkdir -p boot; fi
                 if [ -n "${'$'}BIOS_BOOT" ] && [ -n "${'$'}EFI_BOOT" ]; then
-                    ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -hide "*" -hide-udf boot.catalog -V "POCKETBOOT_SLIM" -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOut .
+                    ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -hide "*" -c boot/boot.cat -V "POCKETBOOT_SLIM" -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOut .
                 elif [ -n "${'$'}EFI_BOOT" ]; then
-                    ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -hide "*" -hide-udf boot.catalog -V "POCKETBOOT_SLIM" -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOut .
+                    ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -hide "*" -c boot/boot.cat -V "POCKETBOOT_SLIM" -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOut .
                 else
                     ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -hide "*" -V "POCKETBOOT_SLIM" -o $qOut .
                 fi

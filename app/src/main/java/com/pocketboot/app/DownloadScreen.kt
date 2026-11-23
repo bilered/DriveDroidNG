@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -637,6 +638,7 @@ fun DownloadScreen(
 
     var pendingResumables by remember { mutableStateOf<List<PendingResumableDownload>>(emptyList()) }
     var pendingWinBuilds by remember { mutableStateOf<List<PendingWindowsBuild>>(emptyList()) }
+    var rebuildOptionsTarget by remember { mutableStateOf<PendingWindowsBuild?>(null) }
     val turboActive = turboState != null
     val winDlActive = winDlState != null
     val winDlPaused = winDlState?.isPaused == true
@@ -1083,7 +1085,14 @@ fun DownloadScreen(
                             Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                 Text(pb.title, style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 Text(
-                                    text = if (pb.totalBytes > 0L) "${(pb.progress * 100).toInt()}% · ${UsbGadgetEngine.formatBytes(pb.cachedBytes)} / ${UsbGadgetEngine.formatBytes(pb.totalBytes)}" else "${UsbGadgetEngine.formatBytes(pb.cachedBytes)} cached",
+                                    text = if (pb.isCachedReady) {
+                                        val readyTag = if (pb.hasStagedIsoDir) "Fast Step-4 ready" else "Offline ready"
+                                        "${UsbGadgetEngine.formatBytes(pb.cachedBytes)} · ${pb.config.compression.shortLabel} · $readyTag"
+                                    } else if (pb.totalBytes > 0L) {
+                                        "${(pb.progress * 100).toInt()}% · ${UsbGadgetEngine.formatBytes(pb.cachedBytes)} / ${UsbGadgetEngine.formatBytes(pb.totalBytes)}"
+                                    } else {
+                                        "${UsbGadgetEngine.formatBytes(pb.cachedBytes)} cached"
+                                    },
                                     style = PocketColors.monoStyle,
                                     color = PocketColors.textSecondary
                                 )
@@ -1091,13 +1100,7 @@ fun DownloadScreen(
                             Button(
                                 onClick = {
                                     if (pb.isCachedReady) {
-                                        WindowsBuildEngine.rebuildCachedPending(
-                                            context = context,
-                                            pending = pb,
-                                            onComplete = { evt -> scope.launch { onDownloadCompleted(evt) } },
-                                            onError = { err -> scope.launch { onMessage(err, true) } },
-                                            onLog = { entry -> scope.launch { onAppendLog(entry) } }
-                                        )
+                                        rebuildOptionsTarget = pb
                                     } else {
                                         WindowsBuildEngine.startBuild(
                                             context = context,
@@ -1785,6 +1788,379 @@ fun DownloadScreen(
         )
     }
 
+    rebuildOptionsTarget?.let { pb ->
+        val orig = pb.config
+        val detOs = remember(orig.build.title) { WindowsCustomizationEngine.detectWindowsOsKind(orig.build.title) }
+        var rbCompression by remember(pb.workRootPath) { mutableStateOf(orig.compression) }
+        var rbOutputMode by remember(pb.workRootPath) { mutableStateOf(orig.outputMode) }
+        var rbScheme by remember(pb.workRootPath) { mutableStateOf(orig.scheme) }
+        var rbThermal by remember(pb.workRootPath) { mutableStateOf(orig.thermalProfile) }
+        var rbAutoCooldown by remember(pb.workRootPath) { mutableStateOf(orig.autoThermalCooldown) }
+        var rbOutName by remember(pb.workRootPath) { mutableStateOf(orig.customOutputName.ifBlank { pb.outputName }) }
+        var rbIncludeUpdates by remember(pb.workRootPath) { mutableStateOf(orig.includeUpdates) }
+        var rbNetFx3 by remember(pb.workRootPath) { mutableStateOf(orig.integrateNetFx3) }
+        var rbCleanup by remember(pb.workRootPath) { mutableStateOf(orig.runComponentCleanup) }
+        var rbSplitFat32 by remember(pb.workRootPath) { mutableStateOf(orig.splitWimForFat32) }
+        var rbSkipWinRe by remember(pb.workRootPath) { mutableStateOf(orig.skipWinRe) }
+        var rbEiCfg by remember(pb.workRootPath) { mutableStateOf(orig.eiCfgUnlock) }
+        var rbKeepPkgs by remember(pb.workRootPath) { mutableStateOf(true) }
+        var rbAutoMount by remember(pb.workRootPath) { mutableStateOf(orig.autoMount) }
+        var rbForceFull by remember(pb.workRootPath) { mutableStateOf(false) }
+        var rbVirtualEds by remember(pb.workRootPath) { mutableStateOf(orig.virtualEditions.toSet()) }
+        var rbExperience by remember(pb.workRootPath) { mutableStateOf(orig.experience) }
+        var rbWinUtil by remember(pb.workRootPath) { mutableStateOf(orig.winUtil) }
+        var rbTargetMbPath by remember(pb.workRootPath) {
+            mutableStateOf(
+                orig.targetMultiBootPath.ifBlank {
+                    activeMultiBootTarget?.path ?: multiBootDrives.firstOrNull()?.path.orEmpty()
+                }
+            )
+        }
+
+        val stagingChanged = rbCompression != orig.compression ||
+            rbIncludeUpdates != orig.includeUpdates ||
+            rbNetFx3 != orig.integrateNetFx3 ||
+            rbCleanup != orig.runComponentCleanup ||
+            rbSkipWinRe != orig.skipWinRe ||
+            rbEiCfg != orig.eiCfgUnlock ||
+            rbSplitFat32 != orig.splitWimForFat32 ||
+            rbVirtualEds.toList().sorted() != orig.virtualEditions.sorted() ||
+            rbExperience != orig.experience ||
+            rbWinUtil != orig.winUtil
+        val willFastStep4 = pb.hasStagedIsoDir && !rbForceFull && !stagingChanged
+
+        ModalBottomSheet(
+            onDismissRequest = { rebuildOptionsTarget = null },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+            containerColor = PocketColors.surfaceCard
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .fillMaxHeight(0.88f)
+                    .padding(horizontal = 18.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                PocketSheetHeader(
+                    icon = Icons.Rounded.Build,
+                    tint = PocketColors.infoBlue,
+                    iconBg = PocketColors.infoBlueBg,
+                    title = "Offline Rebuild Options",
+                    subtitle = "${pb.title} · ${UsbGadgetEngine.formatBytes(pb.cachedBytes)} cached"
+                )
+
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    if (pb.hasStagedIsoDir) {
+                        Surface(
+                            shape = RoundedCornerShape(11.dp),
+                            color = if (willFastStep4) PocketColors.successBg else PocketColors.infoBlueBg,
+                            border = BorderStroke(0.75.dp, if (willFastStep4) PocketColors.success else PocketColors.infoBlue)
+                        ) {
+                            Text(
+                                text = if (willFastStep4) {
+                                    "Staged ISODIR ready — will jump straight to Step 4 packing (${rbCompression.shortLabel}). Change compression or options below for a full offline rebuild."
+                                } else {
+                                    "Options changed — will run a fresh 100% offline rebuild from cached packages with ${rbCompression.label}."
+                                },
+                                modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp),
+                                fontSize = 11.sp,
+                                color = if (willFastStep4) PocketColors.success else PocketColors.infoBlue
+                            )
+                        }
+                    }
+
+                    OutlinedTextField(
+                        value = rbOutName,
+                        onValueChange = { rbOutName = it },
+                        label = { Text("Output File Name") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(10.dp)
+                    )
+
+                    // Compression Picker (Standard LZX / Fast & Cool XPRESS / Compact Solid ESD)
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = PocketColors.surfaceInput,
+                        border = BorderStroke(0.5.dp, PocketColors.border)
+                    ) {
+                        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                Text("WIM / ESD Compression", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                                Text(rbCompression.label, style = PocketColors.monoStyle, fontSize = 10.5.sp, color = PocketColors.accentSoft)
+                            }
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                WinIsoCompression.entries.forEach { comp ->
+                                    val disabled = comp == WinIsoCompression.ESD && !detOs.supportsEsd
+                                    val sel = rbCompression == comp && !disabled
+                                    Surface(
+                                        modifier = Modifier.weight(1f).height(34.dp).bounceClick(enabled = !disabled) {
+                                            rbCompression = comp
+                                            if (comp == WinIsoCompression.ESD) rbSplitFat32 = false
+                                        },
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = if (sel) PocketColors.accentBg else PocketColors.surfaceCard,
+                                        border = BorderStroke(if (sel) 1.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                                    ) {
+                                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                            Text(
+                                                comp.shortLabel,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Medium,
+                                                color = if (disabled) PocketColors.textMuted else if (sel) PocketColors.accentSoft else PocketColors.textSecondary,
+                                                maxLines = 1
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                            Text(rbCompression.subtitle, fontSize = 10.5.sp, color = PocketColors.textSecondary)
+                        }
+                    }
+
+                    // Thermal Profile Picker
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = PocketColors.surfaceInput,
+                        border = BorderStroke(0.5.dp, PocketColors.border)
+                    ) {
+                        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                Text("Thermal Profile", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                                Text(rbThermal.label, style = PocketColors.monoStyle, fontSize = 10.5.sp, color = PocketColors.infoBlue)
+                            }
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                BuildThermalProfile.entries.forEach { prof ->
+                                    val sel = rbThermal == prof
+                                    Surface(
+                                        modifier = Modifier.weight(1f).height(34.dp).bounceClick { rbThermal = prof },
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = if (sel) PocketColors.infoBlueBg else PocketColors.surfaceCard,
+                                        border = BorderStroke(if (sel) 1.dp else 0.5.dp, if (sel) PocketColors.infoBlue else PocketColors.border)
+                                    ) {
+                                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                            Text(
+                                                prof.shortLabel,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Medium,
+                                                color = if (sel) PocketColors.infoBlue else PocketColors.textSecondary,
+                                                maxLines = 1
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                            Text(rbThermal.subtitle, fontSize = 10.5.sp, color = PocketColors.textSecondary)
+                        }
+                    }
+
+                    // Output Target Selector
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        PocketSectionHeader("Output Target")
+                        val modes = buildList {
+                            add(WinBuildOutputMode.STANDARD_ISO)
+                            if (multiBootDrives.isNotEmpty()) add(WinBuildOutputMode.DIRECT_MULTIBOOT)
+                            add(WinBuildOutputMode.DIRECT_NTFS_USB)
+                        }
+                        modes.forEach { mode ->
+                            val isSel = rbOutputMode == mode
+                            Surface(
+                                modifier = Modifier.fillMaxWidth().bounceClick {
+                                    rbOutputMode = mode
+                                    val base = rbOutName.substringBeforeLast('.')
+                                    if (base.isNotBlank()) {
+                                        rbOutName = base + if (mode == WinBuildOutputMode.DIRECT_NTFS_USB) ".img" else ".iso"
+                                    }
+                                },
+                                shape = RoundedCornerShape(11.dp),
+                                color = if (isSel) PocketColors.accentBg else PocketColors.surfaceInput,
+                                border = BorderStroke(if (isSel) 1.25.dp else 0.5.dp, if (isSel) PocketColors.accent else PocketColors.border)
+                            ) {
+                                Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                        Text(mode.label, style = MaterialTheme.typography.labelLarge, color = if (isSel) PocketColors.accentSoft else PocketColors.textPrimary)
+                                        Text(mode.subtitle, fontSize = 10.5.sp, color = PocketColors.textSecondary)
+                                    }
+                                    if (isSel) Icon(Icons.Rounded.Check, null, tint = PocketColors.accentSoft, modifier = Modifier.size(18.dp))
+                                }
+                            }
+                        }
+                        if (rbOutputMode == WinBuildOutputMode.DIRECT_NTFS_USB) {
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                PartitionScheme.entries.forEach { s ->
+                                    val sel = rbScheme == s
+                                    Surface(
+                                        modifier = Modifier.weight(1f).bounceClick { rbScheme = s },
+                                        shape = RoundedCornerShape(10.dp),
+                                        color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput,
+                                        border = BorderStroke(if (sel) 1.25.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                                    ) {
+                                        Column(modifier = Modifier.padding(9.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                            Text(s.label, style = MaterialTheme.typography.labelMedium, color = if (sel) PocketColors.accentSoft else PocketColors.textPrimary)
+                                            Text(s.subtitle, fontSize = 10.sp, color = PocketColors.textSecondary)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Build Options Toggles
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = PocketColors.surfaceInput,
+                        border = BorderStroke(0.5.dp, PocketColors.border)
+                    ) {
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            OfflineRebuildSwitchRow("Include Updates (Setup DU + LCU/SSU)", rbIncludeUpdates) { rbIncludeUpdates = it }; PocketHairlineDivider()
+                            OfflineRebuildSwitchRow("Integrate .NET Framework 3.5", rbNetFx3) { rbNetFx3 = it }; PocketHairlineDivider()
+                            OfflineRebuildSwitchRow("Run component cleanup (/ResetBase)", rbCleanup) { rbCleanup = it }; PocketHairlineDivider()
+                            if (rbCompression != WinIsoCompression.ESD && rbOutputMode != WinBuildOutputMode.DIRECT_NTFS_USB) {
+                                OfflineRebuildSwitchRow("Split WIM for FAT32 (install*.swm ≤ 3.5 GB)", rbSplitFat32) { rbSplitFat32 = it }; PocketHairlineDivider()
+                            }
+                            OfflineRebuildSwitchRow("Skip WinRE Recovery (~480 MB smaller)", rbSkipWinRe) { rbSkipWinRe = it }; PocketHairlineDivider()
+                            OfflineRebuildSwitchRow("Unlock all editions (ei.cfg)", rbEiCfg) { rbEiCfg = it }; PocketHairlineDivider()
+                            OfflineRebuildSwitchRow("Keep base UUP packages after build", rbKeepPkgs) { rbKeepPkgs = it }; PocketHairlineDivider()
+                            OfflineRebuildSwitchRow("Auto-cooldown if phone gets warm", rbAutoCooldown) { rbAutoCooldown = it }; PocketHairlineDivider()
+                            OfflineRebuildSwitchRow("Auto-mount output when finished", rbAutoMount) { rbAutoMount = it }
+                            if (pb.hasStagedIsoDir && !stagingChanged) {
+                                PocketHairlineDivider()
+                                OfflineRebuildSwitchRow("Force full rebuild (re-run Steps 1–3)", rbForceFull) { rbForceFull = it }
+                            }
+                        }
+                    }
+
+                    // Virtual Editions quick toggles
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = PocketColors.surfaceInput,
+                        border = BorderStroke(0.5.dp, PocketColors.border)
+                    ) {
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            Text(
+                                "Virtual Editions (Zero Extra Download)",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = PocketColors.textSecondary,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                            )
+                            PocketHairlineDivider()
+                            listOf(
+                                "Enterprise" to "Windows Enterprise",
+                                "Education" to "Windows Education",
+                                "ProfessionalWorkstation" to "Pro for Workstations",
+                                "IoTEnterprise" to "IoT Enterprise"
+                            ).forEachIndexed { idx, (edId, edLabel) ->
+                                val isChecked = rbVirtualEds.contains(edId)
+                                OfflineRebuildSwitchRow(edLabel, isChecked) { on ->
+                                    rbVirtualEds = if (on) rbVirtualEds + edId else rbVirtualEds - edId
+                                }
+                                if (idx < 3) PocketHairlineDivider()
+                            }
+                        }
+                    }
+
+                    // Full Experience & WinUtil Tweaks Customizer
+                    WindowsTwoPaneCustomizer(
+                        osKind = detOs,
+                        arch = orig.build.arch,
+                        experience = rbExperience,
+                        winUtil = rbWinUtil,
+                        presets = settings.autounattendPresets,
+                        showCa2023Option = true,
+                        showCustomScriptOption = true,
+                        defaultBrowseDir = defaultDir,
+                        onExperienceChange = { rbExperience = it },
+                        onWinUtilChange = { rbWinUtil = it },
+                        onApplyPreset = { preset ->
+                            rbExperience = preset.experience
+                            rbWinUtil = preset.winUtil
+                            onMessage("Applied preset "${preset.name}".", false)
+                        },
+                        onSavePreset = { name ->
+                            val newPreset = AutounattendPreset(name, rbExperience, rbWinUtil)
+                            val updatedPresets = (settings.autounattendPresets.filterNot { it.name.equals(name, true) } + newPreset)
+                            onUpdateSettings(settings.copy(autounattendPresets = updatedPresets))
+                            onMessage("Saved preset "$name".", false)
+                        },
+                        onDeletePreset = { presetName ->
+                            val updatedPresets = settings.autounattendPresets.filterNot { it.name == presetName }
+                            onUpdateSettings(settings.copy(autounattendPresets = updatedPresets))
+                            onMessage("Deleted preset "$presetName".", false)
+                        }
+                    )
+
+                    Spacer(modifier = Modifier.height(6.dp))
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = { rebuildOptionsTarget = null },
+                        modifier = Modifier.weight(0.38f).height(46.dp),
+                        shape = RoundedCornerShape(PocketTokens.ButtonRadius)
+                    ) {
+                        Text("Cancel")
+                    }
+                    Button(
+                        onClick = {
+                            val updatedCfg = orig.copy(
+                                compression = rbCompression,
+                                outputMode = rbOutputMode,
+                                scheme = rbScheme,
+                                targetMultiBootPath = if (rbOutputMode == WinBuildOutputMode.DIRECT_MULTIBOOT) rbTargetMbPath else "",
+                                customOutputName = rbOutName.trim(),
+                                autoMount = rbAutoMount,
+                                includeUpdates = rbIncludeUpdates,
+                                integrateNetFx3 = rbNetFx3,
+                                runComponentCleanup = rbCleanup,
+                                skipWinRe = rbSkipWinRe,
+                                eiCfgUnlock = rbEiCfg,
+                                keepPackagesAfterBuild = rbKeepPkgs,
+                                splitWimForFat32 = rbSplitFat32,
+                                thermalProfile = rbThermal,
+                                autoThermalCooldown = rbAutoCooldown,
+                                virtualEditions = rbVirtualEds.toList(),
+                                experience = rbExperience,
+                                winUtil = rbWinUtil,
+                                bypassRequirements = rbExperience.bypassRequirements,
+                                bypassMicrosoftAccount = rbExperience.bypassMicrosoftAccount,
+                                disableDataCollection = rbExperience.disableDataCollection,
+                                disableBitLocker = rbExperience.disableBitLocker
+                            )
+                            rebuildOptionsTarget = null
+                            WindowsBuildEngine.rebuildCachedPending(
+                                context = context,
+                                pending = pb,
+                                configOverride = updatedCfg,
+                                forceFullRebuild = rbForceFull,
+                                onComplete = { evt -> scope.launch { onDownloadCompleted(evt) } },
+                                onError = { err -> scope.launch { onMessage(err, true) } },
+                                onLog = { entry -> scope.launch { onAppendLog(entry) } }
+                            )
+                        },
+                        enabled = rbOutName.trim().isNotEmpty(),
+                        modifier = Modifier.weight(0.62f).height(46.dp),
+                        shape = RoundedCornerShape(PocketTokens.ButtonRadius),
+                        colors = ButtonDefaults.buttonColors(containerColor = PocketColors.infoBlue, contentColor = Color.White)
+                    ) {
+                        Text(
+                            if (willFastStep4) "Fast Pack (${rbCompression.shortLabel})" else "Rebuild (${rbCompression.shortLabel})",
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     selectedDistroForVersion?.let { iso ->
         ModalBottomSheet(
             onDismissRequest = { selectedDistroForVersion = null },
@@ -2373,5 +2749,25 @@ private fun DistroCatalogCard(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun OfflineRebuildSwitchRow(
+    title: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onCheckedChange(!checked) }
+            .padding(horizontal = 12.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(title, style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary, modifier = Modifier.weight(1f))
+        Spacer(modifier = Modifier.width(8.dp))
+        PocketSwitch(checked = checked, onCheckedChange = onCheckedChange, activeColor = PocketColors.success)
     }
 }

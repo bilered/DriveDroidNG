@@ -109,7 +109,7 @@ enum class BuildThermalProfile(
 
 enum class WinIsoCompression(val label: String, val shortLabel: String, val subtitle: String, val ext: String, val wimlibArg: String, val recommended: Boolean = false) {
     WIM("Standard (LZX)", "LZX", "Default · retail size · balanced heat", "wim", "--compress=maximum", recommended = true),
-    XPRESS("Fast & Cool (XPRESS)", "XPRESS", "~2× faster · lowest heat · +500 MB", "wim", "--compress=fast", recommended = false),
+    XPRESS("Fast & Cool (XPRESS)", "XPRESS", "~2× faster · lowest heat · larger ISO (~7 GB)", "wim", "--compress=fast", recommended = false),
     ESD("Compact (Solid ESD)", "ESD", "Smallest ISO · slowest & warmest", "esd", "--compress=LZMS --solid", recommended = false)
 }
 
@@ -187,7 +187,8 @@ data class WindowsChannelBuildConfig(
 
 data class PendingWindowsBuild(
     val workRootPath: String, val workPrefix: String, val title: String, val outputName: String,
-    val cachedBytes: Long, val totalBytes: Long, val isCachedReady: Boolean = false, val config: WindowsChannelBuildConfig
+    val cachedBytes: Long, val totalBytes: Long, val isCachedReady: Boolean = false, val config: WindowsChannelBuildConfig,
+    val hasStagedIsoDir: Boolean = false
 ) {
     val progress: Float get() = if (totalBytes > 0L) (cachedBytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f) else 0f
 }
@@ -1301,7 +1302,10 @@ object WindowsBuildEngine {
                     val stageBytes = stageCacheDir(context, workPrefix).walkTopDown().filter { it.isFile && it.name.endsWith(".part") }.sumOf { it.length() }
                     val totalBytes = o.optLong("totalBytes", 0L).coerceAtLeast(pkgBytes)
                     if (pkgBytes > 0L || stageBytes > 0L) {
-                        results.add(PendingWindowsBuild(workRoot, workPrefix, "Win ${bld.build} (${bld.archDisplay})", cfg.customOutputName.ifBlank { "Win_${bld.build}_${bld.archDisplay}_${lang.code}${if (mode == WinBuildOutputMode.DIRECT_NTFS_USB) "_USB.img" else ".iso"}" }, (pkgBytes + stageBytes).coerceAtMost(totalBytes.coerceAtLeast(pkgBytes + stageBytes)), totalBytes, o.optBoolean("isCachedReady", false), cfg))
+                        val stagedReady = Shell.cmd(
+                            "[ -f ${shellQuote("$workRoot/.pb_isodir_ready")} ] && [ -f ${shellQuote("$workRoot/ISODIR/sources/boot.wim")} ] && echo OK || true"
+                        ).exec().out.any { it.trim() == "OK" }
+                        results.add(PendingWindowsBuild(workRoot, workPrefix, "Win ${bld.build} (${bld.archDisplay})", cfg.customOutputName.ifBlank { "Win_${bld.build}_${bld.archDisplay}_${lang.code}${if (mode == WinBuildOutputMode.DIRECT_NTFS_USB) "_USB.img" else ".iso"}" }, (pkgBytes + stageBytes).coerceAtMost(totalBytes.coerceAtLeast(pkgBytes + stageBytes)), totalBytes, o.optBoolean("isCachedReady", false), cfg, hasStagedIsoDir = stagedReady))
                     }
                 }
             }
@@ -1384,12 +1388,15 @@ object WindowsBuildEngine {
     fun rebuildCachedPending(
         context: Context,
         pending: PendingWindowsBuild,
+        configOverride: WindowsChannelBuildConfig? = null,
+        forceFullRebuild: Boolean = false,
         onComplete: (DownloadCompletionEvent) -> Unit,
         onError: (String) -> Unit,
         onLog: (LogEntry) -> Unit
     ) {
         val appCtx = context.applicationContext
-        val config = pending.config
+        val prevConfig = pending.config
+        val config = configOverride ?: prevConfig
         val workRootPath = pending.workRootPath
         val pkgPath = "$workRootPath/PKGS"
         scope.launch {
@@ -1401,18 +1408,36 @@ object WindowsBuildEngine {
                 if (config.outputMode != WinBuildOutputMode.DIRECT_NTFS_USB && !tools.canConvertIso) {
                     throw IllegalStateException("Bundled ISO build tools (cabextract/wimlib/chntpw/xorriso) missing.")
                 }
-                val hasReadyIsoDir = Shell.cmd(
+                val stagingOptionsChanged = config.compression != prevConfig.compression ||
+                    config.includeUpdates != prevConfig.includeUpdates ||
+                    config.integrateNetFx3 != prevConfig.integrateNetFx3 ||
+                    config.runComponentCleanup != prevConfig.runComponentCleanup ||
+                    config.skipWinRe != prevConfig.skipWinRe ||
+                    config.eiCfgUnlock != prevConfig.eiCfgUnlock ||
+                    config.splitWimForFat32 != prevConfig.splitWimForFat32 ||
+                    config.virtualEditions != prevConfig.virtualEditions ||
+                    config.experience != prevConfig.experience ||
+                    config.winUtil != prevConfig.winUtil
+                val rawReadyIsoDir = Shell.cmd(
                     "[ -f ${shellQuote("$workRootPath/.pb_isodir_ready")} ] && [ -f ${shellQuote("$workRootPath/ISODIR/sources/boot.wim")} ] && echo OK || true"
                 ).exec().out.any { it.trim() == "OK" }
+                val canFastStep4 = rawReadyIsoDir && !forceFullRebuild && !stagingOptionsChanged
+                if (rawReadyIsoDir && !canFastStep4) {
+                    Shell.cmd("rm -f ${shellQuote("$workRootPath/.pb_isodir_ready")} 2>/dev/null || true").exec()
+                }
                 val esdCount = Shell.cmd("ls ${shellQuote(pkgPath)}/*.esd ${shellQuote(pkgPath)}/*.ESD 2>/dev/null | wc -l").exec().out.firstOrNull()?.trim()?.toIntOrNull() ?: 0
-                if (!hasReadyIsoDir && esdCount <= 0) {
+                if (!canFastStep4 && esdCount <= 0) {
                     throw IllegalStateException("Cached packages are incomplete or missing. Please tap Resume to verify/download.")
                 }
                 val hasUpd = Shell.cmd("find ${shellQuote(pkgPath)} -maxdepth 1 -type f \\( -iname '*.msu' -o -iname '*-kb*.cab' -o -iname '*ssu*.cab' -o -iname '*ndp*.cab' -o -iname '*dynamicupdate*.cab' \\) 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
                 val hasApps = Shell.cmd("find ${shellQuote(pkgPath)} -maxdepth 1 -type f \\( -iname '*.msixbundle' -o -iname '*.appxbundle' -o -iname '*.msix' -o -iname '*.appx' \\) 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
                 val hasFx3 = Shell.cmd("find ${shellQuote(pkgPath)} -maxdepth 1 -type f -iname '*netfx3*.cab' 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
 
-                onLog(LogEntry(nowTs(), "win-build", "Queued 100% offline rebuild for ${pending.title}${if (hasReadyIsoDir) " (Fast Step-4 resume)" else " ($esdCount cached ESDs)"}"))
+                if (configOverride != null) {
+                    saveBuildJobJson(appCtx, workRootPath, config, pending.totalBytes.coerceAtLeast(pending.cachedBytes), isCachedReady = true)
+                }
+                val modeDesc = if (canFastStep4) "Fast Step-4 pack (${config.compression.shortLabel})" else "${config.compression.shortLabel} · $esdCount cached ESDs"
+                onLog(LogEntry(nowTs(), "win-build", "Queued 100% offline rebuild for ${pending.title} ($modeDesc)"))
                 enqueueConversion(
                     QueuedConversionJob(
                         context = appCtx,
@@ -1426,7 +1451,7 @@ object WindowsBuildEngine {
                         hasNetFx3 = config.integrateNetFx3 && hasFx3,
                         isReadOnlySource = false,
                         pkgDirOverride = "",
-                        resumeFromStep4 = hasReadyIsoDir,
+                        resumeFromStep4 = canFastStep4,
                         onComplete = onComplete,
                         onError = onError,
                         onLog = onLog
@@ -2441,15 +2466,20 @@ object WindowsBuildEngine {
                 tmpEi.delete(); addConsole("Wrote sources/ei.cfg")
             }
 
-            val needUnattendOrOem = config.experience.hasAnyActive() || config.winUtil.hasAnyActive() || job.hasUpdates || job.hasApps || job.hasNetFx3 || config.runComponentCleanup
-            if (needUnattendOrOem) {
+            val hasStagedOemUpdates = job.hasUpdates && Shell.cmd("[ -d ${shellQuote(oemUpdates)} ] && [ -n \"\$(ls -A ${shellQuote(oemUpdates)} 2>/dev/null)\" ] && echo OK || true").exec().out.any { it.trim() == "OK" }
+            val hasStagedOemApps = job.hasApps && Shell.cmd("[ -d ${shellQuote(oemApps)} ] && [ -n \"\$(ls -A ${shellQuote(oemApps)} 2>/dev/null)\" ] && echo OK || true").exec().out.any { it.trim() == "OK" }
+            val hasStagedOemNetFx3 = job.hasNetFx3 && Shell.cmd("[ -d ${shellQuote(oemSxs)} ] && [ -n \"\$(ls -A ${shellQuote(oemSxs)} 2>/dev/null)\" ] && echo OK || true").exec().out.any { it.trim() == "OK" }
+            val needUnattendOrOem = config.experience.hasAnyActive() || config.winUtil.hasAnyActive() || hasStagedOemUpdates || hasStagedOemApps || hasStagedOemNetFx3 || config.runComponentCleanup
+            if (!needUnattendOrOem) {
+                Shell.cmd("rm -rf ${shellQuote("${isoDir.absolutePath}/sources/\$OEM\$")} 2>/dev/null || true").exec()
+            } else {
                 val arch = if (config.build.arch.lowercase() in setOf("x86", "arm64", "amd64")) config.build.arch.lowercase() else "amd64"
-                val tmpXml = File(appCtx.cacheDir, "wb_auto.xml").apply { writeText(WindowsCustomizationEngine.generateAutounattendXml(config.experience, config.winUtil, arch, null, true, job.hasUpdates, includeWindowsPePass = true), Charsets.UTF_8) }
-                val tmpPantherXml = File(appCtx.cacheDir, "wb_panther.xml").apply { writeText(WindowsCustomizationEngine.generateAutounattendXml(config.experience, config.winUtil, arch, null, true, job.hasUpdates, includeWindowsPePass = false), Charsets.UTF_8) }
-                val tmpSpec = File(appCtx.cacheDir, "wb_spec.cmd").apply { writeText(WindowsCustomizationEngine.buildSpecializeScript(config.experience, config.winUtil, job.hasUpdates, job.hasApps, job.hasNetFx3), Charsets.UTF_8) }
+                val tmpXml = File(appCtx.cacheDir, "wb_auto.xml").apply { writeText(WindowsCustomizationEngine.generateAutounattendXml(config.experience, config.winUtil, arch, null, true, hasStagedOemUpdates, includeWindowsPePass = true), Charsets.UTF_8) }
+                val tmpPantherXml = File(appCtx.cacheDir, "wb_panther.xml").apply { writeText(WindowsCustomizationEngine.generateAutounattendXml(config.experience, config.winUtil, arch, null, true, hasStagedOemUpdates, includeWindowsPePass = false), Charsets.UTF_8) }
+                val tmpSpec = File(appCtx.cacheDir, "wb_spec.cmd").apply { writeText(WindowsCustomizationEngine.buildSpecializeScript(config.experience, config.winUtil, hasStagedOemUpdates, hasStagedOemApps, hasStagedOemNetFx3), Charsets.UTF_8) }
                 val customPath = config.experience.customPostInstallScriptPath.trim()
                 val customName = if (customPath.isNotBlank()) customPath.substringAfterLast('/') else ""
-                val tmpComp = File(appCtx.cacheDir, "wb_comp.cmd").apply { writeText(WindowsCustomizationEngine.buildSetupCompleteScript(config.runComponentCleanup, customName.isNotBlank(), customName, hasOemApps = job.hasApps), Charsets.UTF_8) }
+                val tmpComp = File(appCtx.cacheDir, "wb_comp.cmd").apply { writeText(WindowsCustomizationEngine.buildSetupCompleteScript(config.runComponentCleanup, customName.isNotBlank(), customName, hasOemApps = hasStagedOemApps), Charsets.UTF_8) }
                 val customCopy = if (customPath.isNotBlank()) "mkdir -p ${shellQuote(oemCustom)} && cp -f ${shellQuote(UsbGadgetEngine.resolveDirectPath(customPath))} ${shellQuote(oemCustom)}/ 2>/dev/null || true" else "true"
                 Shell.cmd("mkdir -p ${shellQuote(oemPanther)} ${shellQuote(oemScripts)} && cp -f ${shellQuote(tmpXml.absolutePath)} ${shellQuote("${isoDir.absolutePath}/autounattend.xml")} && cp -f ${shellQuote(tmpPantherXml.absolutePath)} ${shellQuote("$oemPanther/unattend.xml")} && cp -f ${shellQuote(tmpSpec.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_Specialize.cmd")} && cp -f ${shellQuote(tmpComp.absolutePath)} ${shellQuote("$oemScripts/SetupComplete.cmd")} && $customCopy").exec()
                 tmpXml.delete(); tmpPantherXml.delete(); tmpSpec.delete(); tmpComp.delete()
@@ -2509,7 +2539,7 @@ object WindowsBuildEngine {
                 val qXorLog = shellQuote(xorLog)
                 val preferNoPrompt = config.experience.hasAnyActive() || config.winUtil.hasAnyActive()
                 if (useUdfGenIso) {
-                    addConsole("genisoimage (UDF 1.02): packing ~${UsbGadgetEngine.formatBytes(estIsoBytes)} (-udf -allow-limited-size -iso-level 3 -hide * -hide-udf boot.catalog)")
+                    addConsole("genisoimage (UDF 1.02): packing ~${UsbGadgetEngine.formatBytes(estIsoBytes)} (-udf -allow-limited-size -iso-level 3 -hide * -c boot/boot.cat)")
                 } else {
                     addConsole("xorriso: packing ~${UsbGadgetEngine.formatBytes(estIsoBytes)} (-iso-level 3 -J -joliet-long --stdio_sync 16m)")
                 }
@@ -2541,6 +2571,7 @@ object WindowsBuildEngine {
                     : > $qXorLog
                     trap 'rm -f $ACTIVE_PID_FILE' EXIT
                     cd "${'$'}ISODIR"
+                    find . -exec touch {} + 2>/dev/null || true
                     EFI_BOOT=""
                     if [ "${if (preferNoPrompt) "1" else "0"}" = "1" ]; then
                         EFI_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'efisys_noprompt.bin' 2>/dev/null | head -n 1 | sed 's|^\./||')
@@ -2549,11 +2580,12 @@ object WindowsBuildEngine {
                         EFI_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'efisys.bin' 2>/dev/null | head -n 1 | sed 's|^\./||')
                     fi
                     BIOS_BOOT=${'$'}(find . -maxdepth 4 -type f -iname 'etfsboot.com' 2>/dev/null | head -n 1 | sed 's|^\./||')
+                    if [ -n "${'$'}BIOS_BOOT" ] || [ -n "${'$'}EFI_BOOT" ]; then mkdir -p boot; fi
                     echo "UDF 1.02 Bootloaders: BIOS=${'$'}{BIOS_BOOT:-none} | EFI=${'$'}{EFI_BOOT:-none}" >> $qXorLog
                     if [ -n "${'$'}BIOS_BOOT" ] && [ -n "${'$'}EFI_BOOT" ]; then
-                        ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -hide "*" -hide-udf boot.catalog -V "$volId" -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOutIso . >> $qXorLog 2>&1 &
+                        ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -hide "*" -c boot/boot.cat -V "$volId" -b "${'$'}BIOS_BOOT" -no-emul-boot -boot-load-size 8 -eltorito-alt-boot -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOutIso . >> $qXorLog 2>&1 &
                     elif [ -n "${'$'}EFI_BOOT" ]; then
-                        ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -hide "*" -hide-udf boot.catalog -V "$volId" -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOutIso . >> $qXorLog 2>&1 &
+                        ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -hide "*" -c boot/boot.cat -V "$volId" -e "${'$'}EFI_BOOT" -no-emul-boot -o $qOutIso . >> $qXorLog 2>&1 &
                     else
                         ${'$'}THERM_PFX $qGenIso -udf -allow-limited-size -iso-level 3 -D -N -relaxed-filenames -hide "*" -V "$volId" -o $qOutIso . >> $qXorLog 2>&1 &
                     fi

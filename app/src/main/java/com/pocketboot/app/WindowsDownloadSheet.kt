@@ -1758,8 +1758,17 @@ fun WindowsDownloadSheet(
         var localOutName by remember(folderPath) { mutableStateOf("${folderPath.substringAfterLast('/').replace(Regex("[^A-Za-z0-9._-]"), "_")}.iso") }
         var localMode by remember(folderPath) { mutableStateOf(WinBuildOutputMode.STANDARD_ISO) }
         var localComp by remember(folderPath) { mutableStateOf(WinIsoCompression.WIM) }
+        var localThermal by remember(folderPath) { mutableStateOf(selectedThermalProfile) }
+        var localIncludeUpdates by remember(folderPath) { mutableStateOf(true) }
+        var localNetFx3 by remember(folderPath) { mutableStateOf(true) }
+        var localSplitFat32 by remember(folderPath) { mutableStateOf(false) }
+        var localSkipWinRe by remember(folderPath) { mutableStateOf(false) }
+        var localEiCfg by remember(folderPath) { mutableStateOf(false) }
+        var localCleanup by remember(folderPath) { mutableStateOf(false) }
         var localAddEnterprise by remember(folderPath) { mutableStateOf(false) }
         var localAddEducation by remember(folderPath) { mutableStateOf(false) }
+        var localAddProWork by remember(folderPath) { mutableStateOf(false) }
+        var localAddIotEnt by remember(folderPath) { mutableStateOf(false) }
         AlertDialog(
             onDismissRequest = { localUupSelectedFolder = null },
             containerColor = PocketColors.surfaceCard,
@@ -1798,9 +1807,64 @@ fun WindowsDownloadSheet(
                             }
                         }
                     }
-                    DirectUsbOptionRow("Solid ESD compression (smallest)", localComp == WinIsoCompression.ESD) { localComp = if (it) WinIsoCompression.ESD else WinIsoCompression.WIM }
+                    Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Text("WIM / ESD Compression", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                            Text(localComp.label, style = PocketColors.monoStyle, fontSize = 10.sp, color = PocketColors.accentSoft)
+                        }
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            WinIsoCompression.entries.forEach { comp ->
+                                val sel = localComp == comp
+                                Surface(
+                                    modifier = Modifier.weight(1f).height(34.dp).bounceClick {
+                                        localComp = comp
+                                        if (comp == WinIsoCompression.ESD) localSplitFat32 = false
+                                    },
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput,
+                                    border = BorderStroke(if (sel) 1.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                                ) {
+                                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                        Text(comp.shortLabel, style = MaterialTheme.typography.labelSmall, fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Medium, color = if (sel) PocketColors.accentSoft else PocketColors.textSecondary, maxLines = 1)
+                                    }
+                                }
+                            }
+                        }
+                        Text(localComp.subtitle, fontSize = 10.sp, color = PocketColors.textSecondary)
+                    }
+                    Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Text("Thermal Profile", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                            Text(localThermal.label, style = PocketColors.monoStyle, fontSize = 10.sp, color = PocketColors.infoBlue)
+                        }
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            BuildThermalProfile.entries.forEach { prof ->
+                                val sel = localThermal == prof
+                                Surface(
+                                    modifier = Modifier.weight(1f).height(32.dp).bounceClick { localThermal = prof },
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = if (sel) PocketColors.infoBlueBg else PocketColors.surfaceInput,
+                                    border = BorderStroke(if (sel) 1.dp else 0.5.dp, if (sel) PocketColors.infoBlue else PocketColors.border)
+                                ) {
+                                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                        Text(prof.shortLabel, style = MaterialTheme.typography.labelSmall, fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Medium, color = if (sel) PocketColors.infoBlue else PocketColors.textSecondary, maxLines = 1)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    DirectUsbOptionRow("Include Updates (Setup DU + LCU/SSU)", localIncludeUpdates) { localIncludeUpdates = it }
+                    DirectUsbOptionRow("Integrate .NET Framework 3.5", localNetFx3) { localNetFx3 = it }
+                    if (localComp != WinIsoCompression.ESD && localMode != WinBuildOutputMode.DIRECT_NTFS_USB) {
+                        DirectUsbOptionRow("Split WIM for FAT32 (install*.swm ≤ 3.5 GB)", localSplitFat32) { localSplitFat32 = it }
+                    }
+                    DirectUsbOptionRow("Run component cleanup (/ResetBase)", localCleanup) { localCleanup = it }
+                    DirectUsbOptionRow("Skip WinRE Recovery (~480 MB smaller)", localSkipWinRe) { localSkipWinRe = it }
+                    DirectUsbOptionRow("Unlock all editions (ei.cfg)", localEiCfg) { localEiCfg = it }
                     DirectUsbOptionRow("Add Virtual Edition: Enterprise", localAddEnterprise) { localAddEnterprise = it }
                     DirectUsbOptionRow("Add Virtual Edition: Education", localAddEducation) { localAddEducation = it }
+                    DirectUsbOptionRow("Add Virtual Edition: Pro for Workstations", localAddProWork) { localAddProWork = it }
+                    DirectUsbOptionRow("Add Virtual Edition: IoT Enterprise", localAddIotEnt) { localAddIotEnt = it }
                 }
             },
             confirmButton = {
@@ -1816,6 +1880,8 @@ fun WindowsDownloadSheet(
                         val ves = buildList {
                             if (localAddEnterprise) add("Enterprise")
                             if (localAddEducation) add("Education")
+                            if (localAddProWork) add("ProfessionalWorkstation")
+                            if (localAddIotEnt) add("IoTEnterprise")
                         }
                         val cfg = WindowsChannelBuildConfig(
                             build = dummyBuild,
@@ -1826,14 +1892,20 @@ fun WindowsDownloadSheet(
                             targetDir = targetDir,
                             customOutputName = localOutName.trim(),
                             autoMount = true,
-                            includeUpdates = true,
-                            integrateNetFx3 = true,
+                            includeUpdates = localIncludeUpdates,
+                            integrateNetFx3 = localNetFx3,
+                            runComponentCleanup = localCleanup,
+                            skipWinRe = localSkipWinRe,
+                            eiCfgUnlock = localEiCfg,
                             scheme = usbScheme,
                             experience = experience,
                             winUtil = winUtil,
                             extraDriversDir = usbExtraDriversDir.trim(),
                             virtualEditions = ves,
-                            localUupDirPath = folderPath
+                            localUupDirPath = folderPath,
+                            splitWimForFat32 = localSplitFat32,
+                            thermalProfile = localThermal,
+                            autoThermalCooldown = autoCooldown
                         )
                         localUupSelectedFolder = null
                         onDismiss()
