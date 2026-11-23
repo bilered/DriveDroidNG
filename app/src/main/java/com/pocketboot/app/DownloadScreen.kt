@@ -2077,21 +2077,54 @@ fun DownloadScreen(
                         defaultBrowseDir = defaultDir,
                         onExperienceChange = { rbExperience = it },
                         onWinUtilChange = { rbWinUtil = it },
-                        onApplyPreset = { preset ->
-                            rbExperience = preset.experience
-                            rbWinUtil = preset.winUtil
-                            onMessage("Applied preset "${preset.name}".", false)
+                        onApplyPreset = { p ->
+                            rbScheme = runCatching { PartitionScheme.valueOf(p.schemeName) }.getOrDefault(rbScheme)
+                            rbExperience = WindowsExperienceConfig(
+                                p.bypassRequirements,
+                                p.bypassMicrosoftAccount,
+                                p.disableDataCollection,
+                                p.disableBitLocker,
+                                p.qolImprovements,
+                                p.disableSponsoredApps,
+                                p.classicContextMenu,
+                                p.skipWifiSetup,
+                                p.createLocalUser,
+                                p.localUsername,
+                                "",
+                                p.skipOobe,
+                                p.useCa2023Bootloaders,
+                                p.applySkuSiPolicy
+                            )
+                            rbWinUtil = WinUtilTweaksConfig.fromJsonString(p.winUtilJson)
+                            onMessage("Applied preset \"${p.name}\".", false)
                         },
                         onSavePreset = { name ->
-                            val newPreset = AutounattendPreset(name, rbExperience, rbWinUtil)
+                            val newPreset = AutounattendPreset(
+                                name,
+                                rbScheme.name,
+                                rbExperience.bypassRequirements,
+                                rbExperience.bypassMicrosoftAccount,
+                                rbExperience.disableDataCollection,
+                                rbExperience.disableBitLocker,
+                                rbExperience.disableSponsoredApps,
+                                rbExperience.classicContextMenu,
+                                rbExperience.skipWifiSetup,
+                                rbExperience.createLocalUser,
+                                rbExperience.localUsername,
+                                rbExperience.skipOobe,
+                                rbExperience.qolImprovements,
+                                rbExperience.useCa2023Bootloaders,
+                                rbExperience.applySkuSiPolicy,
+                                rbWinUtil.toJsonString()
+                            )
                             val updatedPresets = (settings.autounattendPresets.filterNot { it.name.equals(name, true) } + newPreset)
                             onUpdateSettings(settings.copy(autounattendPresets = updatedPresets))
-                            onMessage("Saved preset "$name".", false)
+                            onMessage("Saved preset \"$name\".", false)
                         },
                         onDeletePreset = { presetName ->
                             val updatedPresets = settings.autounattendPresets.filterNot { it.name == presetName }
                             onUpdateSettings(settings.copy(autounattendPresets = updatedPresets))
-                            onMessage("Deleted preset "$presetName".", false)
+                            onMessage("Deleted preset \"$presetName\".", false)
                         }
                     )
 

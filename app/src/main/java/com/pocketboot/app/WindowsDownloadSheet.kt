@@ -1905,7 +1905,7 @@ fun WindowsDownloadSheet(
                             localUupDirPath = folderPath,
                             splitWimForFat32 = localSplitFat32,
                             thermalProfile = localThermal,
-                            autoThermalCooldown = autoCooldown
+                            autoThermalCooldown = defaultAutoThermalCooldown
                         )
                         localUupSelectedFolder = null
                         onDismiss()
