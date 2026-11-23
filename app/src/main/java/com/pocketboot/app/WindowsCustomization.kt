@@ -349,15 +349,18 @@ object WindowsCustomizationEngine {
         }
         if (hasOemUpdates) {
             sb.appendLine("if exist \"C:\\Windows\\Setup\\Updates\" (")
+            sb.appendLine("  echo [PocketBoot] Pass 1/3: Installing Servicing Stack Updates [SSU]...")
             sb.appendLine("  echo [PocketBoot v4.5.0] Pass 1/3: Installing Servicing Stack Updates [SSU]... >> \"%PB_LOG%\"")
-            sb.appendLine("  for %%F in (\"C:\\Windows\\Setup\\Updates\\1_*.cab\" \"C:\\Windows\\Setup\\Updates\\SSU-*.cab\") do if exist \"%%~fF\" (echo Installing SSU: %%~nxF >> \"%PB_LOG%\" & dism /Online /Add-Package /PackagePath:\"%%~fF\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 3010 set \"PB_REBOOT_REQ=1\")")
-            sb.appendLine("  echo [PocketBoot v4.5.0] Pass 2/3: Installing Enablement, .NET & General CAB Updates... >> \"%PB_LOG%\"")
-            sb.appendLine("  for %%F in (\"C:\\Windows\\Setup\\Updates\\2_*.cab\") do if exist \"%%~fF\" (echo Installing UPD: %%~nxF >> \"%PB_LOG%\" & dism /Online /Add-Package /PackagePath:\"%%~fF\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 3010 set \"PB_REBOOT_REQ=1\")")
-            sb.appendLine("  for %%F in (\"C:\\Windows\\Setup\\Updates\\*.cab\") do if exist \"%%~fF\" (echo %%~nxF | findstr /i /b \"1_ 2_ 3_ SSU-\" >nul || (echo Installing CAB: %%~nxF >> \"%PB_LOG%\" & dism /Online /Add-Package /PackagePath:\"%%~fF\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 3010 set \"PB_REBOOT_REQ=1\"))")
+            sb.appendLine("  for %%F in (\"C:\\Windows\\Setup\\Updates\\1_*.cab\" \"C:\\Windows\\Setup\\Updates\\SSU-*.cab\") do if exist \"%%~fF\" (echo [PocketBoot] Installing SSU: %%~nxF & echo Installing SSU: %%~nxF >> \"%PB_LOG%\" & dism /Online /Add-Package /PackagePath:\"%%~fF\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 3010 set \"PB_REBOOT_REQ=1\")")
+            sb.appendLine("  echo [PocketBoot] Pass 2/3: Installing Enablement, .NET and General CAB Updates...")
+            sb.appendLine("  echo [PocketBoot v4.5.0] Pass 2/3: Installing Enablement, .NET and General CAB Updates... >> \"%PB_LOG%\"")
+            sb.appendLine("  for %%F in (\"C:\\Windows\\Setup\\Updates\\2_*.cab\") do if exist \"%%~fF\" (echo [PocketBoot] Installing CAB: %%~nxF & echo Installing UPD: %%~nxF >> \"%PB_LOG%\" & dism /Online /Add-Package /PackagePath:\"%%~fF\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 3010 set \"PB_REBOOT_REQ=1\")")
+            sb.appendLine("  for %%F in (\"C:\\Windows\\Setup\\Updates\\*.cab\") do if exist \"%%~fF\" (echo %%~nxF | findstr /i /b \"1_ 2_ 3_ SSU-\" >nul || (echo [PocketBoot] Installing CAB: %%~nxF & echo Installing CAB: %%~nxF >> \"%PB_LOG%\" & dism /Online /Add-Package /PackagePath:\"%%~fF\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 3010 set \"PB_REBOOT_REQ=1\"))")
             sb.appendLine("  for %%P in (\"C:\\Windows\\Setup\\Updates\\*.msu.pbpart01\") do if exist \"%%~fP\" (")
             sb.appendLine("    set \"PB_MSU=%%~dpnP\"")
+            sb.appendLine("    echo [PocketBoot] Rejoining split update: %%~nxP ...")
             sb.appendLine("    echo [PocketBoot v4.5.0] Rejoining split MSU update: !PB_MSU! >> \"%PB_LOG%\"")
-            sb.appendLine("    copy /b \"%%~dpnP.pbpart*\" \"!PB_MSU!\" >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("    copy /b /y \"%%~dpnP.pbpart*\" \"!PB_MSU!\" >> \"%PB_LOG%\" 2>&1")
             sb.appendLine("    if !ERRORLEVEL! EQU 0 (")
             sb.appendLine("      if exist \"!PB_MSU!\" (")
             sb.appendLine("        for %%Z in (\"!PB_MSU!\") do if %%~zZ GTR 0 (")
@@ -369,19 +372,25 @@ object WindowsCustomizationEngine {
             sb.appendLine("      echo [ERROR] Failed to rejoin !PB_MSU! exit !ERRORLEVEL! >> \"%PB_LOG%\"")
             sb.appendLine("    )")
             sb.appendLine("  )")
+            sb.appendLine("  echo [PocketBoot] Pass 3/3: Installing Cumulative Updates [LCU MSU - may take 10-20 min]...")
             sb.appendLine("  echo [PocketBoot v4.5.0] Pass 3/3: Installing Cumulative Updates [LCU MSU]... >> \"%PB_LOG%\"")
-            sb.appendLine("  for %%F in (\"C:\\Windows\\Setup\\Updates\\3_*.msu\") do if exist \"%%~fF\" (echo Installing LCU: %%~nxF >> \"%PB_LOG%\" & dism /Online /Add-Package /PackagePath:\"%%~fF\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 3010 set \"PB_REBOOT_REQ=1\")")
-            sb.appendLine("  for %%F in (\"C:\\Windows\\Setup\\Updates\\*.msu\") do if exist \"%%~fF\" (echo %%~nxF | findstr /i /b \"3_\" >nul || (echo Installing MSU: %%~nxF >> \"%PB_LOG%\" & dism /Online /Add-Package /PackagePath:\"%%~fF\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 3010 set \"PB_REBOOT_REQ=1\"))")
+            sb.appendLine("  for %%F in (\"C:\\Windows\\Setup\\Updates\\3_*.msu\") do if exist \"%%~fF\" (echo [PocketBoot] Installing LCU: %%~nxF ... & echo Installing LCU: %%~nxF >> \"%PB_LOG%\" & dism /Online /Add-Package /PackagePath:\"%%~fF\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 3010 set \"PB_REBOOT_REQ=1\")")
+            sb.appendLine("  for %%F in (\"C:\\Windows\\Setup\\Updates\\*.msu\") do if exist \"%%~fF\" (echo %%~nxF | findstr /i /b \"3_\" >nul || (echo [PocketBoot] Installing MSU: %%~nxF ... & echo Installing MSU: %%~nxF >> \"%PB_LOG%\" & dism /Online /Add-Package /PackagePath:\"%%~fF\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 3010 set \"PB_REBOOT_REQ=1\"))")
             sb.appendLine("  rmdir /s /q \"C:\\Windows\\Setup\\Updates\" >> \"%PB_LOG%\" 2>&1")
             sb.appendLine(")")
         }
-        if (hasNetFx3) sb.appendLine("if exist \"C:\\Windows\\Setup\\sxs\" (dism /Online /Enable-Feature /FeatureName:NetFx3 /All /LimitAccess /Source:\"C:\\Windows\\Setup\\sxs\" /NoRestart >> \"%PB_LOG%\" 2>&1 & rmdir /s /q \"C:\\Windows\\Setup\\sxs\" >> \"%PB_LOG%\" 2>&1)")
-        if (hasOemApps) sb.appendLine("echo [PocketBoot v4.5.0] Store Apps & SecHealthUI deferred to SetupComplete.cmd >> \"%PB_LOG%\"")
+        if (hasNetFx3) sb.appendLine("if exist \"C:\\Windows\\Setup\\sxs\" (echo [PocketBoot] Enabling .NET Framework 3.5... & dism /Online /Enable-Feature /FeatureName:NetFx3 /All /LimitAccess /Source:\"C:\\Windows\\Setup\\sxs\" /NoRestart >> \"%PB_LOG%\" 2>&1 & rmdir /s /q \"C:\\Windows\\Setup\\sxs\" >> \"%PB_LOG%\" 2>&1)")
+        if (hasOemApps) sb.appendLine("echo [PocketBoot v4.5.0] Store Apps and SecHealthUI deferred to SetupComplete.cmd >> \"%PB_LOG%\"")
         sb.appendLine("echo done > \"%PB_FLAG%\"")
-        sb.appendLine("echo [PocketBoot v4.5.0] Specialize finished %DATE% %TIME% (RebootReq=!PB_REBOOT_REQ!) >> \"%PB_LOG%\"")
-        sb.appendLine("if \"!PB_REBOOT_REQ!\"==\"1\" exit /b 3010")
+        sb.appendLine("echo [PocketBoot v4.5.0] Specialize finished %DATE% %TIME% [RebootReq=!PB_REBOOT_REQ!] >> \"%PB_LOG%\"")
+        // Microsoft-Windows-Deployment RunSynchronousCommand WillReboot=OnRequest ONLY accepts exit codes:
+        //   0 = success (no reboot), 1 = success (immediate reboot required), 2 = in progress (reboot & re-run).
+        // Returning 3010 (DISM's reboot code) causes Windows Setup to abort the specialize pass!
+        if (hasOemUpdates) {
+            sb.appendLine("if \"!PB_REBOOT_REQ!\"==\"1\" (echo [PocketBoot] Updates complete - rebooting to finalize Windows... & exit /b 1)")
+        }
         sb.appendLine("exit /b 0")
-        return sb.toString()
+        return sb.toString().replace("\r\n", "\n").replace("\n", "\r\n")
     }
 
     fun buildSetupCompleteScript(runComponentCleanup: Boolean, hasCustomScript: Boolean, customScriptFileName: String = "", hasOemApps: Boolean = false): String {
@@ -416,7 +425,7 @@ object WindowsCustomizationEngine {
         }
         sb.appendLine("for %%D in (Updates Apps sxs Custom) do if exist \"C:\\Windows\\Setup\\%%D\" rmdir /s /q \"C:\\Windows\\Setup\\%%D\" >nul 2>&1")
         sb.appendLine("exit /b 0")
-        return sb.toString()
+        return sb.toString().replace("\r\n", "\n").replace("\n", "\r\n")
     }
 
     fun generateAutounattendXml(experience: WindowsExperienceConfig, winUtil: WinUtilTweaksConfig, arch: String = "amd64", selectedEditionIndex: Int? = null, hasSpecializeScript: Boolean = false, hasOemUpdates: Boolean = false, includeWindowsPePass: Boolean = true, uiLang: String = ""): String {
