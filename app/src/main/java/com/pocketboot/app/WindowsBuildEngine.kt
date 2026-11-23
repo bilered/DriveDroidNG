@@ -2664,55 +2664,57 @@ object WindowsBuildEngine {
                     addConsole("Split complete: sources/install*.swm ready (all chunks <= 3.5 GB)")
                 }
 
-                // Split any >3.95 GiB .msu cumulative update in $OEM$/$$/Setup/Updates into 3,500 MiB .pbpart01/.pbpart02 chunks
-                val bigMsus = Shell.cmd("if [ -d ${shellQuote(oemUpdates)} ]; then for f in ${shellQuote(oemUpdates)}/*.msu ${shellQuote(oemUpdates)}/*.MSU; do if [ ! -f \"\$f\" ]; then continue; fi; sz=\$(stat -c '%s' \"\$f\" 2>/dev/null || echo 0); if [ \"\$sz\" -gt 3950000000 ]; then printf '%s|%s\\n' \"\$f\" \"\$sz\"; fi; done; fi").exec().out
-                bigMsus.forEach { line ->
+                // Split any >3.95 GiB .msu cumulative update in $OEM$/$$/Setup/Updates into 3,500 MiB .pbpart01/.pbpart02 chunks.
+                // IMPORTANT: Do ALL 64-bit size comparisons & math in Kotlin Long (Android mksh uses 32-bit signed int32_t!).
+                val allStagedMsus = Shell.cmd("if [ -d ${shellQuote(oemUpdates)} ]; then for f in ${shellQuote(oemUpdates)}/*.msu ${shellQuote(oemUpdates)}/*.MSU; do if [ ! -f \"\$f\" ]; then continue; fi; printf '%s|%s\\n' \"\$f\" \"\$(stat -c '%s' \"\$f\" 2>/dev/null || echo 0)\"; done; fi").exec().out
+                val bigMsus = allStagedMsus.mapNotNull { line ->
                     val parts = line.split("|", limit = 2)
                     if (parts.size == 2) {
-                        val msuPath = parts[0].trim()
-                        val msuSz = parts[1].trim().toLongOrNull() ?: 0L
-                        val msuName = msuPath.substringAfterLast('/')
-                        val freeBeforeSplit = UsbGadgetEngine.getFreeSpaceBytes(config.targetDir)
-                        if (freeBeforeSplit > 0L && freeBeforeSplit < msuSz + 256L * 1024L * 1024L) {
-                            throw IllegalStateException("Not enough free space to split $msuName (${UsbGadgetEngine.formatBytes(msuSz)}). Free: ${UsbGadgetEngine.formatBytes(freeBeforeSplit)}")
-                        }
-                        addConsole("Splitting >4 GiB update $msuName (${UsbGadgetEngine.formatBytes(msuSz)}) into 3,500 MiB .pbpart chunks (auto-rejoined during Windows Specialize)...")
-                        publishConv("Step 4/4 · Splitting >4GB update...", "$msuName (.pbpart01/.pbpart02)", 0.84f, msuSz)
-                        val msuSplitRes = runIsolatedRootScript(appCtx, "msusplit", """
-                            set -e
-                            $pathHeader
-                            SRC=${shellQuote(msuPath)}
-                            ORIG_SZ=${'$'}(stat -c '%s' "${'$'}SRC")
-                            BS=4194304
-                            CHUNK_BLKS=875
-                            SKIP=0
-                            IDX=1
-                            SUM=0
-                            rm -f "${'$'}SRC".pbpart*
-                            while [ "${'$'}SUM" -lt "${'$'}ORIG_SZ" ]; do
-                                TAG=${'$'}(printf '%02d' "${'$'}IDX")
-                                OUTP="${'$'}SRC.pbpart${'$'}TAG"
-                                dd if="${'$'}SRC" of="${'$'}OUTP" bs="${'$'}BS" count="${'$'}CHUNK_BLKS" skip="${'$'}SKIP" 2>/dev/null
-                                PSZ=${'$'}(stat -c '%s' "${'$'}OUTP" 2>/dev/null || echo 0)
-                                if [ "${'$'}PSZ" -le 0 ]; then rm -f "${'$'}OUTP"; break; fi
-                                SUM=${'$'}((SUM + PSZ))
-                                SKIP=${'$'}((SKIP + CHUNK_BLKS))
-                                IDX=${'$'}((IDX + 1))
-                            done
-                            if [ "${'$'}SUM" -ne "${'$'}ORIG_SZ" ]; then
-                                rm -f "${'$'}SRC".pbpart*
-                                echo "MSU split byte mismatch (${'$'}SUM != ${'$'}ORIG_SZ)" >&2
-                                exit 1
-                            fi
-                            rm -f "${'$'}SRC"
-                            echo "MSU_SPLIT_OK|${'$'}((IDX - 1)) parts|${'$'}SUM bytes"
-                        """.trimIndent())
-                        if (!msuSplitRes.isSuccess) {
-                            throw IllegalStateException("Failed splitting >4 GiB update $msuName: ${(msuSplitRes.out + msuSplitRes.err).takeLast(2).joinToString(" ").take(200)}")
-                        }
-                        val okInfo = msuSplitRes.out.firstOrNull { it.startsWith("MSU_SPLIT_OK|") }?.substringAfter('|') ?: "split"
-                        addConsole("Split complete: $msuName -> $okInfo (verified byte-exact)")
+                        val p = parts[0].trim()
+                        val sz = parts[1].trim().toLongOrNull() ?: 0L
+                        if (sz > 3_950_000_000L) p to sz else null
+                    } else null
+                }
+                bigMsus.forEach { (msuPath, msuSz) ->
+                    val msuName = msuPath.substringAfterLast('/')
+                    val freeBeforeSplit = UsbGadgetEngine.getFreeSpaceBytes(config.targetDir)
+                    if (freeBeforeSplit > 0L && freeBeforeSplit < msuSz + 256L * 1024L * 1024L) {
+                        throw IllegalStateException("Not enough free space to split $msuName (${UsbGadgetEngine.formatBytes(msuSz)}). Free: ${UsbGadgetEngine.formatBytes(freeBeforeSplit)}")
                     }
+                    val blockSize = 4_194_304L // 4 MiB
+                    val chunkBlocks = 875L     // 875 * 4 MiB = 3,500 MiB (~3.42 GiB, safely under 3.95 GiB & FAT32 4 GiB)
+                    val chunkBytes = blockSize * chunkBlocks
+                    val totalParts = ((msuSz + chunkBytes - 1L) / chunkBytes).toInt().coerceAtLeast(2)
+                    addConsole("Splitting >4 GiB update $msuName (${UsbGadgetEngine.formatBytes(msuSz)}) into $totalParts × ≤3,500 MiB .pbpart chunks...")
+                    publishConv("Step 4/4 · Splitting >4GB update...", "$msuName ($totalParts parts)", 0.84f, msuSz)
+                    val ddSteps = (1..totalParts).joinToString("\n") { idx ->
+                        val tag = String.format(Locale.US, "%02d", idx)
+                        val skipBlocks = (idx - 1L) * chunkBlocks
+                        val outPart = "$msuPath.pbpart$tag"
+                        "dd if=${shellQuote(msuPath)} of=${shellQuote(outPart)} bs=$blockSize count=$chunkBlocks skip=$skipBlocks 2>/dev/null\n" +
+                            "printf 'PART|%s|%s\\n' ${shellQuote(outPart)} \"\$(stat -c '%s' ${shellQuote(outPart)} 2>/dev/null || echo 0)\""
+                    }
+                    val msuSplitRes = runIsolatedRootScript(appCtx, "msusplit", """
+                        set -e
+                        $pathHeader
+                        rm -f ${shellQuote(msuPath)}.pbpart*
+                        $ddSteps
+                    """.trimIndent())
+                    val partSizes = msuSplitRes.out.filter { it.startsWith("PART|") }.mapNotNull { l ->
+                        val pp = l.split("|", limit = 3)
+                        if (pp.size == 3) pp[2].trim().toLongOrNull() else null
+                    }
+                    val sumBytes = partSizes.sum()
+                    val allPartsValid = msuSplitRes.isSuccess &&
+                        partSizes.size == totalParts &&
+                        partSizes.all { it in 1L..3_950_000_000L } &&
+                        sumBytes == msuSz
+                    if (!allPartsValid) {
+                        Shell.cmd("rm -f ${shellQuote(msuPath)}.pbpart* 2>/dev/null || true").exec()
+                        throw IllegalStateException("Failed splitting >4 GiB update $msuName (parts=${partSizes.size}/$totalParts, sum=$sumBytes/$msuSz)")
+                    }
+                    Shell.cmd("rm -f ${shellQuote(msuPath)}").exec()
+                    addConsole("Split complete: $msuName -> $totalParts parts ($sumBytes bytes, verified byte-exact)")
                 }
             }
 
@@ -2726,37 +2728,36 @@ object WindowsBuildEngine {
             val gate1Res = runIsolatedRootScript(appCtx, "gate1_audit", """
                 set -e
                 $pathHeader
-                # 1. Scan ALL files in ISODIR for 0-byte critical files + count total & 0-byte files
-                TOTAL_FILES=0
-                ZERO_ALL=0
-                BAD_ZERO=""
-                BAD_BIG=""
-                G1_LIST="/data/local/tmp/pb_g1_files.txt"
-                find "${'$'}ISODIR" -type f > "${'$'}G1_LIST"
-                while IFS= read -r f; do
-                    if [ ! -f "${'$'}f" ]; then continue; fi
-                    TOTAL_FILES=${'$'}((TOTAL_FILES + 1))
-                    sz=${'$'}(stat -c '%s' "${'$'}f" 2>/dev/null || echo 0)
-                    bn=${'$'}(basename "${'$'}f")
-                    low=${'$'}(printf '%s' "${'$'}bn" | tr 'A-Z' 'a-z')
-                    if [ "${'$'}sz" -eq 0 ]; then
-                        ZERO_ALL=${'$'}((ZERO_ALL + 1))
-                        case "${'$'}low" in
-                            *.wim|*.swm|*.esd|*.msu|*.cab|*.efi|*.dll|*.exe|*.mui|*.xml|*.cmd|*.bat|*.ini|*.cfg|*.sys|*.man|*.vbs|*.com|*.bin|*.pbpart*|bootmgr)
-                                BAD_ZERO="${'$'}f"
-                                break
-                                ;;
-                        esac
-                    fi
-                    if [ "${if (isIsoOutput) "1" else "0"}" = "1" ] && [ "${'$'}sz" -gt 3950000000 ]; then
-                        BAD_BIG="${'$'}f (${'$'}sz bytes)"
-                        break
-                    fi
-                done < "${'$'}G1_LIST"
-                rm -f "${'$'}G1_LIST"
+                # 1. Scan ALL files in ISODIR via 64-bit awk (avoids Android mksh 32-bit int32_t overflow at 2 GiB!)
+                SCAN_OUT=${'$'}(find "${'$'}ISODIR" -type f -exec stat -c '%s|%n' {} + 2>/dev/null | awk -v chk_big="${if (isIsoOutput) "1" else "0"}" '
+                    BEGIN { total=0; zeros=0; bad_zero=""; bad_big="" }
+                    {
+                        sep = index(${'$'}0, "|")
+                        if (sep <= 1) next
+                        sz = substr(${'$'}0, 1, sep - 1) + 0
+                        f = substr(${'$'}0, sep + 1)
+                        total++
+                        n = split(f, parts, "/")
+                        low = tolower(parts[n])
+                        if (sz == 0) {
+                            zeros++
+                            if (bad_zero == "" && low ~ /\.(wim|swm|esd|msu|cab|efi|dll|exe|mui|xml|cmd|bat|ini|cfg|sys|man|vbs|com|bin|pbpart[0-9]+)$|^bootmgr$/) {
+                                bad_zero = f
+                            }
+                        }
+                        if (chk_big == "1" && sz > 3950000000 && bad_big == "") {
+                            bad_big = f " (" sprintf("%.0f", sz) " bytes)"
+                        }
+                    }
+                    END { printf "%d|%d|%s|%s\n", total, zeros, bad_zero, bad_big }
+                ')
+                TOTAL_FILES=${'$'}(printf '%s' "${'$'}SCAN_OUT" | cut -d'|' -f1)
+                ZERO_ALL=${'$'}(printf '%s' "${'$'}SCAN_OUT" | cut -d'|' -f2)
+                BAD_ZERO=${'$'}(printf '%s' "${'$'}SCAN_OUT" | cut -d'|' -f3)
+                BAD_BIG=${'$'}(printf '%s' "${'$'}SCAN_OUT" | cut -d'|' -f4)
                 if [ -n "${'$'}BAD_ZERO" ]; then echo "FAIL|0-byte critical file in ISODIR: ${'$'}BAD_ZERO"; exit 1; fi
                 if [ -n "${'$'}BAD_BIG" ]; then echo "FAIL|File exceeds 3.95 GiB ISO limit: ${'$'}BAD_BIG"; exit 1; fi
-                if [ "${'$'}TOTAL_FILES" -lt 20 ]; then echo "FAIL|ISODIR incomplete (only ${'$'}TOTAL_FILES files)"; exit 1; fi
+                if [ "${'$'}{TOTAL_FILES:-0}" -lt 20 ]; then echo "FAIL|ISODIR incomplete (only ${'$'}{TOTAL_FILES:-0} files)"; exit 1; fi
 
                 # 2. Verify boot.wim (2+ indexes, index 2 bootable) and install.* WIM header
                 BOOT_INFO=${'$'}($qWim info "${'$'}ISODIR/sources/boot.wim" 2>/dev/null || true)
