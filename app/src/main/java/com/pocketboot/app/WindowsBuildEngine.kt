@@ -1497,7 +1497,7 @@ object WindowsBuildEngine {
         _conversionState.value = null
         convContext?.let { IsoBuilderService.stop(it) }
         scope.launch {
-            Shell.cmd("PID=\$(cat $ACTIVE_PID_FILE 2>/dev/null | tr -dc '0-9'); [ -n \"\$PID\" ] && kill -CONT \"\$PID\" 2>/dev/null || true; pkill -CONT -f 'libwimlib_imagex|liblibxorriso|libcabextract' 2>/dev/null || true; [ -n \"\$PID\" ] && kill -TERM \"\$PID\" 2>/dev/null || true; pkill -f 'libwimlib_imagex|liblibxorriso|libcabextract' 2>/dev/null || true; rm -rf $ACTIVE_PID_FILE /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive /data/local/tmp/pb_wim_prog.log /data/local/tmp/pb_cab_prog.log /data/local/tmp/pb_ca2023 /data/local/tmp/pb_win7_efi 2>/dev/null || true").exec()
+            Shell.cmd("PID=\$(cat $ACTIVE_PID_FILE 2>/dev/null | tr -dc '0-9'); [ -n \"\$PID\" ] && kill -CONT \"\$PID\" 2>/dev/null || true; pkill -CONT -f 'libwimlib_imagex|libxorriso|libcabextract' 2>/dev/null || true; [ -n \"\$PID\" ] && kill -TERM \"\$PID\" 2>/dev/null || true; pkill -f 'libwimlib_imagex|libxorriso|libcabextract' 2>/dev/null || true; rm -rf $ACTIVE_PID_FILE /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive /data/local/tmp/pb_wim_prog.log /data/local/tmp/pb_cab_prog.log /data/local/tmp/pb_ca2023 /data/local/tmp/pb_win7_efi 2>/dev/null || true").exec()
             if (curWork.isNotBlank()) Shell.cmd("rm -rf ${shellQuote("$curWork/ISODIR")} ${shellQuote("$curWork/TMP")} 2>/dev/null || true").exec()
         }
         emitConvLog("win-build", "Cancelled active ISO/USB build and cleared scratch files.", true)
@@ -1567,8 +1567,7 @@ object WindowsBuildEngine {
     }
 
     private fun loadPackageManifest(workRootPath: String): List<WinPackageFileEntry> {
-        val raw = Shell.cmd("cat ${shellQuote("$workRootPath/pb_manifest.json")} 2>/dev/null || true").exec().out.joinToString("
-").trim()
+        val raw = Shell.cmd("cat ${shellQuote("$workRootPath/pb_manifest.json")} 2>/dev/null || true").exec().out.joinToString("\n").trim()
         if (raw.isBlank()) return emptyList()
         return runCatching {
             val arr = JSONArray(raw)
@@ -1592,7 +1591,7 @@ object WindowsBuildEngine {
 
     private fun savePkgVerifiedFingerprint(workRootPath: String, fingerprint: String) {
         if (fingerprint.isBlank()) return
-        Shell.cmd("printf '%s\n' ${shellQuote(fingerprint)} > ${shellQuote("$workRootPath/.pb_pkgs_verified")} 2>/dev/null || true").exec()
+        Shell.cmd("printf '%s\\n' ${shellQuote(fingerprint)} > ${shellQuote("$workRootPath/.pb_pkgs_verified")} 2>/dev/null || true").exec()
     }
 
     private fun readPkgVerifiedFingerprint(workRootPath: String): String {
@@ -1732,7 +1731,7 @@ object WindowsBuildEngine {
                 if (dlPausedFlag.get() || dlCancelledFlag.get()) return@launch
                 // Gate 0A post-move audit: verify every expected package landed in PKGS/ with exact non-zero size
                 val landedMap = Shell.cmd(
-                    "for f in ${shellQuote(pkgDir.absolutePath)}/*; do if [ ! -f "\$f" ]; then continue; fi; printf '%s|%s\n' "\$(basename "\$f")" "\$(stat -c '%s' "\$f" 2>/dev/null || echo 0)"; done"
+                    "for f in ${shellQuote(pkgDir.absolutePath)}/*; do if [ ! -f \"\$f\" ]; then continue; fi; printf '%s|%s\\n' \"\$(basename \"\$f\")\" \"\$(stat -c '%s' \"\$f\" 2>/dev/null || echo 0)\"; done"
                 ).exec().out.mapNotNull { line ->
                     val p = line.split("|", limit = 2)
                     if (p.size == 2) p[0] to (p[1].trim().toLongOrNull() ?: 0L) else null
@@ -2628,7 +2627,7 @@ object WindowsBuildEngine {
                 Shell.cmd("rm -rf ${shellQuote("${isoDir.absolutePath}/sources/\$OEM\$")} 2>/dev/null || true").exec()
             } else {
                 val arch = if (config.build.arch.lowercase() in setOf("x86", "arm64", "amd64")) config.build.arch.lowercase() else "amd64"
-                val detectedLang = Shell.cmd("grep -iE '^[a-z]{2,3}(-[a-z0-9]{2,4}){1,2}[[:space:]]*=' ${shellQuote("${isoDir.absolutePath}/sources/lang.ini")} 2>/dev/null | head -n 1 | cut -d= -f1 | tr -d ' \r\n'").exec().out.firstOrNull().orEmpty().trim().ifBlank { config.lang.code }
+                val detectedLang = Shell.cmd("grep -iE '^[a-z]{2,3}(-[a-z0-9]{2,4}){1,2}[[:space:]]*=' ${shellQuote("${isoDir.absolutePath}/sources/lang.ini")} 2>/dev/null | head -n 1 | cut -d= -f1 | tr -d ' \\r\\n'").exec().out.firstOrNull().orEmpty().trim().ifBlank { config.lang.code }
                 val tmpXml = File(appCtx.cacheDir, "wb_auto.xml").apply { writeText(WindowsCustomizationEngine.generateAutounattendXml(config.experience, config.winUtil, arch, null, true, hasStagedOemUpdates, includeWindowsPePass = true, uiLang = detectedLang), Charsets.UTF_8) }
                 val tmpPantherXml = File(appCtx.cacheDir, "wb_panther.xml").apply { writeText(WindowsCustomizationEngine.generateAutounattendXml(config.experience, config.winUtil, arch, null, true, hasStagedOemUpdates, includeWindowsPePass = false), Charsets.UTF_8) }
                 val tmpSpec = File(appCtx.cacheDir, "wb_spec.cmd").apply { writeText(WindowsCustomizationEngine.buildSpecializeScript(config.experience, config.winUtil, hasStagedOemUpdates, hasStagedOemApps, hasStagedOemNetFx3), Charsets.UTF_8) }
@@ -2666,7 +2665,7 @@ object WindowsBuildEngine {
                 }
 
                 // Split any >3.95 GiB .msu cumulative update in $OEM$/$$/Setup/Updates into 3,500 MiB .pbpart01/.pbpart02 chunks
-                val bigMsus = Shell.cmd("if [ -d ${shellQuote(oemUpdates)} ]; then for f in ${shellQuote(oemUpdates)}/*.msu ${shellQuote(oemUpdates)}/*.MSU; do if [ ! -f "\$f" ]; then continue; fi; sz=\$(stat -c '%s' "\$f" 2>/dev/null || echo 0); if [ "\$sz" -gt 3950000000 ]; then printf '%s|%s\n' "\$f" "\$sz"; fi; done; fi").exec().out
+                val bigMsus = Shell.cmd("if [ -d ${shellQuote(oemUpdates)} ]; then for f in ${shellQuote(oemUpdates)}/*.msu ${shellQuote(oemUpdates)}/*.MSU; do if [ ! -f \"\$f\" ]; then continue; fi; sz=\$(stat -c '%s' \"\$f\" 2>/dev/null || echo 0); if [ \"\$sz\" -gt 3950000000 ]; then printf '%s|%s\\n' \"\$f\" \"\$sz\"; fi; done; fi").exec().out
                 bigMsus.forEach { line ->
                     val parts = line.split("|", limit = 2)
                     if (parts.size == 2) {
@@ -2718,7 +2717,7 @@ object WindowsBuildEngine {
             }
 
             // Free temporary CAB/WIM staging files and stamp PB_STAGE_V20 marker for safe Fast Step-4 retry!
-            Shell.cmd("rm -rf $qTmp /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive && printf '%s\n' '$STAGE_SCHEMA_VERSION' > $qIsoReadyMarker").exec()
+            Shell.cmd("rm -rf $qTmp /data/local/tmp/pb_uup_ext /data/local/tmp/pb_uup_hive && printf '%s\\n' '$STAGE_SCHEMA_VERSION' > $qIsoReadyMarker").exec()
             }
 
             // Gate 1: Pre-Pack Full Staging Integrity Audit (checks ALL files in ISODIR before packing ISO or USB)
