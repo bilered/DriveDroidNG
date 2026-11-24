@@ -1756,6 +1756,8 @@ fun DownloadScreen(
             cachedUupBuildsJson = settings.cachedUupBuildsJson,
             defaultThermalProfile = settings.buildThermalProfile,
             defaultAutoThermalCooldown = settings.autoThermalCooldown,
+            defaultKeepPackagesAfterBuild = settings.keepUupPackagesAfterBuild,
+            onUpdateKeepPackagesAfterBuild = { v -> onUpdateSettings(settings.copy(keepUupPackagesAfterBuild = v)) },
             onUpdateCachedUupBuilds = { freshJson ->
                 if (freshJson != settings.cachedUupBuildsJson) {
                     onUpdateSettings(settings.copy(cachedUupBuildsJson = freshJson))
@@ -1820,7 +1822,7 @@ fun DownloadScreen(
         var rbSplitFat32 by remember(pb.workRootPath) { mutableStateOf(orig.splitWimForFat32) }
         var rbSkipWinRe by remember(pb.workRootPath) { mutableStateOf(orig.skipWinRe) }
         var rbEiCfg by remember(pb.workRootPath) { mutableStateOf(orig.eiCfgUnlock) }
-        var rbKeepPkgs by remember(pb.workRootPath) { mutableStateOf(true) }
+        var rbKeepPkgs by remember(pb.workRootPath) { mutableStateOf(settings.keepUupPackagesAfterBuild || orig.keepPackagesAfterBuild) }
         var rbAutoMount by remember(pb.workRootPath) { mutableStateOf(orig.autoMount) }
         var rbForceFull by remember(pb.workRootPath) { mutableStateOf(false) }
         var rbVirtualEds by remember(pb.workRootPath) { mutableStateOf(orig.virtualEditions.toSet()) }
@@ -2133,7 +2135,7 @@ fun DownloadScreen(
                             }
                             OfflineRebuildSwitchRow("Skip WinRE Recovery (~480 MB smaller)", rbSkipWinRe) { rbSkipWinRe = it }; PocketHairlineDivider()
                             OfflineRebuildSwitchRow("Unlock all editions (ei.cfg)", rbEiCfg) { rbEiCfg = it }; PocketHairlineDivider()
-                            OfflineRebuildSwitchRow("Keep base UUP packages after build", rbKeepPkgs) { rbKeepPkgs = it }; PocketHairlineDivider()
+                            OfflineRebuildSwitchRow("Keep base UUP packages after build", rbKeepPkgs) { rbKeepPkgs = it; onUpdateSettings(settings.copy(keepUupPackagesAfterBuild = it)) }; PocketHairlineDivider()
                             OfflineRebuildSwitchRow("Auto-cooldown if phone gets warm", rbAutoCooldown) { rbAutoCooldown = it }; PocketHairlineDivider()
                             OfflineRebuildSwitchRow("Auto-mount output when finished", rbAutoMount) { rbAutoMount = it }
                             if (pb.hasStagedIsoDir && !stagingChanged) {
@@ -2504,7 +2506,7 @@ fun DownloadScreen(
             state = winConvState!!,
             onDismiss = { showBuildMonitorSheet = false },
             onToggleAutoMount = { WindowsBuildEngine.updateConversionAutoMount(it) },
-            onToggleKeepPackages = { WindowsBuildEngine.updateConversionKeepPackages(it) },
+            onToggleKeepPackages = { v -> WindowsBuildEngine.updateConversionKeepPackages(v); onUpdateSettings(settings.copy(keepUupPackagesAfterBuild = v)) },
             onChangeThermalProfile = { prof ->
                 WindowsBuildEngine.updateConversionThermalProfile(prof)
                 onMessage("Live thermal profile switched to ${prof.label}.", false)

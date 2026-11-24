@@ -345,6 +345,43 @@ object UsbGadgetEngine {
         }
     }
 
+    /**
+     * Verifies Android MediaStore's cached `_size` for an output ISO/IMG matches `expectedBytes`
+     * so USB MTP transfers never truncate overwritten files to an older build's size.
+     * Returns Pair(isSynced, mediaStoreReportedSize).
+     */
+    fun syncMediaStoreFileSize(context: Context?, path: String, expectedBytes: Long): Pair<Boolean, Long> {
+        return runCatching {
+            val resolved = resolveDirectPath(path).trimEnd('/')
+            if (resolved.isBlank() || expectedBytes <= 0L) return Pair(false, -1L)
+            val isUserStorage = resolved.startsWith("/data/media/0") || resolved.startsWith("/storage/emulated/0")
+            if (!isUserStorage) return Pair(true, expectedBytes)
+            val publicPath = resolved.replaceFirst("/data/media/0", "/storage/emulated/0")
+            if (context != null) {
+                MediaScannerConnection.scanFile(context.applicationContext, arrayOf(publicPath), arrayOf("application/octet-stream"), null)
+                runCatching { Thread.sleep(600L) }
+            }
+            val escSql = publicPath.replace("'", "''")
+            val qWhere = shellQuote("_data='$escSql'")
+            fun querySize(): Long {
+                val out = Shell.cmd("content query --uri content://media/external/file --projection _size --where $qWhere 2>/dev/null || true").exec().out
+                val m = Regex("""_size=(\d+)""").find(out.joinToString(" "))
+                return m?.groupValues?.getOrNull(1)?.toLongOrNull() ?: -1L
+            }
+            var reported = querySize()
+            if (reported != expectedBytes) {
+                val mtimeSec = Shell.cmd("stat -c '%Y' ${shellQuote(resolved)} 2>/dev/null || date +%s").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: (System.currentTimeMillis() / 1000L)
+                Shell.cmd("sync; content update --uri content://media/external/file --bind _size:l:$expectedBytes --bind date_modified:l:$mtimeSec --where $qWhere >/dev/null 2>&1 || true").exec()
+                if (context != null) {
+                    MediaScannerConnection.scanFile(context.applicationContext, arrayOf(publicPath), arrayOf("application/octet-stream"), null)
+                    runCatching { Thread.sleep(400L) }
+                }
+                reported = querySize()
+            }
+            Pair(reported == expectedBytes, reported)
+        }.getOrDefault(Pair(false, -1L))
+    }
+
     suspend fun ensureDirectoryExists(dirPath: String, context: Context? = null): Boolean = withContext(Dispatchers.IO) {
         runCatching {
             if (!Shell.getShell().isRoot) return@withContext false
@@ -1354,7 +1391,23 @@ object UsbGadgetEngine {
             val before = getTempStorageStats(context, scanDirs).totalBytes
             scanDirs.map { resolveDirectPath(it).trimEnd('/') }.distinct().forEach { dir ->
                 val qTmp = shellQuote("$dir/.pocketboot_tmp")
-                Shell.cmd("rm -rf $qTmp 2>/dev/null || true").exec()
+                // Preserve kept UUP caches ("isCachedReady":true) while cleaning ISODIR/TMP and unfinished work dirs!
+                Shell.cmd(
+                    """
+                    if [ -d $qTmp ]; then
+                        for d in $qTmp/*; do
+                            [ -e "${'$'}d" ] || continue
+                            bn=${'$'}(basename "${'$'}d")
+                            [ "${'$'}bn" = ".nomedia" ] && continue
+                            if [ -d "${'$'}d" ] && grep -q '"isCachedReady":true' "${'$'}d/pb_build.json" 2>/dev/null; then
+                                rm -rf "${'$'}d/ISODIR" "${'$'}d/TMP" "${'$'}d/.pb_isodir_ready" 2>/dev/null || true
+                            else
+                                rm -rf "${'$'}d" 2>/dev/null || true
+                            fi
+                        done
+                    fi
+                    """.trimIndent()
+                ).exec()
             }
             val baseDir = context.applicationContext.getExternalFilesDir(null) ?: context.applicationContext.cacheDir
             val dlDir = File(baseDir, "turbo_dl")

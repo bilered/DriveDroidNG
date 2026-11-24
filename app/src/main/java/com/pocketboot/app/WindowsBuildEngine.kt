@@ -243,7 +243,7 @@ object WindowsBuildEngine {
     private const val DEFAULT_API_BASE = "https://api.uupdump.net"
     private const val GITHUB_RAW_BASE = "https://raw.githubusercontent.com/bilered/PocketBoot/main"
     private const val UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.5.0"
-    private const val STAGE_SCHEMA_VERSION = "PB_STAGE_V26_2"
+    private const val STAGE_SCHEMA_VERSION = "PB_STAGE_V26_3"
 
     @Volatile private var apiBaseUrl: String = DEFAULT_API_BASE
     @Volatile private var preferDirectMicrosoft: Boolean = false
@@ -947,7 +947,7 @@ object WindowsBuildEngine {
             if (MicrosoftUupClient.isUnusablePackageName(entry.name)) return@forEach
             all.add(entry)
             when (entry.kind) {
-                WinPackageKind.BASE_OS -> if (entry.name.lowercase().endsWith(".esd") || entry.name.lowercase().endsWith(".cab")) base.add(entry)
+                WinPackageKind.BASE_OS -> if (entry.name.lowercase().endsWith(".esd") || entry.name.lowercase().endsWith(".cab") || (entry.name.lowercase().endsWith(".wim") && entry.name.lowercase().contains("edge"))) base.add(entry)
                 WinPackageKind.UPDATE -> updates.add(entry)
                 WinPackageKind.STORE_APP -> apps.add(entry)
                 WinPackageKind.NETFX3 -> netfx.add(entry)
@@ -1449,7 +1449,18 @@ object WindowsBuildEngine {
 
     fun updateDownloadAutoMount(value: Boolean) { dlAutoMountLive = value; _downloadState.value = _downloadState.value?.copy(autoMount = value) }
     fun updateConversionAutoMount(value: Boolean) { convAutoMountLive = value; _conversionState.value = _conversionState.value?.copy(autoMount = value) }
-    fun updateConversionKeepPackages(value: Boolean) { convKeepPackagesLive = value; _conversionState.value = _conversionState.value?.copy(keepPackagesAfterBuild = value) }
+    fun updateConversionKeepPackages(value: Boolean) {
+        convKeepPackagesLive = value
+        val cur = _conversionState.value
+        _conversionState.value = cur?.copy(keepPackagesAfterBuild = value)
+        val wd = cur?.workDirPath.orEmpty()
+        if (wd.isNotBlank()) {
+            scope.launch {
+                val qMeta = shellQuote("$wd/pb_build.json")
+                Shell.cmd("if [ -f $qMeta ]; then sed -i 's/"keepPackagesAfterBuild":\(true\|false\)/"keepPackagesAfterBuild":$value/g' $qMeta 2>/dev/null || true; fi").exec()
+            }
+        }
+    }
 
     fun updateConversionThermalProfile(profile: BuildThermalProfile) {
         convThermalProfileLive = profile
@@ -1876,7 +1887,9 @@ object WindowsBuildEngine {
                 val neededFree = ((totalBytes - existingPkgBytes).coerceAtLeast(0L)) + estExtraBuildBytes
                 if (freeNow > 0L && freeNow < neededFree) throw IllegalStateException("Not enough free space. Need ~${UsbGadgetEngine.formatBytes(neededFree)}, have ${UsbGadgetEngine.formatBytes(freeNow)} free.")
 
-                saveBuildJobJson(appCtx, workRootPath, config, totalBytes, false)
+                val existingWasKept = Shell.cmd("grep -q '"isCachedReady":true' ${shellQuote("$workRootPath/pb_build.json")} 2>/dev/null && grep -q '"keepPackagesAfterBuild":true' ${shellQuote("$workRootPath/pb_build.json")} 2>/dev/null").exec().isSuccess
+                val effectiveDlConfig = if (existingWasKept && !config.keepPackagesAfterBuild) config.copy(keepPackagesAfterBuild = true) else config
+                saveBuildJobJson(appCtx, workRootPath, effectiveDlConfig, totalBytes, existingWasKept)
                 savePackageManifest(appCtx, workRootPath, targetFiles)
                 emitLog("win-dl", "Found ${targetFiles.size} package(s) (${UsbGadgetEngine.formatBytes(totalBytes)}) · Method=${config.downloadMethod.name}")
 
@@ -1977,7 +1990,7 @@ object WindowsBuildEngine {
                 enqueueConversion(
                     QueuedConversionJob(
                         context = appCtx,
-                        config = config.copy(autoMount = dlAutoMountLive),
+                        config = effectiveDlConfig.copy(autoMount = dlAutoMountLive),
                         workRootPath = workRootPath,
                         workPrefix = workPrefix,
                         jobTitle = jobTitle,
@@ -2690,6 +2703,37 @@ object WindowsBuildEngine {
                 if (winreRes.isSuccess) { addConsole("Injected Winre.wim ($totalWimIndexes edition(s))"); emitConvLog("win-build", "Injected Winre.wim into /Windows/System32/Recovery/Winre.wim ($totalWimIndexes indexes)") }
             }
 
+            // Offline Microsoft Edge integration (Edge.wim from UUP, when present and user did not select Remove Edge)
+            if (!config.winUtil.removeEdge) {
+                val edgeWimPath = Shell.cmd("find ${shellQuote(pkgDir.absolutePath)} -maxdepth 1 -type f -iname '*edge*.wim' 2>/dev/null | head -n 1").exec().out.firstOrNull()?.trim().orEmpty()
+                if (edgeWimPath.isNotBlank()) {
+                    val totalWimIndexesEdge = Shell.cmd("$qWim info $qStageWim 2>/dev/null | grep -c '^Index:' || echo ${metaList.size}").exec().out.firstOrNull()?.trim()?.toIntOrNull()?.coerceAtLeast(metaList.size) ?: metaList.size
+                    publishConv("Step 3/4 · Integrating Microsoft Edge...", "Merging Edge.wim into $totalWimIndexesEdge edition(s)", 0.65f)
+                    val qEdgeWim = shellQuote(edgeWimPath)
+                    val edgeRes = runIsolatedRootScript(
+                        appCtx,
+                        "edgeinj",
+                        """
+                        set -e
+                        $pathHeader
+                        EDGE_DIR="${'$'}TMP/edge_stage"
+                        rm -rf "${'$'}EDGE_DIR" && mkdir -p "${'$'}EDGE_DIR"
+                        $qWim extract $qEdgeWim 1 / --dest-dir="${'$'}EDGE_DIR" --no-acls --no-attributes >/dev/null 2>&1
+                        for idx in $(seq 1 $totalWimIndexesEdge); do
+                            $qWim update $qStageWim "${'$'}idx" --command="add '${'$'}EDGE_DIR' /" >/dev/null 2>&1
+                        done
+                        rm -rf "${'$'}EDGE_DIR"
+                        """.trimIndent()
+                    )
+                    if (edgeRes.isSuccess) {
+                        addConsole("Integrated offline Microsoft Edge (${edgeWimPath.substringAfterLast('/')}) into $totalWimIndexesEdge edition(s)")
+                        emitConvLog("win-build", "Integrated offline Edge.wim into $totalWimIndexesEdge edition(s)")
+                    } else {
+                        addConsole("Skipped Edge.wim merge (non-fatal)")
+                    }
+                }
+            }
+
             if (useTwoStageSolidEsd) {
                 val esdProf = convThermalProfileLive
                 val esdThreadArg = wimThreadArgFor(esdProf, isSolidEsd = true)
@@ -3119,6 +3163,16 @@ object WindowsBuildEngine {
                     throw IllegalStateException("Not enough free space to pack ISO. Need ~${UsbGadgetEngine.formatBytes(estIsoBytes + 256L * 1024L * 1024L)}, have ${UsbGadgetEngine.formatBytes(freeForIso)} free.")
                 }
 
+                val publicOutPath = finalOutputPath.replaceFirst("/data/media/0", "/storage/emulated/0")
+                val escPublicSql = publicOutPath.replace("'", "''")
+                val qPublicWhere = shellQuote("_data='$escPublicSql'")
+                val tmpOutIsoPath = "$safeTargetDir/.pb_pack_${System.currentTimeMillis().toString().takeLast(6)}.iso.tmp"
+                val qFinalIso = qOutIso
+                val qOutIso = shellQuote(tmpOutIsoPath)
+                // Layer 1 MTP Fix: purge any stale MediaStore row & old ISO BEFORE xorriso writes so Android MTP drops the old cached _size!
+                if (finalOutputPath.startsWith("/data/media/0")) {
+                    Shell.cmd("content delete --uri content://media/external/file --where $qPublicWhere >/dev/null 2>&1 || true; rm -f ${shellQuote(publicOutPath)} $qFinalIso $qOutIso 2>/dev/null || true; sync").exec()
+                }
                 val xorLog = "/data/local/tmp/pb_xorriso_prog.log"
                 val qXorLog = shellQuote(xorLog)
                 val preferNoPrompt = config.experience.hasAnyActive() || config.winUtil.hasAnyActive()
@@ -3258,8 +3312,22 @@ object WindowsBuildEngine {
                     }
                     addConsole("Gate 2 passed: $isoFiles/$isoDirFileCount ISO files verified via 7zzs (0 corrupt)")
                 }
+                // Layer 2 MTP Fix: atomically move verified .tmp ISO into finalOutputPath after Gates 2A & 2B pass
+                val mvIsoRes = Shell.cmd("mv -f $qOutIso $qFinalIso && sync").exec()
+                if (!mvIsoRes.isSuccess) {
+                    Shell.cmd("rm -f $qOutIso 2>/dev/null || true").exec()
+                    throw IllegalStateException("Failed finalizing ISO rename into $finalFileName")
+                }
                 UsbGadgetEngine.fixUserStoragePermissions(appCtx, safeTargetDir, isDir = true)
                 UsbGadgetEngine.fixUserStoragePermissions(appCtx, finalOutputPath, isDir = false)
+                // Layer 3 MTP Fix (Gate 2C): verify & force-sync MediaStore _size so USB MTP never truncates!
+                val verifiedIsoBytes = Shell.cmd("stat -c '%s' $qFinalIso 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                val (mtpSynced, mtpBytes) = UsbGadgetEngine.syncMediaStoreFileSize(appCtx, finalOutputPath, verifiedIsoBytes)
+                if (mtpSynced) {
+                    addConsole("Gate 2C passed: MTP/MediaStore size synced ($verifiedIsoBytes bytes)")
+                } else {
+                    addConsole("Gate 2C notice: MediaStore reported $mtpBytes B vs $verifiedIsoBytes B (use adb pull if MTP truncates)")
+                }
                 if (config.outputMode == WinBuildOutputMode.DIRECT_MULTIBOOT && config.targetMultiBootPath.isNotBlank()) {
                     val mbPath = UsbGadgetEngine.resolveDirectPath(config.targetMultiBootPath)
                     publishConv("Moving ISO into Multi-Boot...", mbPath.substringAfterLast('/'), 0.97f)
@@ -3296,6 +3364,7 @@ object WindowsBuildEngine {
                 Shell.cmd("rm -rf $qIsoDir $qTmp $qIsoReadyMarker").exec()
                 addConsole("Kept base UUP packages for fast rebuilds")
             } else {
+                addConsole("Cleaned temporary UUP packages (Keep UUP packages OFF)")
                 UsbGadgetEngine.cleanupTempWorkDir(workRootPath)
             }
 

@@ -124,6 +124,8 @@ fun WindowsDownloadSheet(
     cachedUupBuildsJson: String = "",
     defaultThermalProfile: BuildThermalProfile = BuildThermalProfile.BALANCED,
     defaultAutoThermalCooldown: Boolean = true,
+    defaultKeepPackagesAfterBuild: Boolean = true,
+    onUpdateKeepPackagesAfterBuild: (Boolean) -> Unit = {},
     onUpdateCachedUupBuilds: (String) -> Unit = {},
     onSavePreset: (AutounattendPreset) -> Unit = {},
     onDeletePreset: (String) -> Unit = {},
@@ -207,7 +209,7 @@ fun WindowsDownloadSheet(
     var runComponentCleanup by remember { mutableStateOf(false) }
     var skipWinRe by remember { mutableStateOf(false) }
     var eiCfgUnlock by remember { mutableStateOf(false) }
-    var keepPackagesAfterBuild by remember { mutableStateOf(false) }
+    var keepPackagesAfterBuild by remember(defaultKeepPackagesAfterBuild) { mutableStateOf(defaultKeepPackagesAfterBuild) }
     var convOptionsExpanded by remember { mutableStateOf(true) }
 
     var usbScheme by remember { mutableStateOf(PartitionScheme.GPT) }
@@ -1602,7 +1604,7 @@ fun WindowsDownloadSheet(
                                             }
                                             DirectUsbOptionRow("Skip WinRE Recovery (~480 MB smaller)", skipWinRe) { skipWinRe = it }; PocketHairlineDivider()
                                             DirectUsbOptionRow("Unlock all editions (ei.cfg)", eiCfgUnlock) { eiCfgUnlock = it }; PocketHairlineDivider()
-                                            DirectUsbOptionRow("Keep base UUP packages after build", keepPackagesAfterBuild) { keepPackagesAfterBuild = it }
+                                            DirectUsbOptionRow("Keep base UUP packages after build", keepPackagesAfterBuild) { keepPackagesAfterBuild = it; onUpdateKeepPackagesAfterBuild(it) }
                                         }
                                     }
                                 }
