@@ -243,7 +243,7 @@ object WindowsBuildEngine {
     private const val DEFAULT_API_BASE = "https://api.uupdump.net"
     private const val GITHUB_RAW_BASE = "https://raw.githubusercontent.com/bilered/PocketBoot/main"
     private const val UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.5.0"
-    private const val STAGE_SCHEMA_VERSION = "PB_STAGE_V24"
+    private const val STAGE_SCHEMA_VERSION = "PB_STAGE_V25"
 
     @Volatile private var apiBaseUrl: String = DEFAULT_API_BASE
     @Volatile private var preferDirectMicrosoft: Boolean = false
@@ -1019,6 +1019,7 @@ object WindowsBuildEngine {
         val langShort = langFull.substringBefore('-')
         val archLow = arch.lowercase()
         val langSatRegex = Regex("""_language-([a-z0-9-]+)(?:[._]|$)""", RegexOption.IGNORE_CASE)
+        val pubIdRegex = Regex("""_[a-z0-9]{13}(?:\.|$)""", RegexOption.IGNORE_CASE)
 
         val licenseFiles = rawApps.filter { f ->
             val low = f.name.lowercase()
@@ -1027,20 +1028,34 @@ object WindowsBuildEngine {
 
         val cleaned = rawApps.filter { f ->
             val low = f.name.lowercase()
-            if (!(low.endsWith(".msixbundle") || low.endsWith(".appxbundle") || low.endsWith(".msix") || low.endsWith(".appx"))) return@filter false
-            if (low.contains("qps-ploc") || low.contains("stub.") || low.contains("stub_") || low.contains("languageexperiencepack")) return@filter false
+            val isBundle = low.endsWith(".msixbundle") || low.endsWith(".appxbundle")
+            val isSinglePkg = low.endsWith(".msix") || low.endsWith(".appx")
+            if (!isBundle && !isSinglePkg) return@filter false
+            // Drop pseudo-locales, stubs, LanguageExperiencePack, and loose internal split/scale/resource sub-packages
+            if (low.contains("qps-ploc") || low.contains("stub.") || low.contains("stub_") || low.contains("stubpackage") ||
+                low.contains("languageexperiencepack") || low.contains("_scale-") || low.contains(".scale-") ||
+                low.contains("split.") || low.contains("_contrast-") || low.contains("_dxfeaturelevel-")) return@filter false
             val satMatch = langSatRegex.find(low)
             if (satMatch != null) {
                 val tag = satMatch.groupValues[1]
                 if (tag != langFull && tag != langShort && !tag.startsWith("$langShort-")) return@filter false
             }
             val isFw = isFrameworkAppName(low)
-            when (archLow) {
-                "amd64", "x64" -> if (low.contains("_arm64_") || low.contains("_arm_")) return@filter false
-                "arm64" -> if (low.contains("_x64_") || low.contains("_amd64_")) return@filter false
-                "x86" -> if (low.contains("_x64_") || low.contains("_amd64_") || low.contains("_arm64_") || low.contains("_arm_")) return@filter false
+            // Standalone non-bundle .msix/.appx apps from UUPdump MUST carry a 13-char Store Publisher ID
+            // (e.g. _8wekyb3d8bbwe, _cw5n1h2txyewy) or be a known inbox standalone (WebExperience, SecHealthUI) or Framework.
+            // This strictly rejects loose unpacked bundle sub-packages like Paint_11.2302_x64.msix or Calculator_11.2311_x64.msix
+            // that otherwise overwrite/corrupt the already-provisioned .msixbundle/.appxbundle packages!
+            if (isSinglePkg && !isFw) {
+                val hasPubId = pubIdRegex.containsMatchIn(low)
+                val isKnownStandalone = low.contains("webexperience") || low.contains("sechealthui")
+                if (!hasPubId && !isKnownStandalone) return@filter false
             }
-            if (!isFw && archLow in setOf("amd64", "x64") && low.contains("_x86_")) return@filter false
+            when (archLow) {
+                "amd64", "x64" -> if (low.contains("_arm64_") || low.contains("_arm_") || low.contains(".arm64.") || low.contains(".arm.")) return@filter false
+                "arm64" -> if (low.contains("_x64_") || low.contains("_amd64_") || low.contains(".x64.") || low.contains(".amd64.")) return@filter false
+                "x86" -> if (low.contains("_x64_") || low.contains("_amd64_") || low.contains("_arm64_") || low.contains("_arm_") || low.contains(".x64.") || low.contains(".arm64.")) return@filter false
+            }
+            if (!isFw && archLow in setOf("amd64", "x64") && (low.contains("_x86_") || low.contains(".x86."))) return@filter false
             true
         }
 
@@ -2866,16 +2881,19 @@ object WindowsBuildEngine {
             } else {
                 val arch = if (config.build.arch.lowercase() in setOf("x86", "arm64", "amd64")) config.build.arch.lowercase() else "amd64"
                 val detectedLang = Shell.cmd("grep -iE '^[a-z]{2,3}(-[a-z0-9]{2,4}){1,2}[[:space:]]*=' ${shellQuote("${isoDir.absolutePath}/sources/lang.ini")} 2>/dev/null | head -n 1 | cut -d= -f1 | tr -d ' \\r\\n'").exec().out.firstOrNull().orEmpty().trim().ifBlank { config.lang.code }
-                val tmpXml = File(appCtx.cacheDir, "wb_auto.xml").apply { writeText(WindowsCustomizationEngine.generateAutounattendXml(config.experience, config.winUtil, arch, null, true, hasStagedOemUpdates, includeWindowsPePass = true, uiLang = detectedLang), Charsets.UTF_8) }
-                val tmpPantherXml = File(appCtx.cacheDir, "wb_panther.xml").apply { writeText(WindowsCustomizationEngine.generateAutounattendXml(config.experience, config.winUtil, arch, null, true, hasStagedOemUpdates, includeWindowsPePass = false), Charsets.UTF_8) }
+                val hasPostBootUpdates = hasStagedOemUpdates || hasStagedOemNetFx3
+                val tmpXml = File(appCtx.cacheDir, "wb_auto.xml").apply { writeText(WindowsCustomizationEngine.generateAutounattendXml(config.experience, config.winUtil, arch, null, true, false, includeWindowsPePass = true, uiLang = detectedLang), Charsets.UTF_8) }
+                val tmpPantherXml = File(appCtx.cacheDir, "wb_panther.xml").apply { writeText(WindowsCustomizationEngine.generateAutounattendXml(config.experience, config.winUtil, arch, null, true, false, includeWindowsPePass = false), Charsets.UTF_8) }
                 val tmpSpec = File(appCtx.cacheDir, "wb_spec.cmd").apply { writeText(WindowsCustomizationEngine.buildSpecializeScript(config.experience, config.winUtil, hasStagedOemUpdates, hasStagedOemApps, hasStagedOemNetFx3), Charsets.UTF_8) }
                 val customPath = config.experience.customPostInstallScriptPath.trim()
                 val customName = if (customPath.isNotBlank()) customPath.substringAfterLast('/') else ""
-                val tmpComp = File(appCtx.cacheDir, "wb_comp.cmd").apply { writeText(WindowsCustomizationEngine.buildSetupCompleteScript(config.runComponentCleanup, customName.isNotBlank(), customName, hasOemApps = hasStagedOemApps), Charsets.UTF_8) }
+                val tmpComp = File(appCtx.cacheDir, "wb_comp.cmd").apply { writeText(WindowsCustomizationEngine.buildSetupCompleteScript(config.runComponentCleanup, customName.isNotBlank(), customName, hasOemApps = hasStagedOemApps, hasPostBootUpdates = hasPostBootUpdates), Charsets.UTF_8) }
+                val tmpUpd = if (hasPostBootUpdates) File(appCtx.cacheDir, "wb_upd.cmd").apply { writeText(WindowsCustomizationEngine.buildPostBootUpdatesScript(hasStagedOemUpdates, hasStagedOemNetFx3, config.runComponentCleanup), Charsets.UTF_8) } else null
+                val updCopy = if (tmpUpd != null) "cp -f ${shellQuote(tmpUpd.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_Updates.cmd")}" else "true"
                 val customCopy = if (customPath.isNotBlank()) "mkdir -p ${shellQuote(oemCustom)} && cp -f ${shellQuote(UsbGadgetEngine.resolveDirectPath(customPath))} ${shellQuote(oemCustom)}/ 2>/dev/null || true" else "true"
-                Shell.cmd("mkdir -p ${shellQuote(oemPanther)} ${shellQuote(oemScripts)} && cp -f ${shellQuote(tmpXml.absolutePath)} ${shellQuote("${isoDir.absolutePath}/autounattend.xml")} && cp -f ${shellQuote(tmpPantherXml.absolutePath)} ${shellQuote("$oemPanther/unattend.xml")} && cp -f ${shellQuote(tmpSpec.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_Specialize.cmd")} && cp -f ${shellQuote(tmpComp.absolutePath)} ${shellQuote("$oemScripts/SetupComplete.cmd")} && $customCopy").exec()
-                tmpXml.delete(); tmpPantherXml.delete(); tmpSpec.delete(); tmpComp.delete()
-                addConsole("Injected autounattend.xml + unplug-safe \$OEM\$ scripts")
+                Shell.cmd("mkdir -p ${shellQuote(oemPanther)} ${shellQuote(oemScripts)} && cp -f ${shellQuote(tmpXml.absolutePath)} ${shellQuote("${isoDir.absolutePath}/autounattend.xml")} && cp -f ${shellQuote(tmpPantherXml.absolutePath)} ${shellQuote("$oemPanther/unattend.xml")} && cp -f ${shellQuote(tmpSpec.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_Specialize.cmd")} && cp -f ${shellQuote(tmpComp.absolutePath)} ${shellQuote("$oemScripts/SetupComplete.cmd")} && $updCopy && $customCopy").exec()
+                tmpXml.delete(); tmpPantherXml.delete(); tmpSpec.delete(); tmpComp.delete(); tmpUpd?.delete()
+                addConsole("Injected autounattend.xml + unplug-safe \$OEM\$ scripts${if (hasPostBootUpdates) " + post-boot SYSTEM updater" else ""}")
             }
 
             // In ISO mode (xorriso ISO-9660 + Joliet), WinPE's cdfs.sys requires every single file <= 4 GiB.
