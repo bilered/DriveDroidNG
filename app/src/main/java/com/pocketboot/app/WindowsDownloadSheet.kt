@@ -1519,28 +1519,13 @@ fun WindowsDownloadSheet(
                                             val updSz = detailedManifest?.updateBytes?.takeIf { it > 0L }?.let { " (+${UsbGadgetEngine.formatBytes(it)})" }.orEmpty()
                                             DirectUsbOptionRow("Include additional updates$updSz", includeUpdates) { includeUpdates = it }; PocketHairlineDivider()
                                         }
-                                        if (detailedManifest?.hasApps == true) {
-                                            Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                                                    Text("Inbox Store Apps", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
-                                                    Text("${filteredAppsForSel.size} pkg(s) · +${UsbGadgetEngine.formatBytes(selAppBytes)}", style = PocketColors.monoStyle, fontSize = 10.5.sp, color = PocketColors.accentSoft)
-                                                }
-                                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                                    WinStoreAppLevel.entries.forEach { lvl ->
-                                                        val sel = storeAppLevel == lvl
-                                                        Surface(
-                                                            modifier = Modifier.weight(1f).height(34.dp).bounceClick { storeAppLevel = lvl },
-                                                            shape = RoundedCornerShape(8.dp),
-                                                            color = if (sel) PocketColors.accentBg else PocketColors.surfaceCard,
-                                                            border = BorderStroke(if (sel) 1.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
-                                                        ) {
-                                                            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                                                                Text(lvl.shortLabel, style = MaterialTheme.typography.labelSmall, fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Medium, color = if (sel) PocketColors.accentSoft else PocketColors.textSecondary, maxLines = 1)
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                Text(storeAppLevel.subtitle, fontSize = 10.5.sp, color = PocketColors.textSecondary)
+                                        val dlIsSrv = WindowsBuildEngine.isServerBuild(b.title, selectedBuildEditions.toList())
+                                        val dlBuildMajor = b.build.substringBefore('.').toIntOrNull() ?: 0
+                                        val dlSupportsApps = !dlIsSrv && (dlBuildMajor == 0 || dlBuildMajor >= 22563)
+                                        if (dlSupportsApps) {
+                                            val appInfoSuffix = if (filteredAppsForSel.isNotEmpty()) " (${filteredAppsForSel.size} pkg · +${UsbGadgetEngine.formatBytes(selAppBytes)})" else " (Auto-fetched)"
+                                            DirectUsbOptionRow("Include All Inbox Store Apps$appInfoSuffix", storeAppLevel != WinStoreAppLevel.NONE) { on ->
+                                                storeAppLevel = if (on) WinStoreAppLevel.ALL_INBOX else WinStoreAppLevel.NONE
                                             }
                                             PocketHairlineDivider()
                                         }

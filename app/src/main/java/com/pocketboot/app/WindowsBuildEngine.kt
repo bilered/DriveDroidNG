@@ -167,7 +167,7 @@ data class WindowsChannelBuildConfig(
     val downloadMethod: WinDownloadMethod = WinDownloadMethod.DOWNLOAD_AND_BUILD,
     val targetDir: String, val customOutputName: String = "", val targetMultiBootPath: String = "",
     val connections: Int = 8, val autoMount: Boolean = true,
-    val includeUpdates: Boolean = false, val includeStoreApps: Boolean = false,
+    val includeUpdates: Boolean = false, val includeStoreApps: Boolean = true,
     val integrateNetFx3: Boolean = false, val runComponentCleanup: Boolean = false,
     val skipWinRe: Boolean = false, val eiCfgUnlock: Boolean = false, val keepPackagesAfterBuild: Boolean = true,
     val scheme: PartitionScheme = PartitionScheme.GPT,
@@ -243,7 +243,7 @@ object WindowsBuildEngine {
     private const val DEFAULT_API_BASE = "https://api.uupdump.net"
     private const val GITHUB_RAW_BASE = "https://raw.githubusercontent.com/bilered/PocketBoot/main"
     private const val UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.5.0"
-    private const val STAGE_SCHEMA_VERSION = "PB_STAGE_V26_3_2"
+    private const val STAGE_SCHEMA_VERSION = "PB_STAGE_V26_4"
 
     @Volatile private var apiBaseUrl: String = DEFAULT_API_BASE
     @Volatile private var preferDirectMicrosoft: Boolean = false
@@ -1128,7 +1128,145 @@ object WindowsBuildEngine {
         return (selectedPkgs + matchedLicenses).distinctBy { it.name.lowercase() }.sortedBy { it.name.lowercase() }
     }
 
-    private fun fetchSeparateStoreAppsFromApi(
+    /**
+     * Resolves official Microsoft Edge Enterprise Stable MSI (~165 MB) directly from Microsoft's CDN
+     * (used when UUP does not include Edge.wim and user did not select Remove Edge).
+     */
+    private fun fetchEdgeEnterpriseMsiEntry(archHint: String): WinPackageFileEntry? {
+        val edgeArch = when (archHint.lowercase()) {
+            "arm64" -> "arm64"
+            "x86" -> "x86"
+            else -> "x64"
+        }
+        val fileName = "MicrosoftEdgeEnterprise_${edgeArch}.msi"
+        runCatching {
+            val conn = (URL("https://edgeupdates.microsoft.com/api/products?view=enterprise").openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 12_000
+                readTimeout = 15_000
+                instanceFollowRedirects = true
+                setRequestProperty("User-Agent", UA)
+                setRequestProperty("Accept", "application/json")
+            }
+            val body = try {
+                if (conn.responseCode in 200..299) conn.inputStream.bufferedReader().use { it.readText() } else ""
+            } finally {
+                conn.disconnect()
+            }
+            if (body.isNotBlank()) {
+                val arr = JSONArray(body)
+                for (i in 0 until arr.length()) {
+                    val prod = arr.optJSONObject(i) ?: continue
+                    if (!prod.optString("Product").equals("Stable", true)) continue
+                    val rels = prod.optJSONArray("Releases") ?: continue
+                    var bestVer = ""
+                    var bestUrl = ""
+                    var bestSize = 0L
+                    for (r in 0 until rels.length()) {
+                        val rel = rels.optJSONObject(r) ?: continue
+                        if (!rel.optString("Platform").equals("Windows", true)) continue
+                        if (!rel.optString("Architecture").equals(edgeArch, true)) continue
+                        val ver = rel.optString("ProductVersion", "")
+                        val arts = rel.optJSONArray("Artifacts") ?: continue
+                        for (a in 0 until arts.length()) {
+                            val art = arts.optJSONObject(a) ?: continue
+                            val loc = art.optString("Location", "").trim()
+                            val aname = art.optString("ArtifactName", "")
+                            if ((aname.equals("msi", true) || loc.endsWith(".msi", true)) && loc.startsWith("http")) {
+                                val sz = art.optLong("SizeInBytes", 0L)
+                                if (bestUrl.isEmpty() || ver > bestVer) {
+                                    bestVer = ver; bestUrl = loc; bestSize = sz
+                                }
+                            }
+                        }
+                    }
+                    if (bestUrl.isNotBlank()) {
+                        return WinPackageFileEntry(fileName, bestUrl, bestSize, "", WinPackageKind.STORE_APP, 0L)
+                    }
+                }
+            }
+        }
+        // Fallback: resolve official Microsoft fwlink permalink (x64 / x86) to direct CDN URL + Content-Length
+        val fwUrl = when (edgeArch) {
+            "x64" -> "https://go.microsoft.com/fwlink/?LinkID=2093437"
+            "x86" -> "https://go.microsoft.com/fwlink/?LinkID=2093505"
+            else -> return null
+        }
+        return runCatching {
+            var cur = fwUrl
+            var finalLen = 0L
+            for (hop in 0..5) {
+                val c = (URL(cur).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "HEAD"
+                    instanceFollowRedirects = false
+                    connectTimeout = 10_000
+                    readTimeout = 10_000
+                    setRequestProperty("User-Agent", UA)
+                }
+                val code = c.responseCode
+                val loc = c.getHeaderField("Location")
+                val len = c.contentLengthLong
+                c.disconnect()
+                if (code in 300..399 && !loc.isNullOrBlank()) {
+                    cur = URL(URL(cur), loc).toString()
+                } else {
+                    if (code in 200..299) finalLen = len.coerceAtLeast(0L)
+                    break
+                }
+            }
+            if (cur.startsWith("http") && cur != fwUrl) {
+                WinPackageFileEntry(fileName, cur, finalLen, "", WinPackageKind.STORE_APP, 0L)
+            } else null
+        }.getOrNull()
+    }
+
+    /**
+     * Zero-rate-limit Direct Microsoft Store Apps fetcher via GetExtendedUpdateInfo2.
+     * Pulls all Inbox Store Apps directly from Microsoft WU servers when UUPdump API returns HTTP 429 or omits edition=app.
+     */
+    private suspend fun fetchStoreAppsDirectFromMicrosoft(
+        updateId: String,
+        langCode: String,
+        archHint: String,
+        requireUrl: Boolean
+    ): List<WinPackageFileEntry> {
+        val candidates = LinkedHashSet<String>()
+        candidates.add(updateId)
+        catalogMetaByUuid.entries
+            .filter { (_, meta) -> meta.second != 7 && (meta.third.substringAfter("10.0.").substringBefore('.').toIntOrNull() ?: 0) >= 22621 }
+            .forEach { (uid, _) -> candidates.add(uid) }
+
+        for (candUid in candidates.take(4)) {
+            val cleanUid = candUid.substringBefore("_rev.")
+            val (ring, sku, checkBuild) = catalogMetaByUuid[candUid] ?: catalogMetaByUuid[cleanUid] ?: Triple("RETAIL", 48, "10.0.26100.1")
+            val rev = MicrosoftUupClient.syncMetaCache[candUid]?.revision ?: MicrosoftUupClient.syncMetaCache[cleanUid]?.revision ?: 1
+            val urlMap = runCatching {
+                MicrosoftUupClient.fetchFileUrlsForUpdate(
+                    updateId = candUid,
+                    revision = rev,
+                    arch = archHint,
+                    ring = ring,
+                    checkBuild = checkBuild,
+                    sku = sku
+                )
+            }.getOrDefault(emptyMap())
+            val rawFiles = MicrosoftUupClient.syncFilesCache[cleanUid]
+                ?: MicrosoftUupClient.syncFilesCache[candUid]
+                ?: fetchGitHubBuildManifest(cleanUid)?.second
+                ?: continue
+            val rawApps = rawFiles.mapNotNull { fm ->
+                if (classifyPackageFile(fm.name) != WinPackageKind.STORE_APP) return@mapNotNull null
+                val direct = urlMap[fm.sha1Hex.lowercase()]
+                if (requireUrl && direct == null) return@mapNotNull null
+                WinPackageFileEntry(fm.name, direct?.url.orEmpty(), fm.sizeBytes, fm.sha1Hex, WinPackageKind.STORE_APP, direct?.expireEpochSec ?: 0L)
+            }
+            val filtered = filterStoreApps(rawApps, langCode, archHint, WinStoreAppLevel.ALL_INBOX)
+            if (filtered.size >= 8) return filtered
+        }
+        return emptyList()
+    }
+
+    private suspend fun fetchSeparateStoreAppsFromApi(
         updateId: String,
         langCode: String,
         archHint: String,
@@ -1136,43 +1274,56 @@ object WindowsBuildEngine {
         allowFallbackReplacement: Boolean = true
     ): List<WinPackageFileEntry> {
         val noLinksParam = if (requireUrl) "" else "&noLinks=1"
-        val appUrl = "$apiBaseUrl/get.php?id=${URLEncoder.encode(updateId, "UTF-8")}&lang=neutral&edition=app$noLinksParam"
-        val appRoot = fetchJsonWithRetry(appUrl, timeoutMs = 12_000)
-        val directApps = appRoot?.let { parseDetailedManifest(it, requireUrl).appFiles }.orEmpty()
-        val filteredDirect = filterStoreApps(directApps, langCode, archHint, WinStoreAppLevel.ALL_INBOX)
-        if (filteredDirect.isNotEmpty() || !allowFallbackReplacement) return filteredDirect
+        // Layer 1: Paced UUPdump `edition=app` query (2.2s delay avoids back-to-back HTTP 429 rate-limits after OS get.php!)
+        if (shouldUseUupDumpApi()) {
+            delay(2_200L)
+            val appUrl = "$apiBaseUrl/get.php?id=${URLEncoder.encode(updateId, "UTF-8")}&lang=neutral&edition=app$noLinksParam"
+            val appRoot = fetchJsonWithRetry(appUrl, timeoutMs = 14_000)
+            val directApps = appRoot?.let { parseDetailedManifest(it, requireUrl).appFiles }.orEmpty()
+            val filteredDirect = filterStoreApps(directApps, langCode, archHint, WinStoreAppLevel.ALL_INBOX)
+            if (filteredDirect.isNotEmpty()) return filteredDirect
+        }
 
-        // Missing AppX Replacement (UUPdump parity): Cumulative Update builds often omit `edition=app`.
-        // Automatically query the newest matching Windows 11 non-Server build UUID for the same arch.
-        val archQ = if (archHint.equals("arm64", true)) "arm64" else "amd64"
-        val candidates = LinkedHashSet<String>()
-        catalogMetaByUuid.entries
-            .filter { (_, meta) -> meta.second != 7 && (meta.third.substringAfter("10.0.").substringBefore('.').toIntOrNull() ?: 0) >= 22621 }
-            .forEach { (uid, _) -> if (!uid.equals(updateId, true)) candidates.add(uid) }
-        val searchRoot = fetchJsonWithRetry("$apiBaseUrl/listid.php?search=${URLEncoder.encode("Windows 11 $archQ", "UTF-8")}&sortByDate=1", timeoutMs = 10_000)
-        val buildsObj = searchRoot?.optJSONObject("response")?.optJSONObject("builds")
-        if (buildsObj != null) {
-            val keys = buildsObj.keys()
-            var added = 0
-            while (keys.hasNext() && added < 8) {
-                val k = keys.next()
-                val bo = buildsObj.optJSONObject(k) ?: continue
-                val uid = bo.optString("uuid", k).trim()
-                val title = bo.optString("title", "").lowercase()
-                val bArch = bo.optString("arch", "").lowercase()
-                val bMajor = bo.optString("build", "").substringBefore('.').toIntOrNull() ?: 0
-                if (uid.isNotBlank() && !uid.equals(updateId, true) && bArch == archQ && bMajor >= 22621 && !title.contains("server") && !title.contains("cumulative")) {
-                    candidates.add(uid)
-                    added++
+        // Layer 2: Direct Microsoft WU failover (zero rate-limits!)
+        val msApps = fetchStoreAppsDirectFromMicrosoft(updateId, langCode, archHint, requireUrl)
+        if (msApps.isNotEmpty()) return msApps
+        if (!allowFallbackReplacement) return emptyList()
+
+        // Layer 3: Missing AppX Replacement via UUPdump fallback UUIDs (only if UUPdump is not rate-limited)
+        if (shouldUseUupDumpApi()) {
+            val archQ = if (archHint.equals("arm64", true)) "arm64" else "amd64"
+            val candidates = LinkedHashSet<String>()
+            catalogMetaByUuid.entries
+                .filter { (_, meta) -> meta.second != 7 && (meta.third.substringAfter("10.0.").substringBefore('.').toIntOrNull() ?: 0) >= 22621 }
+                .forEach { (uid, _) -> if (!uid.equals(updateId, true)) candidates.add(uid) }
+            delay(1_800L)
+            val searchRoot = fetchJsonWithRetry("$apiBaseUrl/listid.php?search=${URLEncoder.encode("Windows 11 $archQ", "UTF-8")}&sortByDate=1", timeoutMs = 10_000)
+            val buildsObj = searchRoot?.optJSONObject("response")?.optJSONObject("builds")
+            if (buildsObj != null) {
+                val keys = buildsObj.keys()
+                var added = 0
+                while (keys.hasNext() && added < 6) {
+                    val k = keys.next()
+                    val bo = buildsObj.optJSONObject(k) ?: continue
+                    val uid = bo.optString("uuid", k).trim()
+                    val title = bo.optString("title", "").lowercase()
+                    val bArch = bo.optString("arch", "").lowercase()
+                    val bMajor = bo.optString("build", "").substringBefore('.').toIntOrNull() ?: 0
+                    if (uid.isNotBlank() && !uid.equals(updateId, true) && bArch == archQ && bMajor >= 22621 && !title.contains("server") && !title.contains("cumulative")) {
+                        candidates.add(uid)
+                        added++
+                    }
                 }
             }
-        }
-        for (fallbackUid in candidates.take(6)) {
-            val fbUrl = "$apiBaseUrl/get.php?id=${URLEncoder.encode(fallbackUid, "UTF-8")}&lang=neutral&edition=app$noLinksParam"
-            val fbRoot = fetchJsonWithRetry(fbUrl, timeoutMs = 12_000) ?: continue
-            val fbApps = parseDetailedManifest(fbRoot, requireUrl).appFiles
-            val fbFiltered = filterStoreApps(fbApps, langCode, archHint, WinStoreAppLevel.ALL_INBOX)
-            if (fbFiltered.size >= 4) return fbFiltered
+            for (fallbackUid in candidates.take(4)) {
+                if (!shouldUseUupDumpApi()) break
+                delay(2_200L)
+                val fbUrl = "$apiBaseUrl/get.php?id=${URLEncoder.encode(fallbackUid, "UTF-8")}&lang=neutral&edition=app$noLinksParam"
+                val fbRoot = fetchJsonWithRetry(fbUrl, timeoutMs = 12_000) ?: continue
+                val fbApps = parseDetailedManifest(fbRoot, requireUrl).appFiles
+                val fbFiltered = filterStoreApps(fbApps, langCode, archHint, WinStoreAppLevel.ALL_INBOX)
+                if (fbFiltered.size >= 4) return fbFiltered
+            }
         }
         return emptyList()
     }
@@ -1649,6 +1800,27 @@ object WindowsBuildEngine {
                     }
                 }
 
+                if (wantApps && (buildMajor == 0 || buildMajor >= 22563) && existingAppCount == 0) {
+                    throw IllegalStateException("Could not fetch Inbox Store Apps (UUPdump rate-limited & Microsoft fallback returned 0 apps). Check internet and tap Rebuild again.")
+                }
+                // Edge Enterprise MSI top-up on cached Win 11 rebuilds when Edge.wim & Edge MSI are both absent
+                val hasEdgeWimCached = Shell.cmd("find ${shellQuote(pkgPath)} -maxdepth 1 -type f -iname '*edge*.wim' 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
+                val hasEdgeMsiCached = Shell.cmd("find ${shellQuote(pkgPath)} -maxdepth 1 -type f -iname 'MicrosoftEdgeEnterprise*.msi' 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
+                if (!isSrv && !config.winUtil.removeEdge && !hasEdgeWimCached && !hasEdgeMsiCached) {
+                    runCatching {
+                        val edgeEntry = fetchEdgeEnterpriseMsiEntry(config.build.arch)
+                        if (edgeEntry != null && edgeEntry.url.startsWith("http")) {
+                            val edgeStageDir = stageCacheDir(appCtx, "${pending.workPrefix}_edge")
+                            val edgeItem = FastIsoDownloader.TurboBatchItem(edgeEntry.name, edgeEntry.url, File(edgeStageDir, "edge.part"), File(edgeStageDir, "edge.part.pbmeta"), edgeEntry.sizeBytes, "", 0L)
+                            val ec = AtomicLong(0L); val et = AtomicInteger(0)
+                            FastIsoDownloader.downloadBatchTurbo(listOf(edgeItem), config.connections.coerceIn(1, 8), AtomicBoolean(false), AtomicBoolean(false), ec, et) { done ->
+                                runIsolatedRootScript(appCtx, "mvedge", "set -e\nmv -f ${shellQuote(done.partFile.absolutePath)} ${shellQuote("$pkgPath/${done.id}")}")
+                            }
+                            runCatching { edgeStageDir.deleteRecursively() }
+                            onLog(LogEntry(nowTs(), "win-dl", "Topped up offline Microsoft Edge Enterprise installer (${edgeEntry.name})"))
+                        }
+                    }
+                }
                 val hasUpd = Shell.cmd("find ${shellQuote(pkgPath)} -maxdepth 1 -type f \\( -iname '*.msu' -o -iname '*-kb*.cab' -o -iname '*ssu*.cab' -o -iname '*ndp*.cab' -o -iname '*dynamicupdate*.cab' \\) 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
                 val hasApps = wantApps && existingAppCount > 0
                 val hasFx3 = Shell.cmd("find ${shellQuote(pkgPath)} -maxdepth 1 -type f -iname '*netfx3*.cab' 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
@@ -1861,9 +2033,28 @@ object WindowsBuildEngine {
                 val buildMajor = config.build.build.substringBefore('.').toIntOrNull() ?: 0
                 val isSrvBuild = isServerBuild(config.build.title, config.editions.map { it.code })
                 val effectiveAppLevel = if (isSrvBuild) WinStoreAppLevel.NONE else config.storeAppLevel
-                val selectedApps = if (!isSrvBuild && manifest.hasApps && effectiveAppLevel != WinStoreAppLevel.NONE && (buildMajor == 0 || buildMajor >= 22563)) {
+                val wantInboxApps = !isSrvBuild && config.downloadMethod != WinDownloadMethod.DOWNLOAD_UPDATES_ONLY &&
+                    effectiveAppLevel != WinStoreAppLevel.NONE && (buildMajor == 0 || buildMajor >= 22563)
+                var selectedApps = if (wantInboxApps && manifest.hasApps) {
                     filterStoreApps(manifest.appFiles, config.lang.code, config.build.arch, effectiveAppLevel)
                 } else emptyList()
+                if (wantInboxApps && selectedApps.isEmpty()) {
+                    emitLog("win-dl", "Primary manifest returned 0 Store Apps — querying Direct Microsoft fallback...")
+                    val fallbackApps = fetchStoreAppsDirectFromMicrosoft(config.build.uuid, config.lang.code, config.build.arch, requireUrl = true)
+                    selectedApps = filterStoreApps(fallbackApps, config.lang.code, config.build.arch, effectiveAppLevel)
+                }
+                val cachedAppFilesCount = if (wantInboxApps && selectedApps.isEmpty()) {
+                    Shell.cmd("find ${shellQuote(pkgDir.absolutePath)} -maxdepth 1 -type f \\( -iname '*.msixbundle' -o -iname '*.appxbundle' -o -iname '*.msix' -o -iname '*.appx' \\) 2>/dev/null | wc -l").exec().out.firstOrNull()?.trim()?.toIntOrNull() ?: 0
+                } else 0
+                if (wantInboxApps && selectedApps.isEmpty() && cachedAppFilesCount == 0) {
+                    throw IllegalStateException("Could not resolve Inbox Store Apps from UUPdump or Microsoft servers (rate-limited/offline). Tap Retry so your ISO isn't built without apps.")
+                }
+
+                // Guaranteed offline Microsoft Edge: if UUP lacks Edge.wim & user didn't choose Remove Edge, fetch official Enterprise MSI
+                val manifestHasEdgeWim = manifest.baseFiles.any { it.name.lowercase().endsWith(".wim") && it.name.lowercase().contains("edge") }
+                val edgeMsiEntry = if (!isSrvBuild && config.downloadMethod != WinDownloadMethod.DOWNLOAD_UPDATES_ONLY && !config.winUtil.removeEdge && !manifestHasEdgeWim) {
+                    fetchEdgeEnterpriseMsiEntry(config.build.arch)
+                } else null
 
                 val targetFiles = when (config.downloadMethod) {
                     WinDownloadMethod.DOWNLOAD_UPDATES_ONLY -> manifest.updateFiles
@@ -1871,13 +2062,18 @@ object WindowsBuildEngine {
                         addAll(manifest.baseFiles)
                         if (config.includeUpdates) addAll(manifest.updateFiles)
                         if (selectedApps.isNotEmpty()) addAll(selectedApps)
+                        if (edgeMsiEntry != null) add(edgeMsiEntry)
                         if (config.integrateNetFx3) addAll(manifest.netFx3Files)
                     }
                 }.distinctBy { it.name }
-                val hasEffectiveApps = selectedApps.isNotEmpty()
-                if (selectedApps.isNotEmpty()) {
-                    emitLog("win-dl", "Included ${selectedApps.size} Store/Security app package(s) (${effectiveAppLevel.shortLabel}, ${UsbGadgetEngine.formatBytes(selectedApps.sumOf { it.sizeBytes })})")
+                val hasEffectiveApps = selectedApps.isNotEmpty() || cachedAppFilesCount > 0
+                val edgeStatusLabel = when {
+                    config.winUtil.removeEdge -> "Removed"
+                    manifestHasEdgeWim -> "Edge.wim"
+                    edgeMsiEntry != null -> "Enterprise MSI (${UsbGadgetEngine.formatBytes(edgeMsiEntry.sizeBytes)})"
+                    else -> "WebView only"
                 }
+                emitLog("win-dl", "Manifest Audit: OS=${manifest.baseFiles.size} · Updates=${if (config.includeUpdates) manifest.updateFiles.size else 0} · Store Apps=${selectedApps.size.coerceAtLeast(cachedAppFilesCount)} · Edge=$edgeStatusLabel")
                 if (targetFiles.isEmpty()) throw IllegalStateException("No downloadable packages matched the selected options.")
 
                 val totalBytes = targetFiles.sumOf { it.sizeBytes }.coerceAtLeast(1L)
@@ -2433,8 +2629,23 @@ object WindowsBuildEngine {
                     Charsets.US_ASCII
                 )
             }
+            val boot2SysRegFile = if (config.experience.bypassRequirements) {
+                File(appCtx.cacheDir, "pb_boot2_sys_labconfig.reg").apply {
+                    writeText(
+                        "REGEDIT4\r\n\r\n" +
+                            "[HKEY_LOCAL_MACHINE\\SYSTEM\\Setup\\LabConfig]\r\n" +
+                            "\"BypassTPMCheck\"=dword:00000001\r\n" +
+                            "\"BypassSecureBootCheck\"=dword:00000001\r\n" +
+                            "\"BypassRAMCheck\"=dword:00000001\r\n" +
+                            "\"BypassCPUCheck\"=dword:00000001\r\n" +
+                            "\"BypassStorageCheck\"=dword:00000001\r\n\r\n",
+                        Charsets.US_ASCII
+                    )
+                }
+            } else null
             val qBoot1Reg = shellQuote(boot1RegFile.absolutePath)
             val qBoot2Reg = shellQuote(boot2RegFile.absolutePath)
+            val qBoot2SysReg = boot2SysRegFile?.let { shellQuote(it.absolutePath) }.orEmpty()
             val archTag = config.build.archDisplay.lowercase()
             val bldMajorForFonts = config.build.build.substringBefore('.').toIntOrNull() ?: 0
             val wantBootFonts = bldMajorForFonts == 0 || bldMajorForFonts in 18890..27499
@@ -2569,6 +2780,17 @@ object WindowsBuildEngine {
                         printf 'cd Microsoft\\Windows NT\\CurrentVersion\\WinPE\ndv CustomShell\nq\ny\n' | $qChntpw -C -e "${'$'}HIVE2" >/dev/null 2>&1
                         set -e
                     fi
+                    SYS_HIVE2=""
+                    if [ -n "$qBoot2SysReg" ]; then
+                        $qWim extract "${'$'}ISODIR/sources/boot.wim" 2 "/Windows/System32/config/SYSTEM" --dest-dir="${'$'}HIVEDIR" --no-acls --no-attributes >/dev/null 2>&1 || \
+                          $qWim extract "${'$'}ISODIR/sources/boot.wim" 2 "/windows/system32/config/system" --dest-dir="${'$'}HIVEDIR" --no-acls --no-attributes >/dev/null 2>&1 || true
+                        SYS_HIVE2=${'$'}(find "${'$'}HIVEDIR" -maxdepth 1 -type f -iname 'system' | head -n 1)
+                        if [ -n "${'$'}SYS_HIVE2" ]; then
+                            set +e
+                            printf 'y\n' | $qChntpw -C -I "${'$'}SYS_HIVE2" 'HKEY_LOCAL_MACHINE\SYSTEM' $qBoot2SysReg >/dev/null 2>&1
+                            set -e
+                        fi
+                    fi
 
                     XML_TMP=""
                     if ! find "${'$'}ISODIR/sources" -maxdepth 1 -type f -iname 'xmllite.dll' 2>/dev/null | grep -q .; then
@@ -2578,6 +2800,7 @@ object WindowsBuildEngine {
                     UPD_TXT="/data/local/tmp/pb_boot_update.txt"; : > "${'$'}UPD_TXT"
                     echo "delete --force /Windows/System32/winpeshl.ini" >> "${'$'}UPD_TXT"
                     if [ -n "${'$'}HIVE2" ]; then echo "add '${'$'}HIVE2' /Windows/System32/config/SOFTWARE" >> "${'$'}UPD_TXT"; fi
+                    if [ -n "${'$'}SYS_HIVE2" ]; then echo "add '${'$'}SYS_HIVE2' /Windows/System32/config/SYSTEM" >> "${'$'}UPD_TXT"; fi
                     if [ -f "${'$'}ISODIR/setup.exe" ]; then echo "add '${'$'}ISODIR/setup.exe' /setup.exe" >> "${'$'}UPD_TXT"; fi
                     if [ -f "${'$'}ISODIR/sources/inf/setup.cfg" ]; then echo "add '${'$'}ISODIR/sources/inf/setup.cfg' /sources/inf/setup.cfg" >> "${'$'}UPD_TXT"; fi
                     if [ -n "${'$'}XML_TMP" ]; then echo "add '${'$'}XML_TMP' /sources/xmllite.dll" >> "${'$'}UPD_TXT"; fi
@@ -2599,6 +2822,7 @@ object WindowsBuildEngine {
             } finally {
                 boot1RegFile.delete()
                 boot2RegFile.delete()
+                boot2SysRegFile?.delete()
             }
             if (!bootWimRes.isSuccess) throw IllegalStateException("boot.wim assembly failed: ${(bootWimRes.out + bootWimRes.err).takeLast(4).joinToString(" ").take(240)}")
             bootWimRes.out.filter { it.startsWith("DU_LOG|") }.forEach { addConsole(it.substringAfter('|')) }
@@ -2949,31 +3173,48 @@ object WindowsBuildEngine {
                 tmpEi.delete(); addConsole("Wrote sources/ei.cfg")
             }
 
+            // Stage offline Microsoft Edge Enterprise MSI if Edge.wim was not integrated and Remove Edge is OFF
+            val hasEdgeWimInPkg = Shell.cmd("find ${shellQuote(pkgDir.absolutePath)} -maxdepth 1 -type f -iname '*edge*.wim' 2>/dev/null | head -n 1").exec().out.any { it.isNotBlank() }
+            var hasStagedEdgeMsi = false
+            if (!isSrvNow && !config.winUtil.removeEdge && !hasEdgeWimInPkg) {
+                val edgeMsiSrc = Shell.cmd("find ${shellQuote(pkgDir.absolutePath)} -maxdepth 1 -type f -iname 'MicrosoftEdgeEnterprise*.msi' 2>/dev/null | head -n 1").exec().out.firstOrNull()?.trim().orEmpty()
+                if (edgeMsiSrc.isNotBlank()) {
+                    val oemEdgeDir = "$oemApps/Edge"
+                    val edgeCopyRes = Shell.cmd("mkdir -p ${shellQuote(oemEdgeDir)} && (ln -f ${shellQuote(edgeMsiSrc)} ${shellQuote("$oemEdgeDir/MicrosoftEdgeEnterprise.msi")} 2>/dev/null || cp -f ${shellQuote(edgeMsiSrc)} ${shellQuote("$oemEdgeDir/MicrosoftEdgeEnterprise.msi")})").exec()
+                    if (edgeCopyRes.isSuccess) {
+                        hasStagedEdgeMsi = true
+                        addConsole("Staged offline Microsoft Edge Enterprise MSI into sources/\$OEM\$/\$\$/Setup/Apps/Edge/")
+                    }
+                }
+            }
+
             val hasStagedOemUpdates = job.hasUpdates && Shell.cmd("[ -d ${shellQuote(oemUpdates)} ] && [ -n \"\$(ls -A ${shellQuote(oemUpdates)} 2>/dev/null)\" ] && echo OK || true").exec().out.any { it.trim() == "OK" }
             val hasStagedOemApps = job.hasApps && Shell.cmd("[ -d ${shellQuote(oemApps)} ] && [ -n \"\$(ls -A ${shellQuote(oemApps)} 2>/dev/null)\" ] && echo OK || true").exec().out.any { it.trim() == "OK" }
             val hasStagedOemNetFx3 = job.hasNetFx3 && Shell.cmd("[ -d ${shellQuote(oemSxs)} ] && [ -n \"\$(ls -A ${shellQuote(oemSxs)} 2>/dev/null)\" ] && echo OK || true").exec().out.any { it.trim() == "OK" }
-            val needUnattendOrOem = config.experience.hasAnyActive() || config.winUtil.hasAnyActive() || hasStagedOemUpdates || hasStagedOemApps || hasStagedOemNetFx3 || config.runComponentCleanup
+            val needUnattendOrOem = config.experience.hasAnyActive() || config.winUtil.hasAnyActive() || hasStagedOemUpdates || hasStagedOemApps || hasStagedOemNetFx3 || hasStagedEdgeMsi || config.runComponentCleanup
             if (!needUnattendOrOem) {
                 Shell.cmd("rm -rf ${shellQuote("${isoDir.absolutePath}/sources/\$OEM\$")} 2>/dev/null || true").exec()
             } else {
                 val arch = if (config.build.arch.lowercase() in setOf("x86", "arm64", "amd64")) config.build.arch.lowercase() else "amd64"
-                val detectedLang = Shell.cmd("grep -iE '^[a-z]{2,3}(-[a-z0-9]{2,4}){1,2}[[:space:]]*=' ${shellQuote("${isoDir.absolutePath}/sources/lang.ini")} 2>/dev/null | head -n 1 | cut -d= -f1 | tr -d ' \\r\\n'").exec().out.firstOrNull().orEmpty().trim().ifBlank { config.lang.code }
                 val hasPostBootUpdates = hasStagedOemUpdates || hasStagedOemNetFx3
                 val hasAutoLogonUser = config.experience.createLocalUser && config.experience.localUsername.trim().isNotEmpty()
                 val logonCount = if (hasPostBootUpdates) 4 else 1
-                val tmpXml = File(appCtx.cacheDir, "wb_auto.xml").apply { writeText(WindowsCustomizationEngine.generateAutounattendXml(config.experience, config.winUtil, arch, null, true, false, includeWindowsPePass = true, uiLang = detectedLang, autoLogonCount = logonCount), Charsets.UTF_8) }
+                // Omit ISO-root autounattend.xml so Windows 11 24H2/26H2 SetupPrep.exe keeps "Previous version of Setup" visible!
+                // Hardware bypasses (LabConfig) are baked directly into boot.wim Index 2 SYSTEM hive, while specialize + oobeSystem
+                // execute automatically via C:\Windows\Panther\unattend.xml (Microsoft Implicit Answer File Search Order #3).
                 val tmpPantherXml = File(appCtx.cacheDir, "wb_panther.xml").apply { writeText(WindowsCustomizationEngine.generateAutounattendXml(config.experience, config.winUtil, arch, null, true, false, includeWindowsPePass = false, autoLogonCount = logonCount), Charsets.UTF_8) }
                 val tmpSpec = File(appCtx.cacheDir, "wb_spec.cmd").apply { writeText(WindowsCustomizationEngine.buildSpecializeScript(config.experience, config.winUtil, hasStagedOemUpdates, hasStagedOemApps, hasStagedOemNetFx3), Charsets.UTF_8) }
                 val customPath = config.experience.customPostInstallScriptPath.trim()
                 val customName = if (customPath.isNotBlank()) customPath.substringAfterLast('/') else ""
-                val tmpComp = File(appCtx.cacheDir, "wb_comp.cmd").apply { writeText(WindowsCustomizationEngine.buildSetupCompleteScript(config.runComponentCleanup, customName.isNotBlank(), customName, hasOemApps = hasStagedOemApps, hasPostBootUpdates = hasPostBootUpdates), Charsets.UTF_8) }
+                val tmpComp = File(appCtx.cacheDir, "wb_comp.cmd").apply { writeText(WindowsCustomizationEngine.buildSetupCompleteScript(config.runComponentCleanup, customName.isNotBlank(), customName, hasOemApps = hasStagedOemApps, hasPostBootUpdates = hasPostBootUpdates, hasEdgeMsi = hasStagedEdgeMsi), Charsets.UTF_8) }
                 val tmpUpd = if (hasPostBootUpdates) File(appCtx.cacheDir, "wb_upd.cmd").apply { writeText(WindowsCustomizationEngine.buildPostBootUpdatesScript(hasStagedOemUpdates, hasStagedOemNetFx3, config.runComponentCleanup, clearAutoLogon = hasAutoLogonUser), Charsets.UTF_8) } else null
                 val tmpWait = if (hasPostBootUpdates) File(appCtx.cacheDir, "wb_wait.cmd").apply { writeText(WindowsCustomizationEngine.buildPreDesktopWaitScreenScript(), Charsets.UTF_8) } else null
-                val updCopy = if (tmpUpd != null && tmpWait != null) "cp -f ${shellQuote(tmpUpd.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_Updates.cmd")} && cp -f ${shellQuote(tmpWait.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_WaitScreen.cmd")}" else "true"
+                val tmpWaitPs1 = if (hasPostBootUpdates) File(appCtx.cacheDir, "wb_wait.ps1").apply { writeText(WindowsCustomizationEngine.buildPreDesktopWaitScreenPs1(), Charsets.UTF_8) } else null
+                val updCopy = if (tmpUpd != null && tmpWait != null && tmpWaitPs1 != null) "cp -f ${shellQuote(tmpUpd.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_Updates.cmd")} && cp -f ${shellQuote(tmpWait.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_WaitScreen.cmd")} && cp -f ${shellQuote(tmpWaitPs1.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_WaitScreen.ps1")}" else "true"
                 val customCopy = if (customPath.isNotBlank()) "mkdir -p ${shellQuote(oemCustom)} && cp -f ${shellQuote(UsbGadgetEngine.resolveDirectPath(customPath))} ${shellQuote(oemCustom)}/ 2>/dev/null || true" else "true"
-                Shell.cmd("mkdir -p ${shellQuote(oemPanther)} ${shellQuote(oemScripts)} && cp -f ${shellQuote(tmpXml.absolutePath)} ${shellQuote("${isoDir.absolutePath}/autounattend.xml")} && cp -f ${shellQuote(tmpPantherXml.absolutePath)} ${shellQuote("$oemPanther/unattend.xml")} && cp -f ${shellQuote(tmpSpec.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_Specialize.cmd")} && cp -f ${shellQuote(tmpComp.absolutePath)} ${shellQuote("$oemScripts/SetupComplete.cmd")} && $updCopy && $customCopy").exec()
-                tmpXml.delete(); tmpPantherXml.delete(); tmpSpec.delete(); tmpComp.delete(); tmpUpd?.delete(); tmpWait?.delete()
-                addConsole("Injected autounattend.xml + unplug-safe \$OEM\$ scripts${if (hasPostBootUpdates) " + pre-desktop SYSTEM updater" else ""}")
+                Shell.cmd("rm -f ${shellQuote("${isoDir.absolutePath}/autounattend.xml")} 2>/dev/null || true; mkdir -p ${shellQuote(oemPanther)} ${shellQuote(oemScripts)} && cp -f ${shellQuote(tmpPantherXml.absolutePath)} ${shellQuote("$oemPanther/unattend.xml")} && cp -f ${shellQuote(tmpSpec.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_Specialize.cmd")} && cp -f ${shellQuote(tmpComp.absolutePath)} ${shellQuote("$oemScripts/SetupComplete.cmd")} && $updCopy && $customCopy").exec()
+                tmpPantherXml.delete(); tmpSpec.delete(); tmpComp.delete(); tmpUpd?.delete(); tmpWait?.delete(); tmpWaitPs1?.delete()
+                addConsole("Injected Panther/unattend.xml (Previous Setup preserved) + unplug-safe \$OEM\$ scripts${if (hasPostBootUpdates) " + pre-desktop dark-mode SYSTEM updater" else ""}")
             }
 
             // In ISO mode (xorriso ISO-9660 + Joliet), WinPE's cdfs.sys requires every single file <= 4 GiB.
@@ -3376,6 +3617,14 @@ object WindowsBuildEngine {
             stepDurations[4] = step4Dur
             addConsole("SUCCESS: $finalFileName ($benchStr${if (bootLabel != null) " · $bootLabel" else ""})")
             emitConvLog("win-build", "Completed $finalFileName ($benchStr${if (bootLabel != null) " · $bootLabel" else ""})")
+            runCatching {
+                val okLogTmp = File(appCtx.cacheDir, "pb_last_build.log")
+                okLogTmp.writeText("PocketBoot v4.5.0 Build Log (${nowTs()})\nBuild: ${job.jobTitle}\nOutput: $finalFileName ($finalSize bytes)\nSummary: $benchStr${if (bootLabel != null) " · $bootLabel" else ""}\n\n--- Console Log ---\n${consoleLines.joinToString("\n")}\n", Charsets.UTF_8)
+                val okDst = "$safeTargetDir/PocketBoot_LastBuild.log"
+                Shell.cmd("cp -f ${shellQuote(okLogTmp.absolutePath)} ${shellQuote(okDst)}").exec()
+                UsbGadgetEngine.fixUserStoragePermissions(appCtx, okDst, isDir = false)
+                okLogTmp.delete()
+            }
             val (doneBatPct, _) = readBatteryPercent(appCtx)
             _conversionState.value = WindowsConversionJobState(
                 title = job.jobTitle,

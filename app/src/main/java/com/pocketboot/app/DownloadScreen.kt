@@ -1813,7 +1813,7 @@ fun DownloadScreen(
         val rbBuildMajor = remember(orig.build.build) { orig.build.build.substringBefore('.').toIntOrNull() ?: 0 }
         val rbSupportsApps = !rbIsServer && (rbBuildMajor == 0 || rbBuildMajor >= 22563)
         var rbStoreAppLevel by remember(pb.workRootPath) {
-            mutableStateOf(if (!rbSupportsApps) WinStoreAppLevel.NONE else orig.storeAppLevel)
+            mutableStateOf(if (!rbSupportsApps) WinStoreAppLevel.NONE else WinStoreAppLevel.ALL_INBOX)
         }
         var rbCabCacheBytes by remember(pb.workRootPath) { mutableStateOf(pb.cabCacheBytes) }
         var rbIncludeUpdates by remember(pb.workRootPath) { mutableStateOf(orig.includeUpdates) }
@@ -2032,47 +2032,26 @@ fun DownloadScreen(
                         }
                     }
 
-                    // Inbox Store Apps 4-Way Selector (for Win 11 22H2+ non-Server builds)
+                    // All Inbox Store Apps (Default ON for Win 11 22H2+ non-Server builds)
                     if (rbSupportsApps) {
                         Surface(
                             shape = RoundedCornerShape(12.dp),
                             color = PocketColors.surfaceInput,
                             border = BorderStroke(0.5.dp, PocketColors.border)
                         ) {
-                            Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                                    Text("Inbox Store Apps", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                            Column(modifier = Modifier.fillMaxWidth()) {
+                                val appBadge = if (pb.cachedAppsCount > 0) " (${pb.cachedAppsCount} cached)" else " (Will top-up missing)"
+                                OfflineRebuildSwitchRow("Include All Inbox Store Apps$appBadge", rbStoreAppLevel != WinStoreAppLevel.NONE) { on ->
+                                    rbStoreAppLevel = if (on) WinStoreAppLevel.ALL_INBOX else WinStoreAppLevel.NONE
+                                }
+                                if (rbStoreAppLevel != WinStoreAppLevel.NONE && pb.cachedAppsCount == 0) {
                                     Text(
-                                        if (pb.cachedAppsCount > 0) "${pb.cachedAppsCount} cached" else "0 cached",
-                                        style = PocketColors.monoStyle,
+                                        "Automatically downloads only missing Store Apps + Edge before rebuilding (keeps cached OS).",
+                                        modifier = Modifier.padding(start = 12.dp, end = 12.dp, bottom = 9.dp),
                                         fontSize = 10.5.sp,
-                                        color = if (pb.cachedAppsCount > 0) PocketColors.success else PocketColors.warning
+                                        color = PocketColors.infoBlue
                                     )
                                 }
-                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                                    WinStoreAppLevel.entries.forEach { lvl ->
-                                        val sel = rbStoreAppLevel == lvl
-                                        Surface(
-                                            modifier = Modifier.weight(1f).height(34.dp).bounceClick { rbStoreAppLevel = lvl },
-                                            shape = RoundedCornerShape(8.dp),
-                                            color = if (sel) PocketColors.accentBg else PocketColors.surfaceCard,
-                                            border = BorderStroke(if (sel) 1.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
-                                        ) {
-                                            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                                                Text(lvl.shortLabel, style = MaterialTheme.typography.labelSmall, fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Medium, color = if (sel) PocketColors.accentSoft else PocketColors.textSecondary, maxLines = 1)
-                                            }
-                                        }
-                                    }
-                                }
-                                Text(
-                                    if (rbStoreAppLevel != WinStoreAppLevel.NONE && pb.cachedAppsCount == 0) {
-                                        "${rbStoreAppLevel.subtitle} · Will top-up only missing Store Apps before rebuilding (keeps cached 8 GB OS)."
-                                    } else {
-                                        rbStoreAppLevel.subtitle
-                                    },
-                                    fontSize = 10.5.sp,
-                                    color = if (rbStoreAppLevel != WinStoreAppLevel.NONE && pb.cachedAppsCount == 0) PocketColors.infoBlue else PocketColors.textSecondary
-                                )
                             }
                         }
                     }

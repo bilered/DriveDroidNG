@@ -390,7 +390,7 @@ object WindowsCustomizationEngine {
             sb.appendLine("      )")
             sb.appendLine("    )")
             sb.appendLine("  )")
-            sb.appendLine("  echo [PocketBoot v4.5.0] OS Updates staged & deferred to post-setup SYSTEM updater [SystemSetupInProgress=0] >> \"%PB_LOG%\"")
+            sb.appendLine("  echo [PocketBoot v4.5.0] OS Updates staged and deferred to post-setup SYSTEM updater [SystemSetupInProgress=0] >> \"%PB_LOG%\"")
             sb.appendLine(")")
         }
         if (hasNetFx3) sb.appendLine("echo [PocketBoot v4.5.0] .NET Framework 3.5 deferred to post-setup SYSTEM updater >> \"%PB_LOG%\"")
@@ -406,7 +406,8 @@ object WindowsCustomizationEngine {
         hasCustomScript: Boolean,
         customScriptFileName: String = "",
         hasOemApps: Boolean = false,
-        hasPostBootUpdates: Boolean = false
+        hasPostBootUpdates: Boolean = false,
+        hasEdgeMsi: Boolean = false
     ): String {
         val sb = StringBuilder()
         sb.appendLine("@echo off")
@@ -446,8 +447,21 @@ object WindowsCustomizationEngine {
             sb.appendLine("      echo %%~nxA | findstr /i \"SecHealthUI\" >nul || call :PB_ADD_APP \"%%~fA\" \"%%~nA\"")
             sb.appendLine("    )")
             sb.appendLine("  )")
-            sb.appendLine("  rmdir /s /q \"C:\\Windows\\Setup\\Apps\" >> \"%PB_LOG%\" 2>&1")
             sb.appendLine(")")
+        }
+        if (hasEdgeMsi) {
+            sb.appendLine("if exist \"C:\\Windows\\Setup\\Apps\\Edge\\MicrosoftEdgeEnterprise.msi\" (")
+            sb.appendLine("  echo [PocketBoot] Installing Microsoft Edge offline...")
+            sb.appendLine("  echo [PocketBoot v4.5.0] Installing offline Microsoft Edge Enterprise MSI... >> \"%PB_LOG%\"")
+            sb.appendLine("  msiexec /i \"C:\\Windows\\Setup\\Apps\\Edge\\MicrosoftEdgeEnterprise.msi\" /qn /norestart >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("  set \"PB_EDGE_RC=!ERRORLEVEL!\"")
+            sb.appendLine("  echo [PocketBoot v4.5.0] Microsoft Edge MSI exit code: !PB_EDGE_RC! >> \"%PB_LOG%\"")
+            sb.appendLine("  if \"!PB_EDGE_RC!\"==\"0\" del /f /q \"C:\\Windows\\Setup\\Apps\\Edge\\MicrosoftEdgeEnterprise.msi\" >nul 2>&1")
+            sb.appendLine("  if \"!PB_EDGE_RC!\"==\"3010\" del /f /q \"C:\\Windows\\Setup\\Apps\\Edge\\MicrosoftEdgeEnterprise.msi\" >nul 2>&1")
+            sb.appendLine(")")
+        }
+        if (hasOemApps) {
+            sb.appendLine("if not exist \"C:\\Windows\\Setup\\Apps\\Edge\\MicrosoftEdgeEnterprise.msi\" if exist \"C:\\Windows\\Setup\\Apps\" rmdir /s /q \"C:\\Windows\\Setup\\Apps\" >> \"%PB_LOG%\" 2>&1")
         }
         if (hasCustomScript && customScriptFileName.isNotBlank()) {
             if (customScriptFileName.lowercase().endsWith(".ps1")) sb.appendLine("if exist \"C:\\Windows\\Setup\\Custom\\$customScriptFileName\" powershell -NoProfile -ExecutionPolicy Bypass -File \"C:\\Windows\\Setup\\Custom\\$customScriptFileName\" >> \"%PB_LOG%\" 2>&1")
@@ -481,7 +495,8 @@ object WindowsCustomizationEngine {
             sb.appendLine("    reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce\" /v \"PocketBoot_Updates\" /t REG_SZ /d \"cmd.exe /c C:\\Windows\\Setup\\Scripts\\PocketBoot_Updates.cmd\" /f >> \"%PB_LOG%\" 2>&1")
             sb.appendLine("  )")
             sb.appendLine(")")
-            sb.appendLine("for %%D in (Apps Custom) do if exist \"C:\\Windows\\Setup\\%%D\" rmdir /s /q \"C:\\Windows\\Setup\\%%D\" >nul 2>&1")
+            sb.appendLine("if exist \"C:\\Windows\\Setup\\Custom\" rmdir /s /q \"C:\\Windows\\Setup\\Custom\" >nul 2>&1")
+            sb.appendLine("if not exist \"C:\\Windows\\Setup\\Apps\\Edge\\MicrosoftEdgeEnterprise.msi\" if exist \"C:\\Windows\\Setup\\Apps\" rmdir /s /q \"C:\\Windows\\Setup\\Apps\" >nul 2>&1")
             sb.appendLine("echo [PocketBoot v4.5.0] SetupComplete finished %DATE% %TIME% [Apps done; OS updates queued for post-OOBE boot] >> \"%PB_LOG%\"")
         } else {
             if (runComponentCleanup) {
@@ -502,6 +517,7 @@ object WindowsCustomizationEngine {
             sb.appendLine(":PB_ADD_APP")
             sb.appendLine("set \"PB_APP_PATH=%~1\"")
             sb.appendLine("set \"PB_APP_BASE=%~2\"")
+            sb.appendLine("echo !PB_APP_BASE! | findstr /i \"MicrosoftSolitaireCollection\" >nul && (echo Skipping known 26100.1 stub app: %~nx1 >> \"%PB_LOG%\" & goto :eof)")
             sb.appendLine("for /f \"tokens=1 delims=_\" %%K in (\"!PB_APP_BASE!\") do set \"PB_APP_FAM=%%K\"")
             sb.appendLine("set \"PB_LIC_ARG=/SkipLicense\"")
             sb.appendLine("if exist \"C:\\Windows\\Setup\\Apps\\Licenses\\!PB_APP_FAM!*.xml\" (")
@@ -510,12 +526,14 @@ object WindowsCustomizationEngine {
             sb.appendLine("echo [PocketBoot] Installing App: %~nx1")
             sb.appendLine("echo Provisioning App: %~nx1 [!PB_LIC_ARG!] >> \"%PB_LOG%\"")
             sb.appendLine("dism /Online /Add-ProvisionedAppxPackage /PackagePath:\"!PB_APP_PATH!\" !PB_DEP_ARGS! !PB_LIC_ARG! /Region:\"all\" >> \"%PB_LOG%\" 2>&1")
-            sb.appendLine("if !ERRORLEVEL! NEQ 0 (")
+            sb.appendLine("set \"PB_APP_RC=!ERRORLEVEL!\"")
+            sb.appendLine("if !PB_APP_RC! NEQ 0 (")
             sb.appendLine("  if /i not \"!PB_LIC_ARG!\"==\"/SkipLicense\" (")
             sb.appendLine("    echo Retrying %~nx1 with /SkipLicense fallback... >> \"%PB_LOG%\"")
             sb.appendLine("    dism /Online /Add-ProvisionedAppxPackage /PackagePath:\"!PB_APP_PATH!\" !PB_DEP_ARGS! /SkipLicense /Region:\"all\" >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("    set \"PB_APP_RC=!ERRORLEVEL!\"")
             sb.appendLine("  )")
-            sb.appendLine("  if !ERRORLEVEL! NEQ 0 (")
+            sb.appendLine("  if !PB_APP_RC! NEQ 0 if defined PB_DEP_ARGS (")
             sb.appendLine("    echo Retrying %~nx1 standalone fallback... >> \"%PB_LOG%\"")
             sb.appendLine("    dism /Online /Add-ProvisionedAppxPackage /PackagePath:\"!PB_APP_PATH!\" /SkipLicense /Region:\"all\" >> \"%PB_LOG%\" 2>&1")
             sb.appendLine("  )")
@@ -531,35 +549,245 @@ object WindowsCustomizationEngine {
      * displays live DISM progress from C:\Windows\Logs\PocketBoot_Updates.log, and includes an anti-lockout
      * watchdog that launches explorer.exe automatically if updates complete without reboot or stay idle >60s.
      */
+    /**
+     * Modern fullscreen borderless dark-mode Windows 11 servicing screen (PowerShell WinForms).
+     * Covers the entire display before explorer.exe loads, parses DISM progress cleanly (zero
+     * repeated [ 1.0% ] spam), shows active phase + elapsed time, and exits cleanly with
+     * anti-lockout watchdog protection.
+     */
+    fun buildPreDesktopWaitScreenPs1(): String {
+        val ps = """
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+${'$'}logPath = 'C:\Windows\Logs\PocketBoot_Updates.log'
+${'$'}doneFlag = 'C:\Windows\Setup\Scripts\.pb_upd_done'
+${'$'}finalReb = 'C:\Windows\Temp\.pb_final_reboot'
+${'$'}p1Flag = 'C:\Windows\Setup\Scripts\.pb_lcu_p1'
+
+# Never run during OOBE
+try {
+    ${'$'}oobe = (Get-ItemProperty 'HKLM:\SYSTEM\Setup' -Name OOBEInProgress -ErrorAction SilentlyContinue).OOBEInProgress
+    if (${'$'}oobe -eq 1 -or ${'$'}env:USERNAME -eq 'defaultuser0') { exit 0 }
+} catch {}
+
+# Keep 24H2 explorer.exe hidden until full 26H2 installation completes
+try { Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue } catch {}
+
+[System.Windows.Forms.Application]::EnableVisualStyles()
+${'$'}form = New-Object System.Windows.Forms.Form
+${'$'}form.Text = 'PocketBoot - Updating Windows'
+${'$'}form.BackColor = [System.Drawing.Color]::FromArgb(11, 15, 23)
+${'$'}form.ForeColor = [System.Drawing.Color]::White
+${'$'}form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+${'$'}form.WindowState = [System.Windows.Forms.FormWindowState]::Maximized
+${'$'}form.TopMost = ${'$'}true
+${'$'}form.ControlBox = ${'$'}false
+${'$'}form.ShowInTaskbar = ${'$'}false
+
+${'$'}panel = New-Object System.Windows.Forms.Panel
+${'$'}panel.Width = 760
+${'$'}panel.Height = 420
+${'$'}panel.BackColor = [System.Drawing.Color]::Transparent
+${'$'}form.Controls.Add(${'$'}panel)
+
+${'$'}lblBrand = New-Object System.Windows.Forms.Label
+${'$'}lblBrand.Text = 'POCKETBOOT  -  WINDOWS SERVICING'
+${'$'}lblBrand.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 10)
+${'$'}lblBrand.ForeColor = [System.Drawing.Color]::FromArgb(21, 245, 171)
+${'$'}lblBrand.AutoSize = ${'$'}true
+${'$'}lblBrand.Location = New-Object System.Drawing.Point(0, 0)
+${'$'}panel.Controls.Add(${'$'}lblBrand)
+
+${'$'}lblPhase = New-Object System.Windows.Forms.Label
+${'$'}lblPhase.Text = 'Installing Windows Updates (Phase 1 of 2)'
+${'$'}lblPhase.Font = New-Object System.Drawing.Font('Segoe UI Light', 24)
+${'$'}lblPhase.ForeColor = [System.Drawing.Color]::White
+${'$'}lblPhase.Size = New-Object System.Drawing.Size(760, 48)
+${'$'}lblPhase.Location = New-Object System.Drawing.Point(0, 26)
+${'$'}panel.Controls.Add(${'$'}lblPhase)
+
+${'$'}lblSub = New-Object System.Windows.Forms.Label
+${'$'}lblSub.Text = 'Your PC will restart automatically. Please keep your PC turned on until setup finishes.'
+${'$'}lblSub.Font = New-Object System.Drawing.Font('Segoe UI', 11)
+${'$'}lblSub.ForeColor = [System.Drawing.Color]::FromArgb(168, 179, 196)
+${'$'}lblSub.Size = New-Object System.Drawing.Size(760, 28)
+${'$'}lblSub.Location = New-Object System.Drawing.Point(0, 82)
+${'$'}panel.Controls.Add(${'$'}lblSub)
+
+${'$'}barBg = New-Object System.Windows.Forms.Panel
+${'$'}barBg.Size = New-Object System.Drawing.Size(760, 10)
+${'$'}barBg.Location = New-Object System.Drawing.Point(0, 130)
+${'$'}barBg.BackColor = [System.Drawing.Color]::FromArgb(32, 41, 58)
+${'$'}panel.Controls.Add(${'$'}barBg)
+
+${'$'}barFill = New-Object System.Windows.Forms.Panel
+${'$'}barFill.Size = New-Object System.Drawing.Size(24, 10)
+${'$'}barFill.Location = New-Object System.Drawing.Point(0, 0)
+${'$'}barFill.BackColor = [System.Drawing.Color]::FromArgb(21, 245, 171)
+${'$'}barBg.Controls.Add(${'$'}barFill)
+
+${'$'}lblPct = New-Object System.Windows.Forms.Label
+${'$'}lblPct.Text = 'Preparing servicing engine...  |  Elapsed 00:00'
+${'$'}lblPct.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 10.5)
+${'$'}lblPct.ForeColor = [System.Drawing.Color]::FromArgb(196, 210, 228)
+${'$'}lblPct.Size = New-Object System.Drawing.Size(760, 24)
+${'$'}lblPct.Location = New-Object System.Drawing.Point(0, 150)
+${'$'}panel.Controls.Add(${'$'}lblPct)
+
+${'$'}logBox = New-Object System.Windows.Forms.Label
+${'$'}logBox.Text = 'Starting PocketBoot SYSTEM servicing...'
+${'$'}logBox.Font = New-Object System.Drawing.Font('Consolas', 9.5)
+${'$'}logBox.ForeColor = [System.Drawing.Color]::FromArgb(138, 152, 173)
+${'$'}logBox.BackColor = [System.Drawing.Color]::FromArgb(17, 23, 35)
+${'$'}logBox.Padding = New-Object System.Windows.Forms.Padding(12)
+${'$'}logBox.Size = New-Object System.Drawing.Size(760, 210)
+${'$'}logBox.Location = New-Object System.Drawing.Point(0, 190)
+${'$'}panel.Controls.Add(${'$'}logBox)
+
+${'$'}centerPanel = {
+    ${'$'}panel.Left = [Math]::Max(20, [int]((${'$'}form.ClientSize.Width - ${'$'}panel.Width) / 2))
+    ${'$'}panel.Top = [Math]::Max(20, [int]((${'$'}form.ClientSize.Height - ${'$'}panel.Height) / 2))
+}
+${'$'}form.Add_Shown(${'$'}centerPanel)
+${'$'}form.Add_Resize(${'$'}centerPanel)
+
+${'$'}startUtc = [DateTime]::UtcNow
+${'$'}idleTicks = 0
+${'$'}bootGrace = 10
+${'$'}lastPct = 2.0
+
+${'$'}timer = New-Object System.Windows.Forms.Timer
+${'$'}timer.Interval = 2500
+${'$'}timer.Add_Tick({
+    try {
+        ${'$'}elapsed = [DateTime]::UtcNow - ${'$'}startUtc
+        ${'$'}elStr = '{0:00}:{1:00}' -f [int]${'$'}elapsed.TotalMinutes, ${'$'}elapsed.Seconds
+
+        if (Test-Path ${'$'}finalReb) {
+            ${'$'}lblPhase.Text = 'Windows Update Complete'
+            ${'$'}lblSub.Text = 'Restarting into your finished Windows 11 desktop...'
+            ${'$'}barFill.Width = 760
+            ${'$'}lblPct.Text = "100%  |  Elapsed ${'$'}elStr"
+            return
+        }
+
+        ${'$'}stillPending = (Test-Path 'C:\Windows\Setup\Updates') -or (Test-Path 'C:\Windows\Setup\sxs') -or (Test-Path 'C:\Windows\Setup\Apps\Edge\MicrosoftEdgeEnterprise.msi')
+        if ((Test-Path ${'$'}doneFlag) -or (-not ${'$'}stillPending)) {
+            ${'$'}timer.Stop()
+            ${'$'}form.Close()
+            return
+        }
+
+        # Keep explorer.exe suppressed while servicing is active so pre-update desktop never appears
+        if (Get-Process -Name explorer -ErrorAction SilentlyContinue) {
+            Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+        }
+
+        if (Test-Path ${'$'}p1Flag) {
+            ${'$'}lblPhase.Text = 'Finalizing Windows 11 (Phase 2 of 2)'
+        } else {
+            ${'$'}lblPhase.Text = 'Installing Windows Updates (Phase 1 of 2)'
+        }
+
+        ${'$'}busy = ${'$'}false
+        if (Get-Process -Name dism,TiWorker,msiexec -ErrorAction SilentlyContinue) { ${'$'}busy = ${'$'}true }
+        elseif (Test-Path ${'$'}logPath) {
+            if (([DateTime]::Now - (Get-Item ${'$'}logPath).LastWriteTime).TotalSeconds -lt 60) { ${'$'}busy = ${'$'}true }
+        }
+
+        if (${'$'}busy) {
+            ${'$'}idleTicks = 0
+            ${'$'}bootGrace = 0
+        } elseif (${'$'}bootGrace -gt 0) {
+            ${'$'}bootGrace--
+        } else {
+            ${'$'}idleTicks++
+        }
+
+        if (Test-Path ${'$'}logPath) {
+            ${'$'}rawLines = Get-Content ${'$'}logPath -Tail 120 -ErrorAction SilentlyContinue
+            ${'$'}pctMatch = ${'$'}null
+            ${'$'}statusLines = New-Object System.Collections.Generic.List[string]
+            foreach (${'$'}rl in ${'$'}rawLines) {
+                ${'$'}seg = (${'$'}rl -split [char]13)[-1].Trim()
+                if ([string]::IsNullOrWhiteSpace(${'$'}seg)) { continue }
+                if (${'$'}seg -match '^\[.*(\d{1,3}\.\d)%.*\]${'$'}') {
+                    ${'$'}pctMatch = [double]${'$'}Matches[1]
+                    continue
+                }
+                if (${'$'}seg -notmatch '^The operation completed successfully\.${'$'}' -or ${'$'}statusLines.Count -eq 0 -or ${'$'}statusLines[${'$'}statusLines.Count - 1] -ne ${'$'}seg) {
+                    ${'$'}statusLines.Add(${'$'}seg)
+                }
+            }
+            if (${'$'}null -ne ${'$'}pctMatch) {
+                ${'$'}lastPct = [Math]::Min(100.0, [Math]::Max(2.0, ${'$'}pctMatch))
+                ${'$'}barFill.Width = [int](760 * (${'$'}lastPct / 100.0))
+                ${'$'}lblPct.Text = ("{0:0.0}%  |  Elapsed {1}" -f ${'$'}lastPct, ${'$'}elStr)
+            } else {
+                ${'$'}pulse = (([int]${'$'}elapsed.TotalSeconds * 18) % 680) + 40
+                ${'$'}barFill.Width = ${'$'}pulse
+                ${'$'}lblPct.Text = "Working...  |  Elapsed ${'$'}elStr"
+            }
+            ${'$'}tailClean = ${'$'}statusLines | Select-Object -Last 8
+            if (${'$'}tailClean) { ${'$'}logBox.Text = (${'$'}tailClean -join "`r`n") }
+        } else {
+            ${'$'}lblPct.Text = "Waiting for Windows Servicing...  |  Elapsed ${'$'}elStr"
+        }
+
+        # Anti-lockout safety watchdog (~90s completely idle -> hand over to desktop)
+        if (${'$'}idleTicks -ge 36) {
+            ${'$'}timer.Stop()
+            ${'$'}form.Close()
+        }
+    } catch {}
+})
+
+${'$'}timer.Start()
+[void]${'$'}form.ShowDialog()
+exit 0
+""".trimIndent()
+        return ps.replace("\r\n", "\n").replace("\n", "\r\n")
+    }
+
+    /**
+     * Lightweight pre-desktop progress wrapper wired to Winlogon\Shell right after OOBE ends.
+     * Launches the fullscreen dark-mode WinForms overlay (PocketBoot_WaitScreen.ps1) while keeping
+     * explorer.exe suppressed until all Cumulative Updates, .NET, and 26H2 Enablement complete.
+     * Includes an automatic console fallback and anti-lockout watchdog so explorer.exe always recovers.
+     */
     fun buildPreDesktopWaitScreenScript(): String {
         val sb = StringBuilder()
         sb.appendLine("@echo off")
         sb.appendLine("setlocal EnableExtensions EnableDelayedExpansion")
         sb.appendLine("cd /d C:\\Windows\\System32 >nul 2>&1")
-        sb.appendLine("title PocketBoot - Finalizing Windows Updates")
-        sb.appendLine("color 1F")
-        sb.appendLine("mode con: cols=92 lines=28 >nul 2>&1")
+        sb.appendLine("title PocketBoot - Updating Windows")
+        sb.appendLine("color 0F")
         sb.appendLine("set \"PB_LOG=C:\\Windows\\Logs\\PocketBoot_Updates.log\"")
         sb.appendLine("set \"PB_SCRIPTS=C:\\Windows\\Setup\\Scripts\"")
         sb.appendLine("set \"PB_DONE=%PB_SCRIPTS%\\.pb_upd_done\"")
-        sb.appendLine("set \"PB_LOCK=%PB_SCRIPTS%\\.pb_upd.lock\"")
         sb.appendLine("set \"PB_FINAL_REB=C:\\Windows\\Temp\\.pb_final_reboot\"")
-        // Never run during OOBE (defaultuser0)
+        // CRITICAL: Never interfere during OOBE (defaultuser0)
         sb.appendLine("set \"PB_OOBE=0x0\"")
         sb.appendLine("for /f \"tokens=3\" %%O in ('reg query \"HKLM\\SYSTEM\\Setup\" /v OOBEInProgress 2^>nul ^| findstr /i \"REG_DWORD\"') do set \"PB_OOBE=%%O\"")
         sb.appendLine("if /i \"!PB_OOBE!\"==\"0x1\" exit /b 0")
-        // Give ONLOGON / ONSTART SYSTEM task a few seconds to claim lock before counting idle ticks
+        sb.appendLine("if /i \"%USERNAME%\"==\"defaultuser0\" exit /b 0")
+        sb.appendLine("if exist \"%PB_DONE%\" goto :PB_LAUNCH_DESKTOP")
+        // Suppress 24H2 explorer.exe immediately so full installation finishes BEFORE actual desktop
+        sb.appendLine("taskkill /f /im explorer.exe >nul 2>&1")
+        // Launch modern fullscreen dark-mode progress screen
+        sb.appendLine("if exist \"%PB_SCRIPTS%\\PocketBoot_WaitScreen.ps1\" (")
+        sb.appendLine("  powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -STA -File \"%PB_SCRIPTS%\\PocketBoot_WaitScreen.ps1\" >nul 2>&1")
+        sb.appendLine("  if !ERRORLEVEL! EQU 0 goto :PB_CHECK_AFTER_GUI")
+        sb.appendLine(")")
+        // Fallback deduplicated console progress loop (only if WinForms GUI could not open)
         sb.appendLine("set \"PB_IDLE=0\"")
-        sb.appendLine("set \"PB_BOOT_GRACE=4\"")
+        sb.appendLine("set \"PB_BOOT_GRACE=6\"")
         sb.appendLine(":PB_WAIT_LOOP")
         sb.appendLine("if exist \"%PB_FINAL_REB%\" (")
-        sb.appendLine("  del /f /q \"%PB_FINAL_REB%\" >nul 2>&1")
         sb.appendLine("  cls")
         sb.appendLine("  echo.")
-        sb.appendLine("  echo   ==============================================================================")
-        sb.appendLine("  echo     PocketBoot - All Windows Updates and Feature Enablement Complete!")
-        sb.appendLine("  echo   ==============================================================================")
-        sb.appendLine("  echo.")
+        sb.appendLine("  echo   PocketBoot - All Windows Updates and Feature Enablement Complete!")
         sb.appendLine("  echo   Restarting your PC into your finished Windows desktop...")
         sb.appendLine("  ping -n 30 127.0.0.1 >nul")
         sb.appendLine("  goto :PB_LAUNCH_DESKTOP")
@@ -569,26 +797,14 @@ object WindowsCustomizationEngine {
         sb.appendLine("if exist \"C:\\Windows\\Setup\\Updates\" set \"PB_STILL=1\"")
         sb.appendLine("if exist \"C:\\Windows\\Setup\\sxs\" set \"PB_STILL=1\"")
         sb.appendLine("if \"!PB_STILL!\"==\"0\" goto :PB_LAUNCH_DESKTOP")
-        // Detect if SYSTEM updater is active via dism.exe, TiWorker.exe, or recent log activity (<45s).
-        // Avoids writing to .pb_upd.lock from a non-elevated HKLM\...\Run session (where Access Denied would false-trigger PB_BUSY=1).
+        sb.appendLine("taskkill /f /im explorer.exe >nul 2>&1")
         sb.appendLine("set \"PB_BUSY=0\"")
         sb.appendLine("tasklist /fi \"imagename eq dism.exe\" 2>nul | findstr /i \"dism.exe\" >nul && set \"PB_BUSY=1\"")
-        sb.appendLine("if \"!PB_BUSY!\"==\"0\" (")
-        sb.appendLine("  tasklist /fi \"imagename eq TiWorker.exe\" 2>nul | findstr /i \"TiWorker.exe\" >nul && set \"PB_BUSY=1\"")
-        sb.appendLine(")")
+        sb.appendLine("if \"!PB_BUSY!\"==\"0\" tasklist /fi \"imagename eq TiWorker.exe\" 2>nul | findstr /i \"TiWorker.exe\" >nul && set \"PB_BUSY=1\"")
         sb.appendLine("if \"!PB_BUSY!\"==\"0\" if exist \"%PB_LOG%\" (")
-        sb.appendLine("  powershell -NoProfile -Command \"if (((Get-Date) - (Get-Item '%PB_LOG%').LastWriteTime).TotalSeconds -lt 45) { exit 0 } else { exit 1 }\" >nul 2>&1 && set \"PB_BUSY=1\"")
+        sb.appendLine("  powershell -NoProfile -Command \"if (((Get-Date) - (Get-Item '%PB_LOG%').LastWriteTime).TotalSeconds -lt 60) { exit 0 } else { exit 1 }\" >nul 2>&1 && set \"PB_BUSY=1\"")
         sb.appendLine(")")
-        sb.appendLine("if \"!PB_BUSY!\"==\"1\" (")
-        sb.appendLine("  set \"PB_IDLE=0\"")
-        sb.appendLine("  set \"PB_BOOT_GRACE=0\"")
-        sb.appendLine(") else (")
-        sb.appendLine("  if !PB_BOOT_GRACE! GTR 0 (")
-        sb.appendLine("    set /a PB_BOOT_GRACE-=1")
-        sb.appendLine("  ) else (")
-        sb.appendLine("    set /a PB_IDLE+=1")
-        sb.appendLine("  )")
-        sb.appendLine(")")
+        sb.appendLine("if \"!PB_BUSY!\"==\"1\" (set \"PB_IDLE=0\" & set \"PB_BOOT_GRACE=0\") else (if !PB_BOOT_GRACE! GTR 0 (set /a PB_BOOT_GRACE-=1) else (set /a PB_IDLE+=1))")
         sb.appendLine("cls")
         sb.appendLine("echo.")
         sb.appendLine("echo   ==============================================================================")
@@ -597,17 +813,15 @@ object WindowsCustomizationEngine {
         sb.appendLine("echo   ==============================================================================")
         sb.appendLine("echo.")
         sb.appendLine("if exist \"%PB_LOG%\" (")
-        sb.appendLine("  powershell -NoProfile -Command \"Get-Content '%PB_LOG%' -Tail 35 -ErrorAction SilentlyContinue | ForEach-Object { (\$_ -split [char]13)[-1].Trim() } | Where-Object { \$_ -ne '' } | Select-Object -Last 14 | ForEach-Object { '  ' + \$_ }\" 2>nul")
+        sb.appendLine("  powershell -NoProfile -Command \"\$l=Get-Content '%PB_LOG%' -Tail 120 -ErrorAction SilentlyContinue | ForEach-Object { (\$_ -split [char]13)[-1].Trim() } | Where-Object { \$_ -ne '' }; \$p=(\$l | Where-Object { \$_ -match '^\\[.*%.*\\]\$' } | Select-Object -Last 1); (\$l | Where-Object { \$_ -notmatch '^\\[.*%.*\\]\$' } | Select-Object -Last 10) | ForEach-Object { '  ' + \$_ }; if (\$p) { ''; '  Progress: ' + \$p }\" 2>nul")
         sb.appendLine(") else (")
         sb.appendLine("  echo   Preparing Windows servicing engine...")
         sb.appendLine(")")
-        sb.appendLine("if !PB_IDLE! GEQ 12 (")
-        sb.appendLine("  echo.")
-        sb.appendLine("  echo   Servicing idle - launching Windows desktop...")
-        sb.appendLine("  goto :PB_LAUNCH_DESKTOP")
-        sb.appendLine(")")
+        sb.appendLine("if !PB_IDLE! GEQ 15 goto :PB_LAUNCH_DESKTOP")
         sb.appendLine("ping -n 6 127.0.0.1 >nul")
         sb.appendLine("goto :PB_WAIT_LOOP")
+        sb.appendLine(":PB_CHECK_AFTER_GUI")
+        sb.appendLine("if exist \"%PB_FINAL_REB%\" (ping -n 25 127.0.0.1 >nul)")
         sb.appendLine(":PB_LAUNCH_DESKTOP")
         sb.appendLine("tasklist /fi \"imagename eq explorer.exe\" 2>nul | findstr /i \"explorer.exe\" >nul || start \"\" explorer.exe")
         sb.appendLine("exit /b 0")
@@ -689,14 +903,41 @@ object WindowsCustomizationEngine {
         sb.appendLine("if /i \"!PB_OOBE!\"==\"0x1\" (")
         sb.appendLine("  if !PB_OOBE_WAIT! EQU 0 echo [PocketBoot v4.5.0] OOBEInProgress=0x1 - waiting for OOBE to finish before servicing... >> \"%PB_LOG%\"")
         sb.appendLine("  set /a PB_OOBE_WAIT+=1")
-        sb.appendLine("  if !PB_OOBE_WAIT! LSS 720 (")
-        sb.appendLine("    ping -n 6 127.0.0.1 >nul")
+        sb.appendLine("  if !PB_OOBE_WAIT! LSS 1800 (")
+        sb.appendLine("    ping -n 3 127.0.0.1 >nul")
         sb.appendLine("    goto :PB_WAIT_OOBE")
         sb.appendLine("  )")
         sb.appendLine("  echo [PocketBoot v4.5.0] OOBE wait timeout - deferring to user logon >> \"%PB_LOG%\"")
         sb.appendLine("  goto :eof")
         sb.appendLine(")")
-        // Hard safety cap of 5 boot attempts so Winlogon\Shell is guaranteed to restore explorer.exe even on corrupt media
+        // OOBE is complete (OOBEInProgress=0x0): immediately lock Winlogon\Shell to our fullscreen dark-mode progress screen
+        // and terminate any early explorer.exe so full 26H2 installation completes BEFORE the actual desktop!
+        sb.appendLine("if exist \"C:\\Windows\\Setup\\Scripts\\PocketBoot_WaitScreen.cmd\" (")
+        sb.appendLine("  reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\" /v Shell /t REG_SZ /d \"cmd.exe /c C:\\Windows\\Setup\\Scripts\\PocketBoot_WaitScreen.cmd\" /f >nul 2>&1")
+        sb.appendLine("  taskkill /f /im explorer.exe >nul 2>&1")
+        sb.appendLine(")")
+        // Post-LCU settle wait BEFORE burning a boot attempt: wait for Windows mid-LCU commit reboot & TiWorker/Recall servicing
+        sb.appendLine("if exist \"%PB_P1%\" (")
+        sb.appendLine("  echo [PocketBoot v4.5.0] Waiting 25s + CBS/TiWorker settle after LCU reboot... >> \"%PB_LOG%\"")
+        sb.appendLine("  ping -n 26 127.0.0.1 >nul")
+        sb.appendLine("  reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Component Based Servicing\\RebootInProgress\" >nul 2>&1 && (")
+        sb.appendLine("    echo [PocketBoot v4.5.0] CBS RebootInProgress detected - waiting for Windows commit restart without burning attempt >> \"%PB_LOG%\"")
+        sb.appendLine("    ping -n 30 127.0.0.1 >nul")
+        sb.appendLine("    goto :eof")
+        sb.appendLine("  )")
+        sb.appendLine("  set \"PB_TI_WAIT=0\"")
+        sb.appendLine("  :PB_WAIT_TI")
+        sb.appendLine("  tasklist /fi \"imagename eq TiWorker.exe\" 2>nul | findstr /i \"TiWorker.exe\" >nul")
+        sb.appendLine("  if !ERRORLEVEL! EQU 0 (")
+        sb.appendLine("    set /a PB_TI_WAIT+=1")
+        sb.appendLine("    if !PB_TI_WAIT! LSS 36 (")
+        sb.appendLine("      ping -n 6 127.0.0.1 >nul")
+        sb.appendLine("      goto :PB_WAIT_TI")
+        sb.appendLine("    )")
+        sb.appendLine("  )")
+        sb.appendLine("  echo [PocketBoot v4.5.0] TiWorker settle complete [ticks=!PB_TI_WAIT!] >> \"%PB_LOG%\"")
+        sb.appendLine(")")
+        // Hard safety cap of 5 active servicing attempts so Winlogon\Shell is guaranteed to restore explorer.exe even on corrupt media
         sb.appendLine("set \"PB_ATT=0\"")
         sb.appendLine("if exist \"%PB_ATTEMPTS_FILE%\" set /p PB_ATT=<\"%PB_ATTEMPTS_FILE%\"")
         sb.appendLine("set /a PB_ATT+=1")
@@ -705,23 +946,6 @@ object WindowsCustomizationEngine {
         sb.appendLine("if !PB_ATT! GTR 5 (")
         sb.appendLine("  echo [PocketBoot v4.5.0] Max attempts reached - restoring desktop shell and finalizing >> \"%PB_LOG%\"")
         sb.appendLine("  goto :PB_FINALIZE")
-        sb.appendLine(")")
-        // Post-LCU settle wait: after Phase 1 reboot, give TrustedInstaller / TiWorker time to finish boot servicing
-        // so Pass 3 (.NET) and Pass 4 (26H2 Enablement) do not collide with 0x8007045b (shutdown in progress)
-        sb.appendLine("if exist \"%PB_P1%\" (")
-        sb.appendLine("  echo [PocketBoot v4.5.0] Waiting 25s + TiWorker settle after LCU reboot... >> \"%PB_LOG%\"")
-        sb.appendLine("  ping -n 26 127.0.0.1 >nul")
-        sb.appendLine("  set \"PB_TI_WAIT=0\"")
-        sb.appendLine("  :PB_WAIT_TI")
-        sb.appendLine("  tasklist /fi \"imagename eq TiWorker.exe\" 2>nul | findstr /i \"TiWorker.exe\" >nul")
-        sb.appendLine("  if !ERRORLEVEL! EQU 0 (")
-        sb.appendLine("    set /a PB_TI_WAIT+=1")
-        sb.appendLine("    if !PB_TI_WAIT! LSS 18 (")
-        sb.appendLine("      ping -n 6 127.0.0.1 >nul")
-        sb.appendLine("      goto :PB_WAIT_TI")
-        sb.appendLine("    )")
-        sb.appendLine("  )")
-        sb.appendLine("  echo [PocketBoot v4.5.0] TiWorker settle complete [ticks=!PB_TI_WAIT!] >> \"%PB_LOG%\"")
         sb.appendLine(")")
         sb.appendLine("for /f \"tokens=3\" %%F in ('dir C:\\ /-c 2^>nul ^| findstr /i /c:\"bytes free\"') do echo [PocketBoot v4.5.0] Free space on C: %%F bytes >> \"%PB_LOG%\"")
         sb.appendLine("set \"PB_CUR_UBR=0x0\"")
@@ -821,8 +1045,20 @@ object WindowsCustomizationEngine {
         if (hasNetFx3) {
             sb.appendLine("if exist \"C:\\Windows\\Setup\\sxs\" (echo [PocketBoot v4.5.0] Enabling .NET Framework 3.5... >> \"%PB_LOG%\" & dism /Online /Enable-Feature /FeatureName:NetFx3 /All /LimitAccess /Source:\"C:\\Windows\\Setup\\sxs\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 1115 goto :eof & rmdir /s /q \"C:\\Windows\\Setup\\sxs\" >> \"%PB_LOG%\" 2>&1)")
         }
+        sb.appendLine("if exist \"C:\\Windows\\Setup\\Apps\\Edge\\MicrosoftEdgeEnterprise.msi\" (")
+        sb.appendLine("  echo [PocketBoot v4.5.0] Retrying offline Microsoft Edge Enterprise MSI... >> \"%PB_LOG%\"")
+        sb.appendLine("  msiexec /i \"C:\\Windows\\Setup\\Apps\\Edge\\MicrosoftEdgeEnterprise.msi\" /qn /norestart >> \"%PB_LOG%\" 2>&1")
+        sb.appendLine("  echo [PocketBoot v4.5.0] Microsoft Edge MSI retry exit code: !ERRORLEVEL! >> \"%PB_LOG%\"")
+        sb.appendLine("  rmdir /s /q \"C:\\Windows\\Setup\\Apps\" >nul 2>&1")
+        sb.appendLine(")")
         if (runComponentCleanup) {
-            sb.appendLine("if not \"!PB_REBOOT_REQ!\"==\"1\" (echo [PocketBoot v4.5.0] Running component cleanup [/ResetBase]... >> \"%PB_LOG%\" & dism /Online /Cleanup-Image /StartComponentCleanup /ResetBase >> \"%PB_LOG%\" 2>&1)")
+            sb.appendLine("if not \"!PB_REBOOT_REQ!\"==\"1\" (")
+            sb.appendLine("  echo [PocketBoot v4.5.0] Running component cleanup [/ResetBase]... >> \"%PB_LOG%\"")
+            sb.appendLine("  dism /Online /Cleanup-Image /StartComponentCleanup /ResetBase >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine(") else (")
+            sb.appendLine("  echo [PocketBoot v4.5.0] Scheduling silent post-reboot /ResetBase component cleanup task... >> \"%PB_LOG%\"")
+            sb.appendLine("  schtasks /create /tn \"PocketBoot_ResetBase\" /tr \"cmd.exe /c ping -n 45 127.0.0.1 ^>nul ^& dism /Online /Cleanup-Image /StartComponentCleanup /ResetBase ^>^> C:\\Windows\\Logs\\PocketBoot_Updates.log 2^>^&1 ^& schtasks /delete /tn PocketBoot_ResetBase /f\" /sc ONSTART /ru SYSTEM /rl HIGHEST /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine(")")
         }
         sb.appendLine(":PB_FINALIZE")
         sb.appendLine("echo [PocketBoot v4.5.0] === Post-Install Verification Summary === >> \"%PB_LOG%\"")
@@ -848,7 +1084,7 @@ object WindowsCustomizationEngine {
         sb.appendLine("if \"!PB_REBOOT_REQ!\"==\"1\" (")
         sb.appendLine("  echo 1 > \"%PB_FINAL_REB%\"")
         sb.appendLine("  set \"PB_FINAL_REBOOT_REQ=1\"")
-        sb.appendLine("  echo [PocketBoot v4.5.0] All updates & enablement applied - final reboot in 10s... >> \"%PB_LOG%\"")
+        sb.appendLine("  echo [PocketBoot v4.5.0] All updates and enablement applied - final reboot in 10s... >> \"%PB_LOG%\"")
         sb.appendLine(")")
         sb.appendLine("echo done > \"%PB_DONE%\"")
         sb.appendLine("goto :eof")

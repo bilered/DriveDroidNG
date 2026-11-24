@@ -518,8 +518,9 @@ object MicrosoftUupClient {
             }
         }
 
-        // Also extract embedded <Files> metadata if returned in Extended fragment
-        if (syncFilesCache[cleanId].isNullOrEmpty() && resp.contains("FileName=")) {
+        // Always extract & merge embedded <Files> metadata from Extended fragment so Direct Microsoft
+        // never drops Inbox Store Apps (.msixbundle/.appxbundle/.msix/.appx) when an older cache entry exists.
+        if (resp.contains("FileName=")) {
             val dec = htmlDecode(resp)
             val fRegex = Regex("""<File\s+([^>]+?)(?:/>|>(.*?)</File>)""", RegexOption.DOT_MATCHES_ALL)
             val aName = Regex("""FileName="([^"]+)"""")
@@ -536,7 +537,10 @@ object MicrosoftUupClient {
                 val hex = base64DigestToHex(dig)
                 if (hex.length == 40 && !isUnusablePackageName(fn)) extracted.add(DirectSyncFileMeta(fn, sz, hex))
             }
-            if (extracted.isNotEmpty()) syncFilesCache[cleanId] = extracted.distinctBy { it.name.lowercase() }
+            if (extracted.isNotEmpty()) {
+                val merged = (extracted + syncFilesCache[cleanId].orEmpty()).distinctBy { it.name.lowercase() }
+                syncFilesCache[cleanId] = merged
+            }
         }
         out
     }

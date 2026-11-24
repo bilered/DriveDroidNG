@@ -1,3 +1,11 @@
+## v4.5.0-v26.4 (2026-11-25)
+- **All Inbox Store Apps Default ON + UI Simplification:** Removed extra 4-way Store App sub-options in Download & Offline Rebuild sheets; replaced with a single default-ON *Include All Inbox Store Apps* toggle (always visible for Win 11 builds).
+- **Bulletproof Store Apps Fetcher (Zero Silent Loss):** Added 2.2 s UUPdump pacing, fixed `MicrosoftUupClient.kt` to always merge embedded `<Files>` from `GetExtendedUpdateInfo2`, added zero-rate-limit Direct Microsoft Store App failover, pre-build manifest audit logging, and a hard guard that aborts instead of building a 0-app ISO.
+- **Guaranteed Offline Microsoft Edge:** Added automatic fallback to official Microsoft Edge Enterprise Stable MSI (`edgeupdates.microsoft.com/api/products?view=enterprise` + Microsoft fwlink fallback) cached in `PKGS/` and installed silently during `SetupComplete.cmd` (with post-boot retry) when `Edge.wim` is absent.
+- **Restored "Previous version of Setup":** Patched the 5 `LabConfig` hardware bypass keys directly into `boot.wim` Index 2's offline `SYSTEM` hive (`chntpw`) and omitted root `autounattend.xml` while keeping `$OEM$\$$\Panther\unattend.xml` (Microsoft Implicit Search Order #3).
+- **Full Pre-Desktop Installation & Dark-Mode Progress Screen:** Locked `Winlogon\Shell` immediately after `OOBEInProgress=0x0` (before Phase 1 DISM starts), suppressed early `explorer.exe`, and added a fullscreen dark-mode WinForms overlay (`PocketBoot_WaitScreen.ps1`) with live phase indicator, single progress bar, elapsed timer, and anti-lockout watchdog so the user never sees a `24H2` desktop before `26H2` finishes.
+- **Servicing Reliability & Polish:** Checked CBS `RebootInProgress` before burning servicing boot attempts, extended post-LCU `TiWorker` settle wait, fixed `/ResetBase` via a self-deleting post-reboot background task, skipped known-failing `MicrosoftSolitaireCollection` retries, fixed unescaped `&` in batch `echo` lines, and auto-saved `PocketBoot_LastBuild.log` on every successful build.
+
 # Changelog
 
 ## v4.5.0-v26.3.2 (2026-11-24)
