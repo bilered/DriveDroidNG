@@ -334,6 +334,12 @@ object UsbGadgetEngine {
 
             if (context != null && isUserStorage) {
                 val publicPath = resolved.replaceFirst("/data/media/0", "/storage/emulated/0")
+                if (!isDir) {
+                    // Non-destructive synchronous MediaProvider rescan: updates cached _size & date_modified for Android MTP
+                    // when overwriting an existing ISO filename (NEVER call MediaStore delete on an existing file, as Android 11+ unlinks it!).
+                    val qPub = shellQuote(publicPath)
+                    Shell.cmd("touch $qPath 2>/dev/null || true; sync; content call --uri content://media --method scan_file --arg $qPub >/dev/null 2>&1 || true").exec()
+                }
                 MediaScannerConnection.scanFile(context.applicationContext, arrayOf(publicPath), null, null)
             }
         }

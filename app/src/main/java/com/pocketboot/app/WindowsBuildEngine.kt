@@ -243,7 +243,7 @@ object WindowsBuildEngine {
     private const val DEFAULT_API_BASE = "https://api.uupdump.net"
     private const val GITHUB_RAW_BASE = "https://raw.githubusercontent.com/bilered/PocketBoot/main"
     private const val UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.5.0"
-    private const val STAGE_SCHEMA_VERSION = "PB_STAGE_V26"
+    private const val STAGE_SCHEMA_VERSION = "PB_STAGE_V26_2"
 
     @Volatile private var apiBaseUrl: String = DEFAULT_API_BASE
     @Volatile private var preferDirectMicrosoft: Boolean = false
@@ -3182,7 +3182,36 @@ object WindowsBuildEngine {
                     throw IllegalStateException("xorriso failed (exit ${xorRes.code}): ${errDetail.take(260)}")
                 }
 
-                // Gate 2: Post-Pack Full ISO Audit via bundled 7zzs (catches any 0-byte truncation or dropped files!)
+                // Gate 2A: ISO-9660 Primary Volume Descriptor (PVD) exact volume-size check (catches any truncated tail!)
+                val pvdRes = Shell.cmd(
+                    "sync; ACT=\$(stat -c '%s' $qOutIso 2>/dev/null || echo 0); " +
+                    "MAG=\$(dd if=$qOutIso bs=1 skip=32769 count=5 2>/dev/null | tr -cd 'A-Z0-9'); " +
+                    "SEC_HEX=\$(dd if=$qOutIso bs=1 skip=32848 count=4 2>/dev/null | od -An -tx1 | tr -d ' \\r\\n'); " +
+                    "BLK_HEX=\$(dd if=$qOutIso bs=1 skip=32896 count=2 2>/dev/null | od -An -tx1 | tr -d ' \\r\\n'); " +
+                    "echo \"PVD|\$ACT|\$MAG|\$SEC_HEX|\$BLK_HEX\""
+                ).exec().out.firstOrNull { it.startsWith("PVD|") }
+                if (pvdRes != null) {
+                    val pp = pvdRes.split('|')
+                    val actBytes = pp.getOrNull(1)?.trim()?.toLongOrNull() ?: 0L
+                    val magic = pp.getOrNull(2)?.trim().orEmpty()
+                    val secHex = pp.getOrNull(3)?.trim().orEmpty()
+                    val blkHex = pp.getOrNull(4)?.trim().orEmpty()
+                    if (magic == "CD001" && secHex.length == 8 && blkHex.length == 4) {
+                        val pvdSectors = (0..3).fold(0L) { acc, idx ->
+                            val b = secHex.substring(idx * 2, idx * 2 + 2).toLongOrNull(16) ?: 0L
+                            acc or (b shl (idx * 8))
+                        }
+                        val blkSize = ((blkHex.substring(0, 2).toLongOrNull(16) ?: 0L) or ((blkHex.substring(2, 4).toLongOrNull(16) ?: 0L) shl 8)).coerceAtLeast(2048L)
+                        val expectedIsoBytes = pvdSectors * blkSize
+                        if (expectedIsoBytes > 0L && actBytes < expectedIsoBytes) {
+                            Shell.cmd("rm -f $qOutIso 2>/dev/null || true").exec()
+                            throw IllegalStateException("Gate 2 ISO truncation detected: file is ${UsbGadgetEngine.formatBytes(actBytes)} ($actBytes B) but ISO-9660 header expects ${UsbGadgetEngine.formatBytes(expectedIsoBytes)} ($expectedIsoBytes B). Staged ISODIR preserved for retry.")
+                        }
+                        addConsole("Gate 2A passed: ISO-9660 volume verified byte-exact ($pvdSectors sectors · $actBytes bytes)")
+                    }
+                }
+
+                // Gate 2B: Post-Pack Full ISO Audit via bundled 7zzs (catches any 0-byte truncation or dropped files!)
                 val q7zBin = tools.sevenZip?.let { shellQuote(it) }
                 if (q7zBin != null) {
                     activeBin = "7zzs"

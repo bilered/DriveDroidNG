@@ -454,11 +454,12 @@ object WindowsCustomizationEngine {
             else sb.appendLine("if exist \"C:\\Windows\\Setup\\Custom\\$customScriptFileName\" call \"C:\\Windows\\Setup\\Custom\\$customScriptFileName\" >> \"%PB_LOG%\" 2>&1")
         }
         if (hasPostBootUpdates) {
-            // Schedule SYSTEM updater on first logon (after SystemSetupInProgress=0) AND on every subsequent boot until finished.
-            // Switch Winlogon\Shell to PocketBoot_WaitScreen.cmd ONLY when both schtasks succeed so the user never sees a 24H2 desktop
-            // before updates finish AND explorer.exe is guaranteed to be restored by NT AUTHORITY\SYSTEM.
+            // Schedule SYSTEM updater on first logon (after SystemSetupInProgress=0 AND OOBEInProgress=0) AND on every subsequent boot until finished.
+            // CRITICAL: NEVER touch Winlogon\Shell before OOBE completes (defaultuser0/CloudExperienceHost requires Shell=explorer.exe or OOBE loops
+            // with "Why did my PC restart?"). Register PocketBoot_WaitScreen under HKLM\...\Run so it opens cleanly on first real user logon,
+            // and let PocketBoot_Updates.cmd switch Winlogon\Shell only AFTER OOBEInProgress=0 right before the Phase 1 commit reboot!
             sb.appendLine("if exist \"C:\\Windows\\Setup\\Scripts\\PocketBoot_Updates.cmd\" (")
-            sb.appendLine("  echo [PocketBoot v4.5.0] Registering pre-desktop SYSTEM update tasks... >> \"%PB_LOG%\"")
+            sb.appendLine("  echo [PocketBoot v4.5.0] Registering post-OOBE SYSTEM update tasks... >> \"%PB_LOG%\"")
             sb.appendLine("  sc start Schedule >nul 2>&1")
             sb.appendLine("  ping -n 3 127.0.0.1 >nul")
             sb.appendLine("  schtasks /create /tn \"PocketBoot_Updates_Logon\" /tr \"cmd.exe /c C:\\Windows\\Setup\\Scripts\\PocketBoot_Updates.cmd\" /sc ONLOGON /ru SYSTEM /rl HIGHEST /f >> \"%PB_LOG%\" 2>&1")
@@ -471,17 +472,17 @@ object WindowsCustomizationEngine {
             sb.appendLine("      if exist \"C:\\Windows\\Setup\\Updates\" set \"PB_HAS_PENDING=1\"")
             sb.appendLine("      if exist \"C:\\Windows\\Setup\\sxs\" set \"PB_HAS_PENDING=1\"")
             sb.appendLine("      if \"!PB_HAS_PENDING!\"==\"1\" (")
-            sb.appendLine("        reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\" /v Shell /t REG_SZ /d \"cmd.exe /c C:\\Windows\\Setup\\Scripts\\PocketBoot_WaitScreen.cmd\" /f >> \"%PB_LOG%\" 2>&1")
-            sb.appendLine("        echo [PocketBoot v4.5.0] Enabled pre-desktop Winlogon progress shell >> \"%PB_LOG%\"")
+            sb.appendLine("        reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\" /v \"PocketBoot_WaitScreen\" /t REG_SZ /d \"cmd.exe /c C:\\Windows\\Setup\\Scripts\\PocketBoot_WaitScreen.cmd\" /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("        echo [PocketBoot v4.5.0] Queued post-OOBE progress window [Winlogon\\Shell kept explorer.exe for OOBE] >> \"%PB_LOG%\"")
             sb.appendLine("      )")
             sb.appendLine("    )")
             sb.appendLine("  ) else (")
-            sb.appendLine("    echo [PocketBoot v4.5.0] schtasks fallback via RunOnce [keeping standard explorer.exe shell] >> \"%PB_LOG%\"")
+            sb.appendLine("    echo [PocketBoot v4.5.0] schtasks fallback via RunOnce >> \"%PB_LOG%\"")
             sb.appendLine("    reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce\" /v \"PocketBoot_Updates\" /t REG_SZ /d \"cmd.exe /c C:\\Windows\\Setup\\Scripts\\PocketBoot_Updates.cmd\" /f >> \"%PB_LOG%\" 2>&1")
             sb.appendLine("  )")
             sb.appendLine(")")
             sb.appendLine("for %%D in (Apps Custom) do if exist \"C:\\Windows\\Setup\\%%D\" rmdir /s /q \"C:\\Windows\\Setup\\%%D\" >nul 2>&1")
-            sb.appendLine("echo [PocketBoot v4.5.0] SetupComplete finished %DATE% %TIME% [Apps done; OS updates queued for pre-desktop boot] >> \"%PB_LOG%\"")
+            sb.appendLine("echo [PocketBoot v4.5.0] SetupComplete finished %DATE% %TIME% [Apps done; OS updates queued for post-OOBE boot] >> \"%PB_LOG%\"")
         } else {
             if (runComponentCleanup) {
                 sb.appendLine("echo [PocketBoot] Running component cleanup [/ResetBase]...")
@@ -543,6 +544,10 @@ object WindowsCustomizationEngine {
         sb.appendLine("set \"PB_DONE=%PB_SCRIPTS%\\.pb_upd_done\"")
         sb.appendLine("set \"PB_LOCK=%PB_SCRIPTS%\\.pb_upd.lock\"")
         sb.appendLine("set \"PB_FINAL_REB=C:\\Windows\\Temp\\.pb_final_reboot\"")
+        // Never run during OOBE (defaultuser0)
+        sb.appendLine("set \"PB_OOBE=0x0\"")
+        sb.appendLine("for /f \"tokens=3\" %%O in ('reg query \"HKLM\\SYSTEM\\Setup\" /v OOBEInProgress 2^>nul ^| findstr /i \"REG_DWORD\"') do set \"PB_OOBE=%%O\"")
+        sb.appendLine("if /i \"!PB_OOBE!\"==\"0x1\" exit /b 0")
         // Give ONLOGON / ONSTART SYSTEM task a few seconds to claim lock before counting idle ticks
         sb.appendLine("set \"PB_IDLE=0\"")
         sb.appendLine("set \"PB_BOOT_GRACE=4\"")
@@ -564,17 +569,15 @@ object WindowsCustomizationEngine {
         sb.appendLine("if exist \"C:\\Windows\\Setup\\Updates\" set \"PB_STILL=1\"")
         sb.appendLine("if exist \"C:\\Windows\\Setup\\sxs\" set \"PB_STILL=1\"")
         sb.appendLine("if \"!PB_STILL!\"==\"0\" goto :PB_LAUNCH_DESKTOP")
-        // Detect if SYSTEM updater is active via kernel-enforced exclusive lock on .pb_upd.lock OR dism.exe / TiWorker.exe
+        // Detect if SYSTEM updater is active via dism.exe, TiWorker.exe, or recent log activity (<45s).
+        // Avoids writing to .pb_upd.lock from a non-elevated HKLM\...\Run session (where Access Denied would false-trigger PB_BUSY=1).
         sb.appendLine("set \"PB_BUSY=0\"")
-        sb.appendLine("if exist \"%PB_LOCK%\" (")
-        sb.appendLine("  (call ) >> \"%PB_LOCK%\" 2>nul")
-        sb.appendLine("  if !ERRORLEVEL! NEQ 0 set \"PB_BUSY=1\"")
-        sb.appendLine(")")
-        sb.appendLine("if \"!PB_BUSY!\"==\"0\" (")
-        sb.appendLine("  tasklist /fi \"imagename eq dism.exe\" 2>nul | findstr /i \"dism.exe\" >nul && set \"PB_BUSY=1\"")
-        sb.appendLine(")")
+        sb.appendLine("tasklist /fi \"imagename eq dism.exe\" 2>nul | findstr /i \"dism.exe\" >nul && set \"PB_BUSY=1\"")
         sb.appendLine("if \"!PB_BUSY!\"==\"0\" (")
         sb.appendLine("  tasklist /fi \"imagename eq TiWorker.exe\" 2>nul | findstr /i \"TiWorker.exe\" >nul && set \"PB_BUSY=1\"")
+        sb.appendLine(")")
+        sb.appendLine("if \"!PB_BUSY!\"==\"0\" if exist \"%PB_LOG%\" (")
+        sb.appendLine("  powershell -NoProfile -Command \"if (((Get-Date) - (Get-Item '%PB_LOG%').LastWriteTime).TotalSeconds -lt 45) { exit 0 } else { exit 1 }\" >nul 2>&1 && set \"PB_BUSY=1\"")
         sb.appendLine(")")
         sb.appendLine("if \"!PB_BUSY!\"==\"1\" (")
         sb.appendLine("  set \"PB_IDLE=0\"")
@@ -606,7 +609,7 @@ object WindowsCustomizationEngine {
         sb.appendLine("ping -n 6 127.0.0.1 >nul")
         sb.appendLine("goto :PB_WAIT_LOOP")
         sb.appendLine(":PB_LAUNCH_DESKTOP")
-        sb.appendLine("start \"\" explorer.exe")
+        sb.appendLine("tasklist /fi \"imagename eq explorer.exe\" 2>nul | findstr /i \"explorer.exe\" >nul || start \"\" explorer.exe")
         sb.appendLine("exit /b 0")
         return sb.toString().replace("\r\n", "\n").replace("\n", "\r\n")
     }
@@ -673,6 +676,25 @@ object WindowsCustomizationEngine {
         sb.appendLine("    ping -n 6 127.0.0.1 >nul")
         sb.appendLine("    goto :PB_WAIT_SETUP")
         sb.appendLine("  )")
+        sb.appendLine("  echo [PocketBoot v4.5.0] SystemSetupInProgress still 0x1 - deferring until next boot >> \"%PB_LOG%\"")
+        sb.appendLine("  goto :eof")
+        sb.appendLine(")")
+        // CRITICAL: Wait cleanly while Windows 11 OOBE (defaultuser0) is active (OOBEInProgress=0x1).
+        // Never run DISM or burn boot attempts during OOBE! The instant OOBE finishes (OOBEInProgress=0x0),
+        // this loop exits automatically and starts Phase 1 without requiring any extra reboot.
+        sb.appendLine("set \"PB_OOBE_WAIT=0\"")
+        sb.appendLine(":PB_WAIT_OOBE")
+        sb.appendLine("set \"PB_OOBE=0x0\"")
+        sb.appendLine("for /f \"tokens=3\" %%O in ('reg query \"HKLM\\SYSTEM\\Setup\" /v OOBEInProgress 2^>nul ^| findstr /i \"REG_DWORD\"') do set \"PB_OOBE=%%O\"")
+        sb.appendLine("if /i \"!PB_OOBE!\"==\"0x1\" (")
+        sb.appendLine("  if !PB_OOBE_WAIT! EQU 0 echo [PocketBoot v4.5.0] OOBEInProgress=0x1 - waiting for OOBE to finish before servicing... >> \"%PB_LOG%\"")
+        sb.appendLine("  set /a PB_OOBE_WAIT+=1")
+        sb.appendLine("  if !PB_OOBE_WAIT! LSS 720 (")
+        sb.appendLine("    ping -n 6 127.0.0.1 >nul")
+        sb.appendLine("    goto :PB_WAIT_OOBE")
+        sb.appendLine("  )")
+        sb.appendLine("  echo [PocketBoot v4.5.0] OOBE wait timeout - deferring to user logon >> \"%PB_LOG%\"")
+        sb.appendLine("  goto :eof")
         sb.appendLine(")")
         // Hard safety cap of 5 boot attempts so Winlogon\Shell is guaranteed to restore explorer.exe even on corrupt media
         sb.appendLine("set \"PB_ATT=0\"")
@@ -747,6 +769,7 @@ object WindowsCustomizationEngine {
             sb.appendLine("        if \"!PB_LCU_RC!\"==\"87\" goto :eof")
             sb.appendLine("        echo 1 > \"%PB_P1%\"")
             sb.appendLine("        if \"!PB_LCU_RC!\"==\"3010\" (")
+            sb.appendLine("          if exist \"C:\\Windows\\Setup\\Scripts\\PocketBoot_WaitScreen.cmd\" reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\" /v Shell /t REG_SZ /d \"cmd.exe /c C:\\Windows\\Setup\\Scripts\\PocketBoot_WaitScreen.cmd\" /f >> \"%PB_LOG%\" 2>&1")
             sb.appendLine("          echo [PocketBoot v4.5.0] Rebooting in 10s to commit Cumulative Update [Phase 1]... >> \"%PB_LOG%\"")
             sb.appendLine("          set \"PB_PHASE_REBOOT=1\"")
             sb.appendLine("          goto :eof")
@@ -807,8 +830,9 @@ object WindowsCustomizationEngine {
         sb.appendLine("for /f \"tokens=3\" %%V in ('reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\" /v DisplayVersion 2^>nul ^| findstr /i DisplayVersion') do echo DisplayVersion: %%V >> \"%PB_LOG%\"")
         sb.appendLine("for /f \"tokens=3\" %%U in ('reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\" /v UBR 2^>nul ^| findstr /i \"REG_DWORD\"') do echo UBR: %%U >> \"%PB_LOG%\"")
         sb.appendLine("dism /Online /Get-ProvisionedAppxPackages 2>nul | findstr /i \"DisplayName\" | find /c /i \"DisplayName\" >> \"%PB_LOG%\"")
-        // Unconditionally restore standard Windows Explorer desktop shell!
+        // Unconditionally restore standard Windows Explorer desktop shell & remove post-OOBE wait window hook!
         sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\" /v Shell /t REG_SZ /d \"explorer.exe\" /f >> \"%PB_LOG%\" 2>&1")
+        sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\" /v \"PocketBoot_WaitScreen\" /f >nul 2>&1")
         sb.appendLine("echo [PocketBoot v4.5.0] Restored Winlogon\\Shell to explorer.exe >> \"%PB_LOG%\"")
         if (clearAutoLogon) {
             // Clear temporary AutoLogon credentials used to skip the Pass 2 Lock Screen
