@@ -1822,7 +1822,7 @@ fun DownloadScreen(
         var rbSplitFat32 by remember(pb.workRootPath) { mutableStateOf(orig.splitWimForFat32) }
         var rbSkipWinRe by remember(pb.workRootPath) { mutableStateOf(orig.skipWinRe) }
         var rbEiCfg by remember(pb.workRootPath) { mutableStateOf(orig.eiCfgUnlock) }
-        var rbKeepPkgs by remember(pb.workRootPath) { mutableStateOf(settings.keepUupPackagesAfterBuild || orig.keepPackagesAfterBuild) }
+        var rbKeepPkgs by remember(pb.workRootPath) { mutableStateOf(settings.keepUupPackagesAfterBuild) }
         var rbAutoMount by remember(pb.workRootPath) { mutableStateOf(orig.autoMount) }
         var rbForceFull by remember(pb.workRootPath) { mutableStateOf(false) }
         var rbVirtualEds by remember(pb.workRootPath) { mutableStateOf(orig.virtualEditions.toSet()) }

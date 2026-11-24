@@ -12,6 +12,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.Date
 import java.util.Locale
@@ -338,7 +340,7 @@ object UsbGadgetEngine {
                     // Non-destructive synchronous MediaProvider rescan: updates cached _size & date_modified for Android MTP
                     // when overwriting an existing ISO filename (NEVER call MediaStore delete on an existing file, as Android 11+ unlinks it!).
                     val qPub = shellQuote(publicPath)
-                    Shell.cmd("touch $qPath 2>/dev/null || true; sync; content call --uri content://media --method scan_file --arg $qPub >/dev/null 2>&1 || true").exec()
+                    Shell.cmd("touch $qPath 2>/dev/null || true; sync; stat $qPub >/dev/null 2>&1 || true; touch $qPub 2>/dev/null || true; content call --user 0 --uri content://media --method scan_file --arg $qPub >/dev/null 2>&1 || true").exec()
                 }
                 MediaScannerConnection.scanFile(context.applicationContext, arrayOf(publicPath), null, null)
             }
@@ -357,25 +359,38 @@ object UsbGadgetEngine {
             val isUserStorage = resolved.startsWith("/data/media/0") || resolved.startsWith("/storage/emulated/0")
             if (!isUserStorage) return Pair(true, expectedBytes)
             val publicPath = resolved.replaceFirst("/data/media/0", "/storage/emulated/0")
-            if (context != null) {
-                MediaScannerConnection.scanFile(context.applicationContext, arrayOf(publicPath), arrayOf("application/octet-stream"), null)
-                runCatching { Thread.sleep(600L) }
-            }
+            val qPub = shellQuote(publicPath)
             val escSql = publicPath.replace("'", "''")
             val qWhere = shellQuote("_data='$escSql'")
+
+            fun triggerBlockingScan() {
+                // Force FUSE dentry/stat refresh on /storage/emulated/0 before MediaProvider scans the file
+                Shell.cmd("sync; stat $qPub >/dev/null 2>&1 || true; touch $qPub 2>/dev/null || true; content call --user 0 --uri content://media --method scan_file --arg $qPub >/dev/null 2>&1 || true").exec()
+                if (context != null) {
+                    val latch = CountDownLatch(1)
+                    runCatching {
+                        MediaScannerConnection.scanFile(
+                            context.applicationContext,
+                            arrayOf(publicPath),
+                            arrayOf("application/octet-stream")
+                        ) { _, _ -> latch.countDown() }
+                        latch.await(6L, TimeUnit.SECONDS)
+                    }
+                }
+            }
+
             fun querySize(): Long {
-                val out = Shell.cmd("content query --uri content://media/external/file --projection _size --where $qWhere 2>/dev/null || true").exec().out
+                val out = Shell.cmd("content query --user 0 --uri content://media/external/file --projection _size --where $qWhere 2>/dev/null || true").exec().out
                 val m = Regex("""_size=(\d+)""").find(out.joinToString(" "))
                 return m?.groupValues?.getOrNull(1)?.toLongOrNull() ?: -1L
             }
+
+            triggerBlockingScan()
             var reported = querySize()
             if (reported != expectedBytes) {
                 val mtimeSec = Shell.cmd("stat -c '%Y' ${shellQuote(resolved)} 2>/dev/null || date +%s").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: (System.currentTimeMillis() / 1000L)
-                Shell.cmd("sync; content update --uri content://media/external/file --bind _size:l:$expectedBytes --bind date_modified:l:$mtimeSec --where $qWhere >/dev/null 2>&1 || true").exec()
-                if (context != null) {
-                    MediaScannerConnection.scanFile(context.applicationContext, arrayOf(publicPath), arrayOf("application/octet-stream"), null)
-                    runCatching { Thread.sleep(400L) }
-                }
+                Shell.cmd("sync; content update --user 0 --uri content://media/external/file --bind _size:l:$expectedBytes --bind date_modified:l:$mtimeSec --where $qWhere >/dev/null 2>&1 || true").exec()
+                triggerBlockingScan()
                 reported = querySize()
             }
             Pair(reported == expectedBytes, reported)
@@ -1369,8 +1384,31 @@ object UsbGadgetEngine {
                 var workBytes = 0L
                 scanDirs.map { resolveDirectPath(it).trimEnd('/') }.distinct().forEach { dir ->
                     val qTmp = shellQuote("$dir/.pocketboot_tmp")
-                    val b = Shell.cmd("[ -d $qTmp ] && du -sb $qTmp 2>/dev/null | awk '{print \$1}' || echo 0")
-                        .exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                    // Only count cleanable temp bytes (exclude kept "isCachedReady":true PKGS/ & CAB_CACHE/)
+                    val b = Shell.cmd(
+                        """
+                        TOT=0
+                        if [ -d $qTmp ]; then
+                            for d in $qTmp/*; do
+                                [ -e "${'$'}d" ] || continue
+                                bn=${'$'}(basename "${'$'}d")
+                                [ "${'$'}bn" = ".nomedia" ] && continue
+                                if [ -d "${'$'}d" ] && grep -q '"isCachedReady":true' "${'$'}d/pb_build.json" 2>/dev/null; then
+                                    for sub in ISODIR TMP; do
+                                        if [ -d "${'$'}d/${'$'}sub" ]; then
+                                            s=${'$'}(du -sb "${'$'}d/${'$'}sub" 2>/dev/null | awk '{print $1}')
+                                            TOT=${'$'}((TOT + ${'$'}{s:-0}))
+                                        fi
+                                    done
+                                else
+                                    s=${'$'}(du -sb "${'$'}d" 2>/dev/null | awk '{print $1}')
+                                    TOT=${'$'}((TOT + ${'$'}{s:-0}))
+                                fi
+                            done
+                        fi
+                        echo "${'$'}TOT"
+                        """.trimIndent()
+                    ).exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
                     workBytes += b
                 }
                 val baseDir = context.applicationContext.getExternalFilesDir(null) ?: context.applicationContext.cacheDir

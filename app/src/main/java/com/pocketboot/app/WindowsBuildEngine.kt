@@ -169,7 +169,7 @@ data class WindowsChannelBuildConfig(
     val connections: Int = 8, val autoMount: Boolean = true,
     val includeUpdates: Boolean = false, val includeStoreApps: Boolean = false,
     val integrateNetFx3: Boolean = false, val runComponentCleanup: Boolean = false,
-    val skipWinRe: Boolean = false, val eiCfgUnlock: Boolean = false, val keepPackagesAfterBuild: Boolean = false,
+    val skipWinRe: Boolean = false, val eiCfgUnlock: Boolean = false, val keepPackagesAfterBuild: Boolean = true,
     val scheme: PartitionScheme = PartitionScheme.GPT,
     val experience: WindowsExperienceConfig = WindowsExperienceConfig(),
     val winUtil: WinUtilTweaksConfig = WinUtilTweaksConfig(),
@@ -243,7 +243,7 @@ object WindowsBuildEngine {
     private const val DEFAULT_API_BASE = "https://api.uupdump.net"
     private const val GITHUB_RAW_BASE = "https://raw.githubusercontent.com/bilered/PocketBoot/main"
     private const val UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.5.0"
-    private const val STAGE_SCHEMA_VERSION = "PB_STAGE_V26_3"
+    private const val STAGE_SCHEMA_VERSION = "PB_STAGE_V26_3_2"
 
     @Volatile private var apiBaseUrl: String = DEFAULT_API_BASE
     @Volatile private var preferDirectMicrosoft: Boolean = false
@@ -1457,7 +1457,7 @@ object WindowsBuildEngine {
         if (wd.isNotBlank()) {
             scope.launch {
                 val qMeta = shellQuote("$wd/pb_build.json")
-                Shell.cmd("if [ -f $qMeta ]; then sed -i 's/"keepPackagesAfterBuild":\(true\|false\)/"keepPackagesAfterBuild":$value/g' $qMeta 2>/dev/null || true; fi").exec()
+                Shell.cmd("""if [ -f $qMeta ]; then sed -i -e 's/"keepPackagesAfterBuild":true/"keepPackagesAfterBuild":$value/g' -e 's/"keepPackagesAfterBuild":false/"keepPackagesAfterBuild":$value/g' $qMeta 2>/dev/null || true; fi""").exec()
             }
         }
     }
@@ -1887,8 +1887,9 @@ object WindowsBuildEngine {
                 val neededFree = ((totalBytes - existingPkgBytes).coerceAtLeast(0L)) + estExtraBuildBytes
                 if (freeNow > 0L && freeNow < neededFree) throw IllegalStateException("Not enough free space. Need ~${UsbGadgetEngine.formatBytes(neededFree)}, have ${UsbGadgetEngine.formatBytes(freeNow)} free.")
 
-                val existingWasKept = Shell.cmd("grep -q '"isCachedReady":true' ${shellQuote("$workRootPath/pb_build.json")} 2>/dev/null && grep -q '"keepPackagesAfterBuild":true' ${shellQuote("$workRootPath/pb_build.json")} 2>/dev/null").exec().isSuccess
-                val effectiveDlConfig = if (existingWasKept && !config.keepPackagesAfterBuild) config.copy(keepPackagesAfterBuild = true) else config
+                val qBuildMeta = shellQuote("$workRootPath/pb_build.json")
+                val existingWasKept = Shell.cmd("""grep -q '"isCachedReady":true' $qBuildMeta 2>/dev/null""").exec().isSuccess
+                val effectiveDlConfig = config
                 saveBuildJobJson(appCtx, workRootPath, effectiveDlConfig, totalBytes, existingWasKept)
                 savePackageManifest(appCtx, workRootPath, targetFiles)
                 emitLog("win-dl", "Found ${targetFiles.size} package(s) (${UsbGadgetEngine.formatBytes(totalBytes)}) · Method=${config.downloadMethod.name}")
@@ -2716,11 +2717,12 @@ object WindowsBuildEngine {
                         """
                         set -e
                         $pathHeader
+                        export WIMLIB_IMAGEX_IGNORE_CASE=1
                         EDGE_DIR="${'$'}TMP/edge_stage"
                         rm -rf "${'$'}EDGE_DIR" && mkdir -p "${'$'}EDGE_DIR"
-                        $qWim extract $qEdgeWim 1 / --dest-dir="${'$'}EDGE_DIR" --no-acls --no-attributes >/dev/null 2>&1
+                        $qWim extract $qEdgeWim 1 / --dest-dir="${'$'}EDGE_DIR" --no-acls --no-attributes 2>&1
                         for idx in $(seq 1 $totalWimIndexesEdge); do
-                            $qWim update $qStageWim "${'$'}idx" --command="add '${'$'}EDGE_DIR' /" >/dev/null 2>&1
+                            $qWim update $qStageWim "${'$'}idx" --command="add --no-acls '${'$'}EDGE_DIR' /" 2>&1
                         done
                         rm -rf "${'$'}EDGE_DIR"
                         """.trimIndent()
@@ -2729,7 +2731,8 @@ object WindowsBuildEngine {
                         addConsole("Integrated offline Microsoft Edge (${edgeWimPath.substringAfterLast('/')}) into $totalWimIndexesEdge edition(s)")
                         emitConvLog("win-build", "Integrated offline Edge.wim into $totalWimIndexesEdge edition(s)")
                     } else {
-                        addConsole("Skipped Edge.wim merge (non-fatal)")
+                        val edgeErr = (edgeRes.out + edgeRes.err).lastOrNull { it.isNotBlank() }?.take(120).orEmpty()
+                        addConsole("Skipped Edge.wim merge (non-fatal${if (edgeErr.isNotBlank()) ": $edgeErr" else ""})")
                     }
                 }
             }
@@ -3155,23 +3158,23 @@ object WindowsBuildEngine {
                 if (usbErr != null) throw IllegalStateException(usbErr)
             } else {
                 activeBin = "xorriso"
-                val qOutIso = shellQuote(finalOutputPath)
+                val qFinalIso = shellQuote(finalOutputPath)
+                val tmpOutIsoPath = "$safeTargetDir/.pb_pack_${System.currentTimeMillis().toString().takeLast(6)}.tmp.iso"
+                val qOutIso = shellQuote(tmpOutIsoPath)
                 val volId = "WIN_${config.build.build.substringBefore('.')}".take(28).uppercase()
                 val estIsoBytes = Shell.cmd("du -sb $qIsoDir 2>/dev/null | awk '{print \$1}'").exec().out.firstOrNull()?.trim()?.toLongOrNull()?.coerceAtLeast(1L) ?: (5L * 1024L * 1024L * 1024L)
+                val existingOutBytes = Shell.cmd("stat -c '%s' $qFinalIso 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
                 val freeForIso = UsbGadgetEngine.getFreeSpaceBytes(config.targetDir)
-                if (freeForIso > 0L && freeForIso < estIsoBytes + 256L * 1024L * 1024L) {
-                    throw IllegalStateException("Not enough free space to pack ISO. Need ~${UsbGadgetEngine.formatBytes(estIsoBytes + 256L * 1024L * 1024L)}, have ${UsbGadgetEngine.formatBytes(freeForIso)} free.")
+                if (freeForIso > 0L && (freeForIso + existingOutBytes) < estIsoBytes + 256L * 1024L * 1024L) {
+                    throw IllegalStateException("Not enough free space to pack ISO. Need ~${UsbGadgetEngine.formatBytes(estIsoBytes + 256L * 1024L * 1024L)}, have ${UsbGadgetEngine.formatBytes(freeForIso + existingOutBytes)} free.")
                 }
 
                 val publicOutPath = finalOutputPath.replaceFirst("/data/media/0", "/storage/emulated/0")
                 val escPublicSql = publicOutPath.replace("'", "''")
                 val qPublicWhere = shellQuote("_data='$escPublicSql'")
-                val tmpOutIsoPath = "$safeTargetDir/.pb_pack_${System.currentTimeMillis().toString().takeLast(6)}.iso.tmp"
-                val qFinalIso = qOutIso
-                val qOutIso = shellQuote(tmpOutIsoPath)
                 // Layer 1 MTP Fix: purge any stale MediaStore row & old ISO BEFORE xorriso writes so Android MTP drops the old cached _size!
                 if (finalOutputPath.startsWith("/data/media/0")) {
-                    Shell.cmd("content delete --uri content://media/external/file --where $qPublicWhere >/dev/null 2>&1 || true; rm -f ${shellQuote(publicOutPath)} $qFinalIso $qOutIso 2>/dev/null || true; sync").exec()
+                    Shell.cmd("content delete --user 0 --uri content://media/external/file --where $qPublicWhere >/dev/null 2>&1 || true; rm -f ${shellQuote(publicOutPath)} $qFinalIso $qOutIso ${shellQuote(safeTargetDir)}/.pb_pack_*.tmp.iso ${shellQuote(safeTargetDir)}/.pb_pack_*.iso.tmp 2>/dev/null || true; sync").exec()
                 }
                 val xorLog = "/data/local/tmp/pb_xorriso_prog.log"
                 val qXorLog = shellQuote(xorLog)
@@ -3272,7 +3275,7 @@ object WindowsBuildEngine {
                     publishConv("Step 4/4 · Gate 2: Verifying final ISO...", "Scanning all ISO entries for corruption", 0.96f)
                     val gate2Res = runIsolatedRootScript(appCtx, "gate2_iso", """
                         set -e
-                        $q7zBin l -slt $qOutIso 2>/dev/null | awk '
+                        $q7zBin l -tiso -slt $qOutIso 2>/dev/null | awk '
                             BEGIN { path=""; folder=""; sz=-1; files=0; zeros=0; bad=""; seen=0 }
                             function flush_rec() {
                                 if (!seen) return
@@ -3413,8 +3416,9 @@ object WindowsBuildEngine {
             NotificationHelper.showBuildComplete(appCtx, job.jobTitle, "$finalFileName · $benchStr")
             job.onComplete(completion)
         } catch (_: CancellationException) {
-            Shell.cmd("rm -rf ${shellQuote(isoDir.absolutePath)} ${shellQuote(tmpDir.absolutePath)} 2>/dev/null || true").exec()
+            Shell.cmd("rm -rf ${shellQuote(isoDir.absolutePath)} ${shellQuote(tmpDir.absolutePath)} ${shellQuote(safeTargetDir)}/.pb_pack_*.tmp.iso ${shellQuote(safeTargetDir)}/.pb_pack_*.iso.tmp 2>/dev/null || true").exec()
         } catch (e: Exception) {
+            Shell.cmd("rm -f ${shellQuote(safeTargetDir)}/.pb_pack_*.tmp.iso ${shellQuote(safeTargetDir)}/.pb_pack_*.iso.tmp 2>/dev/null || true").exec()
             // Preserve PKGS & (if Step 4 already staged) preserve ISODIR so Retry jumps straight to Step 4 packing!
             val keepIsoDir = currentStep == 4 && isStageMarkerValid(workRootPath)
             if (keepIsoDir) {
