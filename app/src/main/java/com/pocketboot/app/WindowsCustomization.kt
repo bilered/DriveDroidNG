@@ -449,7 +449,7 @@ object WindowsCustomizationEngine {
             sb.appendLine("  )")
             sb.appendLine(")")
         }
-        if (hasEdgeMsi) {
+        if (hasEdgeMsi && !hasPostBootUpdates) {
             sb.appendLine("if exist \"C:\\Windows\\Setup\\Apps\\Edge\\MicrosoftEdgeEnterprise.msi\" (")
             sb.appendLine("  echo [PocketBoot] Installing Microsoft Edge offline...")
             sb.appendLine("  echo [PocketBoot v4.5.0] Installing offline Microsoft Edge Enterprise MSI... >> \"%PB_LOG%\"")
@@ -486,7 +486,11 @@ object WindowsCustomizationEngine {
             sb.appendLine("      if exist \"C:\\Windows\\Setup\\Updates\" set \"PB_HAS_PENDING=1\"")
             sb.appendLine("      if exist \"C:\\Windows\\Setup\\sxs\" set \"PB_HAS_PENDING=1\"")
             sb.appendLine("      if \"!PB_HAS_PENDING!\"==\"1\" (")
-            sb.appendLine("        reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\" /v \"PocketBoot_WaitScreen\" /t REG_SZ /d \"cmd.exe /c C:\\Windows\\Setup\\Scripts\\PocketBoot_WaitScreen.cmd\" /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("        if exist \"C:\\Windows\\Setup\\Scripts\\PocketBoot_WaitScreen.ps1\" (")
+            sb.appendLine("          reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\" /v \"PocketBoot_WaitScreen\" /t REG_SZ /d \"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -STA -File C:\\Windows\\Setup\\Scripts\\PocketBoot_WaitScreen.ps1\" /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("        ) else (")
+            sb.appendLine("          reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\" /v \"PocketBoot_WaitScreen\" /t REG_SZ /d \"cmd.exe /c C:\\Windows\\Setup\\Scripts\\PocketBoot_WaitScreen.cmd\" /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("        )")
             sb.appendLine("        echo [PocketBoot v4.5.0] Queued post-OOBE progress window [Winlogon\\Shell kept explorer.exe for OOBE] >> \"%PB_LOG%\"")
             sb.appendLine("      )")
             sb.appendLine("    )")
@@ -565,14 +569,12 @@ ${'$'}doneFlag = 'C:\Windows\Setup\Scripts\.pb_upd_done'
 ${'$'}finalReb = 'C:\Windows\Temp\.pb_final_reboot'
 ${'$'}p1Flag = 'C:\Windows\Setup\Scripts\.pb_lcu_p1'
 
-# Never run during OOBE
+# CRITICAL: Never run during OOBE (defaultuser0 / CloudExperienceHost)
 try {
     ${'$'}oobe = (Get-ItemProperty 'HKLM:\SYSTEM\Setup' -Name OOBEInProgress -ErrorAction SilentlyContinue).OOBEInProgress
     if (${'$'}oobe -eq 1 -or ${'$'}env:USERNAME -eq 'defaultuser0') { exit 0 }
+    if (Get-Process -Name WWAHost,msoobe -ErrorAction SilentlyContinue) { exit 0 }
 } catch {}
-
-# Keep 24H2 explorer.exe hidden until full 26H2 installation completes
-try { Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue } catch {}
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
 ${'$'}form = New-Object System.Windows.Forms.Form
@@ -679,10 +681,8 @@ ${'$'}timer.Add_Tick({
             return
         }
 
-        # Keep explorer.exe suppressed while servicing is active so pre-update desktop never appears
-        if (Get-Process -Name explorer -ErrorAction SilentlyContinue) {
-            Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-        }
+        # Keep fullscreen dark overlay pinned on top until servicing completes
+        ${'$'}form.TopMost = ${'$'}true
 
         if (Test-Path ${'$'}p1Flag) {
             ${'$'}lblPhase.Text = 'Finalizing Windows 11 (Phase 2 of 2)'
@@ -773,8 +773,7 @@ exit 0
         sb.appendLine("if /i \"!PB_OOBE!\"==\"0x1\" exit /b 0")
         sb.appendLine("if /i \"%USERNAME%\"==\"defaultuser0\" exit /b 0")
         sb.appendLine("if exist \"%PB_DONE%\" goto :PB_LAUNCH_DESKTOP")
-        // Suppress 24H2 explorer.exe immediately so full installation finishes BEFORE actual desktop
-        sb.appendLine("taskkill /f /im explorer.exe >nul 2>&1")
+        sb.appendLine("tasklist /fi \"imagename eq WWAHost.exe\" 2>nul | findstr /i \"WWAHost.exe\" >nul && exit /b 0")
         // Launch modern fullscreen dark-mode progress screen
         sb.appendLine("if exist \"%PB_SCRIPTS%\\PocketBoot_WaitScreen.ps1\" (")
         sb.appendLine("  powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -STA -File \"%PB_SCRIPTS%\\PocketBoot_WaitScreen.ps1\" >nul 2>&1")
@@ -797,7 +796,6 @@ exit 0
         sb.appendLine("if exist \"C:\\Windows\\Setup\\Updates\" set \"PB_STILL=1\"")
         sb.appendLine("if exist \"C:\\Windows\\Setup\\sxs\" set \"PB_STILL=1\"")
         sb.appendLine("if \"!PB_STILL!\"==\"0\" goto :PB_LAUNCH_DESKTOP")
-        sb.appendLine("taskkill /f /im explorer.exe >nul 2>&1")
         sb.appendLine("set \"PB_BUSY=0\"")
         sb.appendLine("tasklist /fi \"imagename eq dism.exe\" 2>nul | findstr /i \"dism.exe\" >nul && set \"PB_BUSY=1\"")
         sb.appendLine("if \"!PB_BUSY!\"==\"0\" tasklist /fi \"imagename eq TiWorker.exe\" 2>nul | findstr /i \"TiWorker.exe\" >nul && set \"PB_BUSY=1\"")
@@ -910,12 +908,10 @@ exit 0
         sb.appendLine("  echo [PocketBoot v4.5.0] OOBE wait timeout - deferring to user logon >> \"%PB_LOG%\"")
         sb.appendLine("  goto :eof")
         sb.appendLine(")")
-        // OOBE is complete (OOBEInProgress=0x0): immediately lock Winlogon\Shell to our fullscreen dark-mode progress screen
-        // and terminate any early explorer.exe so full 26H2 installation completes BEFORE the actual desktop!
-        sb.appendLine("if exist \"C:\\Windows\\Setup\\Scripts\\PocketBoot_WaitScreen.cmd\" (")
-        sb.appendLine("  reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\" /v Shell /t REG_SZ /d \"cmd.exe /c C:\\Windows\\Setup\\Scripts\\PocketBoot_WaitScreen.cmd\" /f >nul 2>&1")
-        sb.appendLine("  taskkill /f /im explorer.exe >nul 2>&1")
-        sb.appendLine(")")
+        // CRITICAL: NEVER touch Winlogon\Shell or kill explorer.exe before Phase 1 completes!
+        // On Win 11 24H2/26H2, PocketBoot_Updates.cmd starts ~3s after SetupComplete when OOBEInProgress is still 0x0;
+        // modifying Winlogon\Shell here crashes defaultuser0 OOBE into "Why did my PC restart?".
+        // Boot 1 uses HKLM\...\Run -> fullscreen TopMost dark overlay (after OOBE); Boot 2 uses Winlogon\Shell (set right before Phase 1 reboot).
         // Post-LCU settle wait BEFORE burning a boot attempt: wait for Windows mid-LCU commit reboot & TiWorker/Recall servicing
         sb.appendLine("if exist \"%PB_P1%\" (")
         sb.appendLine("  echo [PocketBoot v4.5.0] Waiting 25s + CBS/TiWorker settle after LCU reboot... >> \"%PB_LOG%\"")
@@ -993,6 +989,20 @@ exit 0
             sb.appendLine("        if \"!PB_LCU_RC!\"==\"87\" goto :eof")
             sb.appendLine("        echo 1 > \"%PB_P1%\"")
             sb.appendLine("        if \"!PB_LCU_RC!\"==\"3010\" (")
+            sb.appendLine("          set \"PB_P1_OOBE_W=0\"")
+            sb.appendLine("          :PB_P1_WAIT_OOBE")
+            sb.appendLine("          set \"PB_P1_OOBE_ACT=0\"")
+            sb.appendLine("          for /f \"tokens=3\" %%O in ('reg query \"HKLM\\SYSTEM\\Setup\" /v OOBEInProgress 2^>nul ^| findstr /i \"REG_DWORD\"') do if /i \"%%O\"==\"0x1\" set \"PB_P1_OOBE_ACT=1\"")
+            sb.appendLine("          tasklist /fi \"imagename eq WWAHost.exe\" 2>nul | findstr /i \"WWAHost.exe\" >nul && set \"PB_P1_OOBE_ACT=1\"")
+            sb.appendLine("          tasklist /fi \"imagename eq msoobe.exe\" 2>nul | findstr /i \"msoobe.exe\" >nul && set \"PB_P1_OOBE_ACT=1\"")
+            sb.appendLine("          if \"!PB_P1_OOBE_ACT!\"==\"1\" (")
+            sb.appendLine("            if !PB_P1_OOBE_W! EQU 0 echo [PocketBoot v4.5.0] Phase 1 staged - waiting for user to finish OOBE before rebooting... >> \"%PB_LOG%\"")
+            sb.appendLine("            set /a PB_P1_OOBE_W+=1")
+            sb.appendLine("            if !PB_P1_OOBE_W! LSS 360 (")
+            sb.appendLine("              ping -n 6 127.0.0.1 >nul")
+            sb.appendLine("              goto :PB_P1_WAIT_OOBE")
+            sb.appendLine("            )")
+            sb.appendLine("          )")
             sb.appendLine("          if exist \"C:\\Windows\\Setup\\Scripts\\PocketBoot_WaitScreen.cmd\" reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\" /v Shell /t REG_SZ /d \"cmd.exe /c C:\\Windows\\Setup\\Scripts\\PocketBoot_WaitScreen.cmd\" /f >> \"%PB_LOG%\" 2>&1")
             sb.appendLine("          echo [PocketBoot v4.5.0] Rebooting in 10s to commit Cumulative Update [Phase 1]... >> \"%PB_LOG%\"")
             sb.appendLine("          set \"PB_PHASE_REBOOT=1\"")
@@ -1046,7 +1056,7 @@ exit 0
             sb.appendLine("if exist \"C:\\Windows\\Setup\\sxs\" (echo [PocketBoot v4.5.0] Enabling .NET Framework 3.5... >> \"%PB_LOG%\" & dism /Online /Enable-Feature /FeatureName:NetFx3 /All /LimitAccess /Source:\"C:\\Windows\\Setup\\sxs\" /NoRestart >> \"%PB_LOG%\" 2>&1 & if !ERRORLEVEL! EQU 1115 goto :eof & rmdir /s /q \"C:\\Windows\\Setup\\sxs\" >> \"%PB_LOG%\" 2>&1)")
         }
         sb.appendLine("if exist \"C:\\Windows\\Setup\\Apps\\Edge\\MicrosoftEdgeEnterprise.msi\" (")
-        sb.appendLine("  echo [PocketBoot v4.5.0] Retrying offline Microsoft Edge Enterprise MSI... >> \"%PB_LOG%\"")
+        sb.appendLine("  echo [PocketBoot v4.5.0] Installing offline Microsoft Edge Enterprise MSI... >> \"%PB_LOG%\"")
         sb.appendLine("  msiexec /i \"C:\\Windows\\Setup\\Apps\\Edge\\MicrosoftEdgeEnterprise.msi\" /qn /norestart >> \"%PB_LOG%\" 2>&1")
         sb.appendLine("  echo [PocketBoot v4.5.0] Microsoft Edge MSI retry exit code: !ERRORLEVEL! >> \"%PB_LOG%\"")
         sb.appendLine("  rmdir /s /q \"C:\\Windows\\Setup\\Apps\" >nul 2>&1")

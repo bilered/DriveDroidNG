@@ -1,3 +1,8 @@
+## v4.5.0-v26.4.1 (2026-11-25)
+- **OOBE "Why did my PC restart?" Hotfix:** Removed the premature `Winlogon\Shell` overwrite and `taskkill /im explorer.exe` from the top of `PocketBoot_Updates.cmd` (which fired ~3 s after `SetupComplete.cmd` before `OOBEInProgress` flipped to `0x1`, crashing `defaultuser0` OOBE).
+- **Safe Fullscreen Pre-Desktop Overlay on Boot 1 & Boot 2:** Boot 1 launches `PocketBoot_WaitScreen.ps1` directly from `HKLM\...\Run` (zero CMD flash, fullscreen `TopMost` dark overlay after OOBE without killing `explorer.exe`), while Boot 2 sets `Winlogon\Shell` only *after* Phase 1 DISM completes and verifies `OOBEInProgress`, `WWAHost.exe`, and `msoobe.exe` are all inactive.
+- **Reliable Offline Edge MSI Install:** Deferred `MicrosoftEdgeEnterprise.msi` installation to `PocketBoot_Updates.cmd` (`SystemSetupInProgress=0`) when updates are queued so Windows Installer (`msiserver`) installs it cleanly on the first attempt.
+
 ## v4.5.0-v26.4 (2026-11-25)
 - **All Inbox Store Apps Default ON + UI Simplification:** Removed extra 4-way Store App sub-options in Download & Offline Rebuild sheets; replaced with a single default-ON *Include All Inbox Store Apps* toggle (always visible for Win 11 builds).
 - **Bulletproof Store Apps Fetcher (Zero Silent Loss):** Added 2.2 s UUPdump pacing, fixed `MicrosoftUupClient.kt` to always merge embedded `<Files>` from `GetExtendedUpdateInfo2`, added zero-rate-limit Direct Microsoft Store App failover, pre-build manifest audit logging, and a hard guard that aborts instead of building a 0-app ISO.

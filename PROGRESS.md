@@ -1,6 +1,6 @@
 # PocketBoot Development Progress
 
-## Current Milestone: v4.5.0 (v26.4)
+## Current Milestone: v4.5.0 (v26.4.1)
 - **Windows 11 26H2 (Build 26300.10075) UUP ISO Builder:**
   - Confirmed clean upgrade from `24H2` (`26100.1`) to **Windows 11 26H2 (`26300.10075`)** with zero OOBE reboot loops.
   - Bulletproof Store Apps: paced UUPdump queries + zero-rate-limit Direct Microsoft (`fe3.delivery.mp.microsoft.com`) fallback + hard guard preventing silent 0-app builds; simplified UI to default-ON **All Inbox Store Apps**.
