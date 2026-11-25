@@ -624,10 +624,7 @@ fun DownloadScreen(
     val scope = rememberCoroutineScope()
     val defaultDir = settings.defaultDir
     val turboState by FastIsoDownloader.state.collectAsState()
-    val winDlState by WindowsBuildEngine.downloadState.collectAsState()
-    val winConvState by WindowsBuildEngine.conversionState.collectAsState()
     val lastCompletion by FastIsoDownloader.lastCompletion.collectAsState()
-    var showBuildMonitorSheet by remember { mutableStateOf(false) }
 
     val activeMultiBootTarget = remember(settings.downloadTargetMultiBootPath, multiBootDrives) {
         val target = settings.downloadTargetMultiBootPath
@@ -637,17 +634,9 @@ fun DownloadScreen(
     }
 
     var pendingResumables by remember { mutableStateOf<List<PendingResumableDownload>>(emptyList()) }
-    var pendingWinBuilds by remember { mutableStateOf<List<PendingWindowsBuild>>(emptyList()) }
-    var rebuildOptionsTarget by remember { mutableStateOf<PendingWindowsBuild?>(null) }
     val turboActive = turboState != null
-    val winDlActive = winDlState != null
-    val winDlPaused = winDlState?.isPaused == true
-    val winConvActive = winConvState != null
-    val winConvFailed = winConvState?.isFailed == true
-    val winConvCompleted = winConvState?.isCompleted == true
-    LaunchedEffect(turboActive, winDlActive, winDlPaused, winConvActive, winConvFailed, winConvCompleted, settings.defaultDir) {
+    LaunchedEffect(turboActive, settings.defaultDir) {
         pendingResumables = FastIsoDownloader.scanPendingResumableDownloads(context)
-        pendingWinBuilds = WindowsBuildEngine.scanPendingBuilds(context, settings.scanDirs + settings.defaultDir)
     }
 
     val initialList = remember(settings.cachedDistrosJson) {
@@ -666,13 +655,11 @@ fun DownloadScreen(
     var longPressedDistro by remember { mutableStateOf<CuratedIso?>(null) }
     var longPressedWindows by remember { mutableStateOf<WindowsCatalogFamily?>(null) }
     var catalogSearch by remember { mutableStateOf("") }
-    var showCancelWinBuildDialog by remember { mutableStateOf(false) }
-
     var customUrl by remember { mutableStateOf("") }
     var selectedCategory by remember { mutableStateOf("All") }
     var autoMount by remember { mutableStateOf(true) }
 
-    val anyDownloadActive = turboState != null || winDlState != null
+    val anyDownloadActive = turboState != null
     val freeBytes = remember(defaultDir, turboState) { UsbGadgetEngine.getFreeSpaceBytes(defaultDir) }
 
     val activeRepoUrls = remember(settings.useDefaultDistroRepo, settings.customRepoUrls) {
@@ -1060,82 +1047,7 @@ fun DownloadScreen(
         }
 
         AnimatedVisibility(
-            visible = pendingWinBuilds.isNotEmpty() && winDlState == null,
-            enter = fadeIn() + expandVertically(),
-            exit = fadeOut() + shrinkVertically()
-        ) {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                PocketSectionHeader("Unfinished & Cached Windows Builds", trailing = "${pendingWinBuilds.size}")
-                pendingWinBuilds.forEach { pb ->
-                    Surface(
-                        shape = RoundedCornerShape(PocketTokens.CardRadius),
-                        color = PocketColors.surfaceCard,
-                        border = BorderStroke(1.dp, PocketColors.infoBlue.copy(alpha = 0.7f))
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 11.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            Box(
-                                modifier = Modifier.size(36.dp).clip(RoundedCornerShape(10.dp)).background(PocketColors.infoBlueBg),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(Icons.Rounded.Build, null, tint = PocketColors.infoBlue, modifier = Modifier.size(18.dp))
-                            }
-                            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                Text(pb.title, style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                Text(
-                                    text = if (pb.isCachedReady) {
-                                        val readyTag = if (pb.hasStagedIsoDir) "Fast Step-4 ready" else "Offline ready"
-                                        "${UsbGadgetEngine.formatBytes(pb.cachedBytes)} · ${pb.config.compression.shortLabel} · $readyTag"
-                                    } else if (pb.totalBytes > 0L) {
-                                        "${(pb.progress * 100).toInt()}% · ${UsbGadgetEngine.formatBytes(pb.cachedBytes)} / ${UsbGadgetEngine.formatBytes(pb.totalBytes)}"
-                                    } else {
-                                        "${UsbGadgetEngine.formatBytes(pb.cachedBytes)} cached"
-                                    },
-                                    style = PocketColors.monoStyle,
-                                    color = PocketColors.textSecondary
-                                )
-                            }
-                            Button(
-                                onClick = {
-                                    if (pb.isCachedReady) {
-                                        rebuildOptionsTarget = pb
-                                    } else {
-                                        WindowsBuildEngine.startBuild(
-                                            context = context,
-                                            config = pb.config.copy(connections = settings.downloadConnections),
-                                            onComplete = { evt -> scope.launch { onDownloadCompleted(evt) } },
-                                            onError = { err -> scope.launch { onMessage(err, true) } },
-                                            onLog = { entry -> scope.launch { onAppendLog(entry) } }
-                                        )
-                                    }
-                                },
-                                contentPadding = PaddingValues(horizontal = 11.dp, vertical = 6.dp),
-                                shape = RoundedCornerShape(PocketTokens.CompactButtonRadius),
-                                colors = ButtonDefaults.buttonColors(containerColor = PocketColors.infoBlue, contentColor = Color.White)
-                            ) {
-                                Text(if (pb.isCachedReady) "Rebuild" else "Resume", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
-                            }
-                            IconButton(
-                                onClick = {
-                                    WindowsBuildEngine.discardPendingBuild(context, pb)
-                                    pendingWinBuilds = pendingWinBuilds.filterNot { it.workRootPath == pb.workRootPath }
-                                    onMessage("Discarded unfinished build ${pb.title}.", false)
-                                },
-                                modifier = Modifier.size(32.dp)
-                            ) {
-                                Icon(Icons.Rounded.Close, "Discard", tint = PocketColors.textMuted, modifier = Modifier.size(16.dp))
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        AnimatedVisibility(
-            visible = lastCompletion != null && turboState == null && winDlState == null,
+            visible = lastCompletion != null && turboState == null,
             enter = fadeIn() + expandVertically(),
             exit = fadeOut() + shrinkVertically()
         ) {
@@ -1350,100 +1262,6 @@ fun DownloadScreen(
                             ) {
                                 Text("Resume", modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp), style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold, color = PocketColors.onAccent)
                             }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Dedicated ISO / USB Builder Pipeline Card (independent of Turbo Downloader — tap for full live telemetry)
-        AnimatedVisibility(
-            visible = winConvState != null,
-            enter = fadeIn(tween(220)) + expandVertically(spring(stiffness = Spring.StiffnessMediumLow)),
-            exit = fadeOut(tween(180)) + shrinkVertically()
-        ) {
-            winConvState?.let { conv ->
-                val pctStr = String.format(Locale.US, "%.1f%%", (conv.overallProgress * 100f).coerceIn(0f, 100f))
-                val cardBorder = when { conv.isFailed -> PocketColors.danger; conv.isCompleted -> PocketColors.success; else -> PocketColors.accent }
-                val cardGradTop = when { conv.isFailed -> PocketColors.dangerBg.copy(alpha = 0.55f); conv.isCompleted -> PocketColors.successBg.copy(alpha = 0.55f); else -> PocketColors.accentBg.copy(alpha = 0.55f) }
-                Surface(
-                    modifier = Modifier.fillMaxWidth().bounceClick { showBuildMonitorSheet = true },
-                    shape = RoundedCornerShape(16.dp), color = PocketColors.surfaceCard, border = BorderStroke(1.5.dp, cardBorder)
-                ) {
-                    Column(
-                        modifier = Modifier.fillMaxWidth().background(Brush.verticalGradient(listOf(cardGradTop, PocketColors.surfaceCard))).padding(14.dp),
-                        verticalArrangement = Arrangement.spacedBy(9.dp)
-                    ) {
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    Surface(shape = RoundedCornerShape(5.dp), color = when { conv.isFailed -> PocketColors.dangerBg; conv.isCompleted -> PocketColors.successBg; conv.isCoolingDown -> PocketColors.warningBg; else -> PocketColors.accentBg }) {
-                                        Text(when { conv.isFailed -> "FAILED"; conv.isCompleted -> "DONE"; conv.isCoolingDown -> "COOLING"; else -> "BUILD" }, modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, color = when { conv.isFailed -> PocketColors.danger; conv.isCompleted -> PocketColors.success; conv.isCoolingDown -> PocketColors.warning; else -> PocketColors.accentSoft })
-                                    }
-                                    Text(conv.title, style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
-                                    if (conv.queuedCount > 0) Surface(shape = RoundedCornerShape(5.dp), color = PocketColors.infoBlueBg) { Text("+${conv.queuedCount} queued", modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, color = PocketColors.infoBlue) }
-                                }
-                                Text(if (conv.isCompleted) conv.completionSummary.ifBlank { conv.stageLabel } else conv.stageLabel, style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            }
-                            if (conv.isCompleted || conv.isFailed) {
-                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    Text("Log ›", style = MaterialTheme.typography.labelSmall, color = if (conv.isCompleted) PocketColors.success else PocketColors.danger)
-                                    IconButton(onClick = { WindowsBuildEngine.dismissFinishedConversion() }, modifier = Modifier.size(30.dp)) {
-                                        Icon(Icons.Rounded.Close, "Dismiss", tint = PocketColors.textSecondary, modifier = Modifier.size(16.dp))
-                                    }
-                                }
-                            } else {
-                                Text("Tap for details ›", style = MaterialTheme.typography.labelSmall, color = PocketColors.accentSoft)
-                            }
-                        }
-                        LinearProgressIndicator(progress = { if (conv.isCompleted) 1f else conv.overallProgress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(999.dp)), color = if (conv.isCompleted) PocketColors.success else if (conv.isFailed) PocketColors.danger else PocketColors.accent, trackColor = PocketColors.surfaceSubtle)
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text(if (conv.isCompleted) "100% · ${formatDurationShort(conv.elapsedSeconds)}${if (conv.bootVerifiedLabel.isNotBlank()) " · ${conv.bootVerifiedLabel}" else ""}" else "$pctStr · ${formatDurationShort(conv.elapsedSeconds)}${if (conv.etaSeconds > 0L) " · ETA ${FastIsoDownloader.formatEta(conv.etaSeconds)}" else ""}", style = PocketColors.monoStyle, color = if (conv.isCompleted) PocketColors.success else PocketColors.accentSoft)
-                            Text(buildString { append(if (conv.isCompleted) "Tap × to dismiss" else if (conv.isCoolingDown) "Cooling" else if (conv.diskSpeedBytesPerSec >= 1024L) FastIsoDownloader.formatSpeed(conv.diskSpeedBytesPerSec) else conv.activeBinary); if (!conv.isCompleted && conv.batteryTempC > 0f) append(" · ${String.format(java.util.Locale.US, "%.1f°C", conv.batteryTempC)}") }, style = PocketColors.monoStyle, color = if (conv.isCompleted) PocketColors.textSecondary else if (conv.batteryTempC >= 42f) PocketColors.danger else if (conv.batteryTempC >= 38f) PocketColors.warning else PocketColors.success)
-                        }
-                    }
-                }
-            }
-        }
-
-        // Active Windows Package Downloader Card (frees up immediately once packages finish!)
-        AnimatedVisibility(
-            visible = winDlState != null,
-            enter = fadeIn(tween(220)) + expandVertically(spring(stiffness = Spring.StiffnessMediumLow)),
-            exit = fadeOut(tween(180)) + shrinkVertically()
-        ) {
-            winDlState?.let { job ->
-                Surface(shape = RoundedCornerShape(16.dp), color = PocketColors.surfaceCard, border = BorderStroke(1.5.dp, PocketColors.infoBlue)) {
-                    Column(
-                        modifier = Modifier.fillMaxWidth().background(Brush.verticalGradient(listOf(PocketColors.infoBlueBg.copy(alpha = 0.55f), PocketColors.surfaceCard))).padding(14.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    Text(job.title, style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
-                                    Surface(shape = RoundedCornerShape(5.dp), color = PocketColors.warningBg) { Text(if (job.isPaused) "PAUSED" else "⚡ ${job.activeThreads}x", modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, color = PocketColors.warning) }
-                                }
-                                Text(job.stage, style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            }
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                IconButton(onClick = { if (job.isPaused) WindowsBuildEngine.resumeDownload() else WindowsBuildEngine.pauseDownload() }, modifier = Modifier.size(34.dp)) {
-                                    Icon(if (job.isPaused) Icons.Rounded.PlayArrow else Icons.Rounded.Pause, null, tint = PocketColors.accentSoft, modifier = Modifier.size(19.dp))
-                                }
-                                IconButton(onClick = { showCancelWinBuildDialog = true }, modifier = Modifier.size(34.dp)) {
-                                    Icon(Icons.Rounded.Close, "Cancel", tint = PocketColors.danger, modifier = Modifier.size(18.dp))
-                                }
-                            }
-                        }
-                        LinearProgressIndicator(progress = { job.progress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(999.dp)), color = PocketColors.infoBlue, trackColor = PocketColors.surfaceSubtle)
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text("${(job.progress * 100).toInt()}% · ${job.detail}", style = PocketColors.monoStyle, color = PocketColors.infoBlue, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(if (job.isPaused) "Paused · Resumable" else "${FastIsoDownloader.formatSpeed(job.speedBytesPerSec)} · ${FastIsoDownloader.formatEta(job.etaSeconds)}", style = PocketColors.monoStyle, color = if (job.isPaused) PocketColors.warning else PocketColors.success, maxLines = 1)
-                        }
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                            Text("Auto-mount when finished", style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary)
-                            PocketSwitch(checked = job.autoMount, onCheckedChange = { WindowsBuildEngine.updateDownloadAutoMount(it) })
                         }
                     }
                 }
@@ -1746,542 +1564,12 @@ fun DownloadScreen(
     selectedWindowsFamily?.let { fam ->
         WindowsDownloadSheet(
             family = fam,
-            targetDir = defaultDir,
-            multiBootDrives = multiBootDrives,
-            activeMultiBootTarget = activeMultiBootTarget,
             turboConnections = settings.downloadConnections,
-            presets = settings.autounattendPresets,
-            customUupApiUrl = settings.customUupApiUrl,
-            preferDirectMicrosoftUup = settings.preferDirectMicrosoftUup,
-            cachedUupBuildsJson = settings.cachedUupBuildsJson,
-            defaultThermalProfile = settings.buildThermalProfile,
-            defaultAutoThermalCooldown = settings.autoThermalCooldown,
-            defaultKeepPackagesAfterBuild = settings.keepUupPackagesAfterBuild,
-            onUpdateKeepPackagesAfterBuild = { v -> onUpdateSettings(settings.copy(keepUupPackagesAfterBuild = v)) },
-            onUpdateCachedUupBuilds = { freshJson ->
-                if (freshJson != settings.cachedUupBuildsJson) {
-                    onUpdateSettings(settings.copy(cachedUupBuildsJson = freshJson))
-                }
-            },
-            onSavePreset = { preset ->
-                val updatedPresets = (settings.autounattendPresets.filterNot { it.name.equals(preset.name, true) } + preset)
-                onUpdateSettings(settings.copy(autounattendPresets = updatedPresets))
-                onMessage("Saved preset \"${preset.name}\".", false)
-            },
-            onDeletePreset = { presetName ->
-                val updatedPresets = settings.autounattendPresets.filterNot { it.name == presetName }
-                onUpdateSettings(settings.copy(autounattendPresets = updatedPresets))
-                onMessage("Deleted preset \"$presetName\".", false)
-            },
             onDismiss = { selectedWindowsFamily = null },
             onStartDirectDownload = { title, url, fileName, sha ->
                 startTurboDownload(title, url, fileName, expectedSha256 = sha)
-            },
-            onStartChannelBuild = { cfg ->
-                WindowsBuildEngine.configureNetwork(settings.customUupApiUrl, settings.preferDirectMicrosoftUup)
-                WindowsBuildEngine.startBuild(
-                    context = context,
-                    config = cfg,
-                    onComplete = { evt -> scope.launch { onDownloadCompleted(evt) } },
-                    onError = { err -> scope.launch { onMessage(err, true) } },
-                    onLog = { entry -> scope.launch { onAppendLog(entry) } }
-                )
-            },
-            onStartLocalUupBuild = { localDir, cfg ->
-                WindowsBuildEngine.startLocalUupFolderBuild(
-                    context = context,
-                    localFolderPath = localDir,
-                    config = cfg,
-                    onComplete = { evt -> scope.launch { onDownloadCompleted(evt) } },
-                    onError = { err -> scope.launch { onMessage(err, true) } },
-                    onLog = { entry -> scope.launch { onAppendLog(entry) } }
-                )
             }
         )
-    }
-
-    rebuildOptionsTarget?.let { pb ->
-        val orig = pb.config
-        val detOs = remember(orig.build.title) { WindowsCustomizationEngine.detectWindowsOsKind(orig.build.title) }
-        var rbCompression by remember(pb.workRootPath) { mutableStateOf(orig.compression) }
-        var rbOutputMode by remember(pb.workRootPath) { mutableStateOf(orig.outputMode) }
-        var rbScheme by remember(pb.workRootPath) { mutableStateOf(orig.scheme) }
-        var rbThermal by remember(pb.workRootPath) { mutableStateOf(orig.thermalProfile) }
-        var rbAutoCooldown by remember(pb.workRootPath) { mutableStateOf(orig.autoThermalCooldown) }
-        var rbOutName by remember(pb.workRootPath) { mutableStateOf(orig.customOutputName.ifBlank { pb.outputName }) }
-        val rbIsServer = remember(orig.build.title, orig.editions) { WindowsBuildEngine.isServerBuild(orig.build.title, orig.editions.map { it.code }) }
-        val rbBuildMajor = remember(orig.build.build) { orig.build.build.substringBefore('.').toIntOrNull() ?: 0 }
-        val rbSupportsApps = !rbIsServer && (rbBuildMajor == 0 || rbBuildMajor >= 22563)
-        var rbStoreAppLevel by remember(pb.workRootPath) {
-            mutableStateOf(if (!rbSupportsApps) WinStoreAppLevel.NONE else WinStoreAppLevel.ALL_INBOX)
-        }
-        var rbCabCacheBytes by remember(pb.workRootPath) { mutableStateOf(pb.cabCacheBytes) }
-        var rbIncludeUpdates by remember(pb.workRootPath) { mutableStateOf(orig.includeUpdates) }
-        var rbNetFx3 by remember(pb.workRootPath) { mutableStateOf(orig.integrateNetFx3) }
-        var rbCleanup by remember(pb.workRootPath) { mutableStateOf(orig.runComponentCleanup) }
-        var rbSplitFat32 by remember(pb.workRootPath) { mutableStateOf(orig.splitWimForFat32) }
-        var rbSkipWinRe by remember(pb.workRootPath) { mutableStateOf(orig.skipWinRe) }
-        var rbEiCfg by remember(pb.workRootPath) { mutableStateOf(orig.eiCfgUnlock) }
-        var rbKeepPkgs by remember(pb.workRootPath) { mutableStateOf(settings.keepUupPackagesAfterBuild) }
-        var rbAutoMount by remember(pb.workRootPath) { mutableStateOf(orig.autoMount) }
-        var rbForceFull by remember(pb.workRootPath) { mutableStateOf(false) }
-        var rbVirtualEds by remember(pb.workRootPath) { mutableStateOf(orig.virtualEditions.toSet()) }
-        var rbExperience by remember(pb.workRootPath) { mutableStateOf(orig.experience) }
-        var rbWinUtil by remember(pb.workRootPath) { mutableStateOf(orig.winUtil) }
-        var rbTargetMbPath by remember(pb.workRootPath) {
-            mutableStateOf(
-                orig.targetMultiBootPath.ifBlank {
-                    activeMultiBootTarget?.path ?: multiBootDrives.firstOrNull()?.path.orEmpty()
-                }
-            )
-        }
-
-        val stagingChanged = rbCompression != orig.compression ||
-            (rbOutputMode == WinBuildOutputMode.DIRECT_NTFS_USB) != (orig.outputMode == WinBuildOutputMode.DIRECT_NTFS_USB) ||
-            rbIncludeUpdates != orig.includeUpdates ||
-            rbStoreAppLevel != orig.storeAppLevel ||
-            rbNetFx3 != orig.integrateNetFx3 ||
-            rbCleanup != orig.runComponentCleanup ||
-            rbSkipWinRe != orig.skipWinRe ||
-            rbEiCfg != orig.eiCfgUnlock ||
-            rbSplitFat32 != orig.splitWimForFat32 ||
-            rbVirtualEds.toList().sorted() != orig.virtualEditions.sorted() ||
-            rbExperience != orig.experience ||
-            rbWinUtil != orig.winUtil
-        val willFastStep4 = pb.hasStagedIsoDir && !rbForceFull && !stagingChanged
-
-        ModalBottomSheet(
-            onDismissRequest = { rebuildOptionsTarget = null },
-            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
-            containerColor = PocketColors.surfaceCard
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .fillMaxHeight(0.88f)
-                    .padding(horizontal = 18.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                PocketSheetHeader(
-                    icon = Icons.Rounded.Build,
-                    tint = PocketColors.infoBlue,
-                    iconBg = PocketColors.infoBlueBg,
-                    title = "Offline Rebuild Options",
-                    subtitle = "${pb.title} · ${UsbGadgetEngine.formatBytes(pb.cachedBytes)} cached"
-                )
-
-                Column(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth()
-                        .verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    if (pb.hasStagedIsoDir) {
-                        Surface(
-                            shape = RoundedCornerShape(11.dp),
-                            color = if (willFastStep4) PocketColors.successBg else PocketColors.infoBlueBg,
-                            border = BorderStroke(0.75.dp, if (willFastStep4) PocketColors.success else PocketColors.infoBlue)
-                        ) {
-                            Text(
-                                text = if (willFastStep4) {
-                                    "Staged ISODIR ready — will jump straight to Step 4 packing (${rbCompression.shortLabel}). Change compression or options below for a full offline rebuild."
-                                } else {
-                                    "Options changed — will run a fresh 100% offline rebuild from cached packages with ${rbCompression.label}."
-                                },
-                                modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp),
-                                fontSize = 11.sp,
-                                color = if (willFastStep4) PocketColors.success else PocketColors.infoBlue
-                            )
-                        }
-                    }
-
-                    OutlinedTextField(
-                        value = rbOutName,
-                        onValueChange = { rbOutName = it },
-                        label = { Text("Output File Name") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(10.dp)
-                    )
-
-                    // Compression Picker (Standard LZX / Fast & Cool XPRESS / Compact Solid ESD)
-                    Surface(
-                        shape = RoundedCornerShape(12.dp),
-                        color = PocketColors.surfaceInput,
-                        border = BorderStroke(0.5.dp, PocketColors.border)
-                    ) {
-                        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                                Text("WIM / ESD Compression", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
-                                Text(rbCompression.label, style = PocketColors.monoStyle, fontSize = 10.5.sp, color = PocketColors.accentSoft)
-                            }
-                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                WinIsoCompression.entries.forEach { comp ->
-                                    val disabled = comp == WinIsoCompression.ESD && !detOs.supportsEsd
-                                    val sel = rbCompression == comp && !disabled
-                                    Surface(
-                                        modifier = Modifier.weight(1f).height(34.dp).bounceClick(enabled = !disabled) {
-                                            rbCompression = comp
-                                            if (comp == WinIsoCompression.ESD) rbSplitFat32 = false
-                                        },
-                                        shape = RoundedCornerShape(8.dp),
-                                        color = if (sel) PocketColors.accentBg else PocketColors.surfaceCard,
-                                        border = BorderStroke(if (sel) 1.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
-                                    ) {
-                                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                                            Text(
-                                                comp.shortLabel,
-                                                style = MaterialTheme.typography.labelSmall,
-                                                fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Medium,
-                                                color = if (disabled) PocketColors.textMuted else if (sel) PocketColors.accentSoft else PocketColors.textSecondary,
-                                                maxLines = 1
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                            Text(rbCompression.subtitle, fontSize = 10.5.sp, color = PocketColors.textSecondary)
-                        }
-                    }
-
-                    // Thermal Profile Picker
-                    Surface(
-                        shape = RoundedCornerShape(12.dp),
-                        color = PocketColors.surfaceInput,
-                        border = BorderStroke(0.5.dp, PocketColors.border)
-                    ) {
-                        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                                Text("Thermal Profile", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
-                                Text(rbThermal.label, style = PocketColors.monoStyle, fontSize = 10.5.sp, color = PocketColors.infoBlue)
-                            }
-                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                BuildThermalProfile.entries.forEach { prof ->
-                                    val sel = rbThermal == prof
-                                    Surface(
-                                        modifier = Modifier.weight(1f).height(34.dp).bounceClick { rbThermal = prof },
-                                        shape = RoundedCornerShape(8.dp),
-                                        color = if (sel) PocketColors.infoBlueBg else PocketColors.surfaceCard,
-                                        border = BorderStroke(if (sel) 1.dp else 0.5.dp, if (sel) PocketColors.infoBlue else PocketColors.border)
-                                    ) {
-                                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                                            Text(
-                                                prof.shortLabel,
-                                                style = MaterialTheme.typography.labelSmall,
-                                                fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Medium,
-                                                color = if (sel) PocketColors.infoBlue else PocketColors.textSecondary,
-                                                maxLines = 1
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                            Text(rbThermal.subtitle, fontSize = 10.5.sp, color = PocketColors.textSecondary)
-                        }
-                    }
-
-                    // Output Target Selector
-                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        PocketSectionHeader("Output Target")
-                        val modes = buildList {
-                            add(WinBuildOutputMode.STANDARD_ISO)
-                            if (multiBootDrives.isNotEmpty()) add(WinBuildOutputMode.DIRECT_MULTIBOOT)
-                            add(WinBuildOutputMode.DIRECT_NTFS_USB)
-                        }
-                        modes.forEach { mode ->
-                            val isSel = rbOutputMode == mode
-                            Surface(
-                                modifier = Modifier.fillMaxWidth().bounceClick {
-                                    rbOutputMode = mode
-                                    val base = rbOutName.substringBeforeLast('.')
-                                    if (base.isNotBlank()) {
-                                        rbOutName = base + if (mode == WinBuildOutputMode.DIRECT_NTFS_USB) ".img" else ".iso"
-                                    }
-                                },
-                                shape = RoundedCornerShape(11.dp),
-                                color = if (isSel) PocketColors.accentBg else PocketColors.surfaceInput,
-                                border = BorderStroke(if (isSel) 1.25.dp else 0.5.dp, if (isSel) PocketColors.accent else PocketColors.border)
-                            ) {
-                                Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-                                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                        Text(mode.label, style = MaterialTheme.typography.labelLarge, color = if (isSel) PocketColors.accentSoft else PocketColors.textPrimary)
-                                        Text(mode.subtitle, fontSize = 10.5.sp, color = PocketColors.textSecondary)
-                                    }
-                                    if (isSel) Icon(Icons.Rounded.Check, null, tint = PocketColors.accentSoft, modifier = Modifier.size(18.dp))
-                                }
-                            }
-                        }
-                        if (rbOutputMode == WinBuildOutputMode.DIRECT_NTFS_USB) {
-                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                PartitionScheme.entries.forEach { s ->
-                                    val sel = rbScheme == s
-                                    Surface(
-                                        modifier = Modifier.weight(1f).bounceClick { rbScheme = s },
-                                        shape = RoundedCornerShape(10.dp),
-                                        color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput,
-                                        border = BorderStroke(if (sel) 1.25.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
-                                    ) {
-                                        Column(modifier = Modifier.padding(9.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                            Text(s.label, style = MaterialTheme.typography.labelMedium, color = if (sel) PocketColors.accentSoft else PocketColors.textPrimary)
-                                            Text(s.subtitle, fontSize = 10.sp, color = PocketColors.textSecondary)
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // All Inbox Store Apps (Default ON for Win 11 22H2+ non-Server builds)
-                    if (rbSupportsApps) {
-                        Surface(
-                            shape = RoundedCornerShape(12.dp),
-                            color = PocketColors.surfaceInput,
-                            border = BorderStroke(0.5.dp, PocketColors.border)
-                        ) {
-                            Column(modifier = Modifier.fillMaxWidth()) {
-                                val appBadge = if (pb.cachedAppsCount > 0) " (${pb.cachedAppsCount} cached)" else " (Will top-up missing)"
-                                OfflineRebuildSwitchRow("Include All Inbox Store Apps$appBadge", rbStoreAppLevel != WinStoreAppLevel.NONE) { on ->
-                                    rbStoreAppLevel = if (on) WinStoreAppLevel.ALL_INBOX else WinStoreAppLevel.NONE
-                                }
-                                if (rbStoreAppLevel != WinStoreAppLevel.NONE && pb.cachedAppsCount == 0) {
-                                    Text(
-                                        "Automatically downloads only missing Store Apps + Edge before rebuilding (keeps cached OS).",
-                                        modifier = Modifier.padding(start = 12.dp, end = 12.dp, bottom = 9.dp),
-                                        fontSize = 10.5.sp,
-                                        color = PocketColors.infoBlue
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    // CAB Cache Size & One-Tap Clear
-                    if (rbCabCacheBytes > 0L) {
-                        Surface(
-                            shape = RoundedCornerShape(12.dp),
-                            color = PocketColors.surfaceInput,
-                            border = BorderStroke(0.5.dp, PocketColors.border)
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 9.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text("Reusable CAB Cache (${UsbGadgetEngine.formatBytes(rbCabCacheBytes)})", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
-                                    Text("Speeds up Step 1 on future offline rebuilds", fontSize = 10.5.sp, color = PocketColors.textSecondary)
-                                }
-                                TextButton(onClick = {
-                                    WindowsBuildEngine.clearCabCache(pb)
-                                    rbCabCacheBytes = 0L
-                                    onMessage("Cleared reusable CAB cache.", false)
-                                }) {
-                                    Text("Clear", color = PocketColors.danger, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                                }
-                            }
-                        }
-                    }
-
-                    // Local User Password Reminder (passwords are never stored in plaintext in pb_build.json)
-                    if (rbExperience.createLocalUser && rbExperience.localPassword.isBlank()) {
-                        Surface(
-                            shape = RoundedCornerShape(11.dp),
-                            color = PocketColors.warningBg.copy(alpha = 0.5f),
-                            border = BorderStroke(0.75.dp, PocketColors.warning)
-                        ) {
-                            Text(
-                                "Local User \"${rbExperience.localUsername.ifBlank { "User" }}\" has a blank password (cached builds don't store passwords). Re-enter it in Customizer below if you want a password.",
-                                modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp),
-                                fontSize = 10.5.sp,
-                                color = PocketColors.textPrimary
-                            )
-                        }
-                    }
-
-                    // Build Options Toggles
-                    Surface(
-                        shape = RoundedCornerShape(12.dp),
-                        color = PocketColors.surfaceInput,
-                        border = BorderStroke(0.5.dp, PocketColors.border)
-                    ) {
-                        Column(modifier = Modifier.fillMaxWidth()) {
-                            OfflineRebuildSwitchRow("Include Updates (Setup DU + LCU/SSU)", rbIncludeUpdates) { rbIncludeUpdates = it }; PocketHairlineDivider()
-                            OfflineRebuildSwitchRow("Integrate .NET Framework 3.5", rbNetFx3) { rbNetFx3 = it }; PocketHairlineDivider()
-                            OfflineRebuildSwitchRow("Run component cleanup (/ResetBase)", rbCleanup) { rbCleanup = it }; PocketHairlineDivider()
-                            if (rbCompression != WinIsoCompression.ESD && rbOutputMode != WinBuildOutputMode.DIRECT_NTFS_USB) {
-                                OfflineRebuildSwitchRow("Split WIM for FAT32 (install*.swm ≤ 3.5 GB)", rbSplitFat32) { rbSplitFat32 = it }; PocketHairlineDivider()
-                            }
-                            OfflineRebuildSwitchRow("Skip WinRE Recovery (~480 MB smaller)", rbSkipWinRe) { rbSkipWinRe = it }; PocketHairlineDivider()
-                            OfflineRebuildSwitchRow("Unlock all editions (ei.cfg)", rbEiCfg) { rbEiCfg = it }; PocketHairlineDivider()
-                            OfflineRebuildSwitchRow("Keep base UUP packages after build", rbKeepPkgs) { rbKeepPkgs = it; onUpdateSettings(settings.copy(keepUupPackagesAfterBuild = it)) }; PocketHairlineDivider()
-                            OfflineRebuildSwitchRow("Auto-cooldown if phone gets warm", rbAutoCooldown) { rbAutoCooldown = it }; PocketHairlineDivider()
-                            OfflineRebuildSwitchRow("Auto-mount output when finished", rbAutoMount) { rbAutoMount = it }
-                            if (pb.hasStagedIsoDir && !stagingChanged) {
-                                PocketHairlineDivider()
-                                OfflineRebuildSwitchRow("Force full rebuild (re-run Steps 1–3)", rbForceFull) { rbForceFull = it }
-                            }
-                        }
-                    }
-
-                    // Virtual Editions quick toggles
-                    Surface(
-                        shape = RoundedCornerShape(12.dp),
-                        color = PocketColors.surfaceInput,
-                        border = BorderStroke(0.5.dp, PocketColors.border)
-                    ) {
-                        Column(modifier = Modifier.fillMaxWidth()) {
-                            Text(
-                                "Virtual Editions (Zero Extra Download)",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = PocketColors.textSecondary,
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
-                            )
-                            PocketHairlineDivider()
-                            listOf(
-                                "Enterprise" to "Windows Enterprise",
-                                "Education" to "Windows Education",
-                                "ProfessionalWorkstation" to "Pro for Workstations",
-                                "IoTEnterprise" to "IoT Enterprise"
-                            ).forEachIndexed { idx, (edId, edLabel) ->
-                                val isChecked = rbVirtualEds.contains(edId)
-                                OfflineRebuildSwitchRow(edLabel, isChecked) { on ->
-                                    rbVirtualEds = if (on) rbVirtualEds + edId else rbVirtualEds - edId
-                                }
-                                if (idx < 3) PocketHairlineDivider()
-                            }
-                        }
-                    }
-
-                    // Full Experience & WinUtil Tweaks Customizer
-                    WindowsTwoPaneCustomizer(
-                        osKind = detOs,
-                        arch = orig.build.arch,
-                        experience = rbExperience,
-                        winUtil = rbWinUtil,
-                        presets = settings.autounattendPresets,
-                        showCa2023Option = true,
-                        showCustomScriptOption = true,
-                        defaultBrowseDir = defaultDir,
-                        onExperienceChange = { rbExperience = it },
-                        onWinUtilChange = { rbWinUtil = it },
-                        onApplyPreset = { p ->
-                            rbScheme = runCatching { PartitionScheme.valueOf(p.schemeName) }.getOrDefault(rbScheme)
-                            rbExperience = WindowsExperienceConfig(
-                                p.bypassRequirements,
-                                p.bypassMicrosoftAccount,
-                                p.disableDataCollection,
-                                p.disableBitLocker,
-                                p.qolImprovements,
-                                p.disableSponsoredApps,
-                                p.classicContextMenu,
-                                p.skipWifiSetup,
-                                p.createLocalUser,
-                                p.localUsername,
-                                "",
-                                p.skipOobe,
-                                p.useCa2023Bootloaders,
-                                p.applySkuSiPolicy
-                            )
-                            rbWinUtil = WinUtilTweaksConfig.fromJsonString(p.winUtilJson)
-                            onMessage("Applied preset \"${p.name}\".", false)
-                        },
-                        onSavePreset = { name ->
-                            val newPreset = AutounattendPreset(
-                                name,
-                                rbScheme.name,
-                                rbExperience.bypassRequirements,
-                                rbExperience.bypassMicrosoftAccount,
-                                rbExperience.disableDataCollection,
-                                rbExperience.disableBitLocker,
-                                rbExperience.disableSponsoredApps,
-                                rbExperience.classicContextMenu,
-                                rbExperience.skipWifiSetup,
-                                rbExperience.createLocalUser,
-                                rbExperience.localUsername,
-                                rbExperience.skipOobe,
-                                rbExperience.qolImprovements,
-                                rbExperience.useCa2023Bootloaders,
-                                rbExperience.applySkuSiPolicy,
-                                rbWinUtil.toJsonString()
-                            )
-                            val updatedPresets = (settings.autounattendPresets.filterNot { it.name.equals(name, true) } + newPreset)
-                            onUpdateSettings(settings.copy(autounattendPresets = updatedPresets))
-                            onMessage("Saved preset \"$name\".", false)
-                        },
-                        onDeletePreset = { presetName ->
-                            val updatedPresets = settings.autounattendPresets.filterNot { it.name == presetName }
-                            onUpdateSettings(settings.copy(autounattendPresets = updatedPresets))
-                            onMessage("Deleted preset \"$presetName\".", false)
-                        }
-                    )
-
-                    Spacer(modifier = Modifier.height(6.dp))
-                }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    OutlinedButton(
-                        onClick = { rebuildOptionsTarget = null },
-                        modifier = Modifier.weight(0.38f).height(46.dp),
-                        shape = RoundedCornerShape(PocketTokens.ButtonRadius)
-                    ) {
-                        Text("Cancel")
-                    }
-                    Button(
-                        onClick = {
-                            val updatedCfg = orig.copy(
-                                compression = rbCompression,
-                                outputMode = rbOutputMode,
-                                scheme = rbScheme,
-                                targetMultiBootPath = if (rbOutputMode == WinBuildOutputMode.DIRECT_MULTIBOOT) rbTargetMbPath else "",
-                                customOutputName = rbOutName.trim(),
-                                autoMount = rbAutoMount,
-                                includeUpdates = rbIncludeUpdates,
-                                includeStoreApps = rbStoreAppLevel != WinStoreAppLevel.NONE,
-                                storeAppLevel = rbStoreAppLevel,
-                                integrateNetFx3 = rbNetFx3,
-                                runComponentCleanup = rbCleanup,
-                                skipWinRe = rbSkipWinRe,
-                                eiCfgUnlock = rbEiCfg,
-                                keepPackagesAfterBuild = rbKeepPkgs,
-                                splitWimForFat32 = rbSplitFat32,
-                                thermalProfile = rbThermal,
-                                autoThermalCooldown = rbAutoCooldown,
-                                virtualEditions = rbVirtualEds.toList(),
-                                experience = rbExperience,
-                                winUtil = rbWinUtil,
-                                bypassRequirements = rbExperience.bypassRequirements,
-                                bypassMicrosoftAccount = rbExperience.bypassMicrosoftAccount,
-                                disableDataCollection = rbExperience.disableDataCollection,
-                                disableBitLocker = rbExperience.disableBitLocker
-                            )
-                            rebuildOptionsTarget = null
-                            WindowsBuildEngine.rebuildCachedPending(
-                                context = context,
-                                pending = pb,
-                                configOverride = updatedCfg,
-                                forceFullRebuild = rbForceFull,
-                                onComplete = { evt -> scope.launch { onDownloadCompleted(evt) } },
-                                onError = { err -> scope.launch { onMessage(err, true) } },
-                                onLog = { entry -> scope.launch { onAppendLog(entry) } }
-                            )
-                        },
-                        enabled = rbOutName.trim().isNotEmpty(),
-                        modifier = Modifier.weight(0.62f).height(46.dp),
-                        shape = RoundedCornerShape(PocketTokens.ButtonRadius),
-                        colors = ButtonDefaults.buttonColors(containerColor = PocketColors.infoBlue, contentColor = Color.White)
-                    ) {
-                        Text(
-                            if (willFastStep4) "Fast Pack (${rbCompression.shortLabel})" else "Rebuild (${rbCompression.shortLabel})",
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    }
-                }
-            }
-        }
     }
 
     selectedDistroForVersion?.let { iso ->
@@ -2403,66 +1691,50 @@ fun DownloadScreen(
             title = { Text(fam.title, color = PocketColors.textPrimary) },
             text = {
                 Text(
-                    text = if (fam.supportsDirectRetail) {
-                        "Copy the latest English (x64) official Microsoft CDN link for external download managers, or open the selector to choose another version, language, or channel."
-                    } else {
-                        "Open All Channels to browse Public, Release Preview, Beta, Dev, Canary, and Server builds."
-                    },
+                    text = "Copy the latest English (x64) official Microsoft CDN link for external download managers, or open the selector to choose another version, architecture, or language.",
                     style = MaterialTheme.typography.bodySmall,
                     color = PocketColors.textSecondary
                 )
             },
             confirmButton = {
-                if (fam.supportsDirectRetail) {
-                    Button(
-                        onClick = {
-                            scope.launch {
-                                fetchingLink = true
-                                var copiedUrl: String? = null
-                                val rel = WindowsDirectCatalog.fetchReleases(fam).let { list -> list.firstOrNull { !it.isArm64Only } ?: list.firstOrNull() }
-                                if (rel != null) {
-                                    val skuRes = WindowsDirectCatalog.fetchLanguages(context, rel)
-                                    val data = skuRes.data
-                                    if (data != null) {
-                                        val enSku = data.second.firstOrNull { it.localizedLanguage.contains("English (United States)", true) }
-                                            ?: data.second.firstOrNull()
-                                        if (enSku != null) {
-                                            val dlRes = WindowsDirectCatalog.fetchDownloadLinks(context, rel, data.first, enSku.skuId)
-                                            copiedUrl = (dlRes.data?.firstOrNull { it.arch.equals("x64", true) } ?: dlRes.data?.firstOrNull())?.url
-                                        }
+                Button(
+                    onClick = {
+                        scope.launch {
+                            fetchingLink = true
+                            var copiedUrl: String? = null
+                            val rel = WindowsDirectCatalog.fetchReleases(fam).let { list -> list.firstOrNull { !it.isArm64Only } ?: list.firstOrNull() }
+                            if (rel != null) {
+                                val skuRes = WindowsDirectCatalog.fetchLanguages(context, rel)
+                                val data = skuRes.data
+                                if (data != null) {
+                                    val enSku = data.second.firstOrNull { it.localizedLanguage.contains("English (United States)", true) }
+                                        ?: data.second.firstOrNull()
+                                    if (enSku != null) {
+                                        val dlRes = WindowsDirectCatalog.fetchDownloadLinks(context, rel, data.first, enSku.skuId)
+                                        copiedUrl = (dlRes.data?.firstOrNull { it.arch.equals("x64", true) } ?: dlRes.data?.firstOrNull())?.url
                                     }
                                 }
-                                fetchingLink = false
-                                longPressedWindows = null
-                                if (copiedUrl != null) {
-                                    copyLinkToClipboard("${fam.title} (English x64)", copiedUrl)
-                                } else {
-                                    onMessage("Direct link unavailable on this IP. Open selector and switch to All Channels.", true)
-                                }
                             }
-                        },
-                        enabled = !fetchingLink,
-                        colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)
-                    ) {
-                        if (fetchingLink) {
-                            CircularProgressIndicator(modifier = Modifier.size(15.dp), strokeWidth = 2.dp, color = PocketColors.onAccent)
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Signing...")
-                        } else {
-                            Icon(Icons.Rounded.ContentCopy, null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Copy Direct Link", fontWeight = FontWeight.SemiBold)
-                        }
-                    }
-                } else {
-                    Button(
-                        onClick = {
+                            fetchingLink = false
                             longPressedWindows = null
-                            selectedWindowsFamily = fam
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)
-                    ) {
-                        Text("Browse Channels", fontWeight = FontWeight.SemiBold)
+                            if (copiedUrl != null) {
+                                copyLinkToClipboard("${fam.title} (English x64)", copiedUrl)
+                            } else {
+                                onMessage("Microsoft CDN link unavailable right now. Open selector and tap Retry.", true)
+                            }
+                        }
+                    },
+                    enabled = !fetchingLink,
+                    colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)
+                ) {
+                    if (fetchingLink) {
+                        CircularProgressIndicator(modifier = Modifier.size(15.dp), strokeWidth = 2.dp, color = PocketColors.onAccent)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Signing...")
+                    } else {
+                        Icon(Icons.Rounded.ContentCopy, null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Copy Direct Link", fontWeight = FontWeight.SemiBold)
                     }
                 }
             },
@@ -2475,70 +1747,6 @@ fun DownloadScreen(
                     enabled = !fetchingLink
                 ) {
                     Text("Open Selector", color = PocketColors.textSecondary)
-                }
-            }
-        )
-    }
-
-    if (showBuildMonitorSheet && winConvState != null) {
-        WindowsBuildMonitorSheet(
-            state = winConvState!!,
-            onDismiss = { showBuildMonitorSheet = false },
-            onToggleAutoMount = { WindowsBuildEngine.updateConversionAutoMount(it) },
-            onToggleKeepPackages = { v -> WindowsBuildEngine.updateConversionKeepPackages(v); onUpdateSettings(settings.copy(keepUupPackagesAfterBuild = v)) },
-            onChangeThermalProfile = { prof ->
-                WindowsBuildEngine.updateConversionThermalProfile(prof)
-                onMessage("Live thermal profile switched to ${prof.label}.", false)
-            },
-            onToggleAutoCooldown = { enabled ->
-                WindowsBuildEngine.updateConversionAutoCooldown(enabled)
-            },
-            onRetryBuild = {
-                if (WindowsBuildEngine.retryFailedConversion()) {
-                    onMessage("Retrying Windows build from cached packages...", false)
-                }
-            },
-            onDismissFailed = { WindowsBuildEngine.dismissFinishedConversion() },
-            onCancelBuild = {
-                WindowsBuildEngine.cancelConversion()
-                onMessage("Cancelled active ISO/USB build.", false)
-            }
-        )
-    }
-
-    if (showCancelWinBuildDialog) {
-        AlertDialog(
-            onDismissRequest = { showCancelWinBuildDialog = false },
-            containerColor = PocketColors.surfaceCard,
-            title = { Text("Cancel Windows Build?", color = PocketColors.textPrimary) },
-            text = {
-                Text(
-                    "Keep downloaded packages in .pocketboot_tmp so you can resume this build later (auto-cleaned after 24h), or discard all temporary files immediately.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = PocketColors.textSecondary
-                )
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        showCancelWinBuildDialog = false
-                        WindowsBuildEngine.cancelDownload(discardTemp = true)
-                        onMessage("Cancelled build and cleaned temporary files.", false)
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = PocketColors.danger, contentColor = Color.White)
-                ) {
-                    Text("Discard Temp", fontWeight = FontWeight.SemiBold)
-                }
-            },
-            dismissButton = {
-                TextButton(
-                    onClick = {
-                        showCancelWinBuildDialog = false
-                        WindowsBuildEngine.cancelDownload(discardTemp = false)
-                        onMessage("Cancelled build (verified packages kept for 24h resume).", false)
-                    }
-                ) {
-                    Text("Keep for Resume", color = PocketColors.accentSoft)
                 }
             }
         )
@@ -2718,7 +1926,6 @@ private fun WindowsFamilyCard(
     onClick: () -> Unit,
     onLongClick: () -> Unit
 ) {
-    val isCustomCard = fam == WindowsCatalogFamily.ALL_BUILDS
     Surface(
         modifier = Modifier
             .fillMaxWidth()
@@ -2736,13 +1943,13 @@ private fun WindowsFamilyCard(
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Box(
-                modifier = Modifier.size(42.dp).clip(RoundedCornerShape(11.dp)).background(if (isCustomCard) PocketColors.violetBg else PocketColors.infoBlueBg),
+                modifier = Modifier.size(42.dp).clip(RoundedCornerShape(11.dp)).background(PocketColors.infoBlueBg),
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
-                    imageVector = if (isCustomCard) Icons.Rounded.Build else Icons.Rounded.Window,
+                    imageVector = Icons.Rounded.Window,
                     contentDescription = null,
-                    tint = if (isCustomCard) PocketColors.violet else PocketColors.infoBlue,
+                    tint = PocketColors.infoBlue,
                     modifier = Modifier.size(21.dp)
                 )
             }
@@ -2754,12 +1961,12 @@ private fun WindowsFamilyCard(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     modifier = Modifier.padding(top = 2.dp)
                 ) {
-                    Surface(shape = RoundedCornerShape(5.dp), color = if (isCustomCard) PocketColors.violetBg else PocketColors.infoBlueBg) {
+                    Surface(shape = RoundedCornerShape(5.dp), color = PocketColors.infoBlueBg) {
                         Text(
                             text = fam.badgeLabel,
                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
                             style = MaterialTheme.typography.labelSmall,
-                            color = if (isCustomCard) PocketColors.violet else PocketColors.infoBlue
+                            color = PocketColors.infoBlue
                         )
                     }
                     Text(fam.sizeHint, style = PocketColors.monoStyle, color = PocketColors.textMuted)
@@ -2872,25 +2079,5 @@ private fun DistroCatalogCard(
                 }
             }
         }
-    }
-}
-
-@Composable
-private fun OfflineRebuildSwitchRow(
-    title: String,
-    checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable { onCheckedChange(!checked) }
-            .padding(horizontal = 12.dp, vertical = 9.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        Text(title, style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary, modifier = Modifier.weight(1f))
-        Spacer(modifier = Modifier.width(8.dp))
-        PocketSwitch(checked = checked, onCheckedChange = onCheckedChange, activeColor = PocketColors.success)
     }
 }

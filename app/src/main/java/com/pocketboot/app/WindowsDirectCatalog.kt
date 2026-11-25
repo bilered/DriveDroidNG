@@ -29,45 +29,28 @@ enum class WindowsCatalogFamily(
     val title: String,
     val subtitle: String,
     val badgeLabel: String,
-    val sizeHint: String,
-    val supportsDirectRetail: Boolean,
-    val defaultBuilderFamily: WinFamilyFilter
+    val sizeHint: String
 ) {
     WIN11(
         id = "win11",
         title = "Windows 11",
-        subtitle = "Latest Retail ISO (26H2 / 25H2) & Channel Builds",
-        badgeLabel = "Direct ISO · All Channels",
-        sizeHint = "~5.5–7 GB",
-        supportsDirectRetail = true,
-        defaultBuilderFamily = WinFamilyFilter.WIN11
+        subtitle = "Official Microsoft Retail ISO (26H2 / 25H2 / 24H2)",
+        badgeLabel = "Official Direct ISO",
+        sizeHint = "~5.5–8.5 GB"
     ),
     WIN10(
         id = "win10",
         title = "Windows 10",
-        subtitle = "Official 22H2 Retail ISO & Channel Builds",
-        badgeLabel = "Direct ISO · All Channels",
-        sizeHint = "~4.8–6 GB",
-        supportsDirectRetail = true,
-        defaultBuilderFamily = WinFamilyFilter.WIN10
+        subtitle = "Official Microsoft 22H2 Retail ISO (x64 & x86)",
+        badgeLabel = "Official Direct ISO",
+        sizeHint = "~4.8–6 GB"
     ),
     WIN81(
         id = "win81",
         title = "Windows 8.1",
         subtitle = "Official Microsoft Retail ISO (x64 & x86)",
-        badgeLabel = "Direct ISO",
-        sizeHint = "~3.6–4.3 GB",
-        supportsDirectRetail = true,
-        defaultBuilderFamily = WinFamilyFilter.WIN10
-    ),
-    ALL_BUILDS(
-        id = "all_builds",
-        title = "Windows Builds & Server",
-        subtitle = "Windows 11, 10 & Server · Stable, Preview & Insider",
-        badgeLabel = "Custom ISO Builder",
-        sizeHint = "On-Phone Build",
-        supportsDirectRetail = false,
-        defaultBuilderFamily = WinFamilyFilter.WIN11
+        badgeLabel = "Official Direct ISO",
+        sizeHint = "~3.6–4.3 GB"
     )
 }
 

@@ -230,20 +230,13 @@ fun PocketBootApp(initialShortcutPath: String = "") {
     var slimmerProgress by remember { mutableStateOf(WindowsBuildProgress()) }
     var slimmerCompletedMsg by remember { mutableStateOf<String?>(null) }
     var handledShortcut by remember { mutableStateOf(false) }
-    val winChannelDlState by WindowsBuildEngine.downloadState.collectAsState()
-    val winChannelConvState by WindowsBuildEngine.conversionState.collectAsState()
     var refreshJob by remember { mutableStateOf<Job?>(null) }
     var drivesFreeBytes by remember { mutableStateOf(0L) }
     var tempCacheBytes by remember { mutableStateOf(0L) }
 
     val isLightSurface = settings.surfaceMode == SurfaceMode.LIGHT
-    val winDlActive = winChannelDlState != null
-    val winConvActive = winChannelConvState != null
-    val winConvFailed = winChannelConvState?.isFailed == true
-    val winConvCompleted = winChannelConvState?.isCompleted == true
     val anyBuildOrDlActive = windowsBuildJob != null || linuxBuildJob != null ||
-        ventoyBuildJob != null || slimmerJob != null ||
-        (winDlActive && winChannelDlState?.isPaused != true) || (winConvActive && !winConvFailed && !winConvCompleted)
+        ventoyBuildJob != null || slimmerJob != null
     val keepScreenAwake = settings.keepScreenAwakeDuringBuilds && anyBuildOrDlActive
 
     SideEffect {
@@ -258,15 +251,11 @@ fun PocketBootApp(initialShortcutPath: String = "") {
         }
     }
 
-    LaunchedEffect(settings.customUupApiUrl, settings.preferDirectMicrosoftUup) {
-        WindowsBuildEngine.configureNetwork(settings.customUupApiUrl, settings.preferDirectMicrosoftUup)
-    }
-
     LaunchedEffect(settings.buildThermalProfile, settings.autoThermalCooldown) {
-        WindowsBuildEngine.configureThermal(settings.buildThermalProfile, settings.autoThermalCooldown)
+        BuildThermalHelper.configureThermal(settings.buildThermalProfile, settings.autoThermalCooldown)
     }
 
-    LaunchedEffect(images.size, settings.defaultDir, winDlActive, winConvActive, winConvFailed, winConvCompleted, windowsBuildJob != null, ventoyBuildJob != null) {
+    LaunchedEffect(images.size, settings.defaultDir, windowsBuildJob != null, slimmerJob != null, ventoyBuildJob != null) {
         withContext(Dispatchers.IO) {
             drivesFreeBytes = UsbGadgetEngine.getFreeSpaceBytes(settings.defaultDir)
             tempCacheBytes = UsbGadgetEngine.getTempStorageStats(context, settings.scanDirs + settings.defaultDir).totalBytes

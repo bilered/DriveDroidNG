@@ -1384,30 +1384,8 @@ object UsbGadgetEngine {
                 var workBytes = 0L
                 scanDirs.map { resolveDirectPath(it).trimEnd('/') }.distinct().forEach { dir ->
                     val qTmp = shellQuote("$dir/.pocketboot_tmp")
-                    // Only count cleanable temp bytes (exclude kept "isCachedReady":true PKGS/ & CAB_CACHE/)
                     val b = Shell.cmd(
-                        """
-                        TOT=0
-                        if [ -d $qTmp ]; then
-                            for d in $qTmp/*; do
-                                [ -e "${'$'}d" ] || continue
-                                bn=${'$'}(basename "${'$'}d")
-                                [ "${'$'}bn" = ".nomedia" ] && continue
-                                if [ -d "${'$'}d" ] && grep -q '"isCachedReady":true' "${'$'}d/pb_build.json" 2>/dev/null; then
-                                    for sub in ISODIR TMP; do
-                                        if [ -d "${'$'}d/${'$'}sub" ]; then
-                                            s=${'$'}(du -sb "${'$'}d/${'$'}sub" 2>/dev/null | awk '{print $1}')
-                                            TOT=${'$'}((TOT + ${'$'}{s:-0}))
-                                        fi
-                                    done
-                                else
-                                    s=${'$'}(du -sb "${'$'}d" 2>/dev/null | awk '{print $1}')
-                                    TOT=${'$'}((TOT + ${'$'}{s:-0}))
-                                fi
-                            done
-                        fi
-                        echo "${'$'}TOT"
-                        """.trimIndent()
+                        "if [ -d $qTmp ]; then du -sb $qTmp 2>/dev/null | awk '{print \$1}'; else echo 0; fi"
                     ).exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
                     workBytes += b
                 }
@@ -1429,23 +1407,7 @@ object UsbGadgetEngine {
             val before = getTempStorageStats(context, scanDirs).totalBytes
             scanDirs.map { resolveDirectPath(it).trimEnd('/') }.distinct().forEach { dir ->
                 val qTmp = shellQuote("$dir/.pocketboot_tmp")
-                // Preserve kept UUP caches ("isCachedReady":true) while cleaning ISODIR/TMP and unfinished work dirs!
-                Shell.cmd(
-                    """
-                    if [ -d $qTmp ]; then
-                        for d in $qTmp/*; do
-                            [ -e "${'$'}d" ] || continue
-                            bn=${'$'}(basename "${'$'}d")
-                            [ "${'$'}bn" = ".nomedia" ] && continue
-                            if [ -d "${'$'}d" ] && grep -q '"isCachedReady":true' "${'$'}d/pb_build.json" 2>/dev/null; then
-                                rm -rf "${'$'}d/ISODIR" "${'$'}d/TMP" "${'$'}d/.pb_isodir_ready" 2>/dev/null || true
-                            else
-                                rm -rf "${'$'}d" 2>/dev/null || true
-                            fi
-                        done
-                    fi
-                    """.trimIndent()
-                ).exec()
+                Shell.cmd("if [ -d $qTmp ]; then find $qTmp -mindepth 1 -maxdepth 1 ! -name '.nomedia' -exec rm -rf {} + 2>/dev/null || true; fi").exec()
             }
             val baseDir = context.applicationContext.getExternalFilesDir(null) ?: context.applicationContext.cacheDir
             val dlDir = File(baseDir, "turbo_dl")

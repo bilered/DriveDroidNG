@@ -182,17 +182,13 @@ object PreFlightDiagnostics {
         val stayOn = runCatching {
             Settings.Global.getInt(context.contentResolver, Settings.Global.STAY_ON_WHILE_PLUGGED_IN, 0) > 0
         }.getOrDefault(false)
-        val winTools = WindowsBuildEngine.inspectTools(context)
-        val winDetail = "cabextract=${if (winTools.cabextract != null) "OK" else "NO"} • wimlib=${if (winTools.wimlib != null) "OK" else "NO"} • reged/VE=${if (winTools.chntpw != null) "OK" else "NO"} • xorriso=${if (winTools.xorriso != null) "OK" else "NO"} • 7zzs=${if (winTools.sevenZip != null) "OK" else "NO"}"
+        val isoTools = BuildThermalHelper.inspectIsoTools(context)
+        val isoDetail = "7zzs=${if (isoTools.sevenZip != null) "OK" else "NO"} • wimlib=${if (isoTools.wimlib != null) "OK" else "NO"} • xorriso=${if (isoTools.xorriso != null) "OK" else "NO"}"
         items.add(
             DiagCheckItem(
-                title = "Windows ISO Build Engine",
-                detail = winDetail,
-                level = when {
-                    winTools.canConvertIso -> DiagLevel.PASS
-                    winTools.canBuildDirectUsb -> DiagLevel.WARN
-                    else -> DiagLevel.WARN
-                }
+                title = "ISO Slimmer & Repack Tools",
+                detail = isoDetail,
+                level = if (isoTools.canSlimIso) DiagLevel.PASS else DiagLevel.WARN
             )
         )
 
@@ -226,7 +222,7 @@ object PreFlightDiagnostics {
 
     fun formatReport(items: List<DiagCheckItem>): String {
         val sb = StringBuilder()
-        sb.appendLine("PocketBoot v4.5.0 Pre-Flight Diagnostic Report")
+        sb.appendLine("PocketBoot v4.6.0 Pre-Flight Diagnostic Report")
         sb.appendLine("Device: ${Build.MANUFACTURER} ${Build.MODEL} (Android ${Build.VERSION.RELEASE}, API ${Build.VERSION.SDK_INT}, ABI ${Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"})")
         sb.appendLine("---")
         items.forEach { item ->

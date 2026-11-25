@@ -45,19 +45,14 @@ data class AppSettings(
     val autounattendPresets: List<AutounattendPreset> = emptyList(),
     val downloadConnections: Int = 8,
     val autoVerifySha256: Boolean = true,
-    val customUupApiUrl: String = DEFAULT_UUP_API_URL,
-    val preferDirectMicrosoftUup: Boolean = false,
-    val cachedUupBuildsJson: String = "",
     val buildThermalProfile: BuildThermalProfile = BuildThermalProfile.BALANCED,
     val autoThermalCooldown: Boolean = true,
-    val keepScreenAwakeDuringBuilds: Boolean = false,
-    val keepUupPackagesAfterBuild: Boolean = true
+    val keepScreenAwakeDuringBuilds: Boolean = false
 ) {
     companion object {
         const val DEFAULT_ACCENT_HEX = 0xFF15F5ABL
         const val LEGACY_DEFAULT_ACCENT_HEX = 0xFF6366F1L
-        const val DEFAULT_UUP_API_URL = "https://api.uupdump.net"
-        const val CURRENT_CATALOG_VERSION = 450
+        const val CURRENT_CATALOG_VERSION = 460
     }
 }
 
@@ -153,17 +148,11 @@ class AppPrefs(context: Context) {
             autounattendPresets = presets,
             downloadConnections = prefs.getInt("dl_connections", 8).coerceIn(1, 16),
             autoVerifySha256 = prefs.getBoolean("auto_verify_sha256", true),
-            customUupApiUrl = prefs.getString("custom_uup_api_url", AppSettings.DEFAULT_UUP_API_URL)
-                ?.trim()?.trimEnd('/')?.ifBlank { AppSettings.DEFAULT_UUP_API_URL }
-                ?: AppSettings.DEFAULT_UUP_API_URL,
-            preferDirectMicrosoftUup = prefs.getBoolean("prefer_direct_ms_uup", false),
-            cachedUupBuildsJson = prefs.getString("cached_uup_builds_json", "").orEmpty(),
             buildThermalProfile = runCatching {
                 BuildThermalProfile.valueOf(prefs.getString("build_thermal_profile", BuildThermalProfile.BALANCED.name).orEmpty())
             }.getOrDefault(BuildThermalProfile.BALANCED),
             autoThermalCooldown = prefs.getBoolean("auto_thermal_cooldown", true),
-            keepScreenAwakeDuringBuilds = prefs.getBoolean("keep_screen_awake_builds", false),
-            keepUupPackagesAfterBuild = prefs.getBoolean("keep_uup_packages_after_build", true)
+            keepScreenAwakeDuringBuilds = prefs.getBoolean("keep_screen_awake_builds", false)
         )
     }
 
@@ -206,13 +195,9 @@ class AppPrefs(context: Context) {
             .putString("autounattend_presets_json", presetsArr.toString())
             .putInt("dl_connections", settings.downloadConnections.coerceIn(1, 16))
             .putBoolean("auto_verify_sha256", settings.autoVerifySha256)
-            .putString("custom_uup_api_url", settings.customUupApiUrl.trim().trimEnd('/').ifBlank { AppSettings.DEFAULT_UUP_API_URL })
-            .putBoolean("prefer_direct_ms_uup", settings.preferDirectMicrosoftUup)
-            .putString("cached_uup_builds_json", settings.cachedUupBuildsJson)
             .putString("build_thermal_profile", settings.buildThermalProfile.name)
             .putBoolean("auto_thermal_cooldown", settings.autoThermalCooldown)
             .putBoolean("keep_screen_awake_builds", settings.keepScreenAwakeDuringBuilds)
-            .putBoolean("keep_uup_packages_after_build", settings.keepUupPackagesAfterBuild)
             .apply()
     }
 
@@ -241,8 +226,8 @@ class AppPrefs(context: Context) {
                 put("surfaceMode", settings.surfaceMode.name); put("useMonet", settings.useMonet)
                 put("accentHex", settings.accentHex); put("scanDirs", JSONArray(settings.scanDirs))
                 put("useDefaultDistroRepo", settings.useDefaultDistroRepo); put("customRepoUrls", JSONArray(settings.customRepoUrls))
-                put("downloadConnections", settings.downloadConnections); put("autoVerifySha256", settings.autoVerifySha256); put("customUupApiUrl", settings.customUupApiUrl); put("preferDirectMicrosoftUup", settings.preferDirectMicrosoftUup)
-                put("buildThermalProfile", settings.buildThermalProfile.name); put("autoThermalCooldown", settings.autoThermalCooldown); put("keepScreenAwakeDuringBuilds", settings.keepScreenAwakeDuringBuilds); put("keepUupPackagesAfterBuild", settings.keepUupPackagesAfterBuild)
+                put("downloadConnections", settings.downloadConnections); put("autoVerifySha256", settings.autoVerifySha256)
+                put("buildThermalProfile", settings.buildThermalProfile.name); put("autoThermalCooldown", settings.autoThermalCooldown); put("keepScreenAwakeDuringBuilds", settings.keepScreenAwakeDuringBuilds)
                 put("fileModes", modesObj); put("autounattendPresets", presetsArr)
             }.toString(2)
         }
@@ -270,7 +255,7 @@ class AppPrefs(context: Context) {
                 }
             }
             val surfMode = runCatching { SurfaceMode.valueOf(obj.optString("surfaceMode", current.surfaceMode.name)) }.getOrDefault(current.surfaceMode)
-            current.copy(hasCompletedSetup = true, defaultDir = defDir, favoriteQuickMountPath = obj.optString("favoriteQuickMountPath", current.favoriteQuickMountPath), keepAdbActive = obj.optBoolean("keepAdbActive", current.keepAdbActive), autoPatchSelinux = obj.optBoolean("autoPatchSelinux", current.autoPatchSelinux), surfaceMode = surfMode, useMonet = obj.optBoolean("useMonet", current.useMonet), accentHex = obj.optLong("accentHex", current.accentHex), scanDirs = scanDirs, useDefaultDistroRepo = obj.optBoolean("useDefaultDistroRepo", current.useDefaultDistroRepo), customRepoUrls = parsedRepos.distinct(), downloadConnections = obj.optInt("downloadConnections", current.downloadConnections).coerceIn(1, 16), autoVerifySha256 = obj.optBoolean("autoVerifySha256", current.autoVerifySha256), customUupApiUrl = obj.optString("customUupApiUrl", current.customUupApiUrl).trim().trimEnd('/').ifBlank { AppSettings.DEFAULT_UUP_API_URL }, preferDirectMicrosoftUup = obj.optBoolean("preferDirectMicrosoftUup", current.preferDirectMicrosoftUup), buildThermalProfile = runCatching { BuildThermalProfile.valueOf(obj.optString("buildThermalProfile", current.buildThermalProfile.name)) }.getOrDefault(current.buildThermalProfile), autoThermalCooldown = obj.optBoolean("autoThermalCooldown", current.autoThermalCooldown), keepScreenAwakeDuringBuilds = obj.optBoolean("keepScreenAwakeDuringBuilds", current.keepScreenAwakeDuringBuilds), keepUupPackagesAfterBuild = obj.optBoolean("keepUupPackagesAfterBuild", current.keepUupPackagesAfterBuild), fileModes = modesMap, autounattendPresets = presets)
+            current.copy(hasCompletedSetup = true, defaultDir = defDir, favoriteQuickMountPath = obj.optString("favoriteQuickMountPath", current.favoriteQuickMountPath), keepAdbActive = obj.optBoolean("keepAdbActive", current.keepAdbActive), autoPatchSelinux = obj.optBoolean("autoPatchSelinux", current.autoPatchSelinux), surfaceMode = surfMode, useMonet = obj.optBoolean("useMonet", current.useMonet), accentHex = obj.optLong("accentHex", current.accentHex), scanDirs = scanDirs, useDefaultDistroRepo = obj.optBoolean("useDefaultDistroRepo", current.useDefaultDistroRepo), customRepoUrls = parsedRepos.distinct(), downloadConnections = obj.optInt("downloadConnections", current.downloadConnections).coerceIn(1, 16), autoVerifySha256 = obj.optBoolean("autoVerifySha256", current.autoVerifySha256), buildThermalProfile = runCatching { BuildThermalProfile.valueOf(obj.optString("buildThermalProfile", current.buildThermalProfile.name)) }.getOrDefault(current.buildThermalProfile), autoThermalCooldown = obj.optBoolean("autoThermalCooldown", current.autoThermalCooldown), keepScreenAwakeDuringBuilds = obj.optBoolean("keepScreenAwakeDuringBuilds", current.keepScreenAwakeDuringBuilds), fileModes = modesMap, autounattendPresets = presets)
         }.getOrNull()
     }
 }

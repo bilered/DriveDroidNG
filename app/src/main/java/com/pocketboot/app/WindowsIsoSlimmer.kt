@@ -108,9 +108,12 @@ object WindowsIsoSlimmer {
         return@withContext runCatching {
             onProgress(WindowsBuildProgress("Extracting source Windows ISO...", config.sourceIso.name, 0.14f, true))
             Shell.cmd("mkdir -p $qIsoDir $qTmp").exec()
-            val slimProf = WindowsBuildEngine.currentDefaultThermalProfile()
-            val mmtArg = if (slimProf.sevenZipThreads > 0) "-mmt=${slimProf.sevenZipThreads}" else ""
-            val extRes = WindowsBuildEngine.runIsolatedRootScript(context, "slim_ext", "set -e\n$envPrefix\n${WindowsBuildEngine.thermalExecPrefix(slimProf)}\n\$THERM_PFX $q7z x -y $mmtArg -o$qIsoDir $qIso")
+            val slimProf = BuildThermalHelper.currentDefaultThermalProfile()
+            val mmtArg = BuildThermalHelper.sevenZipThreadArgFor(slimProf)
+            BuildThermalHelper.waitForThermalCooldownIfNeeded(context, slimProf) { temp, resumeAt ->
+                onProgress(WindowsBuildProgress("Cooling down phone...", String.format(java.util.Locale.US, "%.1f°C -> resuming at %.1f°C", temp, resumeAt), 0.14f, true))
+            }
+            val extRes = BuildThermalHelper.runIsolatedRootScript(context, "slim_ext", "set -e\n$envPrefix\n${BuildThermalHelper.thermalExecPrefix(slimProf)}\n\$THERM_PFX $q7z x -y $mmtArg -o$qIsoDir $qIso")
             if (!isActive) {
                 UsbGadgetEngine.cleanupTempWorkDir(workRoot)
                 return@withContext ActionResult(false, "ISO slimming cancelled.")
@@ -127,7 +130,7 @@ object WindowsIsoSlimmer {
             }
 
             val dstExt = if (config.convertToEsd) "esd" else "wim"
-            val wimThrArg = WindowsBuildEngine.wimThreadArgFor(slimProf, isSolidEsd = config.convertToEsd)
+            val wimThrArg = BuildThermalHelper.wimThreadArgFor(slimProf, isSolidEsd = config.convertToEsd)
             val compArg = if (config.convertToEsd) "--compress=LZMS --solid $wimThrArg" else "--compress=maximum $wimThrArg"
             val newInstall = "$tmpDir/install.$dstExt"
             val qSrcWim = shellQuote(srcWim)
@@ -147,7 +150,10 @@ object WindowsIsoSlimmer {
                         isIndeterminate = false
                     )
                 )
-                val expRes = WindowsBuildEngine.runIsolatedRootScript(context, "slim_exp", "set -e\n$envPrefix\n${WindowsBuildEngine.thermalExecPrefix(slimProf)}\n\$THERM_PFX $qWim export $qSrcWim $edIdx $qNewInstall $compArg")
+                BuildThermalHelper.waitForThermalCooldownIfNeeded(context, slimProf) { temp, resumeAt ->
+                    onProgress(WindowsBuildProgress("Cooling down phone...", String.format(java.util.Locale.US, "%.1f°C -> resuming at %.1f°C", temp, resumeAt), pct, false))
+                }
+                val expRes = BuildThermalHelper.runIsolatedRootScript(context, "slim_exp", "set -e\n$envPrefix\n${BuildThermalHelper.thermalExecPrefix(slimProf)}\n\$THERM_PFX $qWim export $qSrcWim $edIdx $qNewInstall $compArg")
                 if (!expRes.isSuccess) {
                     throw IllegalStateException("Edition export failed: ${(expRes.out + expRes.err).takeLast(3).joinToString(" ").take(180)}")
                 }
@@ -160,7 +166,7 @@ object WindowsIsoSlimmer {
             // Optional Windows CA 2023 bootloaders, ei.cfg unlock, and Two-Pane Experience/WinUtil tweaks
             if (config.experience.useCa2023Bootloaders) {
                 onProgress(WindowsBuildProgress("Applying CA 2023 bootloaders...", outName, 0.80f, false))
-                WindowsBuildEngine.runIsolatedRootScript(
+                BuildThermalHelper.runIsolatedRootScript(
                     context,
                     "slim_ca2023",
                     WindowsCustomizationEngine.applyCa2023BootloadersSnippet(qWim, shellQuote(finalInstallInIso), qIsoDir)
@@ -210,17 +216,20 @@ object WindowsIsoSlimmer {
                 if (slimWimSz > 3_950_000_000L) {
                     onProgress(WindowsBuildProgress("Auto-splitting >4GB install.wim...", "cdfs.sys compatibility (3.5 GB chunks)", 0.85f, false))
                     val swmDst = "$isoDir/sources/install.swm"
-                    val swmRes = WindowsBuildEngine.runIsolatedRootScript(context, "slim_swm", "set -e\n$envPrefix\n$qWim split ${shellQuote(finalInstallInIso)} ${shellQuote(swmDst)} 3500 >/dev/null 2>&1\nrm -f ${shellQuote(finalInstallInIso)}")
+                    val swmRes = BuildThermalHelper.runIsolatedRootScript(context, "slim_swm", "set -e\n$envPrefix\n$qWim split ${shellQuote(finalInstallInIso)} ${shellQuote(swmDst)} 3500 >/dev/null 2>&1\nrm -f ${shellQuote(finalInstallInIso)}")
                     if (!swmRes.isSuccess) throw IllegalStateException("Failed to split >4 GiB install.wim")
                 }
             }
 
+            BuildThermalHelper.waitForThermalCooldownIfNeeded(context, slimProf) { temp, resumeAt ->
+                onProgress(WindowsBuildProgress("Cooling down phone...", String.format(java.util.Locale.US, "%.1f°C -> resuming at %.1f°C", temp, resumeAt), 0.86f, false))
+            }
             onProgress(WindowsBuildProgress("Rebuilding bootable ISO (xorriso)...", outName, 0.87f, false))
             val preferNoPrompt = config.experience.hasAnyActive() || config.winUtil.hasAnyActive()
             val packCmd = """
                 set -e
                 $envPrefix
-                ${WindowsBuildEngine.thermalExecPrefix(slimProf)}
+                ${BuildThermalHelper.thermalExecPrefix(slimProf)}
                 mkdir -p ${shellQuote(outDir)}
                 rm -f $qOut
                 ISODIR=$qIsoDir
@@ -244,12 +253,12 @@ object WindowsIsoSlimmer {
                     ${'$'}THERM_PFX $qXor -as mkisofs --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -volid "POCKETBOOT_SLIM" -o $qOut .
                 fi
             """.trimIndent()
-            val xorRes = WindowsBuildEngine.runIsolatedRootScript(context, "slim_iso", packCmd)
+            val xorRes = BuildThermalHelper.runIsolatedRootScript(context, "slim_iso", packCmd)
             if (!xorRes.isSuccess) {
                 throw IllegalStateException("ISO rebuild failed: ${(xorRes.out + xorRes.err).takeLast(3).joinToString(" ").take(180)}")
             }
             onProgress(WindowsBuildProgress("Verifying rebuilt ISO...", outName, 0.96f, false))
-            val slimVerify = WindowsBuildEngine.runIsolatedRootScript(context, "slim_verify", """
+            val slimVerify = BuildThermalHelper.runIsolatedRootScript(context, "slim_verify", """
                 set -e
                 $q7z l -slt $qOut 2>/dev/null | awk '
                     BEGIN { path=""; folder=""; sz=-1; bad=""; seen=0 }

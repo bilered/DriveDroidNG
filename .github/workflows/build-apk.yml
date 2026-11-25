@@ -205,27 +205,7 @@ jobs:
             ls -lh app/src/main/assets/ventoy/
           ) || echo "::warning::Could not bundle Ventoy boot files; users can download them in-app"
 
-          # 7. Cross-compile STATIC ARM64 cabextract -> libcabextract.so (Windows ISO Builder)
-          (
-            set -e
-            curl -fSL "https://www.cabextract.org.uk/cabextract-1.11.tar.gz" -o /tmp/cabextract.tar.gz || \
-              curl -fSL "https://www.cabextract.org.uk/cabextract-1.12.tar.gz" -o /tmp/cabextract.tar.gz
-            mkdir -p /tmp/cabextract-src
-            tar -xzf /tmp/cabextract.tar.gz --strip-components=1 -C /tmp/cabextract-src
-            cd /tmp/cabextract-src
-            ac_cv_func_malloc_0_nonnull=yes ac_cv_func_realloc_0_nonnull=yes \
-              ac_cv_func_fnmatch_works=yes ac_cv_func_fnmatch_gnu=yes \
-              ./configure --host=aarch64-linux-gnu CFLAGS="-O2 -std=gnu17" LDFLAGS="-static"
-            make -j"$(nproc)"
-            file cabextract
-            if ! aarch64-linux-gnu-readelf -l cabextract 2>/dev/null | grep -q INTERP; then
-              aarch64-linux-gnu-strip cabextract
-              cp cabextract "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libcabextract.so"
-              chmod 755 "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libcabextract.so"
-            fi
-          ) || echo "::warning::Could not bundle static cabextract"
-
-          # 8. Cross-compile minimal STATIC ARM64 libxml2 + wimlib-imagex -> libwimlib_imagex.so (Windows ISO Builder)
+          # 7. Cross-compile minimal STATIC ARM64 libxml2 + wimlib-imagex -> libwimlib_imagex.so (ISO Slimmer & Edition Inspector)
           (
             set -e
             SYSROOT="/tmp/arm64-sysroot"
@@ -273,26 +253,7 @@ jobs:
             fi
           ) || echo "::warning::Could not bundle static wimlib-imagex"
 
-          # 9. Cross-compile STATIC ARM64 chntpw/reged -> libchntpw.so (offline registry editor, zero OpenSSL dep)
-          (
-            set -e
-            git clone --depth 1 https://github.com/Tody-Guo/chntpw.git /tmp/chntpw-src || (
-              curl -fSL "https://deb.debian.org/debian/pool/main/c/chntpw/chntpw_140201.orig.tar.gz" -o /tmp/chntpw.tar.gz &&
-              mkdir -p /tmp/chntpw-src && tar -xzf /tmp/chntpw.tar.gz --strip-components=1 -C /tmp/chntpw-src
-            )
-            cd /tmp/chntpw-src
-            aarch64-linux-gnu-gcc -static -O2 -std=gnu17 -D_FILE_OFFSET_BITS=64 \
-              -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion \
-              reged.c ntreg.c edlib.c -o reged-static
-            file reged-static
-            if ! aarch64-linux-gnu-readelf -l reged-static 2>/dev/null | grep -q INTERP; then
-              aarch64-linux-gnu-strip reged-static
-              cp reged-static "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libchntpw.so"
-              chmod 755 "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libchntpw.so"
-            fi
-          ) || echo "::warning::Could not bundle static chntpw/reged"
-
-          # 10. Cross-compile STATIC ARM64 GNU xorriso -> libxorriso.so (UEFI+BIOS bootable ISO creator)
+          # 8. Cross-compile STATIC ARM64 GNU xorriso -> libxorriso.so (UEFI+BIOS bootable ISO creator)
           (
             set -e
             curl -fSL "https://ftp.gnu.org/gnu/xorriso/xorriso-1.5.6.pl02.tar.gz" -o /tmp/xorriso.tar.gz || \

@@ -208,7 +208,7 @@ object FastIsoDownloader {
     private var cachedOnError: ((String) -> Unit)? = null
     private var cachedOnLog: ((LogEntry) -> Unit)? = null
     @Volatile private var cachedUserAgent: String = BROWSER_UA
-    private const val BROWSER_UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.5.0"
+    private const val BROWSER_UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.6.0"
     private const val WGET_UA = "Wget/1.21.4"
     private const val CURL_UA = "curl/8.5.0"
     private fun logDl(msg: String, isError: Boolean = false) { cachedOnLog?.invoke(LogEntry(SimpleDateFormat("HH:mm:ss", Locale.US).format(Date()), "download", msg, isError)) }

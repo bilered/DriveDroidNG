@@ -590,17 +590,33 @@ object WindowsImageBuilder {
                 return@withContext ActionResult(false, "Could not mount target partition: $errTxt", entries = entries)
             }
 
+            val usbProf = BuildThermalHelper.currentDefaultThermalProfile()
+            BuildThermalHelper.waitForThermalCooldownIfNeeded(context, usbProf) { temp, resumeAt ->
+                onProgress(
+                    WindowsBuildProgress(
+                        stage = "Cooling down phone...",
+                        detail = String.format(Locale.US, "%.1f°C -> resuming at %.1f°C", temp, resumeAt),
+                        progress = 0.40f,
+                        isIndeterminate = true
+                    )
+                )
+            }
             onProgress(
                 WindowsBuildProgress(
                     stage = "Extracting Windows ISO...",
-                    detail = "Copying setup files (${UsbGadgetEngine.formatBytes(isoSize)}) — please keep screen on",
+                    detail = "Copying setup files (${UsbGadgetEngine.formatBytes(isoSize)} · ${usbProf.shortLabel} thermal)",
                     progress = 0.42f,
                     isIndeterminate = true
                 )
             )
 
             val extractRes = if (sevenZip != null) {
-                Shell.cmd("${shellQuote(sevenZip)} x -y -o$TEMP_MNT $qIso 2>&1").exec()
+                val mmtArg = BuildThermalHelper.sevenZipThreadArgFor(usbProf)
+                BuildThermalHelper.runIsolatedRootScript(
+                    context,
+                    "winusb_ext",
+                    "set -e\n${BuildThermalHelper.thermalExecPrefix(usbProf)}\n\$THERM_PFX ${shellQuote(sevenZip)} x -y $mmtArg -o$TEMP_MNT $qIso 2>&1"
+                )
             } else {
                 Shell.cmd(
                     """

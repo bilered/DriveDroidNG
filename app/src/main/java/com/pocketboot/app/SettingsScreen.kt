@@ -328,7 +328,7 @@ fun SettingsScreen(
                         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
                             Text("Download Engine", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
                             Text(
-                                text = "Turbo · ${settings.downloadConnections}x · UUP: ${if (settings.preferDirectMicrosoftUup) "Direct MS" else if (settings.customUupApiUrl != AppSettings.DEFAULT_UUP_API_URL) "Custom Mirror" else "Auto + MS Fallback"}",
+                                text = "Turbo · ${settings.downloadConnections}x · ${if (settings.autoVerifySha256) "SHA-256 On" else "SHA-256 Off"}",
                                 style = PocketColors.monoStyle,
                                 color = PocketColors.textSecondary
                             )
@@ -349,7 +349,7 @@ fun SettingsScreen(
                         ) {
                             SettingsIconBadge(Icons.Rounded.DeviceThermostat, PocketColors.infoBlue, PocketColors.infoBlueBg)
                             Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
-                                Text("ISO Builder Thermal Profile", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                                Text("Build & Slimmer Thermal Profile", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
                                 Text(settings.buildThermalProfile.subtitle, style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary)
                             }
                         }
@@ -385,7 +385,7 @@ fun SettingsScreen(
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Text("Auto Thermal Cooldown", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
-                                Text("Pauses native binary if battery gets hot, resumes when cool", fontSize = 11.sp, color = PocketColors.textSecondary)
+                                Text("Pauses between ISO Slimmer & USB Builder steps if battery gets hot", fontSize = 11.sp, color = PocketColors.textSecondary)
                             }
                             PocketSwitch(
                                 checked = settings.autoThermalCooldown,
@@ -882,7 +882,7 @@ fun SettingsScreen(
                             Icon(Icons.Rounded.Usb, null, tint = PocketColors.onAccent, modifier = Modifier.size(22.dp))
                         }
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("PocketBoot v4.5.0", style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary)
+                            Text("PocketBoot v4.6.0", style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary)
                             Text(
                                 text = "${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE}",
                                 style = MaterialTheme.typography.bodySmall,
@@ -893,7 +893,7 @@ fun SettingsScreen(
                         }
                         Surface(
                             modifier = Modifier.bounceClick {
-                                val info = "PocketBoot v4.5.0\nDevice: ${Build.MANUFACTURER} ${Build.MODEL}\nAndroid: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\nRoot: ${status.rootManager}\nSELinux: ${status.selinuxMode}\nUDC: ${status.udcName}\nKernel: ${status.kernelVersion}"
+                                val info = "PocketBoot v4.6.0\nDevice: ${Build.MANUFACTURER} ${Build.MODEL}\nAndroid: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\nRoot: ${status.rootManager}\nSELinux: ${status.selinuxMode}\nUDC: ${status.udcName}\nKernel: ${status.kernelVersion}"
                                 val cm = context.getSystemService(ClipboardManager::class.java)
                                 cm?.setPrimaryClip(ClipData.newPlainText("Device Info", info))
                                 Toast.makeText(context, "Device info copied.", Toast.LENGTH_SHORT).show()
@@ -1225,7 +1225,6 @@ fun SettingsScreen(
                     Text("• exfatprogs (GPLv2) — exFAT filesystem formatter", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
                     Text("• 7-Zip / 7zzs (LGPL / BSD) — ISO archive extractor", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
                     Text("• wimlib (GPLv3/LGPLv3) — WIM/ESD imaging engine", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
-                    Text("• cabextract (GPLv3) & chntpw (GPLv2) — Cabinet & offline registry tools", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
                     Text("• GNU xorriso (GPLv3) — UEFI/BIOS bootable ISO creator", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
                     Text("• libsu (Apache 2.0) — Root shell execution", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
                 }
@@ -1239,7 +1238,6 @@ fun SettingsScreen(
     }
 
     if (showDlSpeedDialog) {
-        var uupMirrorDraft by remember(settings.customUupApiUrl) { mutableStateOf(settings.customUupApiUrl) }
         AlertDialog(
             onDismissRequest = { showDlSpeedDialog = false },
             containerColor = PocketColors.surfaceCard,
@@ -1291,65 +1289,10 @@ fun SettingsScreen(
                             activeColor = PocketColors.success
                         )
                     }
-
-                    PocketHairlineDivider()
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Prefer Direct Microsoft UUP", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
-                            Text("Skip UUPdump API & query Microsoft directly (faster if ISP blocks uupdump)", style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary)
-                        }
-                        Spacer(modifier = Modifier.width(8.dp))
-                        PocketSwitch(
-                            checked = settings.preferDirectMicrosoftUup,
-                            onCheckedChange = { onUpdateSettings(settings.copy(preferDirectMicrosoftUup = it)) },
-                            activeColor = PocketColors.accent
-                        )
-                    }
-
-                    Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                            Text("UUP API Mirror URL", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
-                            if (uupMirrorDraft.trim().trimEnd('/') != AppSettings.DEFAULT_UUP_API_URL) {
-                                TextButton(
-                                    onClick = { uupMirrorDraft = AppSettings.DEFAULT_UUP_API_URL },
-                                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp)
-                                ) {
-                                    Text("Reset", fontSize = 11.sp, color = PocketColors.accentSoft)
-                                }
-                            }
-                        }
-                        OutlinedTextField(
-                            value = uupMirrorDraft,
-                            onValueChange = { uupMirrorDraft = it },
-                            placeholder = { Text(AppSettings.DEFAULT_UUP_API_URL, fontSize = 12.sp) },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(10.dp),
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedBorderColor = PocketColors.accent,
-                                unfocusedBorderColor = PocketColors.border,
-                                focusedTextColor = PocketColors.textPrimary,
-                                unfocusedTextColor = PocketColors.textPrimary
-                            )
-                        )
-                    }
                 }
             },
             confirmButton = {
-                TextButton(onClick = {
-                    val cleaned = uupMirrorDraft.trim().trimEnd('/').let {
-                        if (it.startsWith("http://") || it.startsWith("https://")) it else AppSettings.DEFAULT_UUP_API_URL
-                    }
-                    if (cleaned != settings.customUupApiUrl) {
-                        onUpdateSettings(settings.copy(customUupApiUrl = cleaned))
-                    }
-                    showDlSpeedDialog = false
-                }) {
+                TextButton(onClick = { showDlSpeedDialog = false }) {
                     Text("Done", color = PocketColors.accentSoft)
                 }
             }
