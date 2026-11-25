@@ -1391,10 +1391,7 @@ object UsbGadgetEngine {
                 }
                 val baseDir = context.applicationContext.getExternalFilesDir(null) ?: context.applicationContext.cacheDir
                 val dlDir = File(baseDir, "turbo_dl")
-                val winStageDir = File(baseDir, "pb_winbuild_cache")
-                val dlBytes = dlDir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
-                val winStageBytes = winStageDir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
-                val resumableBytes = dlBytes + winStageBytes
+                val resumableBytes = dlDir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
                 val rootTmpBytes = Shell.cmd(
                     "du -sbc /data/local/tmp/pb_* 2>/dev/null | tail -n 1 | awk '{print \$1}'"
                 ).exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L

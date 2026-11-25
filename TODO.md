@@ -1,9 +1,7 @@
 # PocketBoot Pending Tasks
 
-1. **GitHub Actions CI Build:** Push `v4.6.0` and verify `assembleDebug` + `XOR_SMOKE` pass cleanly (faster CI without `cabextract`/`chntpw`).
-2. **Phone Smoke Test:**
-   - Verify normal ISO/IMG USB Gadget mounting works normally across all thermal profiles.
-   - Verify **Downloads → Windows 11** opens straight to Direct Official Retail ISO (26H2 / 25H2 / 24H2) and generates signed Microsoft CDN links.
-   - Verify **Settings → Build & Slimmer Thermal Profile** persists Cool / Balanced / Max Speed + Auto Thermal Cooldown.
-   - Verify **ISO Slimmer** and **Windows USB Builder** run with the selected thermal profile and produce clean bootable outputs.
-   - Verify **Settings → Clean Temp** clears any leftover `.pocketboot_tmp` / old UUP cache folders cleanly.
+1. **GitHub Actions CI Build:** Push `v4.6.1` and verify `assembleDebug` + `XOR_SMOKE` pass cleanly.
+2. **Phone & VirtualBox Verification:**
+   - Slim an official Windows 11 26H2 (`26300.9457`) ISO down to **Windows 11 Pro** with default Clean Stock settings (confirm `ei.cfg` auto-enables, source volume ID is preserved, and MTP copy is byte-exact).
+   - Boot the slimmed ISO in VirtualBox and confirm *"Press any key to boot..."*, *"Previous version of Setup"*, genuine Edge, all inbox Store Apps, and OOBE behave identically to the official Microsoft ISO.
+   - Test tapping **Cancel** mid-slim and confirm native `7zzs`/`wimlib-imagex`/`xorriso` stops immediately and `.pocketboot_tmp` cleans up.

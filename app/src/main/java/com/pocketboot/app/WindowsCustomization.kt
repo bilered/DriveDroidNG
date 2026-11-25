@@ -79,13 +79,22 @@ data class WindowsExperienceConfig(
     val skipOobe: Boolean = false, val useCa2023Bootloaders: Boolean = false,
     val applySkuSiPolicy: Boolean = false, val customPostInstallScriptPath: String = ""
 ) {
-    fun hasAnyActive(): Boolean = bypassRequirements || bypassMicrosoftAccount || disableDataCollection || disableBitLocker ||
+    fun hasUnattendTweaks(): Boolean = bypassRequirements || bypassMicrosoftAccount || disableDataCollection || disableBitLocker ||
         qolImprovements || disableSponsoredApps || classicContextMenu || skipWifiSetup || skipOobe ||
-        (createLocalUser && localUsername.isNotBlank()) || useCa2023Bootloaders || applySkuSiPolicy || customPostInstallScriptPath.isNotBlank()
+        (createLocalUser && localUsername.isNotBlank()) || applySkuSiPolicy || customPostInstallScriptPath.isNotBlank()
+    fun hasAnyActive(): Boolean = hasUnattendTweaks() || useCa2023Bootloaders
     fun activeCount(): Int = listOf(bypassRequirements, bypassMicrosoftAccount, disableDataCollection, disableBitLocker,
         qolImprovements, disableSponsoredApps, classicContextMenu, skipWifiSetup, skipOobe,
         createLocalUser && localUsername.isNotBlank(), useCa2023Bootloaders, applySkuSiPolicy, customPostInstallScriptPath.isNotBlank()).count { it }
     companion object {
+        fun cleanStock(): WindowsExperienceConfig = WindowsExperienceConfig(
+            bypassRequirements = false,
+            bypassMicrosoftAccount = false,
+            disableDataCollection = false,
+            disableBitLocker = false,
+            qolImprovements = false,
+            skipWifiSetup = false
+        )
         fun defaultForOs(osKind: WindowsOsKind): WindowsExperienceConfig = when (osKind) {
             WindowsOsKind.WIN11, WindowsOsKind.UNKNOWN -> WindowsExperienceConfig()
             WindowsOsKind.WIN10 -> WindowsExperienceConfig(bypassRequirements = false, bypassMicrosoftAccount = true, disableDataCollection = true, disableBitLocker = true, qolImprovements = true, skipWifiSetup = true)
@@ -198,7 +207,7 @@ object WindowsCustomizationEngine {
         sb.appendLine("if exist \"%PB_FLAG%\" exit /b 0")
         sb.appendLine("mkdir \"C:\\Windows\\Setup\\Scripts\" >nul 2>&1")
         sb.appendLine("echo [PocketBoot] Specialize configuration started...")
-        sb.appendLine("echo [PocketBoot v4.6.0] Specialize started %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.6.1] Specialize started %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("set \"PB_BUILD=0\"")
         sb.appendLine("for /f \"tokens=3\" %%B in ('reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\" /v CurrentBuildNumber 2^>nul ^| findstr /i CurrentBuildNumber') do set \"PB_BUILD=%%B\"")
         if (experience.bypassMicrosoftAccount) sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\OOBE\" /v BypassNRO /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
@@ -353,7 +362,7 @@ object WindowsCustomizationEngine {
         // Register SetupComplete.cmd under FirstBoot\PostOobe so it executes right after OOBE on every machine (guarded by .pb_setupcomplete_done so it runs strictly once).
         sb.appendLine("if exist \"C:\\Windows\\Setup\\Scripts\\SetupComplete.cmd\" reg add \"HKLM\\SYSTEM\\Setup\\FirstBoot\\PostOobe\" /v \"00\" /t REG_SZ /d \"cmd.exe /c C:\\Windows\\Setup\\Scripts\\SetupComplete.cmd & exit /b 0\" /f >> \"%PB_LOG%\" 2>&1")
         sb.appendLine("echo done > \"%PB_FLAG%\"")
-        sb.appendLine("echo [PocketBoot v4.6.0] Specialize finished %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.6.1] Specialize finished %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("exit /b 0")
         return sb.toString().replace("\r\n", "\n").replace("\n", "\r\n")
     }
@@ -386,7 +395,7 @@ object WindowsCustomizationEngine {
             sb.appendLine("dism /Online /Cleanup-Image /StartComponentCleanup /ResetBase >> \"%PB_LOG%\" 2>&1")
         }
         sb.appendLine("if exist \"C:\\Windows\\Setup\\Custom\" rmdir /s /q \"C:\\Windows\\Setup\\Custom\" >nul 2>&1")
-        sb.appendLine("echo [PocketBoot v4.6.0] SetupComplete finished %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.6.1] SetupComplete finished %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("start \"\" /b cmd /c \"ping -n 4 127.0.0.1 >nul & rmdir /s /q C:\\Windows\\Setup\\Scripts >nul 2>&1\"")
         sb.appendLine("exit /b 0")
         return sb.toString().replace("\r\n", "\n").replace("\n", "\r\n")
@@ -487,27 +496,55 @@ object WindowsCustomizationEngine {
         CA_TMP="/data/local/tmp/pb_ca2023"
         rm -rf "${'$'}CA_TMP" && mkdir -p "${'$'}CA_TMP"
         CA_APPLIED=""
-        if $qWimBin extract $qInstallFile 1 /Windows/Boot/EFI_EX/bootmgfw_EX.efi --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null && [ -s "${'$'}CA_TMP/bootmgfw_EX.efi" ]; then
-            mkdir -p $qIsoRoot/efi/boot $qIsoRoot/efi/microsoft/boot
-            if [ -f $qIsoRoot/efi/boot/bootaa64.efi ] && [ ! -f $qIsoRoot/efi/boot/bootx64.efi ]; then
-                cp -f "${'$'}CA_TMP/bootmgfw_EX.efi" $qIsoRoot/efi/boot/bootaa64.efi
+        INST_SRC=$qInstallFile
+        ISO_ROOT=$qIsoRoot
+        extract_wim_file() {
+            local rel_path="${'$'}1"
+            case "${'$'}INST_SRC" in
+                *.swm|*.SWM)
+                    local wdir=${'$'}(dirname "${'$'}INST_SRC")
+                    local wbase=${'$'}(basename "${'$'}INST_SRC")
+                    local wpre="${'$'}{wbase%.*}"
+                    local wext="${'$'}{wbase##*.}"
+                    $qWimBin extract "${'$'}INST_SRC" 1 "${'$'}rel_path" --ref="${'$'}{wdir}/${'$'}{wpre}*.${'$'}{wext}" --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null
+                    ;;
+                *)
+                    $qWimBin extract "${'$'}INST_SRC" 1 "${'$'}rel_path" --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null
+                    ;;
+            esac
+        }
+        resolve_ci_dir() {
+            local base="${'$'}1"; local child="${'$'}2"
+            local hit=${'$'}(find "${'$'}base" -maxdepth 1 -mindepth 1 -type d -iname "${'$'}child" 2>/dev/null | head -n 1)
+            if [ -n "${'$'}hit" ]; then printf '%s' "${'$'}hit"; else mkdir -p "${'$'}base/${'$'}child"; printf '%s' "${'$'}base/${'$'}child"; fi
+        }
+        copy_ci_file() {
+            local src="${'$'}1"; local dir="${'$'}2"; local name="${'$'}3"
+            local existing=${'$'}(find "${'$'}dir" -maxdepth 1 -mindepth 1 -type f -iname "${'$'}name" 2>/dev/null | head -n 1)
+            if [ -n "${'$'}existing" ]; then cp -f "${'$'}src" "${'$'}existing"; else cp -f "${'$'}src" "${'$'}dir/${'$'}name"; fi
+        }
+        EFI_DIR=${'$'}(resolve_ci_dir "${'$'}ISO_ROOT" "efi")
+        EFI_BOOT_DIR=${'$'}(resolve_ci_dir "${'$'}EFI_DIR" "boot")
+        EFI_MS_DIR=${'$'}(resolve_ci_dir "${'$'}EFI_DIR" "microsoft")
+        EFI_MS_BOOT_DIR=${'$'}(resolve_ci_dir "${'$'}EFI_MS_DIR" "boot")
+        if extract_wim_file /Windows/Boot/EFI_EX/bootmgfw_EX.efi && [ -s "${'$'}CA_TMP/bootmgfw_EX.efi" ]; then
+            if find "${'$'}EFI_BOOT_DIR" -maxdepth 1 -type f -iname 'bootaa64.efi' 2>/dev/null | grep -q . && ! find "${'$'}EFI_BOOT_DIR" -maxdepth 1 -type f -iname 'bootx64.efi' 2>/dev/null | grep -q .; then
+                copy_ci_file "${'$'}CA_TMP/bootmgfw_EX.efi" "${'$'}EFI_BOOT_DIR" "bootaa64.efi"
             else
-                cp -f "${'$'}CA_TMP/bootmgfw_EX.efi" $qIsoRoot/efi/boot/bootx64.efi
+                copy_ci_file "${'$'}CA_TMP/bootmgfw_EX.efi" "${'$'}EFI_BOOT_DIR" "bootx64.efi"
             fi
             CA_APPLIED="bootmgfw_EX.efi"
         fi
-        if $qWimBin extract $qInstallFile 1 /Windows/Boot/EFI_EX/bootmgr_EX.efi --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null && [ -s "${'$'}CA_TMP/bootmgr_EX.efi" ]; then
-            cp -f "${'$'}CA_TMP/bootmgr_EX.efi" $qIsoRoot/bootmgr.efi
+        if extract_wim_file /Windows/Boot/EFI_EX/bootmgr_EX.efi && [ -s "${'$'}CA_TMP/bootmgr_EX.efi" ]; then
+            copy_ci_file "${'$'}CA_TMP/bootmgr_EX.efi" "${'$'}ISO_ROOT" "bootmgr.efi"
             CA_APPLIED="${'$'}{CA_APPLIED:+${'$'}CA_APPLIED + }bootmgr_EX.efi"
         fi
-        if $qWimBin extract $qInstallFile 1 /Windows/Boot/DVD/EFI/efisys_ex.bin --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null && [ -s "${'$'}CA_TMP/efisys_ex.bin" ]; then
-            mkdir -p $qIsoRoot/efi/microsoft/boot
-            cp -f "${'$'}CA_TMP/efisys_ex.bin" $qIsoRoot/efi/microsoft/boot/efisys.bin
+        if extract_wim_file /Windows/Boot/DVD/EFI/efisys_ex.bin && [ -s "${'$'}CA_TMP/efisys_ex.bin" ]; then
+            copy_ci_file "${'$'}CA_TMP/efisys_ex.bin" "${'$'}EFI_MS_BOOT_DIR" "efisys.bin"
             CA_APPLIED="${'$'}{CA_APPLIED:+${'$'}CA_APPLIED + }efisys_ex.bin"
         fi
-        if $qWimBin extract $qInstallFile 1 /Windows/Boot/DVD/EFI/efisys_noprompt_ex.bin --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null && [ -s "${'$'}CA_TMP/efisys_noprompt_ex.bin" ]; then
-            mkdir -p $qIsoRoot/efi/microsoft/boot
-            cp -f "${'$'}CA_TMP/efisys_noprompt_ex.bin" $qIsoRoot/efi/microsoft/boot/efisys_noprompt.bin
+        if extract_wim_file /Windows/Boot/DVD/EFI/efisys_noprompt_ex.bin && [ -s "${'$'}CA_TMP/efisys_noprompt_ex.bin" ]; then
+            copy_ci_file "${'$'}CA_TMP/efisys_noprompt_ex.bin" "${'$'}EFI_MS_BOOT_DIR" "efisys_noprompt.bin"
             CA_APPLIED="${'$'}{CA_APPLIED:+${'$'}CA_APPLIED + }efisys_noprompt_ex.bin"
         fi
         if [ -n "${'$'}CA_APPLIED" ]; then
@@ -519,15 +556,29 @@ object WindowsCustomizationEngine {
     """.trimIndent()
 
     fun applyWin7UefiFixSnippet(qWimBin: String, qInstallFile: String, qIsoRoot: String): String = """
-        if [ ! -f $qIsoRoot/efi/boot/bootx64.efi ] && [ ! -f $qIsoRoot/EFI/BOOT/BOOTX64.EFI ] && [ ! -f $qIsoRoot/efi/boot/bootaa64.efi ]; then
+        ISO_ROOT=$qIsoRoot
+        INST_SRC=$qInstallFile
+        if ! find "${'$'}ISO_ROOT" -maxdepth 3 -type f \( -iname 'bootx64.efi' -o -iname 'bootaa64.efi' \) 2>/dev/null | grep -q .; then
             W7_TMP="/data/local/tmp/pb_win7_efi"
             rm -rf "${'$'}W7_TMP" && mkdir -p "${'$'}W7_TMP"
-            if $qWimBin extract $qInstallFile 1 /Windows/Boot/EFI/bootmgfw.efi --dest-dir="${'$'}W7_TMP" --no-acls --no-attributes 2>/dev/null; then
-                if [ -f "${'$'}W7_TMP/bootmgfw.efi" ]; then
-                    mkdir -p $qIsoRoot/efi/boot
-                    cp -f "${'$'}W7_TMP/bootmgfw.efi" $qIsoRoot/efi/boot/bootx64.efi
-                    echo "LOG|win7|Extracted Windows 7 UEFI bootx64.efi from install.wim"
-                fi
+            W7_OK=0
+            case "${'$'}INST_SRC" in
+                *.swm|*.SWM)
+                    WDIR=${'$'}(dirname "${'$'}INST_SRC"); WBASE=${'$'}(basename "${'$'}INST_SRC"); WPRE="${'$'}{WBASE%.*}"; WEXT="${'$'}{WBASE##*.}"
+                    if $qWimBin extract "${'$'}INST_SRC" 1 /Windows/Boot/EFI/bootmgfw.efi --ref="${'$'}{WDIR}/${'$'}{WPRE}*.${'$'}{WEXT}" --dest-dir="${'$'}W7_TMP" --no-acls --no-attributes 2>/dev/null; then W7_OK=1; fi
+                    ;;
+                *)
+                    if $qWimBin extract "${'$'}INST_SRC" 1 /Windows/Boot/EFI/bootmgfw.efi --dest-dir="${'$'}W7_TMP" --no-acls --no-attributes 2>/dev/null; then W7_OK=1; fi
+                    ;;
+            esac
+            if [ "${'$'}W7_OK" = "1" ] && [ -s "${'$'}W7_TMP/bootmgfw.efi" ]; then
+                EFI_DIR=${'$'}(find "${'$'}ISO_ROOT" -maxdepth 1 -mindepth 1 -type d -iname 'efi' 2>/dev/null | head -n 1)
+                [ -z "${'$'}EFI_DIR" ] && EFI_DIR="${'$'}ISO_ROOT/efi"
+                EFI_BOOT_DIR=${'$'}(find "${'$'}EFI_DIR" -maxdepth 1 -mindepth 1 -type d -iname 'boot' 2>/dev/null | head -n 1)
+                [ -z "${'$'}EFI_BOOT_DIR" ] && EFI_BOOT_DIR="${'$'}EFI_DIR/boot"
+                mkdir -p "${'$'}EFI_BOOT_DIR"
+                cp -f "${'$'}W7_TMP/bootmgfw.efi" "${'$'}EFI_BOOT_DIR/bootx64.efi"
+                echo "LOG|win7|Extracted Windows 7 UEFI bootx64.efi from install image"
             fi
             rm -rf "${'$'}W7_TMP"
         fi

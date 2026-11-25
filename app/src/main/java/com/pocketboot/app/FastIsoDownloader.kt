@@ -208,7 +208,7 @@ object FastIsoDownloader {
     private var cachedOnError: ((String) -> Unit)? = null
     private var cachedOnLog: ((LogEntry) -> Unit)? = null
     @Volatile private var cachedUserAgent: String = BROWSER_UA
-    private const val BROWSER_UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.6.0"
+    private const val BROWSER_UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.6.1"
     private const val WGET_UA = "Wget/1.21.4"
     private const val CURL_UA = "curl/8.5.0"
     private fun logDl(msg: String, isError: Boolean = false) { cachedOnLog?.invoke(LogEntry(SimpleDateFormat("HH:mm:ss", Locale.US).format(Date()), "download", msg, isError)) }
@@ -752,6 +752,8 @@ object FastIsoDownloader {
         val savedPath = if (movedViaRoot) {
             UsbGadgetEngine.fixUserStoragePermissions(ctx, targetDir, isDir = true)
             UsbGadgetEngine.fixUserStoragePermissions(ctx, finalDest, isDir = false)
+            val dlSz = Shell.cmd("stat -c '%s' $qDst 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+            if (dlSz > 0L) UsbGadgetEngine.syncMediaStoreFileSize(ctx, finalDest, dlSz)
             finalDest
         } else {
             val fallback = File(targetDir.replaceFirst("/data/media/0", "/storage/emulated/0"), finalState.fileName)
@@ -870,7 +872,7 @@ object FastIsoDownloader {
         stagedZip.delete()
         val finalName = extractedName ?: return null
         val finalOutPath = "${targetDir.trimEnd('/')}/$finalName"
-        if (Shell.cmd("mv -f '${outTmp.absolutePath.replace("'", "'\\''")}' '${finalOutPath.replace("'", "'\\''")}' && rm -f $qZip").exec().isSuccess) { UsbGadgetEngine.fixUserStoragePermissions(context, finalOutPath, false); finalOutPath } else { outTmp.delete(); null }
+        if (Shell.cmd("mv -f '${outTmp.absolutePath.replace("'", "'\\''")}' '${finalOutPath.replace("'", "'\\''")}' && rm -f $qZip").exec().isSuccess) { UsbGadgetEngine.fixUserStoragePermissions(context, finalOutPath, false); val zSz = Shell.cmd("stat -c '%s' '${finalOutPath.replace("'", "'\\''")}' 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L; if (zSz > 0L) UsbGadgetEngine.syncMediaStoreFileSize(context, finalOutPath, zSz); finalOutPath } else { outTmp.delete(); null }
     }.getOrNull()
 
     private fun downloadChunkWithRetries(file: File, idx: Int, totalCounter: AtomicLong) {

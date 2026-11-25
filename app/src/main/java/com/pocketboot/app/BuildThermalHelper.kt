@@ -8,6 +8,7 @@ import com.topjohnwu.superuser.Shell
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.coroutineContext
 
 enum class BuildThermalProfile(
@@ -40,9 +41,49 @@ data class IsoToolsStatus(
  * Wraps only heavy native build binaries (7zzs, wimlib-imagex, xorriso) and never touches USB Gadget mounting.
  */
 object BuildThermalHelper {
+    private const val ACTIVE_BUILD_PID_FILE = "/data/local/tmp/pb_active_build_pid"
+    private val buildCancelledFlag = AtomicBoolean(false)
     @Volatile private var defaultThermalProfile: BuildThermalProfile = BuildThermalProfile.BALANCED
     @Volatile private var defaultAutoCooldown: Boolean = true
     @Volatile private var cachedCpuMasks: Triple<String, String, String>? = null
+
+    fun resetCancelFlag() {
+        buildCancelledFlag.set(false)
+        Shell.cmd("rm -f $ACTIVE_BUILD_PID_FILE 2>/dev/null || true").exec()
+    }
+
+    fun isBuildCancelled(): Boolean = buildCancelledFlag.get()
+
+    /**
+     * Immediately terminates the currently tracked native build binary (7zzs, wimlib-imagex, xorriso)
+     * and its parent wrapper shell so cancelling a build stops CPU/storage work instantly.
+     */
+    fun cancelActiveBuildProcess() {
+        buildCancelledFlag.set(true)
+        Shell.cmd(
+            """
+            if [ -f $ACTIVE_BUILD_PID_FILE ]; then
+                ROOT_PID=${'$'}(cat $ACTIVE_BUILD_PID_FILE 2>/dev/null | tr -dc '0-9')
+                if [ -n "${'$'}ROOT_PID" ]; then
+                    kill_tree() {
+                        local p="${'$'}1"
+                        for st in /proc/[0-9]*/status; do
+                            [ -r "${'$'}st" ] || continue
+                            if grep -q "^PPid:[[:space:]]*${'$'}{p}${'$'}" "${'$'}st" 2>/dev/null; then
+                                local ch="${'$'}{st#/proc/}"
+                                ch="${'$'}{ch%/status}"
+                                kill_tree "${'$'}ch"
+                            fi
+                        done
+                        kill -9 "${'$'}p" 2>/dev/null || true
+                    }
+                    kill_tree "${'$'}ROOT_PID"
+                fi
+                rm -f $ACTIVE_BUILD_PID_FILE 2>/dev/null || true
+            fi
+            """.trimIndent()
+        ).exec()
+    }
 
     private fun shellQuote(value: String): String = "'${value.replace("'", "'\\''")}'"
 
@@ -159,7 +200,7 @@ object BuildThermalHelper {
         var temp = readBatteryTempC(context)
         if (temp < profile.cooldownTriggerC) return
         var waitedSec = 0
-        while (coroutineContext.isActive && temp > profile.cooldownResumeC && waitedSec < 300) {
+        while (coroutineContext.isActive && !buildCancelledFlag.get() && temp > profile.cooldownResumeC && waitedSec < 300) {
             onStatus?.invoke(temp, profile.cooldownResumeC)
             delay(3_000L)
             waitedSec += 3
@@ -167,20 +208,29 @@ object BuildThermalHelper {
         }
     }
 
-    internal fun runIsolatedRootScript(context: Context, tag: String, scriptBody: String): Shell.Result {
+    internal fun runIsolatedRootScript(
+        context: Context,
+        tag: String,
+        scriptBody: String,
+        trackPid: Boolean = false
+    ): Shell.Result {
         val stamp = System.nanoTime()
         val localScript = File(context.applicationContext.cacheDir, "pb_${tag}_$stamp.sh")
         val rootScriptPath = "/data/local/tmp/pb_${tag}_$stamp.sh"
         val qLocal = shellQuote(localScript.absolutePath)
         val qRoot = shellQuote(rootScriptPath)
+        val pidHeader = if (trackPid) {
+            "echo \"\$\$\" > $ACTIVE_BUILD_PID_FILE\ntrap 'rm -f $ACTIVE_BUILD_PID_FILE' EXIT\n"
+        } else ""
         return try {
-            localScript.writeText("#!/system/bin/sh\n$scriptBody\n", Charsets.UTF_8)
+            localScript.writeText("#!/system/bin/sh\n$pidHeader$scriptBody\n", Charsets.UTF_8)
             val prep = Shell.cmd("cp -f $qLocal $qRoot 2>&1 && chmod 700 $qRoot 2>&1").exec()
             if (!prep.isSuccess) return prep
             Shell.cmd("sh $qRoot 2>&1").exec()
         } finally {
             localScript.delete()
-            Shell.cmd("rm -f $qRoot 2>/dev/null || true").exec()
+            val rmPid = if (trackPid) " $ACTIVE_BUILD_PID_FILE" else ""
+            Shell.cmd("rm -f $qRoot$rmPid 2>/dev/null || true").exec()
         }
     }
 

@@ -1,3 +1,15 @@
+## v4.6.1 (2026-11-25)
+- **ISO Slimmer Official-ISO Parity (`WindowsIsoSlimmer.kt`):**
+  - Added case-insensitive resolution for `sources/`, `efi/`, and `boot/` folders plus full split-WIM (`install.swm` `--ref`) source support.
+  - Defaulted ISO Slimmer to **Clean Official Stock** (all tweaks OFF unless enabled), auto-enabled `sources/ei.cfg` when trimming editions, decoupled `useCa2023Bootloaders` from `autounattend.xml`, and auto-detected `uiLang` from `lang.ini`.
+  - Switched UEFI boot image preference to official `efisys.bin` (preventing Setup reboot loops), added >3.95 GiB multi-edition ESD auto-fallback to split WIM (`install*.swm`), added Win 7 UEFI fix, preserved source ISO-9660 volume IDs, and added atomic `.tmp.iso` packing with PVD size + `7zzs -tiso` verification.
+- **Windows USB Builder & Customization Fixes (`WindowsImageBuilder.kt`, `WindowsCustomization.kt`):**
+  - Made `sources/`, `efi/`, CA 2023, and Win 7 UEFI snippets case-safe and `.swm`-aware; updated `inspectEditionsViaBundledTools()` to detect `install.swm`.
+  - Separated `Panther/unattend.xml` (`includeWindowsPePass = false`) from root `autounattend.xml` and passed auto-detected `uiLang`.
+- **Reliable Cancel & MTP Sync (`BuildThermalHelper.kt`, `MainActivity.kt`, `FastIsoDownloader.kt`, `LinuxImageBuilder.kt`, `VentoyImageBuilder.kt`, `UsbGadgetEngine.kt`):**
+  - Added native PID-tree tracking and immediate process termination when cancelling ISO Slimmer or Windows USB Builder.
+  - Wired `UsbGadgetEngine.syncMediaStoreFileSize()` into all ISO/IMG builders and downloads so overwritten images sync byte-exact over USB MTP, and removed stale `pb_winbuild_cache` temp stat counting.
+
 ## v4.6.0 (2026-11-25)
 - **Removed On-Phone UUP ISO Builder:** Removed `WindowsBuildEngine.kt`, `MicrosoftUupClient.kt`, `VirtualEditionsPlugin.kt`, `WindowsBuildMonitorSheet.kt`, `sync-uup-builds.yml`, `uup-builds.json`, UUP settings/caches, and `IsoBuilderService` / `IsoBuilderActionReceiver`. Eliminates OOBE servicing loops, offline Edge/AppX issues, and ~400 KB of high-maintenance code.
 - **Standalone Build Thermal Helper (`BuildThermalHelper.kt`):** Preserved **Cool / Balanced / Max Speed** thermal profiles (`taskset` core affinity, `nice`/`ionice`, thread limits) and **Auto Thermal Cooldown** and wired them into both **Windows ISO Slimmer** and **Windows USB Builder** — with zero impact on normal USB Gadget ISO/IMG mounting.

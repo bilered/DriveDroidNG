@@ -156,6 +156,8 @@ object LinuxImageBuilder {
             cleanup(false)
             UsbGadgetEngine.fixUserStoragePermissions(context, safeDir, isDir = true)
             UsbGadgetEngine.fixUserStoragePermissions(context, outPath, isDir = false)
+            val lOutBytes = Shell.cmd("stat -c '%s' $qOut 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+            if (lOutBytes > 0L) UsbGadgetEngine.syncMediaStoreFileSize(context, outPath, lOutBytes)
             onProgress(WindowsBuildProgress("Done!", safeName, 1f, false))
             val msg = if (withPersistence) "Built $safeName with ${config.persistenceGb} GB ${config.style.volumeLabel}." else "Built standard live USB image $safeName."
             entries.add(LogEntry(ts, "linux-build", msg))
@@ -235,6 +237,8 @@ object LinuxImageBuilder {
             cleanup(false)
             UsbGadgetEngine.fixUserStoragePermissions(context, safeDir, isDir = true)
             UsbGadgetEngine.fixUserStoragePermissions(context, outPath, isDir = false)
+            val lOutBytes = Shell.cmd("stat -c '%s' $qOut 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+            if (lOutBytes > 0L) UsbGadgetEngine.syncMediaStoreFileSize(context, outPath, lOutBytes)
             val msg = if (withPersistence) "Built FAT32 USB $safeName + ${config.persistenceGb} GB ${config.style.volumeLabel}." else "Built Extracted FAT32 USB $safeName."
             entries.add(LogEntry(ts, "linux-build", msg))
             onProgress(WindowsBuildProgress("Done!", safeName, 1f, false))

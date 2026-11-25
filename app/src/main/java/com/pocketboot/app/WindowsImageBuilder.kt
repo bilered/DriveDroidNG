@@ -242,7 +242,7 @@ object WindowsImageBuilder {
             val qTmp = shellQuote(tmpDir.absolutePath)
             // Extract only install.wim/esd if small or use 7zzs listing to locate exact path
             val wimRel = Shell.cmd(
-                "$q7z l -ba $qIso 2>/dev/null | awk '{print \$NF}' | grep -iE '(^|/)sources/install\\.(wim|esd)$' | head -n 1"
+                "$q7z l -ba $qIso 2>/dev/null | awk '{print \$NF}' | grep -iE '(^|/)sources/install\\.(wim|esd|swm)$' | head -n 1"
             ).exec().out.firstOrNull().orEmpty().trim()
             if (wimRel.isBlank()) return emptyList()
             val extOk = Shell.cmd("export TMPDIR=$qTmp && $q7z e -y -o$qTmp $qIso ${shellQuote(wimRel)} >/dev/null 2>&1").exec().isSuccess
@@ -277,9 +277,23 @@ object WindowsImageBuilder {
         }
     }
 
-    fun generateAutounattendXml(config: WindowsBuildConfig): String = WindowsCustomizationEngine.generateAutounattendXml(
-        experience = config.experience, winUtil = config.winUtil, arch = config.arch,
-        selectedEditionIndex = config.selectedEditionIndex, hasSpecializeScript = config.experience.hasAnyActive() || config.winUtil.hasAnyActive(), hasOemUpdates = false
+    fun cancelActiveBuild() {
+        BuildThermalHelper.cancelActiveBuildProcess()
+    }
+
+    fun generateAutounattendXml(
+        config: WindowsBuildConfig,
+        includeWindowsPePass: Boolean = true,
+        uiLang: String = ""
+    ): String = WindowsCustomizationEngine.generateAutounattendXml(
+        experience = config.experience,
+        winUtil = config.winUtil,
+        arch = config.arch,
+        selectedEditionIndex = config.selectedEditionIndex,
+        hasSpecializeScript = config.experience.hasUnattendTweaks() || config.winUtil.hasAnyActive(),
+        hasOemUpdates = false,
+        includeWindowsPePass = includeWindowsPePass,
+        uiLang = uiLang
     )
 
     private fun loadUefiNtfsImage(context: Context): ByteArray? {
@@ -328,6 +342,7 @@ object WindowsImageBuilder {
         onProgress: (WindowsBuildProgress) -> Unit
     ): ActionResult = withContext(Dispatchers.IO) {
         val ts = nowTs()
+        BuildThermalHelper.resetCancelFlag()
         val entries = mutableListOf<LogEntry>()
         val safeDir = UsbGadgetEngine.resolveDirectPath(config.outputDir).trimEnd('/')
         val safeName = config.outputName.trim().let {
@@ -615,7 +630,8 @@ object WindowsImageBuilder {
                 BuildThermalHelper.runIsolatedRootScript(
                     context,
                     "winusb_ext",
-                    "set -e\n${BuildThermalHelper.thermalExecPrefix(usbProf)}\n\$THERM_PFX ${shellQuote(sevenZip)} x -y $mmtArg -o$TEMP_MNT $qIso 2>&1"
+                    "set -e\n${BuildThermalHelper.thermalExecPrefix(usbProf)}\n\$THERM_PFX ${shellQuote(sevenZip)} x -y $mmtArg -o$TEMP_MNT $qIso 2>&1",
+                    trackPid = true
                 )
             } else {
                 Shell.cmd(
@@ -626,7 +642,7 @@ object WindowsImageBuilder {
                     """.trimIndent()
                 ).exec()
             }
-            if (!isActive) {
+            if (!isActive || BuildThermalHelper.isBuildCancelled()) {
                 cleanup(deletePartial = true)
                 return@withContext ActionResult(false, "Build cancelled.", entries = entries)
             }
@@ -639,7 +655,9 @@ object WindowsImageBuilder {
             entries.add(LogEntry(ts, "win-build", "Extracted Windows ISO contents into Partition 1"))
 
             val wimBin = findBundledBinary(context, "libwimlib_imagex.so", listOf("wimlib-imagex"))
-            val installWimCandidate = Shell.cmd("ls $TEMP_MNT/sources/install.wim $TEMP_MNT/sources/install.esd $TEMP_MNT/SOURCES/INSTALL.WIM $TEMP_MNT/SOURCES/INSTALL.ESD 2>/dev/null | head -n 1").exec().out.firstOrNull().orEmpty().trim()
+            val sourcesDir = Shell.cmd("find $TEMP_MNT -maxdepth 1 -mindepth 1 -type d -iname 'sources' 2>/dev/null | head -n 1").exec().out.firstOrNull().orEmpty().trim().ifBlank { "$TEMP_MNT/sources" }
+            val qSourcesDir = shellQuote(sourcesDir)
+            val installWimCandidate = Shell.cmd("find $qSourcesDir -maxdepth 1 -type f \\( -iname 'install.wim' -o -iname 'install.esd' -o -iname 'install.swm' \\) 2>/dev/null | head -n 1").exec().out.firstOrNull().orEmpty().trim()
             if (wimBin != null && installWimCandidate.isNotBlank()) {
                 Shell.cmd(WindowsCustomizationEngine.applyWin7UefiFixSnippet(shellQuote(wimBin), shellQuote(installWimCandidate), TEMP_MNT)).exec()
                     .out.filter { it.startsWith("LOG|") }.forEach { l -> val p = l.split("|", limit = 3); if (p.size == 3) entries.add(LogEntry(ts, p[1], p[2])) }
@@ -649,25 +667,30 @@ object WindowsImageBuilder {
                 Shell.cmd(WindowsCustomizationEngine.applyCa2023BootloadersSnippet(shellQuote(wimBin), shellQuote(installWimCandidate), TEMP_MNT)).exec()
                     .out.filter { it.startsWith("LOG|") }.forEach { l -> val p = l.split("|", limit = 3); if (p.size == 3) entries.add(LogEntry(ts, p[1], p[2])) }
             }
-            val anyBypass = config.experience.hasAnyActive() || config.winUtil.hasAnyActive() || config.selectedEditionIndex != null
+            val anyBypass = config.experience.hasUnattendTweaks() || config.winUtil.hasAnyActive() || config.selectedEditionIndex != null
             if (anyBypass) {
                 onProgress(WindowsBuildProgress("Applying Windows tweaks...", "Writing autounattend.xml & scripts", 0.85f, false))
-                val tmpXml = File(context.cacheDir, "autounattend.xml").apply { writeText(generateAutounattendXml(config), Charsets.UTF_8) }
-                val oemPanther = "$TEMP_MNT/sources/\$OEM\$/\$\$/Panther"
-                val oemScripts = "$TEMP_MNT/sources/\$OEM\$/\$\$/Setup/Scripts"
-                val oemCustom = "$TEMP_MNT/sources/\$OEM\$/\$\$/Setup/Custom"
+                val langIniPath = Shell.cmd("find $qSourcesDir -maxdepth 1 -type f -iname 'lang.ini' 2>/dev/null | head -n 1").exec().out.firstOrNull().orEmpty().trim()
+                val detectedLang = if (langIniPath.isNotBlank()) {
+                    Shell.cmd("grep -iE '^[a-z]{2,3}(-[a-z0-9]{2,4}){1,2}[[:space:]]*=' ${shellQuote(langIniPath)} 2>/dev/null | head -n 1 | cut -d= -f1 | tr -d ' \\r\\n'").exec().out.firstOrNull().orEmpty().trim()
+                } else ""
+                val tmpXml = File(context.cacheDir, "autounattend.xml").apply { writeText(generateAutounattendXml(config, includeWindowsPePass = true, uiLang = detectedLang), Charsets.UTF_8) }
+                val tmpPantherXml = File(context.cacheDir, "panther_unattend.xml").apply { writeText(generateAutounattendXml(config, includeWindowsPePass = false, uiLang = detectedLang), Charsets.UTF_8) }
+                val oemPanther = "$sourcesDir/\$OEM\$/\$\$/Panther"
+                val oemScripts = "$sourcesDir/\$OEM\$/\$\$/Setup/Scripts"
+                val oemCustom = "$sourcesDir/\$OEM\$/\$\$/Setup/Custom"
                 val tmpSpec = File(context.cacheDir, "PocketBoot_Specialize.cmd").apply { writeText(WindowsCustomizationEngine.buildSpecializeScript(config.experience, config.winUtil), Charsets.UTF_8) }
                 val customPath = config.experience.customPostInstallScriptPath.trim()
                 val customFileName = if (customPath.isNotBlank()) customPath.substringAfterLast('/') else ""
                 val tmpComp = File(context.cacheDir, "SetupComplete.cmd").apply { writeText(WindowsCustomizationEngine.buildSetupCompleteScript(false, customFileName.isNotBlank(), customFileName), Charsets.UTF_8) }
                 val customCopyCmd = if (customPath.isNotBlank()) "mkdir -p ${shellQuote(oemCustom)} && cp -f ${shellQuote(UsbGadgetEngine.resolveDirectPath(customPath))} ${shellQuote(oemCustom)}/ 2>/dev/null || true" else "true"
-                Shell.cmd("cp ${shellQuote(tmpXml.absolutePath)} $TEMP_MNT/autounattend.xml && mkdir -p ${shellQuote(oemPanther)} ${shellQuote(oemScripts)} && cp ${shellQuote(tmpXml.absolutePath)} ${shellQuote("$oemPanther/unattend.xml")} && cp ${shellQuote(tmpSpec.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_Specialize.cmd")} && cp ${shellQuote(tmpComp.absolutePath)} ${shellQuote("$oemScripts/SetupComplete.cmd")} && $customCopyCmd").exec()
-                tmpXml.delete(); tmpSpec.delete(); tmpComp.delete()
+                Shell.cmd("cp -f ${shellQuote(tmpXml.absolutePath)} $TEMP_MNT/autounattend.xml && mkdir -p ${shellQuote(oemPanther)} ${shellQuote(oemScripts)} && cp -f ${shellQuote(tmpPantherXml.absolutePath)} ${shellQuote("$oemPanther/unattend.xml")} && cp -f ${shellQuote(tmpSpec.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_Specialize.cmd")} && cp -f ${shellQuote(tmpComp.absolutePath)} ${shellQuote("$oemScripts/SetupComplete.cmd")} && $customCopyCmd").exec()
+                tmpXml.delete(); tmpPantherXml.delete(); tmpSpec.delete(); tmpComp.delete()
                 entries.add(LogEntry(ts, "win-build", "Injected autounattend.xml (${config.arch}, Exp=${config.experience.activeCount()}, WinUtil=${config.winUtil.activeCount()})"))
             }
             if (config.selectedEditionIndex != null || config.eiCfgUnlock) {
                 val tmpEi = File(context.cacheDir, "ei.cfg").apply { writeText(if (config.eiCfgUnlock && config.selectedEditionIndex == null) "[Channel]\r\nRetail\r\n" else "[Channel]\r\n_Default\r\n[VL]\r\n0\r\n", Charsets.UTF_8) }
-                Shell.cmd("mkdir -p $TEMP_MNT/sources && cp ${shellQuote(tmpEi.absolutePath)} $TEMP_MNT/sources/ei.cfg").exec()
+                Shell.cmd("mkdir -p $qSourcesDir && find $qSourcesDir -maxdepth 1 -type f -iname 'ei.cfg' -exec rm -f {} + 2>/dev/null || true && cp -f ${shellQuote(tmpEi.absolutePath)} ${shellQuote("$sourcesDir/ei.cfg")}").exec()
                 tmpEi.delete()
                 entries.add(LogEntry(ts, "win-build", "Wrote sources/ei.cfg"))
             }
@@ -697,6 +720,8 @@ object WindowsImageBuilder {
 
             UsbGadgetEngine.fixUserStoragePermissions(context, safeDir, isDir = true)
             UsbGadgetEngine.fixUserStoragePermissions(context, outPath, isDir = false)
+            val builtOutBytes = Shell.cmd("stat -c '%s' $qOut 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+            if (builtOutBytes > 0L) UsbGadgetEngine.syncMediaStoreFileSize(context, outPath, builtOutBytes)
 
             onProgress(WindowsBuildProgress("Done!", safeName, 1f, false))
             entries.add(LogEntry(ts, "win-build", "Built Windows USB image: $outPath"))

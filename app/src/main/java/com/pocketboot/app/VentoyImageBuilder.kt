@@ -912,6 +912,8 @@ object VentoyImageBuilder {
 
             UsbGadgetEngine.fixUserStoragePermissions(context, safeDir, isDir = true)
             UsbGadgetEngine.fixUserStoragePermissions(context, outPath, isDir = false)
+            val vOutBytes = Shell.cmd("stat -c '%s' $qOut 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+            if (vOutBytes > 0L) UsbGadgetEngine.syncMediaStoreFileSize(context, outPath, vOutBytes)
             IsoInspector.invalidate(outPath)
 
             onProgress(WindowsBuildProgress("Done!", safeName, 1f, false))
@@ -1199,7 +1201,7 @@ object VentoyImageBuilder {
                 }
             }
 
-            UsbGadgetEngine.fixUserStoragePermissions(context, resolvedImg, isDir = false)
+            UsbGadgetEngine.fixUserStoragePermissions(context, resolvedImg, isDir = false); Shell.cmd("stat -c '%s' $qImg 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull()?.takeIf { it > 0L }?.let { UsbGadgetEngine.syncMediaStoreFileSize(context, resolvedImg, it) }
             val afterBlocks = Shell.cmd("stat -c '%b' $qImg 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: beforeBlocks
             val afterDisk = afterBlocks * 512L
             val saved = (beforeDisk - afterDisk).coerceAtLeast(0L)
@@ -1279,7 +1281,7 @@ object VentoyImageBuilder {
                 if (!nrRes.isSuccess) {
                     return@withContext ActionResult(false, "ntfsresize failed: ${(nrRes.out + nrRes.err).takeLast(3).joinToString(" ").take(160)}")
                 }
-                UsbGadgetEngine.fixUserStoragePermissions(context, resolvedImg, isDir = false)
+                UsbGadgetEngine.fixUserStoragePermissions(context, resolvedImg, isDir = false); Shell.cmd("stat -c '%s' $qImg 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull()?.takeIf { it > 0L }?.let { UsbGadgetEngine.syncMediaStoreFileSize(context, resolvedImg, it) }
                 onProgress(WindowsBuildProgress("Done!", "Expanded to $newSizeGb GB", 1f, false))
                 ActionResult(true, "Expanded ${resolvedImg.substringAfterLast('/')} to $newSizeGb GB (all ISOs preserved).")
             }.getOrElse { e ->
@@ -1355,7 +1357,7 @@ object VentoyImageBuilder {
             val swapRes = Shell.cmd("mv -f ${shellQuote(newImgPath)} $qImg 2>&1").exec()
             if (!swapRes.isSuccess) return@withContext ActionResult(false, "Failed to finalize resized drive.")
 
-            UsbGadgetEngine.fixUserStoragePermissions(context, resolvedImg, isDir = false)
+            UsbGadgetEngine.fixUserStoragePermissions(context, resolvedImg, isDir = false); Shell.cmd("stat -c '%s' $qImg 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull()?.takeIf { it > 0L }?.let { UsbGadgetEngine.syncMediaStoreFileSize(context, resolvedImg, it) }
             onProgress(WindowsBuildProgress("Done!", "Expanded to $newSizeGb GB", 1f, false))
             ActionResult(true, "Expanded ${resolvedImg.substringAfterLast('/')} to $newSizeGb GB (all ISOs preserved).")
         }.getOrElse { e ->

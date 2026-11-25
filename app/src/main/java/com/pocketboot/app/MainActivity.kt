@@ -881,6 +881,7 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                 progress = windowsBuildProgress,
                 onDismiss = { windowsBuilderTarget = null },
                 onCancelBuild = {
+                    WindowsImageBuilder.cancelActiveBuild()
                     windowsBuildJob?.cancel()
                     windowsBuildJob = null
                     showFeedback("Cancelled Windows USB build.")
@@ -1325,6 +1326,7 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                     showFeedback("Deleted preset \"$presetName\".", false)
                 },
                 onCancel = {
+                    WindowsIsoSlimmer.cancelActiveSlim()
                     slimmerJob?.cancel()
                     slimmerJob = null
                     showFeedback("Cancelled Windows ISO Slimmer.")

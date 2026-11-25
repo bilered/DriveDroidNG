@@ -882,7 +882,7 @@ fun SettingsScreen(
                             Icon(Icons.Rounded.Usb, null, tint = PocketColors.onAccent, modifier = Modifier.size(22.dp))
                         }
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("PocketBoot v4.6.0", style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary)
+                            Text("PocketBoot v4.6.1", style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary)
                             Text(
                                 text = "${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE}",
                                 style = MaterialTheme.typography.bodySmall,
@@ -893,7 +893,7 @@ fun SettingsScreen(
                         }
                         Surface(
                             modifier = Modifier.bounceClick {
-                                val info = "PocketBoot v4.6.0\nDevice: ${Build.MANUFACTURER} ${Build.MODEL}\nAndroid: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\nRoot: ${status.rootManager}\nSELinux: ${status.selinuxMode}\nUDC: ${status.udcName}\nKernel: ${status.kernelVersion}"
+                                val info = "PocketBoot v4.6.1\nDevice: ${Build.MANUFACTURER} ${Build.MODEL}\nAndroid: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\nRoot: ${status.rootManager}\nSELinux: ${status.selinuxMode}\nUDC: ${status.udcName}\nKernel: ${status.kernelVersion}"
                                 val cm = context.getSystemService(ClipboardManager::class.java)
                                 cm?.setPrimaryClip(ClipData.newPlainText("Device Info", info))
                                 Toast.makeText(context, "Device info copied.", Toast.LENGTH_SHORT).show()
