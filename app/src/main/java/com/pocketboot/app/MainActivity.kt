@@ -54,12 +54,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AddCircleOutline
 import androidx.compose.material.icons.rounded.Album
-import androidx.compose.material.icons.rounded.AddToHomeScreen
 import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material.icons.rounded.Build
-import androidx.compose.material.icons.rounded.CleaningServices
-import androidx.compose.material.icons.rounded.Star
-import androidx.compose.material.icons.rounded.StarBorder
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ContentCopy
@@ -146,6 +142,8 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 
 class MainActivity : ComponentActivity() {
     companion object {
@@ -230,8 +228,10 @@ fun PocketBootApp(initialShortcutPath: String = "") {
     var tempCacheBytes by remember { mutableStateOf(0L) }
 
     val isLightSurface = settings.surfaceMode == SurfaceMode.LIGHT
-    val anyBuildOrDlActive = windowsBuildJob != null || linuxBuildJob != null ||
+    val activeTurboDl by FastIsoDownloader.state.collectAsState()
+    val anyBuildActive = windowsBuildJob != null || linuxBuildJob != null ||
         ventoyBuildJob != null
+    val anyBuildOrDlActive = anyBuildActive || (activeTurboDl != null && activeTurboDl?.isPaused != true)
     val keepScreenAwake = settings.keepScreenAwakeDuringBuilds && anyBuildOrDlActive
 
     SideEffect {
@@ -783,6 +783,7 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                             settings = settings,
                             logs = logs,
                             forceExpandLogs = forceExpandSettingsLog,
+                            isOperationActive = anyBuildActive || activeTurboDl != null,
                             onUpdateSettings = { updated -> updateSettings(updated, rescan = true) },
                             onResetNormalUsb = { unmountSlot(null) },
                             onClearLogs = { logs.clear() }
@@ -892,29 +893,33 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                     showFeedback("Deleted preset \"$presetName\".")
                 },
                 onStartBuild = { cfg ->
-                    windowsBuildProgress = WindowsBuildProgress("Starting...", cfg.isoFile.name, 0.02f, true)
-                    windowsBuildJob = scope.launch {
-                        val res = WindowsImageBuilder.buildWindowsUsbImage(
-                            context = context,
-                            config = cfg,
-                            onProgress = { p -> windowsBuildProgress = p }
-                        )
-                        logs.addAll(res.entries)
-                        windowsBuildJob = null
-                        if (res.success && res.createdPath != null) {
-                            windowsBuilderTarget = null
-                            val updated = settings.copy(
-                                pinnedFiles = (settings.pinnedFiles + res.createdPath).distinct(),
-                                hiddenFiles = settings.hiddenFiles - res.createdPath
+                    if (anyBuildActive) {
+                        showFeedback("Another USB build is already running. Wait or cancel it first.", true)
+                    } else {
+                        windowsBuildProgress = WindowsBuildProgress("Starting...", cfg.isoFile.name, 0.02f, true)
+                        windowsBuildJob = scope.launch {
+                            val res = WindowsImageBuilder.buildWindowsUsbImage(
+                                context = context,
+                                config = cfg,
+                                onProgress = { p -> windowsBuildProgress = p }
                             )
-                            updateSettings(updated, rescan = true)
-                            if (cfg.autoMountAfterBuild) {
-                                mountPath(res.createdPath, MountMode.USB_RO, lunIndex = 0)
+                            logs.addAll(res.entries)
+                            windowsBuildJob = null
+                            if (res.success && res.createdPath != null) {
+                                windowsBuilderTarget = null
+                                val updated = settings.copy(
+                                    pinnedFiles = (settings.pinnedFiles + res.createdPath).distinct(),
+                                    hiddenFiles = settings.hiddenFiles - res.createdPath
+                                )
+                                updateSettings(updated, rescan = true)
+                                if (cfg.autoMountAfterBuild) {
+                                    mountPath(res.createdPath, MountMode.USB_RO, lunIndex = 0)
+                                } else {
+                                    showFeedback(res.userMessage, false)
+                                }
                             } else {
-                                showFeedback(res.userMessage, false)
+                                showFeedback(res.userMessage, true)
                             }
-                        } else {
-                            showFeedback(res.userMessage, true)
                         }
                     }
                 }
@@ -930,35 +935,40 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                 progress = linuxBuildProgress,
                 onDismiss = { linuxBuilderTarget = null },
                 onCancelBuild = {
+                    LinuxImageBuilder.cancelActiveBuild()
                     linuxBuildJob?.cancel()
                     linuxBuildJob = null
                     showFeedback("Cancelled Linux persistent USB build.")
                 },
                 onStartBuild = { cfg ->
-                    linuxBuildProgress = WindowsBuildProgress("Starting...", cfg.isoFile.name, 0.02f, true)
-                    linuxBuildJob = scope.launch {
-                        val res = LinuxImageBuilder.buildLinuxPersistentImage(
-                            context = context,
-                            config = cfg,
-                            onProgress = { p -> linuxBuildProgress = p }
-                        )
-                        logs.addAll(res.entries)
-                        linuxBuildJob = null
-                        if (res.success && res.createdPath != null) {
-                            linuxBuilderTarget = null
-                            val updated = settings.copy(
-                                pinnedFiles = (settings.pinnedFiles + res.createdPath).distinct(),
-                                hiddenFiles = settings.hiddenFiles - res.createdPath
+                    if (anyBuildActive) {
+                        showFeedback("Another USB build is already running. Wait or cancel it first.", true)
+                    } else {
+                        linuxBuildProgress = WindowsBuildProgress("Starting...", cfg.isoFile.name, 0.02f, true)
+                        linuxBuildJob = scope.launch {
+                            val res = LinuxImageBuilder.buildLinuxPersistentImage(
+                                context = context,
+                                config = cfg,
+                                onProgress = { p -> linuxBuildProgress = p }
                             )
-                            updateSettings(updated, rescan = true)
-                            if (cfg.autoMountAfterBuild) {
-                                val targetMode = if (cfg.usbMode == LinuxUsbMode.WITH_PERSISTENCE) MountMode.USB_RW else MountMode.USB_RO
-                                mountPath(res.createdPath, targetMode, lunIndex = 0)
+                            logs.addAll(res.entries)
+                            linuxBuildJob = null
+                            if (res.success && res.createdPath != null) {
+                                linuxBuilderTarget = null
+                                val updated = settings.copy(
+                                    pinnedFiles = (settings.pinnedFiles + res.createdPath).distinct(),
+                                    hiddenFiles = settings.hiddenFiles - res.createdPath
+                                )
+                                updateSettings(updated, rescan = true)
+                                if (cfg.autoMountAfterBuild) {
+                                    val targetMode = if (cfg.usbMode == LinuxUsbMode.WITH_PERSISTENCE) MountMode.USB_RW else MountMode.USB_RO
+                                    mountPath(res.createdPath, targetMode, lunIndex = 0)
+                                } else {
+                                    showFeedback(res.userMessage, false)
+                                }
                             } else {
-                                showFeedback(res.userMessage, false)
+                                showFeedback(res.userMessage, true)
                             }
-                        } else {
-                            showFeedback(res.userMessage, true)
                         }
                     }
                 }
@@ -988,36 +998,41 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                     ventoyBuilderInitialIso = null
                 },
                 onCancelBuild = {
+                    VentoyImageBuilder.cancelActiveBuild()
                     ventoyBuildJob?.cancel()
                     ventoyBuildJob = null
                     showFeedback("Cancelled Multi-Boot drive build.")
                 },
                 onStartBuild = { cfg ->
-                    ventoyBuildProgress = WindowsBuildProgress("Starting...", cfg.outputName, 0.02f, true)
-                    ventoyBuildJob = scope.launch {
-                        val res = VentoyImageBuilder.buildVentoyImage(
-                            context = context,
-                            config = cfg,
-                            onProgress = { p -> ventoyBuildProgress = p }
-                        )
-                        logs.addAll(res.entries)
-                        ventoyBuildJob = null
-                        if (res.success && res.createdPath != null) {
-                            showVentoyBuilder = false
-                            ventoyBuilderInitialIso = null
-                            isoTypes[res.createdPath] = IsoOsType.VENTOY_IMAGE
-                            val updated = settings.copy(
-                                pinnedFiles = (settings.pinnedFiles + res.createdPath).distinct(),
-                                hiddenFiles = settings.hiddenFiles - res.createdPath
+                    if (anyBuildActive) {
+                        showFeedback("Another USB build is already running. Wait or cancel it first.", true)
+                    } else {
+                        ventoyBuildProgress = WindowsBuildProgress("Starting...", cfg.outputName, 0.02f, true)
+                        ventoyBuildJob = scope.launch {
+                            val res = VentoyImageBuilder.buildVentoyImage(
+                                context = context,
+                                config = cfg,
+                                onProgress = { p -> ventoyBuildProgress = p }
                             )
-                            updateSettings(updated, rescan = true)
-                            if (cfg.autoMountAfterBuild) {
-                                mountPath(res.createdPath, MountMode.USB_RO, lunIndex = 0)
+                            logs.addAll(res.entries)
+                            ventoyBuildJob = null
+                            if (res.success && res.createdPath != null) {
+                                showVentoyBuilder = false
+                                ventoyBuilderInitialIso = null
+                                isoTypes[res.createdPath] = IsoOsType.VENTOY_IMAGE
+                                val updated = settings.copy(
+                                    pinnedFiles = (settings.pinnedFiles + res.createdPath).distinct(),
+                                    hiddenFiles = settings.hiddenFiles - res.createdPath
+                                )
+                                updateSettings(updated, rescan = true)
+                                if (cfg.autoMountAfterBuild) {
+                                    mountPath(res.createdPath, MountMode.USB_RO, lunIndex = 0)
+                                } else {
+                                    showFeedback(res.userMessage, false)
+                                }
                             } else {
-                                showFeedback(res.userMessage, false)
+                                showFeedback(res.userMessage, true)
                             }
-                        } else {
-                            showFeedback(res.userMessage, true)
                         }
                     }
                 },
@@ -1266,13 +1281,16 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                 confirmButton = {
                     Button(
                         onClick = {
-                            val isMounted = status.mountedLunFor(file.path) != null
+                            val delLun = status.mountedLunFor(file.path)
                             confirmDeleteFile = null
                             scope.launch {
                                 busy = true
-                                if (isMounted) UsbKeepAliveService.stop(context)
-                                val res = UsbGadgetEngine.deleteImageFile(file.path, isMounted)
+                                val res = UsbGadgetEngine.deleteImageFile(file.path, delLun)
                                 logs.addAll(res.entries)
+                                if (delLun != null) {
+                                    val afterStatus = UsbGadgetEngine.getStatus()
+                                    if (!afterStatus.isAnyMounted) UsbKeepAliveService.stop(context)
+                                }
                                 val updated = settings.copy(
                                     pinnedFiles = settings.pinnedFiles - file.path,
                                     hiddenFiles = settings.hiddenFiles - file.path
@@ -1357,6 +1375,8 @@ private fun MountProtocolSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .navigationBarsPadding()
+                .imePadding()
                 .padding(horizontal = 20.dp)
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -1831,6 +1851,8 @@ private fun FileInfoBottomSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .navigationBarsPadding()
+                .imePadding()
                 .padding(horizontal = 20.dp)
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp)

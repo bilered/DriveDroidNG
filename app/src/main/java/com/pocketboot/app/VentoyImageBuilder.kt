@@ -40,7 +40,6 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -89,6 +88,8 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.math.roundToInt
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 
 enum class VentoyFilesystem(val label: String, val subtitle: String, val badge: String? = null) {
     AUTO("Auto", "Fast exFAT when supported, else universal NTFS", "Recommended"),
@@ -736,17 +737,20 @@ object VentoyImageBuilder {
         }.getOrDefault(true to true)
     }
 
+    fun cancelActiveBuild() {
+        BuildThermalHelper.cancelActiveBuildProcess()
+    }
+
     suspend fun buildVentoyImage(
         context: Context,
         config: VentoyBuildConfig,
         onProgress: (WindowsBuildProgress) -> Unit
     ): ActionResult = withContext(Dispatchers.IO) {
+        BuildThermalHelper.resetCancelFlag()
         val ts = nowTs()
         val entries = mutableListOf<LogEntry>()
         val safeDir = UsbGadgetEngine.resolveDirectPath(config.outputDir).trimEnd('/')
-        val safeName = config.outputName.trim().let {
-            if (it.endsWith(".img", ignoreCase = true)) it else "$it.img"
-        }
+        val safeName = UsbGadgetEngine.sanitizeOutputFileName(config.outputName, ".img", "Pocket Multi Boot")
         val outPath = "$safeDir/$safeName"
         val qOut = shellQuote(outPath)
         val qDir = shellQuote(safeDir)
@@ -755,6 +759,14 @@ object VentoyImageBuilder {
         return@withContext runCatching {
             if (!Shell.getShell().isRoot) {
                 return@withContext ActionResult(false, "Root access is required.", entries = entries)
+            }
+            config.initialIsoToAdd?.let { initIso ->
+                if (outPath.equals(UsbGadgetEngine.resolveDirectPath(initIso.path), ignoreCase = true)) {
+                    return@withContext ActionResult(false, "Output drive cannot overwrite the source ISO.", entries = entries)
+                }
+            }
+            if (UsbGadgetEngine.getStatus().mountedLunFor(outPath) != null) {
+                return@withContext ActionResult(false, "$safeName is currently mounted to your PC. Unmount it before overwriting.", entries = entries)
             }
 
             onProgress(WindowsBuildProgress("Checking Multi-Boot engine...", "Loading offline boot files", 0.06f, true))
@@ -891,8 +903,20 @@ object VentoyImageBuilder {
                             )
                         }
                     }
-                    val cpRes = Shell.cmd("cp -f ${shellQuote(srcPath)} ${shellQuote(destPath)} 2>&1").exec()
+                    val vProf = BuildThermalHelper.currentDefaultThermalProfile()
+                    val cpRes = BuildThermalHelper.runIsolatedRootScript(
+                        context,
+                        "ventoy_cp",
+                        "set -e\n${BuildThermalHelper.thermalExecPrefix(vProf)}\n\$THERM_PFX cp -f ${shellQuote(srcPath)} ${shellQuote(destPath)} 2>&1",
+                        trackPid = true
+                    )
                     copyJob.cancel()
+                    if (!isActive || BuildThermalHelper.isBuildCancelled()) {
+                        unmountVentoyPartition1(loopDev)
+                        loopDev = ""
+                        Shell.cmd("rm -f $qOut 2>/dev/null || true").exec()
+                        return@withContext ActionResult(false, "Multi-Boot drive build cancelled.", entries = entries)
+                    }
                     if (cpRes.isSuccess) {
                         if (config.moveInitialIso) {
                             Shell.cmd("rm -f ${shellQuote(srcPath)} 2>/dev/null").exec()
@@ -1424,6 +1448,12 @@ fun VentoyBuilderSheet(
     val trimmedName = outputName.trim().ifBlank { "Pocket Multi Boot" }
     val finalImgName = if (trimmedName.endsWith(".img", ignoreCase = true)) trimmedName else "$trimmedName.img"
 
+    var targetExists by remember(defaultDir) { mutableStateOf(false) }
+    val resolvedOutName = remember(finalImgName) { UsbGadgetEngine.sanitizeOutputFileName(finalImgName, ".img", "Pocket Multi Boot") }
+    LaunchedEffect(defaultDir, resolvedOutName) {
+        targetExists = UsbGadgetEngine.fileExistsInDir(defaultDir, resolvedOutName)
+    }
+
     ModalBottomSheet(
         onDismissRequest = { if (!building && !updatingAssets) onDismiss() },
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
@@ -1432,6 +1462,8 @@ fun VentoyBuilderSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .navigationBarsPadding()
+                .imePadding()
                 .padding(horizontal = 20.dp)
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(14.dp)
@@ -1894,6 +1926,15 @@ fun VentoyBuilderSheet(
                     }
                 }
 
+                if (targetExists) {
+                    Surface(shape = RoundedCornerShape(10.dp), color = PocketColors.warningBg, border = BorderStroke(0.5.dp, PocketColors.warning)) {
+                        Row(modifier = Modifier.fillMaxWidth().padding(10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Rounded.WarningAmber, null, tint = PocketColors.warning, modifier = Modifier.size(16.dp))
+                            Text("$resolvedOutName already exists in this folder and will be overwritten.", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
+                        }
+                    }
+                }
+
                 Button(
                     onClick = {
                         onStartBuild(
@@ -1991,6 +2032,8 @@ fun VentoyManagerSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .navigationBarsPadding()
+                .imePadding()
                 .padding(horizontal = 20.dp)
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp)

@@ -159,6 +159,12 @@ class TurboDownloadService : Service() {
         runCatching { if (wifiLock?.isHeld == true) wifiLock?.release() }
     }
 
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        FastIsoDownloader.pause()
+        releaseLocks()
+        stopSelf(startId)
+    }
+
     override fun onDestroy() {
         releaseLocks()
         super.onDestroy()
@@ -208,7 +214,7 @@ object FastIsoDownloader {
     private var cachedOnError: ((String) -> Unit)? = null
     private var cachedOnLog: ((LogEntry) -> Unit)? = null
     @Volatile private var cachedUserAgent: String = BROWSER_UA
-    private const val BROWSER_UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.6.2"
+    private const val BROWSER_UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.6.3"
     private const val WGET_UA = "Wget/1.21.4"
     private const val CURL_UA = "curl/8.5.0"
     private fun logDl(msg: String, isError: Boolean = false) { cachedOnLog?.invoke(LogEntry(SimpleDateFormat("HH:mm:ss", Locale.US).format(Date()), "download", msg, isError)) }
@@ -474,7 +480,7 @@ object FastIsoDownloader {
                 val probe = probeServer(resolvedUrl)
                 if (probe.isHtmlPage) {
                     val isMsLink = resolvedUrl.contains("microsoft.com", true) || resolvedUrl.contains("software-static", true)
-                    val hint = if (isMsLink) "Use All Channels or Copy Link." else "Check Activity Log for the resolved URL or try another mirror."
+                    val hint = if (isMsLink) "Disable VPN or switch networks and retry, or tap Copy Link." else "Check Activity Log for the resolved URL or try another mirror."
                     val msg = "Server returned a web page (HTTP ${probe.httpCode}, ${probe.contentType.ifBlank { "text/html" }}) instead of an ISO file. $hint"
                     logDl("HTML rejection at ${probe.finalUrl} (HTTP ${probe.httpCode}, ${probe.contentType})", isError = true)
                     throw IllegalStateException(msg)

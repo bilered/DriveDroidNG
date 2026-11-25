@@ -14,7 +14,6 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.CookieHandler
 import java.net.CookieManager
 import java.net.CookiePolicy
 import java.net.HttpURLConnection
@@ -23,6 +22,7 @@ import java.net.URLEncoder
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.resume
+import java.util.concurrent.atomic.AtomicBoolean
 
 enum class WindowsCatalogFamily(
     val id: String,
@@ -118,11 +118,7 @@ object WindowsDirectCatalog {
         DirectWindowsRelease("win81", "8.1 Update 3 (Build 9600)", "Windows 8.1 Core/Pro", 52, isArm64Only = false)
     )
 
-    private fun ensureCookieManager() {
-        if (CookieHandler.getDefault() == null) {
-            CookieHandler.setDefault(CookieManager(null, CookiePolicy.ACCEPT_ALL))
-        }
-    }
+    private val localCookieManager = CookieManager(null, CookiePolicy.ACCEPT_ALL)
 
     private fun httpGet(
         urlStr: String,
@@ -130,8 +126,9 @@ object WindowsDirectCatalog {
         acceptJson: Boolean = false,
         followRedirects: Boolean = true
     ): Pair<Int, String> {
-        ensureCookieManager()
-        val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+        val url = URL(urlStr)
+        val uri = runCatching { url.toURI() }.getOrNull()
+        val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             connectTimeout = 12_000
             readTimeout = 18_000
@@ -143,9 +140,20 @@ object WindowsDirectCatalog {
                 setRequestProperty("Referer", referer)
                 setRequestProperty("Origin", "https://www.microsoft.com")
             }
+            if (uri != null) {
+                runCatching {
+                    val cookieVals = localCookieManager.get(uri, emptyMap())["Cookie"]
+                    if (!cookieVals.isNullOrEmpty()) {
+                        setRequestProperty("Cookie", cookieVals.joinToString("; "))
+                    }
+                }
+            }
         }
         return try {
             val code = conn.responseCode
+            if (uri != null) {
+                runCatching { localCookieManager.put(uri, conn.headerFields) }
+            }
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
             val body = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
             code to body
@@ -387,12 +395,11 @@ object WindowsDirectCatalog {
             mainHandler.post {
                 val pageSlug = when (osFamily) { "win11" -> "windows11"; "win81" -> "windows8ISO"; else -> "windows10ISO" }
                 val originUrl = "https://www.microsoft.com/en-us/software-download/$pageSlug"
-                var finished = false
+                val finished = AtomicBoolean(false)
                 var wv: WebView? = null
 
                 fun finish(result: String?) {
-                    if (finished) return
-                    finished = true
+                    if (!finished.compareAndSet(false, true)) return
                     mainHandler.post {
                         runCatching {
                             wv?.stopLoading()
@@ -424,11 +431,10 @@ object WindowsDirectCatalog {
                         }
                     }, "PocketBootBridge")
 
-                    var triggered = false
+                    val triggered = AtomicBoolean(false)
                     webView.webViewClient = object : WebViewClient() {
                         override fun onPageFinished(view: WebView?, url: String?) {
-                            if (triggered || view == null) return
-                            triggered = true
+                            if (view == null || !triggered.compareAndSet(false, true)) return
                             val safeUrl = apiUrl.replace("\\", "\\\\").replace("'", "\\'")
                             val js = """
                                 (function(){
@@ -462,7 +468,7 @@ object WindowsDirectCatalog {
             val blocked = errVal.contains("715-123130") || errVal.contains("automated", true) || errVal.contains("banned", true)
             return DirectApiResult(
                 errorMessage = if (blocked) {
-                    "Microsoft rate-limited direct retail downloads on this connection. Switch to 'All Channels' for unblocked downloads."
+                    "Microsoft temporarily rate-limited downloads on this IP/VPN. Disable VPN, switch between Wi-Fi and mobile data, or tap Retry Microsoft CDN."
                 } else errVal.ifBlank { "Microsoft rejected the language lookup." },
                 isRateLimited = blocked
             )
@@ -499,7 +505,7 @@ object WindowsDirectCatalog {
             val blocked = errVal.contains("715-123130") || errVal.contains("automated", true) || errVal.contains("validate", true)
             return DirectApiResult(
                 errorMessage = if (blocked) {
-                    "Microsoft rate-limited direct link signing on this IP. Switch to 'All Channels' below to build directly from Microsoft servers."
+                    "Microsoft temporarily rate-limited link signing on this IP. Disable VPN or switch networks, then tap Retry Microsoft CDN."
                 } else errVal.ifBlank { "Could not sign download link." },
                 isRateLimited = blocked
             )
@@ -527,7 +533,7 @@ object WindowsDirectCatalog {
             }
         }
         return if (sorted.isEmpty()) {
-            DirectApiResult(errorMessage = "Microsoft returned no direct links for this language. Try 'All Channels' instead.", isRateLimited = true)
+            DirectApiResult(errorMessage = "Microsoft returned no download links for this language right now. Try another language or tap Retry Microsoft CDN.", isRateLimited = true)
         } else {
             DirectApiResult(data = sorted)
         }
@@ -575,7 +581,7 @@ object WindowsDirectCatalog {
         }
 
         DirectApiResult(
-            errorMessage = "Microsoft blocked direct retail queries on this IP/VPN. Switch to 'All Channels' for unblocked Microsoft builds.",
+            errorMessage = "Microsoft temporarily blocked direct retail queries on this IP/VPN. Disable VPN, switch networks, and tap Retry Microsoft CDN.",
             isRateLimited = true
         )
     }
@@ -606,7 +612,7 @@ object WindowsDirectCatalog {
         }
 
         DirectApiResult(
-            errorMessage = "Microsoft rate-limited direct link signing. Switch to 'All Channels' to download directly from Windows Update servers.",
+            errorMessage = "Microsoft temporarily rate-limited direct link signing on this connection. Switch networks or tap Retry Microsoft CDN.",
             isRateLimited = true
         )
     }

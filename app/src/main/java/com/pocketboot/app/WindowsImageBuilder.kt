@@ -1,22 +1,11 @@
 package com.pocketboot.app
 
 import android.content.Context
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.animateContentSize
-import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.spring
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -28,27 +17,14 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.BookmarkAdd
 import androidx.compose.material.icons.rounded.Build
-import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.FolderOpen
-import androidx.compose.material.icons.rounded.DeleteOutline
-import androidx.compose.material.icons.rounded.ExpandLess
-import androidx.compose.material.icons.rounded.ExpandMore
-import androidx.compose.material.icons.rounded.FolderCopy
-import androidx.compose.material.icons.rounded.Info
-import androidx.compose.material.icons.rounded.Lock
-import androidx.compose.material.icons.rounded.Person
-import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.WarningAmber
 import androidx.compose.material.icons.rounded.Window
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -60,7 +36,6 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -88,6 +63,8 @@ import java.nio.ByteOrder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 
 data class WindowsEditionItem(
     val index: Int,
@@ -345,9 +322,7 @@ object WindowsImageBuilder {
         BuildThermalHelper.resetCancelFlag()
         val entries = mutableListOf<LogEntry>()
         val safeDir = UsbGadgetEngine.resolveDirectPath(config.outputDir).trimEnd('/')
-        val safeName = config.outputName.trim().let {
-            if (it.endsWith(".img", ignoreCase = true)) it else "$it.img"
-        }
+        val safeName = UsbGadgetEngine.sanitizeOutputFileName(config.outputName, ".img", "windows-usb")
         val outPath = "$safeDir/$safeName"
         val srcIsoPath = UsbGadgetEngine.resolveDirectPath(config.isoFile.path)
         val qIso = shellQuote(srcIsoPath)
@@ -378,6 +353,12 @@ object WindowsImageBuilder {
             if (!Shell.getShell().isRoot) {
                 return@withContext ActionResult(false, "Root access is required to build a bootable USB image.", entries = entries)
             }
+            if (outPath.equals(srcIsoPath, ignoreCase = true)) {
+                return@withContext ActionResult(false, "Output image cannot overwrite the source ISO.", entries = entries)
+            }
+            if (UsbGadgetEngine.getStatus().mountedLunFor(outPath) != null) {
+                return@withContext ActionResult(false, "$safeName is currently mounted to your PC. Unmount it before overwriting.", entries = entries)
+            }
 
             onProgress(WindowsBuildProgress("Checking ISO & tools...", config.isoFile.name, 0.04f, true))
 
@@ -386,9 +367,13 @@ object WindowsImageBuilder {
             if (isoSize <= 0L) {
                 return@withContext ActionResult(false, "Source ISO not found or empty.", entries = entries)
             }
+            val extraDriversBytes = if (config.extraDriversDir.isNotBlank()) {
+                val drvResolved = UsbGadgetEngine.resolveDirectPath(config.extraDriversDir)
+                Shell.cmd("du -sb ${shellQuote(drvResolved)} 2>/dev/null | awk '{print \$1}'").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+            } else 0L
 
             val uefiNtfsBytes = loadUefiNtfsImage(context)
-            val layout = DiskPartitioner.calculateLayout(isoSize, uefiNtfsBytes?.size?.toLong() ?: (1024L * 1024L))
+            val layout = DiskPartitioner.calculateLayout(isoSize + extraDriversBytes, uefiNtfsBytes?.size?.toLong() ?: (1024L * 1024L))
 
             val freeSpace = UsbGadgetEngine.getFreeSpaceBytes(safeDir)
             if (freeSpace > 0L && freeSpace < layout.totalBytes + (128L * 1024L * 1024L)) {
@@ -820,13 +805,26 @@ fun WindowsBuilderSheet(
     var showDriversFolderPicker by remember { mutableStateOf(false) }
     var autoMount by remember { mutableStateOf(true) }
 
+    var driversBytes by remember(isoFile.path) { mutableStateOf(0L) }
+    var targetExists by remember(isoFile.path) { mutableStateOf(false) }
+    val resolvedOutName = remember(outputName, baseName) { UsbGadgetEngine.sanitizeOutputFileName(outputName.ifBlank { baseName }, ".img", "windows-usb") }
     LaunchedEffect(isoFile.path) { inspectingEditions = true; editions = WindowsImageBuilder.inspectWindowsEditions(context, isoFile.path); inspectingEditions = false }
-    val estNeeded = isoFile.sizeBytes + (512L * 1024L * 1024L)
+    LaunchedEffect(extraDriversDir) {
+        driversBytes = if (extraDriversDir.isBlank()) 0L else withContext(Dispatchers.IO) {
+            val drv = UsbGadgetEngine.resolveDirectPath(extraDriversDir)
+            val qDrv = "'${drv.replace("'", "'\\''")}'"
+            Shell.cmd("du -sb $qDrv 2>/dev/null | awk '{print \$1}'").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+        }
+    }
+    LaunchedEffect(defaultDir, resolvedOutName) {
+        targetExists = UsbGadgetEngine.fileExistsInDir(defaultDir, resolvedOutName)
+    }
+    val estNeeded = isoFile.sizeBytes + driversBytes + (512L * 1024L * 1024L)
     val freeSpace = remember(defaultDir) { UsbGadgetEngine.getFreeSpaceBytes(defaultDir) }
     val lowSpace = freeSpace in 1 until estNeeded
 
     ModalBottomSheet(onDismissRequest = { if (!building) onDismiss() }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), containerColor = PocketColors.surfaceCard) {
-        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(13.dp)) {
+        Column(modifier = Modifier.fillMaxWidth().navigationBarsPadding().imePadding().padding(horizontal = 20.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(13.dp)) {
             PocketSheetHeader(icon = Icons.Rounded.Window, tint = PocketColors.infoBlue, iconBg = PocketColors.infoBlueBg, title = "Windows USB Builder", subtitle = "${detectedOs.label} ($detectedArch) · ${UsbGadgetEngine.formatBytes(isoFile.sizeBytes)}", subtitleMono = true)
             if (building) {
                 Surface(shape = RoundedCornerShape(14.dp), color = PocketColors.surfaceInput, border = BorderStroke(1.dp, PocketColors.accent)) {
@@ -915,6 +913,14 @@ fun WindowsBuilderSheet(
                             Text("Mounts immediately as Read-Only USB", fontSize = 11.sp, color = PocketColors.textSecondary)
                         }
                         PocketSwitch(checked = autoMount, onCheckedChange = { autoMount = it }, activeColor = PocketColors.accent)
+                    }
+                }
+                if (targetExists) {
+                    Surface(shape = RoundedCornerShape(10.dp), color = PocketColors.warningBg, border = BorderStroke(0.5.dp, PocketColors.warning)) {
+                        Row(modifier = Modifier.fillMaxWidth().padding(10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Rounded.WarningAmber, null, tint = PocketColors.warning, modifier = Modifier.size(16.dp))
+                            Text("$resolvedOutName already exists in this folder and will be overwritten.", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
+                        }
                     }
                 }
                 if (lowSpace) {

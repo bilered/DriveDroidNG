@@ -98,6 +98,8 @@ import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -173,6 +175,8 @@ fun RootFileBrowserSheet(
             modifier = Modifier
                 .fillMaxWidth()
                 .fillMaxHeight(0.88f)
+                .navigationBarsPadding()
+                .imePadding()
                 .padding(horizontal = 18.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
@@ -846,8 +850,11 @@ fun RootFileBrowserSheet(
                         deleteTarget = null
                         scope.launch {
                             fileOpBusy = true
-                            if (isMounted) UsbKeepAliveService.stop(context)
-                            val res = UsbGadgetEngine.deleteImageFile(item.path, isMounted)
+                            val delLun = if (isMounted) UsbGadgetEngine.getStatus().mountedLunFor(item.path) else null
+                            val res = UsbGadgetEngine.deleteImageFile(item.path, delLun)
+                            if (delLun != null && !UsbGadgetEngine.getStatus().isAnyMounted) {
+                                UsbKeepAliveService.stop(context)
+                            }
                             if (res.success) {
                                 selectedPaths.remove(item.path)
                                 onFileDeleted(item.path)
@@ -918,7 +925,7 @@ fun RootFolderPickerSheet(
     val folders = remember(entries) { entries.filter { it.isDirectory }.sortedBy { it.name.lowercase() } }
     val filesCount = remember(entries) { entries.count { !it.isDirectory } }
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), containerColor = PocketColors.surfaceCard) {
-        Column(modifier = Modifier.fillMaxWidth().fillMaxHeight(0.84f).padding(horizontal = 18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Column(modifier = Modifier.fillMaxWidth().fillMaxHeight(0.84f).navigationBarsPadding().imePadding().padding(horizontal = 18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Box(modifier = Modifier.size(38.dp).clip(RoundedCornerShape(10.dp)).background(PocketColors.accentBg), contentAlignment = Alignment.Center) { Icon(Icons.Rounded.FolderOpen, null, tint = PocketColors.accentSoft, modifier = Modifier.size(20.dp)) }
                 Column(modifier = Modifier.weight(1f)) {
@@ -1013,7 +1020,7 @@ fun RootSingleFilePickerSheet(
         dirs + files
     }
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), containerColor = PocketColors.surfaceCard) {
-        Column(modifier = Modifier.fillMaxWidth().fillMaxHeight(0.80f).padding(horizontal = 18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Column(modifier = Modifier.fillMaxWidth().fillMaxHeight(0.80f).navigationBarsPadding().imePadding().padding(horizontal = 18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             PocketSheetHeader(icon = Icons.Rounded.Code, tint = PocketColors.accentSoft, iconBg = PocketColors.accentBg, title = title, subtitle = subtitle)
             Surface(shape = RoundedCornerShape(10.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
                 Text(currentDir.replace("/data/media/0", "/sdcard"), modifier = Modifier.fillMaxWidth().padding(horizontal = 11.dp, vertical = 8.dp), style = PocketColors.monoStyle, color = PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)

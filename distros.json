@@ -1,6 +1,6 @@
 {
-  "version": 440,
-  "updated": "2026-11-22",
+  "version": 463,
+  "updated": "2026-11-25",
   "distros": [
     {
       "title": "Ubuntu Desktop",
@@ -12,7 +12,7 @@
       "url": "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-desktop-amd64.iso",
       "versions": [
         {
-          "label": "26.04.1 LTS (Latest \u00b7 Resolute)",
+          "label": "26.04.1 LTS (Latest · Resolute)",
           "releaseYear": "2026",
           "sizeLabel": "5.9 GB",
           "approxBytes": 6335076761,
@@ -20,7 +20,7 @@
           "url": "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-desktop-amd64.iso"
         },
         {
-          "label": "24.04.5 LTS (Mature \u00b7 Noble)",
+          "label": "24.04.5 LTS (Mature · Noble)",
           "releaseYear": "2026",
           "sizeLabel": "5.8 GB",
           "approxBytes": 6227702579,
@@ -28,7 +28,7 @@
           "url": "https://releases.ubuntu.com/noble/ubuntu-24.04.5.1-desktop-amd64.iso"
         },
         {
-          "label": "22.04.5 LTS (Legacy \u00b7 Jammy)",
+          "label": "22.04.5 LTS (Legacy · Jammy)",
           "releaseYear": "2024",
           "sizeLabel": "4.7 GB",
           "approxBytes": 5046586572,
@@ -47,7 +47,7 @@
       "url": "https://api.pop-os.org/builds/24.04/intel",
       "versions": [
         {
-          "label": "24.04 LTS COSMIC (Intel / AMD \u00b7 Live API)",
+          "label": "24.04 LTS COSMIC (Intel / AMD · Live API)",
           "releaseYear": "2026",
           "sizeLabel": "2.8 GB",
           "approxBytes": 3006477107,
@@ -55,7 +55,7 @@
           "url": "https://api.pop-os.org/builds/24.04/intel"
         },
         {
-          "label": "24.04 LTS COSMIC (NVIDIA \u00b7 Live API)",
+          "label": "24.04 LTS COSMIC (NVIDIA · Live API)",
           "releaseYear": "2026",
           "sizeLabel": "3.2 GB",
           "approxBytes": 3435973836,
@@ -63,7 +63,7 @@
           "url": "https://api.pop-os.org/builds/24.04/nvidia"
         },
         {
-          "label": "22.04 LTS GNOME (Intel / AMD \u00b7 Live API)",
+          "label": "22.04 LTS GNOME (Intel / AMD · Live API)",
           "releaseYear": "2025",
           "sizeLabel": "2.6 GB",
           "approxBytes": 2791728742,
@@ -71,7 +71,7 @@
           "url": "https://api.pop-os.org/builds/22.04/intel"
         },
         {
-          "label": "22.04 LTS GNOME (NVIDIA \u00b7 Live API)",
+          "label": "22.04 LTS GNOME (NVIDIA · Live API)",
           "releaseYear": "2025",
           "sizeLabel": "3.0 GB",
           "approxBytes": 3221225472,
@@ -90,7 +90,7 @@
       "url": "https://mirrors.edge.kernel.org/linuxmint/stable/22.1/linuxmint-22.1-cinnamon-64bit.iso",
       "versions": [
         {
-          "label": "22.1 Xia (Cinnamon \u00b7 Recommended)",
+          "label": "22.1 Xia (Cinnamon · Recommended)",
           "releaseYear": "2025",
           "sizeLabel": "2.9 GB",
           "approxBytes": 3113851289,
@@ -268,7 +268,7 @@
       "url": "https://enterprise.proxmox.com/iso/proxmox-ve_9.2-1.iso",
       "versions": [
         {
-          "label": "Proxmox VE 9.2-1 (x86_64 \u00b7 Latest)",
+          "label": "Proxmox VE 9.2-1 (x86_64 · Latest)",
           "releaseYear": "2026",
           "sizeLabel": "1.71 GB",
           "approxBytes": 1836098682,
@@ -297,7 +297,7 @@
       "url": "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso",
       "versions": [
         {
-          "label": "26.04.1 LTS Server (Latest \u00b7 Resolute)",
+          "label": "26.04.1 LTS Server (Latest · Resolute)",
           "releaseYear": "2026",
           "sizeLabel": "2.6 GB",
           "approxBytes": 2791728742,
@@ -305,7 +305,7 @@
           "url": "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso"
         },
         {
-          "label": "24.04.5 LTS Server (Mature \u00b7 Noble)",
+          "label": "24.04.5 LTS Server (Mature · Noble)",
           "releaseYear": "2026",
           "sizeLabel": "2.6 GB",
           "approxBytes": 2791728742,
@@ -351,7 +351,7 @@
       "url": "https://cdimage.kali.org/kali-2026.3/kali-linux-2026.3-live-amd64.iso",
       "versions": [
         {
-          "label": "2026.3 Live (amd64 \u00b7 Recommended)",
+          "label": "2026.3 Live (amd64 · Recommended)",
           "releaseYear": "2026",
           "sizeLabel": "4.3 GB",
           "approxBytes": 4617089843,
@@ -397,7 +397,7 @@
       "url": "https://sourceforge.net/projects/gparted/files/gparted-live-stable/1.8.1-6/gparted-live-1.8.1-6-amd64.iso/download",
       "versions": [
         {
-          "label": "1.8.1-6 (amd64 \u00b7 Latest)",
+          "label": "1.8.1-6 (amd64 · Latest)",
           "releaseYear": "2026",
           "sizeLabel": "645 MB",
           "approxBytes": 676331520,
@@ -406,7 +406,7 @@
           "sha256": "d789c38779f0d6f7026c12f44c2c52a04f66e28a1aea7d51f3045ad1bbf28411"
         },
         {
-          "label": "1.7.0-8 (amd64 \u00b7 Legacy)",
+          "label": "1.7.0-8 (amd64 · Legacy)",
           "releaseYear": "2025",
           "sizeLabel": "560 MB",
           "approxBytes": 587202560,
@@ -498,7 +498,7 @@
       "url": "https://github.com/PartialVolume/shredos.x86_64/releases/download/v2025.11_32_x86-64_v0.43.1/shredos-2025.11_32_x86-64_v0.43.1_20261010.img",
       "versions": [
         {
-          "label": "v0.43.1 USB Image (.img \u00b7 x86_64)",
+          "label": "v0.43.1 USB Image (.img · x86_64)",
           "releaseYear": "2026",
           "sizeLabel": "355 MB",
           "approxBytes": 372244480,
@@ -507,7 +507,7 @@
           "sha256": "c856cfb91ebd525e23caffc284d84764e9d9b5427ee1925783773642e3d50ae4"
         },
         {
-          "label": "v0.43.1 Optical ISO (.iso \u00b7 x86_64)",
+          "label": "v0.43.1 Optical ISO (.iso · x86_64)",
           "releaseYear": "2026",
           "sizeLabel": "342 MB",
           "approxBytes": 358612992,
@@ -527,7 +527,7 @@
       "url": "https://www.memtest.org/download/v9.00/mt86plus_9.00_x86_64.iso.zip",
       "versions": [
         {
-          "label": "v9.00 (x86_64 \u00b7 UEFI & BIOS)",
+          "label": "v9.00 (x86_64 · UEFI & BIOS)",
           "releaseYear": "2026",
           "sizeLabel": "6 MB",
           "approxBytes": 6291456,
@@ -535,7 +535,7 @@
           "url": "https://www.memtest.org/download/v9.00/mt86plus_9.00_x86_64.iso.zip"
         },
         {
-          "label": "v9.00 (ARM64 \u00b7 UEFI)",
+          "label": "v9.00 (ARM64 · UEFI)",
           "releaseYear": "2026",
           "sizeLabel": "5 MB",
           "approxBytes": 5242880,
@@ -581,7 +581,7 @@
       "url": "https://distro.ibiblio.org/tinycorelinux/15.x/x86/release/TinyCore-current.iso",
       "versions": [
         {
-          "label": "15.x TinyCore (GUI \u00b7 23 MB)",
+          "label": "15.x TinyCore (GUI · 23 MB)",
           "releaseYear": "2025",
           "sizeLabel": "23 MB",
           "approxBytes": 24117248,
@@ -589,7 +589,7 @@
           "url": "https://distro.ibiblio.org/tinycorelinux/15.x/x86/release/TinyCore-current.iso"
         },
         {
-          "label": "15.x CorePlus (Wi-Fi + Tools \u00b7 248 MB)",
+          "label": "15.x CorePlus (Wi-Fi + Tools · 248 MB)",
           "releaseYear": "2025",
           "sizeLabel": "248 MB",
           "approxBytes": 260046848,

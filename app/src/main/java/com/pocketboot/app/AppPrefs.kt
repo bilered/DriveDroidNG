@@ -52,7 +52,7 @@ data class AppSettings(
     companion object {
         const val DEFAULT_ACCENT_HEX = 0xFF15F5ABL
         const val LEGACY_DEFAULT_ACCENT_HEX = 0xFF6366F1L
-        const val CURRENT_CATALOG_VERSION = 460
+        const val CURRENT_CATALOG_VERSION = 463
     }
 }
 

@@ -3,7 +3,6 @@ package com.pocketboot.app
 import android.content.Context
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -58,6 +57,8 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 
 enum class LinuxUsbMode(val title: String, val subtitle: String) {
     WITHOUT_PERSISTENCE("Without Persistence", "Standard Live USB (Hybrid ISO or FAT32)"),
@@ -101,7 +102,12 @@ object LinuxImageBuilder {
             .exec().out.lastOrNull()?.trim()?.toLongOrNull() ?: 0L
     }
 
+    fun cancelActiveBuild() {
+        BuildThermalHelper.cancelActiveBuildProcess()
+    }
+
     suspend fun buildLinuxPersistentImage(context: Context, config: LinuxBuildConfig, onProgress: (WindowsBuildProgress) -> Unit): ActionResult = withContext(Dispatchers.IO) {
+        BuildThermalHelper.resetCancelFlag()
         if (config.writeMethod == LinuxWriteMethod.EXTRACTED_FAT32) buildExtractedFat32Image(context, config, onProgress)
         else buildHybridDdImage(context, config, onProgress)
     }
@@ -110,9 +116,10 @@ object LinuxImageBuilder {
         val ts = nowTs()
         val entries = mutableListOf<LogEntry>()
         val safeDir = UsbGadgetEngine.resolveDirectPath(config.outputDir).trimEnd('/')
-        val safeName = config.outputName.trim().let { if (it.endsWith(".img", true)) it else "$it.img" }
+        val safeName = UsbGadgetEngine.sanitizeOutputFileName(config.outputName, ".img", "linux-usb")
         val outPath = "$safeDir/$safeName"
-        val qIso = shellQuote(UsbGadgetEngine.resolveDirectPath(config.isoFile.path))
+        val srcIsoPath = UsbGadgetEngine.resolveDirectPath(config.isoFile.path)
+        val qIso = shellQuote(srcIsoPath)
         val qOut = shellQuote(outPath); val qDir = shellQuote(safeDir)
         var loopDev = ""
         fun cleanup(deletePartial: Boolean) {
@@ -121,6 +128,8 @@ object LinuxImageBuilder {
         }
         return@withContext runCatching {
             if (!Shell.getShell().isRoot) return@withContext ActionResult(false, "Root access is required.", entries = entries)
+            if (outPath.equals(srcIsoPath, ignoreCase = true)) return@withContext ActionResult(false, "Output image cannot overwrite the source ISO.", entries = entries)
+            if (UsbGadgetEngine.getStatus().mountedLunFor(outPath) != null) return@withContext ActionResult(false, "$safeName is currently mounted to your PC. Unmount it before overwriting.", entries = entries)
             onProgress(WindowsBuildProgress("Checking ISO image...", config.isoFile.name, 0.05f, true))
             val isoSize = Shell.cmd("stat -c '%s' $qIso 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: config.isoFile.sizeBytes
             if (isoSize <= 0L) return@withContext ActionResult(false, "Source ISO not found or empty.", entries = entries)
@@ -132,8 +141,18 @@ object LinuxImageBuilder {
             val freeSpace = UsbGadgetEngine.getFreeSpaceBytes(safeDir)
             if (freeSpace > 0L && freeSpace < totalBytes + (64L * 1024L * 1024L)) return@withContext ActionResult(false, "Not enough free space. Need ${UsbGadgetEngine.formatBytes(totalBytes)}, have ${UsbGadgetEngine.formatBytes(freeSpace)}.", entries = entries)
             onProgress(WindowsBuildProgress("Copying ISO image...", if (withPersistence) "${UsbGadgetEngine.formatBytes(isoSize)} + ${config.persistenceGb} GB ${config.style.volumeLabel}" else UsbGadgetEngine.formatBytes(isoSize), 0.28f, true))
-            val cpRes = Shell.cmd("mkdir -p $qDir && rm -f $qOut && cp -f $qIso $qOut 2>&1").exec()
-            if (!isActive) { cleanup(true); return@withContext ActionResult(false, "Build cancelled.", entries = entries) }
+            val linuxProf = BuildThermalHelper.currentDefaultThermalProfile()
+            BuildThermalHelper.waitForThermalCooldownIfNeeded(context, linuxProf) { temp, resumeAt ->
+                onProgress(WindowsBuildProgress("Cooling down phone...", String.format(Locale.US, "%.1f°C -> resuming at %.1f°C", temp, resumeAt), 0.25f, true))
+            }
+            if (!isActive || BuildThermalHelper.isBuildCancelled()) { cleanup(true); return@withContext ActionResult(false, "Build cancelled.", entries = entries) }
+            val cpRes = BuildThermalHelper.runIsolatedRootScript(
+                context,
+                "linux_cp",
+                "set -e\n${BuildThermalHelper.thermalExecPrefix(linuxProf)}\nmkdir -p $qDir && rm -f $qOut && \$THERM_PFX cp -f $qIso $qOut 2>&1",
+                trackPid = true
+            )
+            if (!isActive || BuildThermalHelper.isBuildCancelled()) { cleanup(true); return@withContext ActionResult(false, "Build cancelled.", entries = entries) }
             if (!cpRes.isSuccess) { cleanup(true); return@withContext ActionResult(false, "Failed to copy ISO: ${(cpRes.out + cpRes.err).joinToString(" ").take(200)}", entries = entries) }
 
             if (withPersistence) {
@@ -169,7 +188,7 @@ object LinuxImageBuilder {
         val ts = nowTs()
         val entries = mutableListOf<LogEntry>()
         val safeDir = UsbGadgetEngine.resolveDirectPath(config.outputDir).trimEnd('/')
-        val safeName = config.outputName.trim().let { if (it.endsWith(".img", true)) it else "$it.img" }
+        val safeName = UsbGadgetEngine.sanitizeOutputFileName(config.outputName, ".img", "linux-usb")
         val outPath = "$safeDir/$safeName"
         val srcIsoPath = UsbGadgetEngine.resolveDirectPath(config.isoFile.path)
         val qIso = shellQuote(srcIsoPath); val qOut = shellQuote(outPath); val qDir = shellQuote(safeDir)
@@ -180,6 +199,8 @@ object LinuxImageBuilder {
         }
         return@withContext runCatching {
             if (!Shell.getShell().isRoot) return@withContext ActionResult(false, "Root access is required.", entries = entries)
+            if (outPath.equals(srcIsoPath, ignoreCase = true)) return@withContext ActionResult(false, "Output image cannot overwrite the source ISO.", entries = entries)
+            if (UsbGadgetEngine.getStatus().mountedLunFor(outPath) != null) return@withContext ActionResult(false, "$safeName is currently mounted to your PC. Unmount it before overwriting.", entries = entries)
             val bin7z = WindowsImageBuilder.findBundledBinary(context, "lib7zzs.so", listOf("7zz", "7z")) ?: return@withContext ActionResult(false, "Bundled 7zz binary missing.", entries = entries)
             onProgress(WindowsBuildProgress("Checking ISO contents...", config.isoFile.name, 0.05f, true))
             val maxFile = inspectMaxFileBytesInIso(context, srcIsoPath)
@@ -217,10 +238,21 @@ object LinuxImageBuilder {
             val fatFmtRes = Shell.cmd(fatFmtCmd).exec()
             if (!fatFmtRes.isSuccess) { cleanup(true); return@withContext ActionResult(false, "FAT32 format failed: ${(fatFmtRes.out + fatFmtRes.err).joinToString(" ").take(200)}", entries = entries) }
 
-            onProgress(WindowsBuildProgress("Extracting ISO files...", config.isoFile.name, 0.45f, true))
+            val linuxProf = BuildThermalHelper.currentDefaultThermalProfile()
+            BuildThermalHelper.waitForThermalCooldownIfNeeded(context, linuxProf) { temp, resumeAt ->
+                onProgress(WindowsBuildProgress("Cooling down phone...", String.format(Locale.US, "%.1f°C -> resuming at %.1f°C", temp, resumeAt), 0.42f, true))
+            }
+            if (!isActive || BuildThermalHelper.isBuildCancelled()) { cleanup(true); return@withContext ActionResult(false, "Build cancelled.", entries = entries) }
+            onProgress(WindowsBuildProgress("Extracting ISO files...", "${config.isoFile.name} · ${linuxProf.shortLabel} thermal", 0.45f, true))
             if (!Shell.cmd("mkdir -p $TEMP_FAT_MNT && mount -t vfat -o rw $qFatLoop $TEMP_FAT_MNT 2>&1").exec().isSuccess) { cleanup(true); return@withContext ActionResult(false, "Could not mount FAT32 partition.", entries = entries) }
-            val extRes = Shell.cmd("${shellQuote(bin7z)} x -y -o$TEMP_FAT_MNT $qIso 2>&1").exec()
-            if (!isActive) { cleanup(true); return@withContext ActionResult(false, "Build cancelled.", entries = entries) }
+            val mmtArg = BuildThermalHelper.sevenZipThreadArgFor(linuxProf)
+            val extRes = BuildThermalHelper.runIsolatedRootScript(
+                context,
+                "linux_ext",
+                "set -e\n${BuildThermalHelper.thermalExecPrefix(linuxProf)}\n\$THERM_PFX ${shellQuote(bin7z)} x -y $mmtArg -o$TEMP_FAT_MNT $qIso 2>&1",
+                trackPid = true
+            )
+            if (!isActive || BuildThermalHelper.isBuildCancelled()) { cleanup(true); return@withContext ActionResult(false, "Build cancelled.", entries = entries) }
             if (!extRes.isSuccess) { cleanup(true); return@withContext ActionResult(false, "ISO extraction failed: ${(extRes.out + extRes.err).takeLast(4).joinToString(" ").take(200)}", entries = entries) }
 
             if (withPersistence) {
@@ -310,8 +342,14 @@ fun LinuxBuilderSheet(
     val freeSpace = remember(defaultDir) { UsbGadgetEngine.getFreeSpaceBytes(defaultDir) }
     val lowSpace = freeSpace in 1 until estNeeded
 
+    var targetExists by remember(isoFile.path) { mutableStateOf(false) }
+    val resolvedOutName = remember(outputName, defaultOutName) { UsbGadgetEngine.sanitizeOutputFileName(outputName.ifBlank { defaultOutName }, ".img", "linux-usb") }
+    LaunchedEffect(defaultDir, resolvedOutName) {
+        targetExists = UsbGadgetEngine.fileExistsInDir(defaultDir, resolvedOutName)
+    }
+
     ModalBottomSheet(onDismissRequest = { if (!building) onDismiss() }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), containerColor = PocketColors.surfaceCard) {
-        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(13.dp)) {
+        Column(modifier = Modifier.fillMaxWidth().navigationBarsPadding().imePadding().padding(horizontal = 20.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(13.dp)) {
             PocketSheetHeader(icon = Icons.Rounded.Terminal, tint = PocketColors.accentSoft, iconBg = PocketColors.accentBg, title = "Linux & Tool USB Builder", subtitle = "${isoFile.name} · ${UsbGadgetEngine.formatBytes(isoFile.sizeBytes)}", subtitleMono = true)
             if (building) {
                 Surface(shape = RoundedCornerShape(14.dp), color = PocketColors.surfaceInput, border = BorderStroke(1.dp, PocketColors.accent)) {
@@ -392,6 +430,14 @@ fun LinuxBuilderSheet(
                             Text("Mounts as Writable USB (RW) for persistence", fontSize = 11.sp, color = PocketColors.textSecondary)
                         }
                         PocketSwitch(checked = autoMount, onCheckedChange = { autoMount = it }, activeColor = PocketColors.accent)
+                    }
+                }
+                if (targetExists) {
+                    Surface(shape = RoundedCornerShape(10.dp), color = PocketColors.warningBg, border = BorderStroke(0.5.dp, PocketColors.warning)) {
+                        Row(modifier = Modifier.fillMaxWidth().padding(10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Rounded.WarningAmber, null, tint = PocketColors.warning, modifier = Modifier.size(16.dp))
+                            Text("$resolvedOutName already exists in this folder and will be overwritten.", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
+                        }
                     }
                 }
                 if (lowSpace) {

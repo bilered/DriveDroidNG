@@ -790,12 +790,33 @@ object UsbGadgetEngine {
         }
     }
 
-    suspend fun deleteImageFile(path: String, isCurrentlyMounted: Boolean): ActionResult = withContext(Dispatchers.IO) {
+    fun sanitizeOutputFileName(raw: String, requiredExt: String, fallbackBase: String = "pocketboot"): String {
+        val ext = if (requiredExt.startsWith(".")) requiredExt else ".$requiredExt"
+        val stripped = raw
+            .replace('\\', '/')
+            .substringAfterLast('/')
+            .replace("..", "")
+            .replace(Regex("[\\x00-\\x1F:*?\"<>|]"), "")
+            .trim()
+            .trim('.')
+        val base = stripped.ifBlank { fallbackBase }
+        return if (base.endsWith(ext, ignoreCase = true)) base else "$base$ext"
+    }
+
+    suspend fun fileExistsInDir(dir: String, fileName: String): Boolean = withContext(Dispatchers.IO) {
+        val safeDir = resolveDirectPath(dir).trimEnd('/')
+        if (safeDir.isBlank() || fileName.isBlank()) return@withContext false
+        val full = "$safeDir/$fileName"
+        runCatching { File(full).exists() }.getOrDefault(false) ||
+            Shell.cmd("[ -e ${shellQuote(full)} ]").exec().isSuccess
+    }
+
+    suspend fun deleteImageFile(path: String, mountedLun: Int? = null): ActionResult = withContext(Dispatchers.IO) {
         val ts = nowTs()
         val entries = mutableListOf<LogEntry>()
         runCatching {
-            if (isCurrentlyMounted) {
-                val unmountRes = unmountImage()
+            if (mountedLun != null) {
+                val unmountRes = unmountImage(mountedLun)
                 entries.addAll(unmountRes.entries)
             }
             val resolved = resolveDirectPath(path)
@@ -1285,10 +1306,11 @@ object UsbGadgetEngine {
         val entries = mutableListOf<LogEntry>()
         return@withContext runCatching {
             val safeDir = resolveDirectPath(targetDir).trimEnd('/')
-            val safeName = fileName.trim().let {
-                if (it.endsWith(".img", ignoreCase = true)) it else "$it.img"
-            }
+            val safeName = sanitizeOutputFileName(fileName, ".img", "blank-usb")
             val outPath = "$safeDir/$safeName"
+            if (getStatus().mountedLunFor(outPath) != null) {
+                return@withContext ActionResult(false, "$safeName is currently mounted to your PC. Unmount it before overwriting.", entries = entries)
+            }
             val qDir = shellQuote(safeDir)
             val qOut = shellQuote(outPath)
 
@@ -1324,6 +1346,8 @@ object UsbGadgetEngine {
             if (res.isSuccess) {
                 fixUserStoragePermissions(context, safeDir, isDir = true)
                 fixUserStoragePermissions(context, outPath, isDir = false)
+                val createdBytes = Shell.cmd("stat -c '%s' $qOut 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                if (createdBytes > 0L) syncMediaStoreFileSize(context, outPath, createdBytes)
             }
 
             ActionResult(

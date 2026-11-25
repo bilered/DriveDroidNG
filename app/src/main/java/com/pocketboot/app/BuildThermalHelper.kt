@@ -34,8 +34,8 @@ data class WindowsToolsStatus(
 }
 
 /**
- * Process-scoped thermal & CPU affinity helper used by Windows USB Builder.
- * Wraps only heavy native build binaries (7zzs) and never touches USB Gadget mounting.
+ * Process-scoped thermal & CPU affinity helper used by Windows, Linux, and Ventoy USB Builders.
+ * Wraps only heavy native build binaries (7zzs, cp, dd) and never touches USB Gadget mounting.
  */
 object BuildThermalHelper {
     private const val ACTIVE_BUILD_PID_FILE = "/data/local/tmp/pb_active_build_pid"
@@ -52,7 +52,7 @@ object BuildThermalHelper {
     fun isBuildCancelled(): Boolean = buildCancelledFlag.get()
 
     /**
-     * Immediately terminates the currently tracked native build binary (7zzs)
+     * Immediately terminates the currently tracked native build binary (7zzs, cp, dd)
      * and its parent wrapper shell so cancelling a build stops CPU/storage work instantly.
      */
     fun cancelActiveBuildProcess() {

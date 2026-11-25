@@ -70,7 +70,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
@@ -101,6 +100,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import java.util.Locale
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 
 @Composable
 private fun SettingsIconBadge(
@@ -126,6 +127,7 @@ fun SettingsScreen(
     settings: AppSettings,
     logs: List<LogEntry>,
     forceExpandLogs: Boolean,
+    isOperationActive: Boolean = false,
     onUpdateSettings: (AppSettings) -> Unit,
     onResetNormalUsb: () -> Unit,
     onClearLogs: () -> Unit
@@ -727,17 +729,18 @@ fun SettingsScreen(
                         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
                             Text("Temp & Build Cache", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
                             Text(
-                                text = if (tempStats.totalBytes > 0L) {
-                                    "${UsbGadgetEngine.formatBytes(tempStats.totalBytes)} in .pocketboot_tmp & downloads"
-                                } else {
-                                    "0 B · Workspace is clean"
+                                text = when {
+                                    isOperationActive -> "Paused while a build or download is active"
+                                    tempStats.totalBytes > 0L -> "${UsbGadgetEngine.formatBytes(tempStats.totalBytes)} in .pocketboot_tmp & downloads"
+                                    else -> "0 B · Workspace is clean"
                                 },
                                 style = PocketColors.monoStyle,
-                                color = if (tempStats.totalBytes > 0L) PocketColors.warning else PocketColors.textSecondary
+                                color = if (!isOperationActive && tempStats.totalBytes > 0L) PocketColors.warning else PocketColors.textSecondary
                             )
                         }
+                        val canCleanTemp = !cleaningTemp && !isOperationActive && tempStats.totalBytes > 0L
                         Surface(
-                            modifier = Modifier.bounceClick(enabled = !cleaningTemp && tempStats.totalBytes > 0L) {
+                            modifier = Modifier.bounceClick(enabled = canCleanTemp) {
                                 scope.launch {
                                     cleaningTemp = true
                                     val res = UsbGadgetEngine.cleanTempStorage(context, settings.scanDirs + settings.defaultDir)
@@ -747,8 +750,8 @@ fun SettingsScreen(
                                 }
                             },
                             shape = RoundedCornerShape(9.dp),
-                            color = if (tempStats.totalBytes > 0L) PocketColors.warningBg else PocketColors.surfaceSubtle,
-                            border = BorderStroke(0.5.dp, if (tempStats.totalBytes > 0L) PocketColors.warning else PocketColors.border)
+                            color = if (canCleanTemp) PocketColors.warningBg else PocketColors.surfaceSubtle,
+                            border = BorderStroke(0.5.dp, if (canCleanTemp) PocketColors.warning else PocketColors.border)
                         ) {
                             Box(modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp), contentAlignment = Alignment.Center) {
                                 if (cleaningTemp) {
@@ -757,7 +760,7 @@ fun SettingsScreen(
                                     Text(
                                         text = "Clean",
                                         style = MaterialTheme.typography.labelMedium,
-                                        color = if (tempStats.totalBytes > 0L) PocketColors.warning else PocketColors.textMuted
+                                        color = if (canCleanTemp) PocketColors.warning else PocketColors.textMuted
                                     )
                                 }
                             }
@@ -882,7 +885,7 @@ fun SettingsScreen(
                             Icon(Icons.Rounded.Usb, null, tint = PocketColors.onAccent, modifier = Modifier.size(22.dp))
                         }
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("PocketBoot v4.6.2", style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary)
+                            Text("PocketBoot v4.6.3", style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary)
                             Text(
                                 text = "${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE}",
                                 style = MaterialTheme.typography.bodySmall,
@@ -893,7 +896,7 @@ fun SettingsScreen(
                         }
                         Surface(
                             modifier = Modifier.bounceClick {
-                                val info = "PocketBoot v4.6.2\nDevice: ${Build.MANUFACTURER} ${Build.MODEL}\nAndroid: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\nRoot: ${status.rootManager}\nSELinux: ${status.selinuxMode}\nUDC: ${status.udcName}\nKernel: ${status.kernelVersion}"
+                                val info = "PocketBoot v4.6.3\nDevice: ${Build.MANUFACTURER} ${Build.MODEL}\nAndroid: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\nRoot: ${status.rootManager}\nSELinux: ${status.selinuxMode}\nUDC: ${status.udcName}\nKernel: ${status.kernelVersion}"
                                 val cm = context.getSystemService(ClipboardManager::class.java)
                                 cm?.setPrimaryClip(ClipData.newPlainText("Device Info", info))
                                 Toast.makeText(context, "Device info copied.", Toast.LENGTH_SHORT).show()
@@ -983,6 +986,8 @@ fun SettingsScreen(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .imePadding()
                     .padding(horizontal = 20.dp)
                     .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(12.dp)

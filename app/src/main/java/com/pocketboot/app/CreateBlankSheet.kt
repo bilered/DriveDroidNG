@@ -2,7 +2,6 @@ package com.pocketboot.app
 
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -42,6 +41,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import java.util.Locale
 import kotlin.math.roundToInt
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.material.icons.rounded.WarningAmber
 
 private enum class SizeUnit(val label: String) {
     MB("MB"),
@@ -80,11 +83,17 @@ fun CreateBlankSheetContent(
     } else {
         "$effectiveSizeMb MB"
     }
-    val finalName = if (trimmedName.endsWith(".img", ignoreCase = true)) trimmedName else "$trimmedName.img"
+    val finalName = UsbGadgetEngine.sanitizeOutputFileName(trimmedName, ".img", "blank-usb")
+    var targetExists by remember(defaultDir) { mutableStateOf(false) }
+    LaunchedEffect(defaultDir, finalName, isNameValid) {
+        targetExists = if (isNameValid) UsbGadgetEngine.fileExistsInDir(defaultDir, finalName) else false
+    }
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            .navigationBarsPadding()
+            .imePadding()
             .padding(horizontal = 20.dp)
             .verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(16.dp)
@@ -277,6 +286,15 @@ fun CreateBlankSheetContent(
                     checked = mountImmediately,
                     onCheckedChange = { mountImmediately = it }
                 )
+            }
+        }
+
+        if (targetExists) {
+            Surface(shape = RoundedCornerShape(10.dp), color = PocketColors.warningBg, border = BorderStroke(0.5.dp, PocketColors.warning)) {
+                Row(modifier = Modifier.fillMaxWidth().padding(10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Rounded.WarningAmber, null, tint = PocketColors.warning, modifier = Modifier.size(16.dp))
+                    Text("$finalName already exists in this folder and will be overwritten.", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
+                }
             }
         }
 

@@ -1,3 +1,17 @@
+## v4.6.3 (2026-11-25)
+- **Android 15 Lifecycle & Edge-to-Edge Fixes (`AndroidManifest.xml`, `FastIsoDownloader.kt`, all 10 UI files):**
+  - Preserved `MainActivity` across orientation/screen-size/keyboard config changes so rotating the phone never kills active USB or Ventoy builds.
+  - Added `TurboDownloadService.onTimeout(startId, fgsType)` for Android 15 `dataSync` foreground service compliance (pauses cleanly with `.pbmeta` state saved).
+  - Applied `.navigationBarsPadding().imePadding()` to all 12 `ModalBottomSheet`s so primary CTA buttons and text inputs never hide behind 3-button navigation bars or software keyboards.
+- **Unified Thermal Control, PID-Tree Cancel & Conflict Guards (`LinuxImageBuilder.kt`, `VentoyImageBuilder.kt`, `MainActivity.kt`, `SettingsScreen.kt`):**
+  - Wired `BuildThermalHelper` thermal limits, cooldown checks, and immediate PID-tree process termination on Cancel into both Linux and Ventoy builders.
+  - Blocked concurrent USB/Ventoy builds and locked **Settings → Clean Temp** while any build or download is active.
+- **Data Safety & Dual-LUN Fixes (`UsbGadgetEngine.kt`, `MainActivity.kt`, `BrowseAndBrowserSheets.kt`, `WindowsImageBuilder.kt`, `CreateBlankSheet.kt`):**
+  - Fixed Dual-LUN deletion in both the Drives screen and Root File Browser so deleting a mounted image only unmounts its specific LUN and keeps `UsbKeepAliveService` alive if the other LUN is still mounted.
+  - Added `UsbGadgetEngine.sanitizeOutputFileName()`, mounted-target & source-ISO overwrite guards, inline overwrite warning banners across all 4 image builders, `extraDriversDir` sizing in `WindowsImageBuilder.kt`, and `syncMediaStoreFileSize()` in `createBlankImage()`.
+- **Network Thread Safety, Copy & Code Hygiene (`WindowsDirectCatalog.kt`, `FastIsoDownloader.kt`, `distros.json`, `AppPrefs.kt`):**
+  - Replaced unsynchronized WebView flags with `AtomicBoolean`, isolated Microsoft CDN cookies to a local `CookieManager` (no global `CookieHandler.setDefault` mutation), updated all 6 stale `'All Channels'` error strings, synced catalog version to `463`, and removed all 38 unused imports across 7 Kotlin files.
+
 ## v4.6.2 (2026-11-25)
 - **Removed Windows ISO Slimmer (`WindowsIsoSlimmer.kt`):** Completely removed `WindowsIsoSlimmer.kt`, its File Info action card, bottom sheet, and coroutine state in `MainActivity.kt`, plus unused `cleanStock()` in `WindowsCustomization.kt`.
 - **Dropped Unused `GNU xorriso` Binary (`build-apk.yml`, `BuildThermalHelper.kt`, `DiagnosticsSheet.kt`, `SettingsScreen.kt`):** Removed `libxorriso.so` cross-compilation and `XOR_SMOKE` from GitHub Actions CI, removed `xorriso` from open-source credits and diagnostics (`Windows Imaging Tools` now checks `7zzs` and `wimlib`), and simplified `BuildThermalHelper.kt` for **Windows USB Builder**.
