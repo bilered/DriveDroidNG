@@ -740,7 +740,7 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                                     showFeedback("Warning: SHA-256 mismatch on ${evt.fileName}!", true)
                                 } else if (evt.autoMount && status.hasRoot) {
                                     activeTab = NavTab.HOME
-                                    val mode = if (evt.injectedMultiBootPath != null) MountMode.USB_RO else MountMode.AUTO
+                                    val mode = if (evt.injectedMultiBootPath != null) MountMode.USB_RW else MountMode.AUTO
                                     mountPath(targetPath, mode, lunIndex = 0)
                                 } else if (evt.injectedMultiBootPath != null) {
                                     showFeedback("Added ${evt.fileName} directly into ${evt.injectedMultiBootPath.substringAfterLast('/')}.")
@@ -913,7 +913,7 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                                 )
                                 updateSettings(updated, rescan = true)
                                 if (cfg.autoMountAfterBuild) {
-                                    mountPath(res.createdPath, MountMode.USB_RO, lunIndex = 0)
+                                    mountPath(res.createdPath, MountMode.USB_RW, lunIndex = 0)
                                 } else {
                                     showFeedback(res.userMessage, false)
                                 }
@@ -1026,7 +1026,7 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                                 )
                                 updateSettings(updated, rescan = true)
                                 if (cfg.autoMountAfterBuild) {
-                                    mountPath(res.createdPath, MountMode.USB_RO, lunIndex = 0)
+                                    mountPath(res.createdPath, MountMode.USB_RW, lunIndex = 0)
                                 } else {
                                     showFeedback(res.userMessage, false)
                                 }
@@ -1348,7 +1348,7 @@ private fun MountProtocolSheet(
     val exceedsKernelCdLimit = isIso && file.sizeBytes > IsoInspector.KERNEL_CDROM_MAX_BYTES
 
     val recommendedMode = when {
-        isVentoy -> MountMode.USB_RO
+        isVentoy -> MountMode.USB_RW
         isLinux -> MountMode.USB_RO
         isIso && !exceedsKernelCdLimit -> MountMode.CDROM
         isIso -> MountMode.USB_RO
@@ -1488,9 +1488,9 @@ private fun MountProtocolSheet(
                     icon = Icons.Rounded.Usb,
                     title = "Mount to PC",
                     badge = "Recommended",
-                    subtitle = "Read-Only USB · boots all over 2.2 GB Windows & Linux ISOs",
+                    subtitle = "Writable USB · boots all over 2.2 GB Windows & Linux ISOs cleanly",
                     highlighted = true,
-                    onClick = { onSelectProtocol(MountMode.USB_RO, selectedLun, rememberForQuickMount) }
+                    onClick = { onSelectProtocol(MountMode.USB_RW, selectedLun, rememberForQuickMount) }
                 )
                 MountActionCard(
                     icon = Icons.Rounded.Layers,
@@ -1505,7 +1505,7 @@ private fun MountProtocolSheet(
                     modifier = Modifier.align(Alignment.CenterHorizontally)
                 ) {
                     Text(
-                        text = if (showOtherModes) "Hide writable mode" else "Mount as Writable USB (PC drag-and-drop)",
+                        text = if (showOtherModes) "Hide read-only mode" else "Mount as Read-Only USB (write-protected)",
                         fontSize = 12.sp,
                         color = PocketColors.textSecondary
                     )
@@ -1612,7 +1612,7 @@ private fun MountProtocolSheet(
             AnimatedVisibility(visible = showOtherModes) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     val modesToShow = when {
-                        isVentoy -> listOf(MountMode.USB_RW)
+                        isVentoy -> listOf(MountMode.USB_RO)
                         isWindows && exceedsKernelCdLimit -> listOf(MountMode.CDROM, MountMode.USB_RO, MountMode.USB_RW)
                         isWindows -> listOf(MountMode.USB_RO, MountMode.USB_RW)
                         isLinux -> listOf(MountMode.CDROM, MountMode.USB_RW)
@@ -1931,7 +1931,7 @@ private fun FileInfoBottomSheet(
                     MountActionCard(
                         icon = Icons.Rounded.Terminal,
                         title = "Linux & Tool USB Builder",
-                        badge = "Rufus-Style",
+                        badge = "Live / Persist",
                         subtitle = "With Persistence (writable/persistence) or Standard FAT32/DD",
                         highlighted = false,
                         onClick = onOpenLinuxBuilder

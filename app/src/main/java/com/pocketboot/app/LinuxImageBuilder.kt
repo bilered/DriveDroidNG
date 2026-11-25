@@ -67,7 +67,7 @@ enum class LinuxUsbMode(val title: String, val subtitle: String) {
 
 enum class LinuxWriteMethod(val title: String, val subtitle: String) {
     HYBRID_DD("Hybrid DD / ISO", "Fastest · keeps exact ISO sectors"),
-    EXTRACTED_FAT32("Extracted FAT32 (Rufus ISO)", "Clean FAT32 USB · best for tools & extra files")
+    EXTRACTED_FAT32("Extracted FAT32 (ISO Mode)", "Clean FAT32 USB · best for tools & extra files")
 }
 
 enum class LinuxPersistenceStyle(val title: String, val volumeLabel: String, val subtitle: String) {
@@ -85,7 +85,8 @@ data class LinuxBuildConfig(
     val scheme: PartitionScheme = PartitionScheme.MBR,
     val persistenceGb: Int = 2,
     val style: LinuxPersistenceStyle = LinuxPersistenceStyle.UBUNTU_WRITABLE,
-    val autoMountAfterBuild: Boolean = true
+    val autoMountAfterBuild: Boolean = true,
+    val volumeLabel: String = ""
 )
 
 object LinuxImageBuilder {
@@ -123,7 +124,11 @@ object LinuxImageBuilder {
         val qOut = shellQuote(outPath); val qDir = shellQuote(safeDir)
         var loopDev = ""
         fun cleanup(deletePartial: Boolean) {
-            Shell.cmd("sync 2>/dev/null; umount $TEMP_LINUX_MNT 2>/dev/null || umount -l $TEMP_LINUX_MNT 2>/dev/null; [ -n ${shellQuote(loopDev)} ] && losetup -d ${shellQuote(loopDev)} 2>/dev/null; rm -rf $TEMP_LINUX_MNT 2>/dev/null").exec()
+            BuildThermalHelper.unmountAndDetachClean(
+                mountPoints = listOf(TEMP_LINUX_MNT),
+                loopDevices = if (loopDev.isNotBlank()) listOf(loopDev) else emptyList(),
+                removeDirs = true
+            )
             if (deletePartial) Shell.cmd("rm -f $qOut 2>/dev/null").exec()
         }
         return@withContext runCatching {
@@ -194,7 +199,11 @@ object LinuxImageBuilder {
         val qIso = shellQuote(srcIsoPath); val qOut = shellQuote(outPath); val qDir = shellQuote(safeDir)
         var fatLoop = ""; var extLoop = ""
         fun cleanup(deletePartial: Boolean) {
-            Shell.cmd("sync 2>/dev/null; umount $TEMP_FAT_MNT 2>/dev/null || umount -l $TEMP_FAT_MNT 2>/dev/null; umount $TEMP_LINUX_MNT 2>/dev/null || umount -l $TEMP_LINUX_MNT 2>/dev/null; [ -n ${shellQuote(fatLoop)} ] && losetup -d ${shellQuote(fatLoop)} 2>/dev/null; [ -n ${shellQuote(extLoop)} ] && losetup -d ${shellQuote(extLoop)} 2>/dev/null; rm -rf $TEMP_FAT_MNT $TEMP_LINUX_MNT 2>/dev/null").exec()
+            BuildThermalHelper.unmountAndDetachClean(
+                mountPoints = listOf(TEMP_FAT_MNT, TEMP_LINUX_MNT),
+                loopDevices = listOf(fatLoop, extLoop).filter { it.isNotBlank() },
+                removeDirs = true
+            )
             if (deletePartial) Shell.cmd("rm -f $qOut 2>/dev/null").exec()
         }
         return@withContext runCatching {
@@ -216,24 +225,32 @@ object LinuxImageBuilder {
             if (freeSpace > 0L && freeSpace < totalBytes + (64L * 1024L * 1024L)) return@withContext ActionResult(false, "Not enough free space. Need ${UsbGadgetEngine.formatBytes(totalBytes)}, have ${UsbGadgetEngine.formatBytes(freeSpace)}.", entries = entries)
             onProgress(WindowsBuildProgress("Allocating FAT32 USB image...", UsbGadgetEngine.formatBytes(totalBytes), 0.14f, false))
             if (!Shell.cmd("mkdir -p $qDir && rm -f $qOut && truncate -s $totalBytes $qOut 2>&1").exec().isSuccess) return@withContext ActionResult(false, "Failed to allocate image file.", entries = entries)
-            val mbrBytes = ByteArray(512)
-            fun putLe32(buf: ByteArray, off: Int, v: Long) { buf[off] = (v and 0xFF).toByte(); buf[off+1] = ((v ushr 8) and 0xFF).toByte(); buf[off+2] = ((v ushr 16) and 0xFF).toByte(); buf[off+3] = ((v ushr 24) and 0xFF).toByte() }
-            mbrBytes[446] = 0x80.toByte(); mbrBytes[450] = 0x0C.toByte(); putLe32(mbrBytes, 454, part1OffsetBytes / 512L); putLe32(mbrBytes, 458, fatBytes / 512L)
-            if (withPersistence) { mbrBytes[466] = 0x83.toByte(); putLe32(mbrBytes, 470, part2OffsetBytes / 512L); putLe32(mbrBytes, 474, persistBytes / 512L) }
-            mbrBytes[510] = 0x55.toByte(); mbrBytes[511] = 0xAA.toByte()
+            val mbrBytes = DiskPartitioner.buildLinuxFat32MbrSector(
+                part1StartLba = part1OffsetBytes / 512L,
+                part1Sectors = fatBytes / 512L,
+                part2StartLba = part2OffsetBytes / 512L,
+                part2Sectors = persistBytes / 512L,
+                includePersistence = withPersistence
+            )
             val tmpMbr = File(context.cacheDir, "pb_fat_mbr.bin").apply { writeBytes(mbrBytes) }
             try { Shell.cmd("dd if=${shellQuote(tmpMbr.absolutePath)} of=$qOut bs=512 count=1 conv=notrunc 2>/dev/null").exec() } finally { tmpMbr.delete() }
             WindowsImageBuilder.findBundledBinary(context, "libms_sys.so", listOf("ms-sys"))?.let { msSys -> Shell.cmd("${shellQuote(msSys)} -s -f $qOut >/dev/null 2>&1 || ${shellQuote(msSys)} -7 -f $qOut >/dev/null 2>&1 || true").exec() }
 
-            onProgress(WindowsBuildProgress("Formatting FAT32 partition...", "${fatBytes / (1024L * 1024L)} MB", 0.28f, false))
+            val fatLabel = if (config.volumeLabel.isNotBlank()) {
+                IsoInspector.sanitizeFatLabel(config.volumeLabel, fallback = "POCKETBOOT", uppercase = true)
+            } else {
+                IsoInspector.defaultLinuxFat32Label(srcIsoPath, config.isoFile.name)
+            }
+            val qFatLbl = shellQuote(fatLabel)
+            onProgress(WindowsBuildProgress("Formatting FAT32 partition...", "${fatBytes / (1024L * 1024L)} MB · $fatLabel", 0.28f, false))
             fatLoop = attachLoopSlice(qOut, part1OffsetBytes, fatBytes)
             if (fatLoop.isBlank() || !fatLoop.startsWith("/dev/")) { cleanup(true); return@withContext ActionResult(false, "Could not attach loop device for FAT32.", entries = entries) }
             val qFatLoop = shellQuote(fatLoop)
             val mkFatBin = WindowsImageBuilder.findBundledBinary(context, "libmkfs_fat.so", listOf("mkfs.vfat", "mkfs.fat", "newfs_msdos"))
             val fatFmtCmd = when {
-                mkFatBin != null && mkFatBin.contains("newfs_msdos") -> "${shellQuote(mkFatBin)} -F 32 -L POCKETBOOT $qFatLoop 2>&1"
-                mkFatBin != null -> "${shellQuote(mkFatBin)} -F 32 -n POCKETBOOT $qFatLoop 2>&1"
-                else -> "mkfs.vfat -F 32 -n POCKETBOOT $qFatLoop 2>&1 || newfs_msdos -F 32 -L POCKETBOOT $qFatLoop 2>&1"
+                mkFatBin != null && mkFatBin.contains("newfs_msdos") -> "${shellQuote(mkFatBin)} -F 32 -L $qFatLbl $qFatLoop 2>&1"
+                mkFatBin != null -> "${shellQuote(mkFatBin)} -F 32 -n $qFatLbl $qFatLoop 2>&1"
+                else -> "mkfs.vfat -F 32 -n $qFatLbl $qFatLoop 2>&1 || newfs_msdos -F 32 -L $qFatLbl $qFatLoop 2>&1"
             }
             val fatFmtRes = Shell.cmd(fatFmtCmd).exec()
             if (!fatFmtRes.isSuccess) { cleanup(true); return@withContext ActionResult(false, "FAT32 format failed: ${(fatFmtRes.out + fatFmtRes.err).joinToString(" ").take(200)}", entries = entries) }
@@ -255,9 +272,26 @@ object LinuxImageBuilder {
             if (!isActive || BuildThermalHelper.isBuildCancelled()) { cleanup(true); return@withContext ActionResult(false, "Build cancelled.", entries = entries) }
             if (!extRes.isSuccess) { cleanup(true); return@withContext ActionResult(false, "ISO extraction failed: ${(extRes.out + extRes.err).takeLast(4).joinToString(" ").take(200)}", entries = entries) }
 
+            // Sync label-dependent distro boot configs (CDLABEL=, root=live:LABEL=, archisolabel=, misolabel=, GRUB search -l/--label)
+            val safeSedLbl = fatLabel.replace("/", "").replace("&", "").replace("|", "").replace("#", "")
+            Shell.cmd(
+                """
+                find $TEMP_FAT_MNT -maxdepth 4 -type f \( -iname 'grub.cfg' -o -iname 'isolinux.cfg' -o -iname 'syslinux.cfg' -o -iname 'loopback.cfg' -o -iname 'txt.cfg' \) 2>/dev/null | while IFS= read -r cfg; do
+                    sed -i -E "s#(CDLABEL=)[^[:space:]\"']+#\1$safeSedLbl#g; s#(root=live:LABEL=)[^[:space:]\"']+#\1$safeSedLbl#g; s#(archisolabel=)[^[:space:]\"']+#\1$safeSedLbl#g; s#(misolabel=)[^[:space:]\"']+#\1$safeSedLbl#g; s#(search[[:space:]][^;#]*[[:space:]](-l|--label)[[:space:]]+['\"]?)[^[:space:]'\"]+(['\"]?)#\1$safeSedLbl\3#g" "${'$'}cfg" 2>/dev/null || true
+                done
+                """.trimIndent()
+            ).exec()
+            entries.add(LogEntry(ts, "linux-build", "Formatted FAT32 ($fatLabel) & synced bootloader label entries"))
+
             if (withPersistence) {
                 val bootParam = if (config.style == LinuxPersistenceStyle.DEBIAN_KALI) "persistence" else "persistent"
-                Shell.cmd("for cfg in $TEMP_FAT_MNT/boot/grub/grub.cfg $TEMP_FAT_MNT/EFI/BOOT/grub.cfg $TEMP_FAT_MNT/isolinux/isolinux.cfg $TEMP_FAT_MNT/syslinux/syslinux.cfg $TEMP_FAT_MNT/boot/grub/loopback.cfg; do [ -f \"\${cfg}\" ] && sed -i 's/boot=casper/boot=casper $bootParam/g; s/boot=live/boot=live $bootParam/g' \"\${cfg}\" 2>/dev/null || true; done").exec()
+                Shell.cmd(
+                    """
+                    find $TEMP_FAT_MNT -maxdepth 4 -type f \( -iname 'grub.cfg' -o -iname 'isolinux.cfg' -o -iname 'syslinux.cfg' -o -iname 'loopback.cfg' -o -iname 'txt.cfg' \) 2>/dev/null | while IFS= read -r cfg; do
+                        sed -i "/$bootParam/!{s/boot=casper/boot=casper $bootParam/g; s/boot=live/boot=live $bootParam/g;}" "${'$'}cfg" 2>/dev/null || true
+                    done
+                    """.trimIndent()
+                ).exec()
                 entries.add(LogEntry(ts, "linux-build", "Injected '$bootParam' kernel boot flag"))
                 onProgress(WindowsBuildProgress("Formatting ext4 persistence...", "${config.persistenceGb} GB ${config.style.volumeLabel}", 0.78f, false))
                 extLoop = attachLoopSlice(qOut, part2OffsetBytes, persistBytes)
@@ -330,7 +364,15 @@ fun LinuxBuilderSheet(
     var persistGb by remember { mutableIntStateOf(2) }
     var autoMount by remember { mutableStateOf(true) }
     var maxIsoFileBytes by remember(isoFile.path) { mutableStateOf(0L) }
-    LaunchedEffect(isoFile.path) { maxIsoFileBytes = LinuxImageBuilder.inspectMaxFileBytesInIso(context, isoFile.path) }
+    var detectedFatLabel by remember(isoFile.path) { mutableStateOf(IsoInspector.sanitizeFatLabel(isoFile.name.substringBeforeLast('.'), "POCKETBOOT", uppercase = true)) }
+    var volumeLabel by remember(isoFile.path) { mutableStateOf(detectedFatLabel) }
+    var volumeLabelEdited by remember(isoFile.path) { mutableStateOf(false) }
+    LaunchedEffect(isoFile.path) {
+        maxIsoFileBytes = LinuxImageBuilder.inspectMaxFileBytesInIso(context, isoFile.path)
+        val probed = withContext(Dispatchers.IO) { IsoInspector.defaultLinuxFat32Label(isoFile.path, isoFile.name) }
+        detectedFatLabel = probed
+        if (!volumeLabelEdited) volumeLabel = probed
+    }
 
     val defaultOutName = remember(isoFile.name, usbMode) {
         val stem = isoFile.name.substringBeforeLast('.').take(32)
@@ -365,7 +407,7 @@ fun LinuxBuilderSheet(
                 }
             } else {
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("USB Mode (Rufus-Style)", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                    Text("USB Mode", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         LinuxUsbMode.entries.forEach { mode ->
                             val selected = usbMode == mode
@@ -423,11 +465,23 @@ fun LinuxBuilderSheet(
                     }
                 }
                 OutlinedTextField(value = outputName, onValueChange = { outputName = it }, label = { Text("Output USB Image Name") }, singleLine = true, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp), colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = PocketColors.accent, unfocusedBorderColor = PocketColors.border, focusedTextColor = PocketColors.textPrimary, unfocusedTextColor = PocketColors.textPrimary))
+                AnimatedVisibility(visible = writeMethod == LinuxWriteMethod.EXTRACTED_FAT32) {
+                    OutlinedTextField(
+                        value = volumeLabel,
+                        onValueChange = { volumeLabelEdited = true; volumeLabel = it.filter { ch -> ch.code in 0x20..0x7E && ch !in "\\/:*?\"<>|.,;+=[]'`" }.uppercase(Locale.US).take(11) },
+                        label = { Text("FAT32 Volume Label (max 11 chars)") },
+                        placeholder = { Text(detectedFatLabel) },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = PocketColors.accent, unfocusedBorderColor = PocketColors.border, focusedTextColor = PocketColors.textPrimary, unfocusedTextColor = PocketColors.textPrimary)
+                    )
+                }
                 Surface(shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
                     Row(modifier = Modifier.fillMaxWidth().clickable { autoMount = !autoMount }.padding(horizontal = 13.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text("Auto-mount when finished", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
-                            Text("Mounts as Writable USB (RW) for persistence", fontSize = 11.sp, color = PocketColors.textSecondary)
+                            Text(if (usbMode == LinuxUsbMode.WITH_PERSISTENCE) "Mounts as Writable USB (RW) for persistence" else "Mounts as Read-Only USB (RO)", fontSize = 11.sp, color = PocketColors.textSecondary)
                         }
                         PocketSwitch(checked = autoMount, onCheckedChange = { autoMount = it }, activeColor = PocketColors.accent)
                     }
@@ -453,7 +507,7 @@ fun LinuxBuilderSheet(
                         Text(if (writeMethod == LinuxWriteMethod.EXTRACTED_FAT32 && usbMode == LinuxUsbMode.WITH_PERSISTENCE) "Auto-injects persistence boot flag into GRUB/Syslinux." else "Estimated image size: ~${UsbGadgetEngine.formatBytes(estNeeded)}", fontSize = 11.sp, color = PocketColors.textSecondary)
                     }
                 }
-                Button(onClick = { onStartBuild(LinuxBuildConfig(isoFile, defaultDir, outputName.trim().ifBlank { defaultOutName }, usbMode, writeMethod, PartitionScheme.MBR, persistGb, style, autoMount)) }, enabled = outputName.trim().isNotEmpty() && !lowSpace && !(writeMethod == LinuxWriteMethod.EXTRACTED_FAT32 && fat32Blocked), modifier = Modifier.fillMaxWidth().height(48.dp), shape = RoundedCornerShape(12.dp), colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)) {
+                Button(onClick = { onStartBuild(LinuxBuildConfig(isoFile, defaultDir, outputName.trim().ifBlank { defaultOutName }, usbMode, writeMethod, PartitionScheme.MBR, persistGb, style, autoMount, volumeLabel = volumeLabel.trim().ifBlank { detectedFatLabel })) }, enabled = outputName.trim().isNotEmpty() && !lowSpace && !(writeMethod == LinuxWriteMethod.EXTRACTED_FAT32 && fat32Blocked), modifier = Modifier.fillMaxWidth().height(48.dp), shape = RoundedCornerShape(12.dp), colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)) {
                     Text(if (usbMode == LinuxUsbMode.WITH_PERSISTENCE) "Build Persistent USB (.img)" else "Build Live USB (.img)", fontWeight = FontWeight.SemiBold)
                 }
             }

@@ -1,16 +1,21 @@
 # PocketBoot Development Progress
 
-## Current Milestone: v4.6.6 (100% Rufus Parity Polish & Versioned USB Volume Labels)
-- **Versioned PocketBoot USB Volume Labels (`WindowsImageBuilder.kt`):**
-  - Automatically probes the Windows ISO's WIM XML header (`<BUILD>` + `<SPBUILD>` + OS version, with filename & `boot.wim` fallbacks) and formats the NTFS Partition 1 label as **`POCKETBOOT- Win 11 -26300.9974`** (clamped safely to 32 chars; FAT32 fallback `PB11-26300`, <= 11 chars).
-- **Exact OOBE & Local Admin Account Parity (`WindowsCustomization.kt`):**
-  - Decoupled **Bypass Online Microsoft Account** (`BypassNRO`) from **Skip Wi-Fi Setup** (`HideWirelessSetupInOOBE`) and gated `HideOnlineAccountScreens` strictly to pre-created local accounts / `skipOobe` (never emits an empty `<OOBE>` block).
-  - Added `<HideLocalAccountScreen>true</HideLocalAccountScreen>` and `<FirstLogonCommands>` (`net accounts /maxpwage:unlimited`) for pre-created local admin accounts, and reordered `Microsoft-Windows-Shell-Setup` and `<OOBE>` elements into strict Microsoft XSD alphabetical order.
-- **Single-Pass `boot.wim` Updates & Tracked Bootloader Helpers (`WindowsCustomization.kt`, `WindowsImageBuilder.kt`):**
-  - Merged `LabConfig` hive patching and `/Autounattend.xml` injection into a single `wimlib-imagex update` pass (`patchBootWimSnippet`), eliminating double rewrites on Unattended Mode builds and clarifying fallback logs.
-  - Routed Win 7 UEFI and CA 2023 bootloader extraction through `BuildThermalHelper.runIsolatedRootScript(..., trackPid = true)` for instant cancellation, and added `sources/boot.wim` Index 2 fallback for CA 2023 extraction.
-  - Passed `selectedEditionIndex` into `WindowsTwoPaneCustomizer` so **Preview XML** reflects edition-locked `boot.wim\Autounattend.xml` accurately.
-- **Post-Audit Edge-Case Hardening (`WindowsImageBuilder.kt`, `WindowsCustomization.kt`):**
-  - Fixed Unattended Mode `LabConfig` fallback so if offline `reged` fails while `Autounattend.xml` succeeds, the replacement `Autounattend.xml` (containing `LabConfig`) overwrites `/Autounattend.xml` inside `boot.wim` (or falls back to USB root) instead of being skipped.
-  - Prevented OOBE dead-end when `Full Unattended OOBE Skip` is toggled ON without a Local Admin username (kept account screens visible + added inline UI hint).
-  - Sorted inner child elements of `<AutoLogon>`, `<FirstLogonCommands>`, and `<LocalAccount>` into strict Microsoft XSD alphabetical order, routed `/Drivers` copy and Step 3 `7zzs` label fallback through `BuildThermalHelper.runIsolatedRootScript(..., trackPid = true)`, clarified Pure Stock **Preview XML**, and fixed the `Part2 UEFI:NTFS` log label.
+## Current Milestone: v4.6.7 (Writable Auto-Mount, Hidden UEFI:NTFS, Editable 1-Line Labels, Clean Flush, Linux FAT32 Boot Fixes & Brand Scrub)
+- **Fixed Windows Setup "Install driver to show hardware" & Missing Explorer Drive (`MainActivity.kt`, `WindowsImageBuilder.kt`, `VentoyImageBuilder.kt`):**
+  - Switched post-build auto-mount for Windows USB and Multi-Boot drives (and Multi-Boot recommended mount mode) from Read-Only USB (`USB_RO`) to **Writable USB (`USB_RW`)** so Windows/WinPE `ntfs.sys` can mount fresh Linux-created NTFS volumes cleanly.
+  - Added shared `BuildThermalHelper.unmountAndDetachClean()` (up to 10 × 1 s `sync` + real `umount` retry before lazy fallback + `losetup -d` + final `sync`) across Windows, Linux, and Multi-Boot builders to prevent dirty/unflushed NTFS handoffs.
+- **Hidden `UEFI:NTFS` Helper Partition (`DiskPartitioner.kt`):**
+  - Updated GPT Partition 2 (`UEFI:NTFS`) attributes from `0x9000000000000000` to **`0xD000000000000001`** (`PLATFORM_REQUIRED | READ_ONLY | HIDDEN | NO_DRIVE_LETTER`) so the 1 MB boot partition no longer appears as an extra drive letter in Windows Explorer while UEFI still boots it and Windows Setup still ignores it.
+- **Hybrid Editable 1-Line Volume Labels (`IsoInspector.kt`, `WindowsImageBuilder.kt`, `LinuxImageBuilder.kt`, `VentoyImageBuilder.kt`):**
+  - **Windows USB:** Defaults to 1-line Explorer-safe `POCKETBOOT-WIN 11` (`WIN 10`, `WIN 8.1`, `WIN 7`, `WIN SRV`) on NTFS (`PB-WIN11` on FAT32), with an editable Volume Label box and live >20-char Explorer wrap warning.
+  - **Multi-Boot:** Defaults to **`POCKETBOOT Multi ISO`** (NTFS, 20 chars) / **`PB MultiISO`** (exFAT, 11 chars) and filename **`POCKETBOOT Multi ISO.img`**, editable, with `-c 4096` NTFS clusters, label preservation on Resize Path B, and instant spaced-name recognition in `IsoInspector.quickGuessByName()`.
+  - **Linux & Tool (Extracted FAT32):** Defaults to the **original ISO-9660 disc label trimmed to 11 chars** (editable), patches `CDLABEL=` / `archisolabel=` / `misolabel=` case-insensitively across boot configs, deduplicates persistence boot flags, and writes standard LBA CHS (`FE FF FF`) MBR entries via `DiskPartitioner.buildLinuxFat32MbrSector()`.
+- **Clean Edition Choice with Full Unattended OOBE (`WindowsImageBuilder.kt`, `WindowsCustomization.kt`):**
+  - Kept `Full Unattended OOBE Skip` + `"Ask during Setup"` on `Panther\unattend.xml` (preserving *"Previous version of Setup"*, Edition picker & EULA while skipping OOBE); only pre-selecting an edition chip injects `/Autounattend.xml` into `boot.wim`.
+- **App-Wide Third-Party Brand Scrub:**
+  - Removed all user-facing `IDM`, `Ventoy`, and `Rufus` references from UI strings, badges, progress states, dialogs, and Activity Logs across the app while keeping proper attribution solely inside **Settings → Open-Source Credits**.
+- **Post-Audit `v4.6.7` Hardening (`BuildThermalHelper.kt`, `VentoyImageBuilder.kt`, `LinuxImageBuilder.kt`, `WindowsImageBuilder.kt`):**
+  - Escaped spaces to `\040` before matching `/proc/mounts` in `unmountAndDetachClean()` so clean-flush retries work inside folders with spaces.
+  - Replaced `blkid -s LABEL -o value` with Toybox-compatible `blkid` regex parsing in Multi-Boot Resize Path B, passed empty `volumeLabel` when untouched in `Auto Select` so exFAT properly gets `PB MultiISO`, deleted partial `.img` on `buildVentoyImage()` exception, and added PID-tracked cancel + clean unmount in Resize Path B.
+  - Extended Linux Extracted FAT32 boot-config syncing to cover `root=live:LABEL=` and GRUB `search ... -l/--label`.
+  - Auto-upgraded unedited `POCKETBOOT-WINDOWS` labels once `install.wim` editions load for generically named Windows ISOs, and tidied `wimBin` lookup.

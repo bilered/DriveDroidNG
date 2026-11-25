@@ -5,6 +5,7 @@ import com.topjohnwu.superuser.Shell
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
 enum class IsoOsType(val badgeLabel: String, val displayType: String) {
@@ -42,7 +43,7 @@ object IsoInspector {
     fun quickGuessByName(fileName: String): IsoOsType {
         val low = fileName.lowercase()
         if (low.endsWith(".img")) {
-            return if (low.contains("multiboot") || low.contains("ventoy")) IsoOsType.VENTOY_IMAGE else IsoOsType.DISK_IMAGE
+            return if (low.contains("multiboot") || low.contains("multi boot") || low.contains("multi-boot") || low.contains("multi iso") || low.contains("multi-iso") || low.contains("ventoy")) IsoOsType.VENTOY_IMAGE else IsoOsType.DISK_IMAGE
         }
         if (!low.endsWith(".iso")) return IsoOsType.DISK_IMAGE
 
@@ -265,4 +266,76 @@ object IsoInspector {
                 summaryNote = note
             )
         }
+
+    const val DEFAULT_MULTIBOOT_NTFS_LABEL = "POCKETBOOT Multi ISO"
+    const val DEFAULT_MULTIBOOT_EXFAT_LABEL = "PB MultiISO"
+    const val DEFAULT_MULTIBOOT_FILE_BASE = "POCKETBOOT Multi ISO"
+    const val EXPLORER_SINGLE_LINE_SAFE_MAX = 20
+
+    fun sanitizeNtfsLabel(raw: String, fallback: String = "POCKETBOOT"): String {
+        val cleaned = raw
+            .filter { ch -> ch.code >= 0x20 && ch !in "\\/:*?\"<>|" }
+            .trim()
+            .take(32)
+            .trimEnd()
+        return cleaned.ifBlank { fallback.take(32) }
+    }
+
+    fun sanitizeFatLabel(raw: String, fallback: String = "POCKETBOOT", uppercase: Boolean = true): String {
+        val base = raw
+            .filter { ch -> ch.code in 0x20..0x7E && ch !in "\\/:*?\"<>|.,;+=[]'`" }
+            .trim()
+            .let { if (uppercase) it.uppercase(Locale.US).replace(' ', '_') else it }
+            .replace(Regex("_+"), "_")
+            .trim('_')
+            .take(11)
+            .trimEnd('_', ' ')
+        return base.ifBlank { fallback.take(11) }
+    }
+
+    fun defaultWindowsVolumeLabel(osKind: WindowsOsKind, isFat32: Boolean = false): String = if (isFat32) {
+        when (osKind) {
+            WindowsOsKind.WIN11 -> "PB-WIN11"
+            WindowsOsKind.WIN10 -> "PB-WIN10"
+            WindowsOsKind.WIN81 -> "PB-WIN81"
+            WindowsOsKind.WIN7 -> "PB-WIN7"
+            WindowsOsKind.SERVER -> "PB-WINSRV"
+            WindowsOsKind.UNKNOWN -> "PB-WIN"
+        }
+    } else {
+        when (osKind) {
+            WindowsOsKind.WIN11 -> "POCKETBOOT-WIN 11"
+            WindowsOsKind.WIN10 -> "POCKETBOOT-WIN 10"
+            WindowsOsKind.WIN81 -> "POCKETBOOT-WIN 8.1"
+            WindowsOsKind.WIN7 -> "POCKETBOOT-WIN 7"
+            WindowsOsKind.SERVER -> "POCKETBOOT-WIN SRV"
+            WindowsOsKind.UNKNOWN -> "POCKETBOOT-WINDOWS"
+        }
+    }
+
+    fun defaultMultiBootLabel(useExfat: Boolean): String =
+        if (useExfat) DEFAULT_MULTIBOOT_EXFAT_LABEL else DEFAULT_MULTIBOOT_NTFS_LABEL
+
+    /**
+     * Reads the original ISO-9660 Primary Volume Descriptor disc label (CD001 @ byte 32769, label @ 32808..32839).
+     */
+    fun readIso9660VolumeLabel(isoPath: String): String {
+        val resolved = UsbGadgetEngine.resolveDirectPath(isoPath)
+        val qIso = shellQuote(resolved)
+        val raw = Shell.cmd(
+            "MAG=\$(dd if=$qIso bs=1 skip=32769 count=5 2>/dev/null | tr -cd 'A-Z0-9'); " +
+                "if [ \"\$MAG\" = \"CD001\" ]; then dd if=$qIso bs=1 skip=32808 count=32 2>/dev/null | tr -cd 'A-Za-z0-9 _-'; fi"
+        ).exec().out.firstOrNull().orEmpty().trim()
+        return raw
+    }
+
+    /**
+     * Default Linux Extracted FAT32 label: original ISO-9660 disc name trimmed & sanitized to FAT32's 11-char cap
+     * (matching standard ISO-mode conventions), falling back to the sanitized filename stem.
+     */
+    fun defaultLinuxFat32Label(isoPath: String, isoFileName: String): String {
+        val pvd = readIso9660VolumeLabel(isoPath)
+        val candidate = pvd.ifBlank { isoFileName.substringBeforeLast('.') }
+        return sanitizeFatLabel(candidate, fallback = "POCKETBOOT", uppercase = true)
+    }
 }

@@ -79,7 +79,8 @@ data class WindowsBuildConfig(
     val experience: WindowsExperienceConfig = WindowsExperienceConfig(),
     val winUtil: WinUtilTweaksConfig = WinUtilTweaksConfig(),
     val eiCfgUnlock: Boolean = false,
-    val extraDriversDir: String = "", val autoMountAfterBuild: Boolean = true
+    val extraDriversDir: String = "", val autoMountAfterBuild: Boolean = true,
+    val volumeLabel: String = ""
 )
 
 data class WindowsBuildProgress(
@@ -237,173 +238,19 @@ object WindowsImageBuilder {
     }
 
     /**
-     * Builds the custom PocketBoot USB volume labels with detected Windows version & exact build:
-     * NTFS (<= 32 chars): e.g. "POCKETBOOT- Win 11 -26300.9974" (or "POCKETBOOT- Win 11" if build unknown)
-     * FAT32 (<= 11 chars): e.g. "PB11-26300" (or "PB-WIN11")
+     * Resolves clean 1-line Windows Explorer-safe NTFS label (default: "POCKETBOOT-WIN 11", <= 20 chars)
+     * and FAT32 11-char fallback label ("PB-WIN11"), honoring any custom user volumeLabel override.
      */
-    internal fun formatPocketBootVolumeLabels(
+    internal fun resolveWindowsVolumeLabels(
         osKind: WindowsOsKind,
-        buildNumber: String?,
-        spBuild: String? = null,
-        editionNameHint: String = ""
+        customLabel: String = ""
     ): Pair<String, String> {
-        val cleanBuild = buildNumber?.trim()?.takeIf { it.matches(Regex("^\\d{4,6}$")) }.orEmpty()
-        val cleanSp = spBuild?.trim()?.takeIf { it.matches(Regex("^\\d{1,6}$")) && it != "0" }.orEmpty()
-        val buildInt = cleanBuild.toIntOrNull()
-        val buildTag = when {
-            cleanBuild.isNotEmpty() && cleanSp.isNotEmpty() -> "$cleanBuild.$cleanSp"
-            cleanBuild.isNotEmpty() -> cleanBuild
-            else -> ""
-        }
-        val lowHint = editionNameHint.lowercase(Locale.US)
-        val osShort = when {
-            lowHint.contains("server") || osKind == WindowsOsKind.SERVER -> "Win Srv"
-            buildInt != null && buildInt >= 22000 -> "Win 11"
-            buildInt != null && buildInt in 10000..21999 -> "Win 10"
-            buildInt == 9600 -> "Win 8.1"
-            buildInt == 9200 -> "Win 8"
-            buildInt in 7600..7601 -> "Win 7"
-            osKind == WindowsOsKind.WIN11 -> "Win 11"
-            osKind == WindowsOsKind.WIN10 -> "Win 10"
-            osKind == WindowsOsKind.WIN81 -> "Win 8.1"
-            osKind == WindowsOsKind.WIN7 -> "Win 7"
-            else -> "Windows"
-        }
-        val ntfsLabel = (if (buildTag.isNotEmpty()) "POCKETBOOT- $osShort -$buildTag" else "POCKETBOOT- $osShort")
-            .take(32)
-            .trimEnd()
-        val fatOsCode = when (osShort) {
-            "Win 11" -> "11"
-            "Win 10" -> "10"
-            "Win 8.1" -> "81"
-            "Win 8" -> "8"
-            "Win 7" -> "7"
-            "Win Srv" -> "SRV"
-            else -> "WIN"
-        }
-        val fatLabel = (if (cleanBuild.isNotEmpty()) "PB$fatOsCode-${cleanBuild.take(5)}" else "PB-$fatOsCode")
-            .uppercase(Locale.US)
-            .take(11)
+        val defaultNtfs = IsoInspector.defaultWindowsVolumeLabel(osKind, isFat32 = false)
+        val defaultFat = IsoInspector.defaultWindowsVolumeLabel(osKind, isFat32 = true)
+        val trimmed = customLabel.trim()
+        val ntfsLabel = if (trimmed.isNotEmpty()) IsoInspector.sanitizeNtfsLabel(trimmed, defaultNtfs) else defaultNtfs
+        val fatLabel = if (trimmed.isNotEmpty()) IsoInspector.sanitizeFatLabel(trimmed, defaultFat, uppercase = true) else defaultFat
         return ntfsLabel to fatLabel
-    }
-
-    private fun probeWindowsUsbVolumeLabels(
-        context: Context,
-        resolvedIso: String,
-        isoFileName: String,
-        fallbackOsKind: WindowsOsKind,
-        selectedEditionIndex: Int?,
-        sevenZip: String?,
-        wimBin: String?
-    ): Pair<String, String> {
-        var detectedBuild = ""
-        var detectedSp = ""
-        var detectedName = ""
-
-        // 1. Fast ~50ms WIM XML header probe via read-only loop-mount (install.wim/esd/swm -> boot.wim)
-        val qIso = shellQuote(resolvedIso)
-        val hdrTmp = File(context.cacheDir, "pb_lbl_hdr_${System.nanoTime()}.bin")
-        val xmlTmp = File(context.cacheDir, "pb_lbl_xml_${System.nanoTime()}.bin")
-        try {
-            val mounted = Shell.cmd(
-                """
-                mkdir -p $TEMP_EDITION_MNT && umount $TEMP_EDITION_MNT 2>/dev/null || true
-                mount -t udf -o loop,ro $qIso $TEMP_EDITION_MNT 2>/dev/null || \
-                mount -t iso9660 -o loop,ro $qIso $TEMP_EDITION_MNT 2>/dev/null || \
-                mount -o loop,ro $qIso $TEMP_EDITION_MNT 2>/dev/null
-                """.trimIndent()
-            ).exec().isSuccess
-            if (mounted) {
-                val wimPath = Shell.cmd(
-                    "find $TEMP_EDITION_MNT -maxdepth 2 -type f \\( -iname 'install.wim' -o -iname 'install.esd' -o -iname 'install.swm' \\) 2>/dev/null | head -n 1"
-                ).exec().out.firstOrNull().orEmpty().trim().ifBlank {
-                    Shell.cmd("find $TEMP_EDITION_MNT -maxdepth 2 -type f -iname 'boot.wim' 2>/dev/null | head -n 1").exec().out.firstOrNull().orEmpty().trim()
-                }
-                if (wimPath.isNotBlank()) {
-                    val qWim = shellQuote(wimPath)
-                    val qHdr = shellQuote(hdrTmp.absolutePath)
-                    if (Shell.cmd("dd if=$qWim of=$qHdr bs=1 count=208 2>/dev/null && chmod 0644 $qHdr").exec().isSuccess && hdrTmp.length() >= 104L) {
-                        val hdr = hdrTmp.readBytes()
-                        val magic = String(hdr, 0, 5, Charsets.US_ASCII)
-                        if (magic == "MSWIM" || magic == "WLPWM") {
-                            var xmlSize = 0L
-                            for (i in 0 until 7) xmlSize = xmlSize or ((hdr[72 + i].toLong() and 0xFFL) shl (8 * i))
-                            val xmlOffset = ByteBuffer.wrap(hdr, 80, 8).order(ByteOrder.LITTLE_ENDIAN).long
-                            if (xmlOffset > 0L && xmlSize in 17L..(2L * 1024L * 1024L)) {
-                                val skipBlocks = xmlOffset / 512L
-                                val leadBytes = (xmlOffset % 512L).toInt()
-                                val blockCount = (leadBytes + xmlSize + 511L) / 512L
-                                val qXml = shellQuote(xmlTmp.absolutePath)
-                                if (Shell.cmd("dd if=$qWim of=$qXml bs=512 skip=$skipBlocks count=$blockCount 2>/dev/null && chmod 0644 $qXml").exec().isSuccess && xmlTmp.exists()) {
-                                    val rawAll = xmlTmp.readBytes()
-                                    if (rawAll.size >= leadBytes + 4) {
-                                        val xmlText = String(rawAll, leadBytes, minOf(xmlSize.toInt(), rawAll.size - leadBytes), Charsets.UTF_16LE)
-                                        val imgRegex = Regex("""<IMAGE\s+INDEX="(\d+)"[^>]*>(.*?)</IMAGE>""", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
-                                        val allImgs = imgRegex.findAll(xmlText).toList()
-                                        val targetBody = (selectedEditionIndex?.let { idx -> allImgs.firstOrNull { it.groupValues[1].toIntOrNull() == idx } }
-                                            ?: allImgs.firstOrNull())?.groupValues?.get(2).orEmpty()
-                                        if (targetBody.isNotEmpty()) {
-                                            detectedBuild = Regex("""<BUILD>(\d+)</BUILD>""", RegexOption.IGNORE_CASE).find(targetBody)?.groupValues?.get(1).orEmpty()
-                                            detectedSp = Regex("""<SPBUILD>(\d+)</SPBUILD>""", RegexOption.IGNORE_CASE).find(targetBody)?.groupValues?.get(1).orEmpty()
-                                            detectedName = (Regex("""<DISPLAYNAME>(.*?)</DISPLAYNAME>""", RegexOption.IGNORE_CASE).find(targetBody)?.groupValues?.get(1)
-                                                ?: Regex("""<NAME>(.*?)</NAME>""", RegexOption.IGNORE_CASE).find(targetBody)?.groupValues?.get(1)).orEmpty()
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (_: Exception) {
-        } finally {
-            hdrTmp.delete()
-            xmlTmp.delete()
-            Shell.cmd("umount $TEMP_EDITION_MNT 2>/dev/null || umount -l $TEMP_EDITION_MNT 2>/dev/null; rm -rf $TEMP_EDITION_MNT 2>/dev/null").exec()
-        }
-
-        // 2. Fallback: parse build(.spbuild) from ISO filename (e.g. Win11_26H2_26300.9974_x64.iso)
-        if (detectedBuild.isBlank()) {
-            val fnMatch = Regex("""(?:^|[^0-9])(2\d{4}|1\d{4}|9600|9200|760[01])(?:\.(\d{1,5}))?(?:[^0-9]|$)""").find(isoFileName)
-            if (fnMatch != null) {
-                detectedBuild = fnMatch.groupValues[1]
-                detectedSp = fnMatch.groupValues[2]
-            }
-        }
-
-        // 3. Fallback for loop-restricted kernels without build in filename: quick boot.wim peek via 7zzs + wimlib
-        if (detectedBuild.isBlank() && sevenZip != null && wimBin != null) {
-            val probeDir = File(context.cacheDir, "pb_lbl_probe_${System.nanoTime()}").apply { mkdirs() }
-            try {
-                val q7z = shellQuote(sevenZip)
-                val qWim = shellQuote(wimBin)
-                val qTmp = shellQuote(probeDir.absolutePath)
-                val bootRel = Shell.cmd("$q7z l -ba $qIso 2>/dev/null | awk '{print \$NF}' | grep -iE '(^|/)sources/boot\\.wim$' | head -n 1")
-                    .exec().out.firstOrNull().orEmpty().trim()
-                if (bootRel.isNotBlank() && !BuildThermalHelper.isBuildCancelled() && BuildThermalHelper.runIsolatedRootScript(
-                        context,
-                        "winusb_lbl_7z",
-                        "set -e\nexport TMPDIR=$qTmp\n$q7z e -y -o$qTmp $qIso ${shellQuote(bootRel)} >/dev/null 2>&1",
-                        trackPid = true
-                    ).isSuccess) {
-                    val extracted = probeDir.listFiles()?.firstOrNull { it.isFile && it.length() > 1024L }
-                    if (extracted != null) {
-                        val infoLines = Shell.cmd("export TMPDIR=$qTmp && $qWim info ${shellQuote(extracted.absolutePath)} 2>/dev/null").exec().out
-                        infoLines.forEach { raw ->
-                            val line = raw.trim()
-                            if (detectedBuild.isBlank() && line.startsWith("Build:")) detectedBuild = line.substringAfter(':').trim()
-                            if (detectedSp.isBlank() && line.startsWith("Service Pack Build:")) detectedSp = line.substringAfter(':').trim()
-                            if (detectedName.isBlank() && line.startsWith("Display Name:")) detectedName = line.substringAfter(':').trim()
-                        }
-                    }
-                }
-            } catch (_: Exception) {
-            } finally {
-                probeDir.deleteRecursively()
-            }
-        }
-
-        return formatPocketBootVolumeLabels(fallbackOsKind, detectedBuild, detectedSp, detectedName)
     }
 
     fun cancelActiveBuild() {
@@ -487,18 +334,11 @@ object WindowsImageBuilder {
         var loopDev = ""
 
         fun cleanup(deletePartial: Boolean) {
-            Shell.cmd(
-                """
-                sync 2>/dev/null
-                umount $TEMP_MNT 2>/dev/null || umount -l $TEMP_MNT 2>/dev/null
-                sleep 1
-                umount $TEMP_ISO_MNT 2>/dev/null || umount -l $TEMP_ISO_MNT 2>/dev/null
-                if [ -n ${shellQuote(loopDev)} ]; then
-                    losetup -d ${shellQuote(loopDev)} 2>/dev/null || (sleep 1 && losetup -d ${shellQuote(loopDev)} 2>/dev/null)
-                fi
-                rm -rf $TEMP_MNT $TEMP_ISO_MNT 2>/dev/null
-                """.trimIndent()
-            ).exec()
+            BuildThermalHelper.unmountAndDetachClean(
+                mountPoints = listOf(TEMP_MNT, TEMP_ISO_MNT),
+                loopDevices = if (loopDev.isNotBlank()) listOf(loopDev) else emptyList(),
+                removeDirs = true
+            )
             if (deletePartial) {
                 Shell.cmd("rm -f $qOut 2>/dev/null").exec()
             }
@@ -680,20 +520,10 @@ object WindowsImageBuilder {
             }
             val qLoop = shellQuote(loopDev)
 
-            val wimBinEarly = findBundledBinary(context, "libwimlib_imagex.so", listOf("wimlib-imagex"))
-            val (ntfsLabel, fatLabel) = probeWindowsUsbVolumeLabels(
-                context = context,
-                resolvedIso = srcIsoPath,
-                isoFileName = config.isoFile.name,
-                fallbackOsKind = config.osKind,
-                selectedEditionIndex = config.selectedEditionIndex,
-                sevenZip = sevenZip,
-                wimBin = wimBinEarly
+            val (ntfsLabel, fatLabel) = resolveWindowsVolumeLabels(
+                osKind = config.osKind,
+                customLabel = config.volumeLabel
             )
-            if (!isActive || BuildThermalHelper.isBuildCancelled()) {
-                cleanup(deletePartial = true)
-                return@withContext ActionResult(false, "Build cancelled.", entries = entries)
-            }
 
             val fmtRes = if (useNtfs) {
                 val qFmt = shellQuote(ntfsFormatter!!)
@@ -809,7 +639,7 @@ object WindowsImageBuilder {
             }
             entries.add(LogEntry(ts, "win-build", "Extracted Windows ISO contents into Partition 1"))
 
-            val wimBin = wimBinEarly ?: findBundledBinary(context, "libwimlib_imagex.so", listOf("wimlib-imagex"))
+            val wimBin = findBundledBinary(context, "libwimlib_imagex.so", listOf("wimlib-imagex"))
             val sourcesDir = Shell.cmd("find $TEMP_MNT -maxdepth 1 -mindepth 1 -type d -iname 'sources' 2>/dev/null | head -n 1").exec().out.firstOrNull().orEmpty().trim().ifBlank { "$TEMP_MNT/sources" }
             val qSourcesDir = shellQuote(sourcesDir)
             val installWimCandidate = Shell.cmd("find $qSourcesDir -maxdepth 1 -type f \\( -iname 'install.wim' -o -iname 'install.esd' -o -iname 'install.swm' \\) 2>/dev/null | head -n 1").exec().out.firstOrNull().orEmpty().trim()
@@ -855,7 +685,7 @@ object WindowsImageBuilder {
             //   /Autounattend.xml into boot.wim Index 2 in ONE wimlib-imagex update call (no double rewrite,
             //   no duplicate Panther/unattend.xml conflict).
             val chntpwBin = findBundledBinary(context, "libchntpw.so", listOf("chntpw", "reged"))
-            val wantsUnattendedWinPe = (config.selectedEditionIndex != null) || config.experience.skipOobe
+            val wantsUnattendedWinPe = (config.selectedEditionIndex != null)
             val needScripts = config.experience.needsSpecializeScript() || config.winUtil.hasAnyActive()
             val langIniPath = Shell.cmd("find $qSourcesDir -maxdepth 1 -type f -iname 'lang.ini' 2>/dev/null | head -n 1").exec().out.firstOrNull().orEmpty().trim()
             val detectedLang = if (langIniPath.isNotBlank()) {
@@ -893,7 +723,7 @@ object WindowsImageBuilder {
                         tmpLabReg != null -> "Writing LabConfig bypasses into WinPE SYSTEM hive"
                         else -> "Injecting Autounattend.xml into boot.wim Index 2"
                     }
-                    onProgress(WindowsBuildProgress("Patching boot.wim (Rufus-style)...", stageDetail, 0.85f, false))
+                    onProgress(WindowsBuildProgress("Patching boot.wim...", stageDetail, 0.85f, false))
                     val patchRes = BuildThermalHelper.runIsolatedRootScript(
                         context,
                         "winusb_bootpatch",
@@ -968,7 +798,7 @@ object WindowsImageBuilder {
                         cmds.add("cp -f ${shellQuote(fallbackXml.absolutePath)} $TEMP_MNT/autounattend.xml")
                     }
                 } else if (needPantherXml) {
-                    onProgress(WindowsBuildProgress("Applying Windows tweaks...", "Writing Panther/unattend.xml (Rufus-style)", 0.87f, false))
+                    onProgress(WindowsBuildProgress("Applying Windows tweaks...", "Writing Panther/unattend.xml (Native Mode)", 0.87f, false))
                     val tmpPantherXml = File(context.cacheDir, "panther_unattend.xml").apply {
                         writeText(
                             generateAutounattendXml(
@@ -1003,10 +833,10 @@ object WindowsImageBuilder {
 
                 if (needWinPeXml || needPantherXml || bootWimLabConfigPatched) {
                     val modeDesc = when {
-                        needWinPeXml && bootWimAutoInjected -> "boot.wim/Autounattend.xml (Rufus Unattended Mode)"
+                        needWinPeXml && bootWimAutoInjected -> "boot.wim/Autounattend.xml (Unattended Mode)"
                         needWinPeXml -> "USB-root autounattend.xml (fallback)"
-                        needPantherXml -> "Panther/unattend.xml only (Rufus Native Mode: Previous Setup & EULA preserved)"
-                        else -> "boot.wim LabConfig only (Rufus Native Mode)"
+                        needPantherXml -> "Panther/unattend.xml only (Native Mode: Previous Setup & EULA preserved)"
+                        else -> "boot.wim LabConfig only (Native Mode)"
                     }
                     entries.add(LogEntry(ts, "win-build", "Applied $modeDesc (${config.arch}, scripts=${if (needScripts) "yes" else "none"}, Exp=${config.experience.activeCount()}, WinUtil=${config.winUtil.activeCount()})"))
                 }
@@ -1148,6 +978,10 @@ fun WindowsBuilderSheet(
     val defaultScheme = remember(detectedOs, detectedArch) { if (detectedOs == WindowsOsKind.WIN7 || detectedArch == "x86") PartitionScheme.MBR else PartitionScheme.GPT }
     val baseName = remember(isoFile.name) { isoFile.name.substringBeforeLast('.').take(36) + "-USB.img" }
     var outputName by remember(isoFile.path) { mutableStateOf(baseName) }
+    var effectiveOs by remember(isoFile.path, detectedOs) { mutableStateOf(detectedOs) }
+    val defaultVolLabel = remember(effectiveOs) { IsoInspector.defaultWindowsVolumeLabel(effectiveOs, isFat32 = false) }
+    var volumeLabel by remember(isoFile.path) { mutableStateOf(IsoInspector.defaultWindowsVolumeLabel(detectedOs, isFat32 = false)) }
+    var volumeLabelEdited by remember(isoFile.path) { mutableStateOf(false) }
     var scheme by remember(isoFile.path) { mutableStateOf(defaultScheme) }
     var editions by remember(isoFile.path) { mutableStateOf<List<WindowsEditionItem>>(emptyList()) }
     var inspectingEditions by remember(isoFile.path) { mutableStateOf(true) }
@@ -1162,7 +996,21 @@ fun WindowsBuilderSheet(
     var driversBytes by remember(isoFile.path) { mutableStateOf(0L) }
     var targetExists by remember(isoFile.path) { mutableStateOf(false) }
     val resolvedOutName = remember(outputName, baseName) { UsbGadgetEngine.sanitizeOutputFileName(outputName.ifBlank { baseName }, ".img", "windows-usb") }
-    LaunchedEffect(isoFile.path) { inspectingEditions = true; editions = WindowsImageBuilder.inspectWindowsEditions(context, isoFile.path); inspectingEditions = false }
+    LaunchedEffect(isoFile.path) {
+        inspectingEditions = true
+        val foundEditions = WindowsImageBuilder.inspectWindowsEditions(context, isoFile.path)
+        editions = foundEditions
+        if (effectiveOs == WindowsOsKind.UNKNOWN && foundEditions.isNotEmpty()) {
+            val inferred = WindowsCustomizationEngine.detectWindowsOsKind(foundEditions.first().name)
+            if (inferred != WindowsOsKind.UNKNOWN) {
+                effectiveOs = inferred
+                if (!volumeLabelEdited) {
+                    volumeLabel = IsoInspector.defaultWindowsVolumeLabel(inferred, isFat32 = false)
+                }
+            }
+        }
+        inspectingEditions = false
+    }
     LaunchedEffect(extraDriversDir) {
         driversBytes = if (extraDriversDir.isBlank()) 0L else withContext(Dispatchers.IO) {
             val drv = UsbGadgetEngine.resolveDirectPath(extraDriversDir)
@@ -1179,7 +1027,7 @@ fun WindowsBuilderSheet(
 
     ModalBottomSheet(onDismissRequest = { if (!building) onDismiss() }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), containerColor = PocketColors.surfaceCard) {
         Column(modifier = Modifier.fillMaxWidth().navigationBarsPadding().imePadding().padding(horizontal = 20.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(13.dp)) {
-            PocketSheetHeader(icon = Icons.Rounded.Window, tint = PocketColors.infoBlue, iconBg = PocketColors.infoBlueBg, title = "Windows USB Builder", subtitle = "${detectedOs.label} ($detectedArch) · ${UsbGadgetEngine.formatBytes(isoFile.sizeBytes)}", subtitleMono = true)
+            PocketSheetHeader(icon = Icons.Rounded.Window, tint = PocketColors.infoBlue, iconBg = PocketColors.infoBlueBg, title = "Windows USB Builder", subtitle = "${effectiveOs.label} ($detectedArch) · ${UsbGadgetEngine.formatBytes(isoFile.sizeBytes)}", subtitleMono = true)
             if (building) {
                 Surface(shape = RoundedCornerShape(14.dp), color = PocketColors.surfaceInput, border = BorderStroke(1.dp, PocketColors.accent)) {
                     Column(modifier = Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -1227,7 +1075,7 @@ fun WindowsBuilderSheet(
                         }
                         if (selectedEditionIndex != null) {
                             Text(
-                                text = "Pre-selecting an edition injects Autounattend.xml into boot.wim and skips Product Key, Edition & EULA prompts. Keep \"Ask during Setup\" for full official Rufus Setup UI.",
+                                text = "Pre-selecting an edition injects Autounattend.xml into boot.wim and skips Product Key, Edition & EULA prompts. Keep \"Ask during Setup\" for full official Windows Setup UI.",
                                 fontSize = 10.5.sp,
                                 color = PocketColors.textSecondary
                             )
@@ -1235,25 +1083,27 @@ fun WindowsBuilderSheet(
                     }
                 }
                 val isPureStock = !experience.hasAnyActive() && !winUtil.hasAnyActive() && selectedEditionIndex == null
-                val isUnattendedMode = selectedEditionIndex != null || experience.skipOobe
+                val isUnattendedWinPe = selectedEditionIndex != null
+                val isNativeSkipOobe = selectedEditionIndex == null && experience.skipOobe
                 val modePillBg = when {
                     isPureStock -> PocketColors.infoBlueBg
-                    isUnattendedMode -> PocketColors.warningBg
+                    isUnattendedWinPe -> PocketColors.warningBg
                     else -> PocketColors.successBg
                 }
                 val modePillFg = when {
                     isPureStock -> PocketColors.infoBlue
-                    isUnattendedMode -> PocketColors.warning
+                    isUnattendedWinPe -> PocketColors.warning
                     else -> PocketColors.success
                 }
                 val modePillText = when {
                     isPureStock -> "Pure Stock ISO · 100% untouched Microsoft Setup & OOBE"
-                    isUnattendedMode -> "Unattended Mode · Autounattend.xml in boot.wim (skips WinPE edition/EULA)"
-                    else -> "Rufus Native Mode · Previous Setup, Product Key & EULA preserved"
+                    isUnattendedWinPe -> "Unattended WinPE · Autounattend.xml in boot.wim (skips edition & EULA)"
+                    isNativeSkipOobe -> "Native Setup + Unattended OOBE · Previous Setup & Edition kept, OOBE skipped"
+                    else -> "Native Setup Mode · Previous Setup, Product Key & EULA preserved"
                 }
                 Surface(shape = RoundedCornerShape(10.dp), color = modePillBg, border = BorderStroke(0.5.dp, modePillFg.copy(alpha = 0.65f))) {
                     Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 11.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Icon(if (isUnattendedMode) Icons.Rounded.WarningAmber else Icons.Rounded.Build, null, tint = modePillFg, modifier = Modifier.size(15.dp))
+                        Icon(if (isUnattendedWinPe) Icons.Rounded.WarningAmber else Icons.Rounded.Build, null, tint = modePillFg, modifier = Modifier.size(15.dp))
                         Text(modePillText, fontSize = 11.sp, fontWeight = FontWeight.Medium, color = PocketColors.textPrimary)
                     }
                 }
@@ -1289,12 +1139,31 @@ fun WindowsBuilderSheet(
                         else Text("Browse", style = MaterialTheme.typography.labelSmall, color = PocketColors.accentSoft)
                     }
                 }
-                OutlinedTextField(value = outputName, onValueChange = { outputName = it }, label = { Text("Output Bootable USB Name") }, singleLine = true, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp), colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = PocketColors.accent, unfocusedBorderColor = PocketColors.border, focusedTextColor = PocketColors.textPrimary, unfocusedTextColor = PocketColors.textPrimary))
+                OutlinedTextField(value = outputName, onValueChange = { outputName = it }, label = { Text("Output Image Filename (.img)") }, singleLine = true, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp), colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = PocketColors.accent, unfocusedBorderColor = PocketColors.border, focusedTextColor = PocketColors.textPrimary, unfocusedTextColor = PocketColors.textPrimary))
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    OutlinedTextField(
+                        value = volumeLabel,
+                        onValueChange = { volumeLabelEdited = true; volumeLabel = it.filter { ch -> ch.code >= 0x20 && ch !in "\\/:*?\"<>|" }.take(32) },
+                        label = { Text("USB Volume Label (Explorer Name)") },
+                        placeholder = { Text(defaultVolLabel) },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = PocketColors.accent, unfocusedBorderColor = PocketColors.border, focusedTextColor = PocketColors.textPrimary, unfocusedTextColor = PocketColors.textPrimary)
+                    )
+                    if (volumeLabel.trim().length > IsoInspector.EXPLORER_SINGLE_LINE_SAFE_MAX) {
+                        Text(
+                            text = "Over ${IsoInspector.EXPLORER_SINGLE_LINE_SAFE_MAX} chars may wrap in Windows Explorer Tiles view and hide free/total space.",
+                            fontSize = 10.5.sp,
+                            color = PocketColors.warning
+                        )
+                    }
+                }
                 Surface(shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
                     Row(modifier = Modifier.fillMaxWidth().clickable { autoMount = !autoMount }.padding(horizontal = 13.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text("Auto-mount when finished", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
-                            Text("Mounts immediately as Read-Only USB", fontSize = 11.sp, color = PocketColors.textSecondary)
+                            Text("Mounts immediately as Writable USB (recommended for NTFS)", fontSize = 11.sp, color = PocketColors.textSecondary)
                         }
                         PocketSwitch(checked = autoMount, onCheckedChange = { autoMount = it }, activeColor = PocketColors.accent)
                     }
@@ -1315,7 +1184,7 @@ fun WindowsBuilderSheet(
                         }
                     }
                 }
-                Button(onClick = { onStartBuild(WindowsBuildConfig(isoFile, defaultDir, outputName.trim().ifBlank { baseName }, scheme, selectedEditionIndex, editions.firstOrNull { it.index == selectedEditionIndex }?.name, detectedOs, detectedArch, experience, winUtil, eiCfgUnlock, extraDriversDir = extraDriversDir, autoMountAfterBuild = autoMount)) }, enabled = outputName.trim().isNotEmpty() && !lowSpace, modifier = Modifier.fillMaxWidth().height(48.dp), shape = RoundedCornerShape(12.dp), colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)) {
+                Button(onClick = { onStartBuild(WindowsBuildConfig(isoFile, defaultDir, outputName.trim().ifBlank { baseName }, scheme, selectedEditionIndex, editions.firstOrNull { it.index == selectedEditionIndex }?.name, effectiveOs, detectedArch, experience, winUtil, eiCfgUnlock, extraDriversDir = extraDriversDir, autoMountAfterBuild = autoMount, volumeLabel = volumeLabel.trim().ifBlank { defaultVolLabel })) }, enabled = outputName.trim().isNotEmpty() && !lowSpace, modifier = Modifier.fillMaxWidth().height(48.dp), shape = RoundedCornerShape(12.dp), colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)) {
                     Text("Build Bootable Windows USB (.img)", fontWeight = FontWeight.SemiBold)
                 }
             }

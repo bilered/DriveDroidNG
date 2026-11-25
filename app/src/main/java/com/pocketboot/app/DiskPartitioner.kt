@@ -39,8 +39,9 @@ object DiskPartitioner {
     // EFI System Partition: C12A7328-F81F-11D2-BA4B-00A0C93EC93B
     private val GUID_ESP = uuidToMixedEndianBytes("C12A7328-F81F-11D2-BA4B-00A0C93EC93B")
 
-    // Official Rufus GPT attributes for UEFI:NTFS (0x9000000000000000 = NO_DRIVE_LETTER | READ_ONLY)
-    private const val GPT_ATTR_NO_DRIVE_LETTER_RO: Long = -0x7000000000000000L
+    // GPT attributes for UEFI:NTFS: 0xD000000000000001 (PLATFORM_REQUIRED | READ_ONLY | HIDDEN | NO_DRIVE_LETTER)
+    // Hides the 1 MB boot helper partition from Windows Explorer while UEFI still boots it and Setup ignores it.
+    private const val GPT_ATTR_UEFI_NTFS_HIDDEN: Long = -0x2FFFFFFFFFFFFFFFL
 
     // Standard minimal x86 MBR chainloader (relocates 0x7C00 -> 0x0600, scans partition table for 0x80 active flag,
     // loads VBR via INT 13h AH=42h LBA Extended Read to 0x7C00, and jumps to 0000:7C00)
@@ -110,6 +111,26 @@ object DiskPartitioner {
         return mbr
     }
 
+    fun buildLinuxFat32MbrSector(
+        part1StartLba: Long,
+        part1Sectors: Long,
+        part2StartLba: Long = 0L,
+        part2Sectors: Long = 0L,
+        includePersistence: Boolean = false
+    ): ByteArray {
+        val mbr = ByteArray(512)
+        System.arraycopy(STANDARD_MBR_BOOTCODE, 0, mbr, 0, STANDARD_MBR_BOOTCODE.size)
+        val buf = ByteBuffer.wrap(mbr).order(ByteOrder.LITTLE_ENDIAN)
+        buf.putInt(440, (System.currentTimeMillis() and 0xFFFFFFFFL).toInt())
+        writeMbrEntry(buf, 446, bootable = 0x80.toByte(), type = 0x0C.toByte(), startLba = part1StartLba, sectors = part1Sectors)
+        if (includePersistence && part2Sectors > 0L) {
+            writeMbrEntry(buf, 462, bootable = 0x00, type = 0x83.toByte(), startLba = part2StartLba, sectors = part2Sectors)
+        }
+        mbr[510] = 0x55.toByte()
+        mbr[511] = 0xAA.toByte()
+        return mbr
+    }
+
     const val VENTOY_EFI_SECTORS = 65536L // Exact 32 MiB VTOYEFI partition
 
     fun calculateVentoyLayoutMb(dataSizeMb: Int, scheme: PartitionScheme): DiskLayoutSpec {
@@ -167,7 +188,7 @@ object DiskPartitioner {
         part1Name: String = "Main Data Partition",
         part2Name: String = "UEFI:NTFS",
         part2IsEsp: Boolean = false,
-        part2Attributes: Long = GPT_ATTR_NO_DRIVE_LETTER_RO
+        part2Attributes: Long = GPT_ATTR_UEFI_NTFS_HIDDEN
     ): GptBuffers {
         val totalSectors = layout.totalSectors
         val firstUsableLba = 34L

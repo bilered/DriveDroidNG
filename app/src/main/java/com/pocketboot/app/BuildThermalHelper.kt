@@ -227,6 +227,65 @@ object BuildThermalHelper {
         }
     }
 
+    /**
+     * Clean-flush unmount and loop-detach helper used by Windows, Linux, and Multi-Boot builders.
+     * Flushes dirty page caches and waits up to 10s for real umount (allowing ntfs-3g/ntfs3 writeback
+     * to finish cleanly before USB Gadget binds the .img), falling back to lazy umount only if still busy.
+     */
+    fun unmountAndDetachClean(
+        mountPoints: List<String>,
+        loopDevices: List<String>,
+        removeDirs: Boolean = true
+    ) {
+        val sb = StringBuilder()
+        sb.appendLine("sync 2>/dev/null || true")
+        mountPoints.filter { it.isNotBlank() }.forEach { mp ->
+            val qMp = shellQuote(mp)
+            sb.appendLine(
+                """
+                M=$qMp
+                M_ESC=${'$'}(printf '%s' "${'$'}M" | sed 's/ /\\040/g')
+                if [ -d "${'$'}M" ]; then
+                    TRIES=0
+                    while [ "${'$'}TRIES" -lt 10 ]; do
+                        sync 2>/dev/null || true
+                        if umount "${'$'}M" 2>/dev/null; then break; fi
+                        if ! grep -qsF " ${'$'}M_ESC " /proc/mounts 2>/dev/null; then break; fi
+                        sleep 1
+                        TRIES=${'$'}((TRIES + 1))
+                    done
+                    if grep -qsF " ${'$'}M_ESC " /proc/mounts 2>/dev/null; then
+                        umount -l "${'$'}M" 2>/dev/null || true
+                        sleep 1
+                    fi
+                fi
+                """.trimIndent()
+            )
+        }
+        loopDevices.filter { it.isNotBlank() }.forEach { dev ->
+            val qDev = shellQuote(dev)
+            sb.appendLine(
+                """
+                L=$qDev
+                if [ -n "${'$'}L" ]; then
+                    DT=0
+                    while [ "${'$'}DT" -lt 4 ]; do
+                        if losetup -d "${'$'}L" 2>/dev/null; then break; fi
+                        sleep 1
+                        DT=${'$'}((DT + 1))
+                    done
+                fi
+                """.trimIndent()
+            )
+        }
+        if (removeDirs) {
+            val dirs = mountPoints.filter { it.isNotBlank() }.joinToString(" ") { shellQuote(it) }
+            if (dirs.isNotBlank()) sb.appendLine("rm -rf $dirs 2>/dev/null || true")
+        }
+        sb.appendLine("sync 2>/dev/null || true")
+        Shell.cmd(sb.toString()).exec()
+    }
+
     fun inspectWindowsTools(context: Context): WindowsToolsStatus = WindowsToolsStatus(
         sevenZip = WindowsImageBuilder.findBundledBinary(context, "lib7zzs.so", listOf("7zzs", "7zz", "7z")),
         wimlib = WindowsImageBuilder.findBundledBinary(context, "libwimlib_imagex.so", listOf("wimlib-imagex")),

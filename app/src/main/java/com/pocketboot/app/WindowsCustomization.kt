@@ -243,7 +243,7 @@ object WindowsCustomizationEngine {
         sb.appendLine("if exist \"%PB_FLAG%\" exit /b 0")
         sb.appendLine("mkdir \"C:\\Windows\\Setup\\Scripts\" >nul 2>&1")
         sb.appendLine("echo [PocketBoot] Specialize configuration started...")
-        sb.appendLine("echo [PocketBoot v4.6.6] Specialize started %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.6.7] Specialize started %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("set \"PB_BUILD=0\"")
         sb.appendLine("for /f \"tokens=3\" %%B in ('reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\" /v CurrentBuildNumber 2^>nul ^| findstr /i CurrentBuildNumber') do set \"PB_BUILD=%%B\"")
         if (experience.bypassMicrosoftAccount) sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\OOBE\" /v BypassNRO /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
@@ -398,7 +398,7 @@ object WindowsCustomizationEngine {
         // Register SetupComplete.cmd under FirstBoot\PostOobe so it executes right after OOBE on every machine (guarded by .pb_setupcomplete_done so it runs strictly once).
         sb.appendLine("if exist \"C:\\Windows\\Setup\\Scripts\\SetupComplete.cmd\" reg add \"HKLM\\SYSTEM\\Setup\\FirstBoot\\PostOobe\" /v \"00\" /t REG_SZ /d \"cmd.exe /c C:\\Windows\\Setup\\Scripts\\SetupComplete.cmd & exit /b 0\" /f >> \"%PB_LOG%\" 2>&1")
         sb.appendLine("echo done > \"%PB_FLAG%\"")
-        sb.appendLine("echo [PocketBoot v4.6.6] Specialize finished %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.6.7] Specialize finished %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("exit /b 0")
         return sb.toString().replace("\r\n", "\n").replace("\n", "\r\n")
     }
@@ -431,7 +431,7 @@ object WindowsCustomizationEngine {
             sb.appendLine("dism /Online /Cleanup-Image /StartComponentCleanup /ResetBase >> \"%PB_LOG%\" 2>&1")
         }
         sb.appendLine("if exist \"C:\\Windows\\Setup\\Custom\" rmdir /s /q \"C:\\Windows\\Setup\\Custom\" >nul 2>&1")
-        sb.appendLine("echo [PocketBoot v4.6.6] SetupComplete finished %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.6.7] SetupComplete finished %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("start \"\" /b cmd /c \"ping -n 4 127.0.0.1 >nul & rmdir /s /q C:\\Windows\\Setup\\Scripts >nul 2>&1\"")
         sb.appendLine("exit /b 0")
         return sb.toString().replace("\r\n", "\n").replace("\n", "\r\n")
@@ -622,11 +622,11 @@ object WindowsCustomizationEngine {
         $qWimBin update "${'$'}BOOT_WIM" "${'$'}BOOT_IDX" < "${'$'}UPD_CMD" >/dev/null 2>&1
         rm -rf "${'$'}BOOT_TMP"
         if [ "${'$'}LAB_READY" = "1" ]; then
-            echo "LOG|labconfig|Patched LabConfig hardware bypasses directly into boot.wim Index ${'$'}BOOT_IDX (Rufus-style)"
+            echo "LOG|labconfig|Patched LabConfig hardware bypasses directly into boot.wim Index ${'$'}BOOT_IDX (Native Mode)"
             echo "PATCHED_LAB_OK"
         fi
         if [ "${'$'}AU_READY" = "1" ]; then
-            echo "LOG|win-build|Injected /Autounattend.xml into boot.wim Index ${'$'}BOOT_IDX (Rufus-style)"
+            echo "LOG|win-build|Injected /Autounattend.xml into boot.wim Index ${'$'}BOOT_IDX (Unattended Mode)"
             echo "PATCHED_AU_OK"
         fi
         """.trimIndent()
@@ -799,7 +799,7 @@ fun WindowsTwoPaneCustomizer(
                     Box(modifier = Modifier.size(34.dp).clip(RoundedCornerShape(9.dp)).background(PocketColors.accentBg), contentAlignment = Alignment.Center) { Icon(Icons.Rounded.Security, null, tint = PocketColors.accentSoft, modifier = Modifier.size(18.dp)) }
                     Column(modifier = Modifier.weight(1f)) {
                         Text("Windows Experience & Bypasses", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
-                        Text(if (expCount > 0) "$expCount enabled · Rufus-style install rules" else "Stock Windows install (tap to customize)", fontSize = 11.sp, color = PocketColors.textSecondary)
+                        Text(if (expCount > 0) "$expCount enabled · Native Setup bypass rules" else "Stock Windows install (tap to customize)", fontSize = 11.sp, color = PocketColors.textSecondary)
                     }
                     Surface(shape = RoundedCornerShape(6.dp), color = if (expCount > 0) PocketColors.accentBg else PocketColors.surfaceSubtle) { Text("$expCount", modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = if (expCount > 0) PocketColors.accentSoft else PocketColors.textMuted) }
                     Icon(if (pane1Expanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore, null, tint = PocketColors.textSecondary, modifier = Modifier.size(19.dp))
@@ -883,7 +883,7 @@ fun WindowsTwoPaneCustomizer(
     }
     if (showPreviewDialog) {
         var previewTab by remember { mutableIntStateOf(0) }
-        val previewUnattended = selectedEditionIndex != null || experience.skipOobe
+        val previewUnattended = selectedEditionIndex != null
         val previewHasXml = previewUnattended || experience.hasPostSetupTweaks() || winUtil.hasAnyActive()
         val previewNeedsScript = experience.needsSpecializeScript() || winUtil.hasAnyActive()
         val xmlText = remember(experience, winUtil, arch, selectedEditionIndex) {
@@ -907,7 +907,7 @@ fun WindowsTwoPaneCustomizer(
             when {
                 previewNeedsScript -> WindowsCustomizationEngine.buildSpecializeScript(experience, winUtil)
                 !previewHasXml && !experience.bypassRequirements -> "; No Specialize.cmd needed (Pure Stock ISO — zero scripts injected)"
-                else -> "; No Specialize.cmd needed (pure Rufus-style Panther\\unattend.xml + boot.wim LabConfig patch)"
+                else -> "; No Specialize.cmd needed (pure Panther\\unattend.xml + boot.wim LabConfig patch)"
             }
         }
         AlertDialog(
