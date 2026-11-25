@@ -75,15 +75,20 @@ enum class WindowsOsKind(val label: String, val isModernWin11: Boolean, val supp
 data class WindowsExperienceConfig(
     val bypassRequirements: Boolean = true, val bypassMicrosoftAccount: Boolean = true,
     val disableDataCollection: Boolean = true, val disableBitLocker: Boolean = true,
-    val qolImprovements: Boolean = true, val disableSponsoredApps: Boolean = false,
+    val qolImprovements: Boolean = false, val disableSponsoredApps: Boolean = false,
     val classicContextMenu: Boolean = false, val skipWifiSetup: Boolean = true,
     val createLocalUser: Boolean = false, val localUsername: String = "", val localPassword: String = "",
     val skipOobe: Boolean = false, val useCa2023Bootloaders: Boolean = false,
     val applySkuSiPolicy: Boolean = false, val customPostInstallScriptPath: String = ""
 ) {
-    fun hasUnattendTweaks(): Boolean = bypassRequirements || bypassMicrosoftAccount || disableDataCollection || disableBitLocker ||
+    /** Post-WinPE tweaks applied via Panther\unattend.xml (specialize/oobeSystem). */
+    fun hasPostSetupTweaks(): Boolean = bypassMicrosoftAccount || disableDataCollection || disableBitLocker ||
         qolImprovements || disableSponsoredApps || classicContextMenu || skipWifiSetup || skipOobe ||
         (createLocalUser && localUsername.isNotBlank()) || applySkuSiPolicy || customPostInstallScriptPath.isNotBlank()
+    /** Tweaks that require staging PocketBoot_Specialize.cmd / SetupComplete.cmd beyond pure XML. */
+    fun needsSpecializeScript(): Boolean = qolImprovements || disableSponsoredApps || classicContextMenu ||
+        applySkuSiPolicy || customPostInstallScriptPath.isNotBlank()
+    fun hasUnattendTweaks(): Boolean = bypassRequirements || hasPostSetupTweaks()
     fun hasAnyActive(): Boolean = hasUnattendTweaks() || useCa2023Bootloaders
     fun activeCount(): Int = listOf(bypassRequirements, bypassMicrosoftAccount, disableDataCollection, disableBitLocker,
         qolImprovements, disableSponsoredApps, classicContextMenu, skipWifiSetup, skipOobe,
@@ -91,7 +96,7 @@ data class WindowsExperienceConfig(
     companion object {
         fun defaultForOs(osKind: WindowsOsKind): WindowsExperienceConfig = when (osKind) {
             WindowsOsKind.WIN11, WindowsOsKind.UNKNOWN -> WindowsExperienceConfig()
-            WindowsOsKind.WIN10 -> WindowsExperienceConfig(bypassRequirements = false, bypassMicrosoftAccount = true, disableDataCollection = true, disableBitLocker = true, qolImprovements = true, skipWifiSetup = true)
+            WindowsOsKind.WIN10 -> WindowsExperienceConfig(bypassRequirements = false, bypassMicrosoftAccount = true, disableDataCollection = true, disableBitLocker = true, qolImprovements = false, skipWifiSetup = true)
             WindowsOsKind.SERVER -> WindowsExperienceConfig(bypassRequirements = false, bypassMicrosoftAccount = false, disableDataCollection = true, disableBitLocker = false, qolImprovements = false, skipWifiSetup = false)
             WindowsOsKind.WIN81, WindowsOsKind.WIN7 -> WindowsExperienceConfig(bypassRequirements = false, bypassMicrosoftAccount = false, disableDataCollection = false, disableBitLocker = false, qolImprovements = false, skipWifiSetup = false)
         }
@@ -201,7 +206,7 @@ object WindowsCustomizationEngine {
         sb.appendLine("if exist \"%PB_FLAG%\" exit /b 0")
         sb.appendLine("mkdir \"C:\\Windows\\Setup\\Scripts\" >nul 2>&1")
         sb.appendLine("echo [PocketBoot] Specialize configuration started...")
-        sb.appendLine("echo [PocketBoot v4.6.3] Specialize started %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.6.4] Specialize started %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("set \"PB_BUILD=0\"")
         sb.appendLine("for /f \"tokens=3\" %%B in ('reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\" /v CurrentBuildNumber 2^>nul ^| findstr /i CurrentBuildNumber') do set \"PB_BUILD=%%B\"")
         if (experience.bypassMicrosoftAccount) sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\OOBE\" /v BypassNRO /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
@@ -356,7 +361,7 @@ object WindowsCustomizationEngine {
         // Register SetupComplete.cmd under FirstBoot\PostOobe so it executes right after OOBE on every machine (guarded by .pb_setupcomplete_done so it runs strictly once).
         sb.appendLine("if exist \"C:\\Windows\\Setup\\Scripts\\SetupComplete.cmd\" reg add \"HKLM\\SYSTEM\\Setup\\FirstBoot\\PostOobe\" /v \"00\" /t REG_SZ /d \"cmd.exe /c C:\\Windows\\Setup\\Scripts\\SetupComplete.cmd & exit /b 0\" /f >> \"%PB_LOG%\" 2>&1")
         sb.appendLine("echo done > \"%PB_FLAG%\"")
-        sb.appendLine("echo [PocketBoot v4.6.3] Specialize finished %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.6.4] Specialize finished %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("exit /b 0")
         return sb.toString().replace("\r\n", "\n").replace("\n", "\r\n")
     }
@@ -389,16 +394,16 @@ object WindowsCustomizationEngine {
             sb.appendLine("dism /Online /Cleanup-Image /StartComponentCleanup /ResetBase >> \"%PB_LOG%\" 2>&1")
         }
         sb.appendLine("if exist \"C:\\Windows\\Setup\\Custom\" rmdir /s /q \"C:\\Windows\\Setup\\Custom\" >nul 2>&1")
-        sb.appendLine("echo [PocketBoot v4.6.3] SetupComplete finished %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.6.4] SetupComplete finished %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("start \"\" /b cmd /c \"ping -n 4 127.0.0.1 >nul & rmdir /s /q C:\\Windows\\Setup\\Scripts >nul 2>&1\"")
         sb.appendLine("exit /b 0")
         return sb.toString().replace("\r\n", "\n").replace("\n", "\r\n")
     }
 
-    fun generateAutounattendXml(experience: WindowsExperienceConfig, winUtil: WinUtilTweaksConfig, arch: String = "amd64", selectedEditionIndex: Int? = null, hasSpecializeScript: Boolean = false, hasOemUpdates: Boolean = false, includeWindowsPePass: Boolean = true, uiLang: String = "", autoLogonCount: Int = 1): String {
+    fun generateAutounattendXml(experience: WindowsExperienceConfig, winUtil: WinUtilTweaksConfig, arch: String = "amd64", selectedEditionIndex: Int? = null, hasSpecializeScript: Boolean = false, hasOemUpdates: Boolean = false, includeWindowsPePass: Boolean = true, uiLang: String = "", autoLogonCount: Int = 1, includeLabConfigInPe: Boolean = true): String {
         val safeArch = if (arch.lowercase() in setOf("x86", "arm64", "amd64")) arch.lowercase() else "amd64"
         val peCommands = mutableListOf<Pair<String, String>>()
-        if (experience.bypassRequirements) {
+        if (includeLabConfigInPe && experience.bypassRequirements) {
             peCommands.add("Bypass TPM Check" to """reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassTPMCheck /t REG_DWORD /d 1 /f""")
             peCommands.add("Bypass Secure Boot Check" to """reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassSecureBootCheck /t REG_DWORD /d 1 /f""")
             peCommands.add("Bypass RAM Check" to """reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassRAMCheck /t REG_DWORD /d 1 /f""")
@@ -460,7 +465,8 @@ object WindowsCustomizationEngine {
             sb.appendLine("""  <settings pass="oobeSystem">""")
             sb.appendLine("""    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="$safeArch" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">""")
             sb.appendLine("""      <OOBE>""")
-            if (experience.disableDataCollection || experience.skipOobe) sb.appendLine("""        <HideEULAPage>true</HideEULAPage><HideOEMRegistrationScreen>true</HideOEMRegistrationScreen><ProtectYourPC>3</ProtectYourPC>""")
+            if (experience.skipOobe) sb.appendLine("""        <HideEULAPage>true</HideEULAPage>""")
+            if (experience.disableDataCollection || experience.skipOobe) sb.appendLine("""        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen><ProtectYourPC>3</ProtectYourPC>""")
             if (experience.bypassMicrosoftAccount || experience.skipOobe) sb.appendLine("""        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>""")
             if (experience.skipWifiSetup || experience.bypassMicrosoftAccount || experience.skipOobe) sb.appendLine("""        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>""")
             if (experience.skipOobe && cleanUser.isNotEmpty()) sb.appendLine("""        <SkipMachineOOBE>true</SkipMachineOOBE><SkipUserOOBE>true</SkipUserOOBE>""")
@@ -478,13 +484,69 @@ object WindowsCustomizationEngine {
     }
 
     fun generateVentoySelfContainedXml(experience: WindowsExperienceConfig, winUtil: WinUtilTweaksConfig, arch: String = "amd64"): String {
+        val safeArch = if (arch.lowercase() in setOf("amd64", "x86", "arm64")) arch.lowercase() else "amd64"
+        val needScript = experience.needsSpecializeScript() || winUtil.hasAnyActive()
+        val baseXml = generateAutounattendXml(experience, winUtil, safeArch, null, hasSpecializeScript = needScript, hasOemUpdates = false)
+        if (!needScript) return baseXml
         val scriptText = buildSpecializeScript(experience, winUtil)
         val b64 = android.util.Base64.encodeToString(scriptText.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
-        val safeArch = if (arch.lowercase() in setOf("amd64", "x86", "arm64")) arch.lowercase() else "amd64"
-        val baseXml = generateAutounattendXml(experience, winUtil, safeArch, null, true, false)
         val inlineCmd = """powershell -NoProfile -ExecutionPolicy Bypass -Command "New-Item -ItemType Directory -Force 'C:\Windows\Setup\Scripts' | Out-Null; [IO.File]::WriteAllBytes('C:\Windows\Setup\Scripts\PocketBoot_Specialize.cmd',[Convert]::FromBase64String('$b64')); & cmd.exe /c 'C:\Windows\Setup\Scripts\PocketBoot_Specialize.cmd'" """.trim()
         return baseXml.replace(xmlEscape("""cmd /c "C:\Windows\Setup\Scripts\PocketBoot_Specialize.cmd""""), xmlEscape(inlineCmd))
     }
+
+    /**
+     * Official Rufus-parity LabConfig patching: writes BypassTPMCheck, BypassSecureBootCheck, BypassRAMCheck,
+     * BypassCPUCheck, and BypassStorageCheck directly into sources/boot.wim Index 2 offline SYSTEM hive so
+     * no USB-root autounattend.xml is needed (preserving "Previous version of Setup", Product Key, Edition & EULA).
+     */
+    fun buildLabConfigRegContent(): String =
+        "REGEDIT4\r\n\r\n" +
+            "[HKEY_LOCAL_MACHINE\\SYSTEM\\Setup\\LabConfig]\r\n" +
+            "\"BypassTPMCheck\"=dword:00000001\r\n" +
+            "\"BypassSecureBootCheck\"=dword:00000001\r\n" +
+            "\"BypassRAMCheck\"=dword:00000001\r\n" +
+            "\"BypassCPUCheck\"=dword:00000001\r\n" +
+            "\"BypassStorageCheck\"=dword:00000001\r\n\r\n"
+
+    fun patchBootWimLabConfigSnippet(
+        qWimBin: String,
+        qChntpwBin: String,
+        qSourcesDir: String,
+        qRegFile: String
+    ): String = """
+        set -e
+        export WIMLIB_IMAGEX_IGNORE_CASE=1
+        BOOT_WIM=${'$'}(find $qSourcesDir -maxdepth 1 -type f -iname 'boot.wim' 2>/dev/null | head -n 1)
+        if [ -z "${'$'}BOOT_WIM" ] || [ ! -s "${'$'}BOOT_WIM" ]; then
+            echo "LOG|labconfig|boot.wim not found in sources/; falling back to autounattend.xml"
+            exit 1
+        fi
+        IDX_CNT=${'$'}($qWimBin info "${'$'}BOOT_WIM" 2>/dev/null | grep -c '^Index:' || echo 0)
+        BOOT_IDX=2
+        if [ "${'$'}{IDX_CNT:-0}" -lt 2 ]; then BOOT_IDX=1; fi
+        HIVE_TMP="/data/local/tmp/pb_boot_labcfg"
+        rm -rf "${'$'}HIVE_TMP" && mkdir -p "${'$'}HIVE_TMP"
+        $qWimBin extract "${'$'}BOOT_WIM" "${'$'}BOOT_IDX" "/Windows/System32/config/SYSTEM" --dest-dir="${'$'}HIVE_TMP" --no-acls --no-attributes >/dev/null 2>&1 ||             $qWimBin extract "${'$'}BOOT_WIM" "${'$'}BOOT_IDX" "/windows/system32/config/system" --dest-dir="${'$'}HIVE_TMP" --no-acls --no-attributes >/dev/null 2>&1 || true
+        SYS_HIVE=${'$'}(find "${'$'}HIVE_TMP" -maxdepth 1 -type f -iname 'system' | head -n 1)
+        if [ -z "${'$'}SYS_HIVE" ] || [ ! -s "${'$'}SYS_HIVE" ]; then
+            rm -rf "${'$'}HIVE_TMP"
+            echo "LOG|labconfig|Could not extract SYSTEM hive from boot.wim index ${'$'}BOOT_IDX"
+            exit 1
+        fi
+        set +e
+        printf 'y\n' | $qChntpwBin -C -I "${'$'}SYS_HIVE" 'HKEY_LOCAL_MACHINE\SYSTEM' $qRegFile >/dev/null 2>&1
+        REG_RC=${'$'}?
+        set -e
+        if [ ! -s "${'$'}SYS_HIVE" ]; then
+            rm -rf "${'$'}HIVE_TMP"
+            echo "LOG|labconfig|reged hive patch failed (rc=${'$'}REG_RC)"
+            exit 1
+        fi
+        $qWimBin update "${'$'}BOOT_WIM" "${'$'}BOOT_IDX" --command="add '${'$'}SYS_HIVE' /Windows/System32/config/SYSTEM" >/dev/null 2>&1
+        rm -rf "${'$'}HIVE_TMP"
+        echo "LOG|labconfig|Patched LabConfig hardware bypasses directly into boot.wim Index ${'$'}BOOT_IDX (Rufus-style; WinPE Setup UI preserved)"
+        echo "PATCHED_OK"
+    """.trimIndent()
 
     fun applyCa2023BootloadersSnippet(qWimBin: String, qInstallFile: String, qIsoRoot: String): String = """
         CA_TMP="/data/local/tmp/pb_ca2023"
@@ -695,15 +757,26 @@ fun WindowsTwoPaneCustomizer(
     }
     if (showPreviewDialog) {
         var previewTab by remember { mutableIntStateOf(0) }
-        val xmlText = remember(experience, winUtil, arch) { WindowsCustomizationEngine.generateAutounattendXml(experience, winUtil, arch, hasSpecializeScript = experience.hasAnyActive() || winUtil.hasAnyActive()) }
-        val scriptText = remember(experience, winUtil) { WindowsCustomizationEngine.buildSpecializeScript(experience, winUtil) }
+        val previewNeedsScript = experience.needsSpecializeScript() || winUtil.hasAnyActive()
+        val xmlText = remember(experience, winUtil, arch) {
+            WindowsCustomizationEngine.generateAutounattendXml(
+                experience, winUtil, arch,
+                hasSpecializeScript = previewNeedsScript,
+                includeWindowsPePass = experience.skipOobe,
+                includeLabConfigInPe = false
+            )
+        }
+        val scriptText = remember(experience, winUtil) {
+            if (previewNeedsScript) WindowsCustomizationEngine.buildSpecializeScript(experience, winUtil)
+            else "; No Specialize.cmd needed (pure Rufus-style Panther\\unattend.xml + boot.wim LabConfig patch)"
+        }
         AlertDialog(
             onDismissRequest = { showPreviewDialog = false }, containerColor = PocketColors.surfaceCard,
             title = { Text("Generated Setup Preview", color = PocketColors.textPrimary) },
             text = {
                 Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        listOf("autounattend.xml", "Specialize.cmd").forEachIndexed { idx, lbl ->
+                        listOf("Panther\\unattend.xml", "Specialize.cmd").forEachIndexed { idx, lbl ->
                             val sel = previewTab == idx
                             Surface(modifier = Modifier.weight(1f).bounceClick { previewTab = idx }, shape = RoundedCornerShape(8.dp), color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput, border = BorderStroke(0.75.dp, if (sel) PocketColors.accent else PocketColors.border)) {
                                 Box(modifier = Modifier.padding(vertical = 6.dp), contentAlignment = Alignment.Center) { Text(lbl, style = MaterialTheme.typography.labelSmall, color = if (sel) PocketColors.accentSoft else PocketColors.textSecondary) }

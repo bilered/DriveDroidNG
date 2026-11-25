@@ -253,9 +253,29 @@ jobs:
             fi
           ) || echo "::warning::Could not bundle static wimlib-imagex"
 
-          # 8. Verify bundled static ARM64 binaries are present and executable
+          # 8. Cross-compile STATIC ARM64 chntpw/reged -> libchntpw.so (offline boot.wim LabConfig registry patcher, Rufus parity)
+          (
+            set -e
+            git clone --depth 1 https://github.com/Tody-Guo/chntpw.git /tmp/chntpw-src || (
+              curl -fSL "https://deb.debian.org/debian/pool/main/c/chntpw/chntpw_140201.orig.tar.gz" -o /tmp/chntpw.tar.gz &&
+              mkdir -p /tmp/chntpw-src && tar -xzf /tmp/chntpw.tar.gz --strip-components=1 -C /tmp/chntpw-src
+            )
+            cd /tmp/chntpw-src
+            aarch64-linux-gnu-gcc -static -O2 -std=gnu17 -D_FILE_OFFSET_BITS=64 \
+              -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion \
+              reged.c ntreg.c edlib.c -o reged-static
+            file reged-static
+            if ! aarch64-linux-gnu-readelf -l reged-static 2>/dev/null | grep -q INTERP; then
+              aarch64-linux-gnu-strip reged-static
+              cp reged-static "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libchntpw.so"
+              chmod 755 "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libchntpw.so"
+            fi
+          ) || echo "::warning::Could not bundle static chntpw/reged"
+
+          # 9. Verify bundled static ARM64 binaries are present and executable
           test -x "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/lib7zzs.so"
           test -x "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libwimlib_imagex.so"
+          test -x "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libchntpw.so"
 
           ls -lh app/src/main/assets/uefi-ntfs.img app/src/main/jniLibs/arm64-v8a/
           file app/src/main/jniLibs/arm64-v8a/*.so

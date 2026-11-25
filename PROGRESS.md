@@ -1,14 +1,13 @@
 # PocketBoot Development Progress
 
-## Current Milestone: v4.6.3 (Full Audit Hardening & Android 15 Polish)
-- **Lifecycle & Android 15 Compliance:**
-  - Added `android:configChanges` to `MainActivity` so screen rotation / foldable resize / dark-mode toggles never cancel active USB/Ventoy builds or orphan native binaries.
-  - Implemented `TurboDownloadService.onTimeout(startId, fgsType)` for Android 15 (`targetSdk = 35`) `dataSync` foreground service compliance, pausing gracefully with `.pbmeta` checkpoint preserved.
-  - Added `.navigationBarsPadding().imePadding()` to all 12 `ModalBottomSheet` layouts for clean Android 15 edge-to-edge spacing above 3-button navbars and keyboards.
-- **Concurrency, Thermal & Data Safety:**
-  - Wired `BuildThermalHelper` (CPU affinity, thread limits, Auto Thermal Cooldown, and PID-tree cancel) into `LinuxImageBuilder.kt` and `VentoyImageBuilder.kt` alongside `WindowsImageBuilder.kt`.
-  - Blocked concurrent USB/Ventoy builds and locked **Clean Temp** while any build or download is active so live `/data/local/tmp/pb_*` mounts and `turbo_dl` caches cannot be wiped mid-job.
-  - Fixed Dual-LUN deletion (`deleteImageFile(path, mountedLun)`) across both `MainActivity.kt` and `BrowseAndBrowserSheets.kt` so deleting LUN 1 only unmounts LUN 1 without disconnecting LUN 0 or stopping `UsbKeepAliveService`.
-  - Added `UsbGadgetEngine.sanitizeOutputFileName()`, mounted-target & source-ISO overwrite guards, inline overwrite warning banners across all 4 image builders/sheets, `extraDriversDir` partition + free-space sizing in `WindowsImageBuilder.kt`, and `syncMediaStoreFileSize()` in `createBlankImage()`.
-- **Network Safety, UI Copy & Hygiene:**
-  - Fixed WebView cross-thread race (`AtomicBoolean`), scoped `WindowsDirectCatalog` cookies to a local `CookieManager`, replaced all 6 stale `'All Channels'` error hints, synced `distros.json` catalog version (`463`), and removed all 38 unused imports.
+## Current Milestone: v4.6.4 (Official Rufus-Parity Windows USB Builder)
+- **Offline `boot.wim` Index 2 `LabConfig` Patching (`WindowsCustomization.kt`, `WindowsImageBuilder.kt`, `build-apk.yml`):**
+  - Re-bundled static ARM64 `libchntpw.so` (`reged-static`, ~200 KB) in CI and Pre-Flight Diagnostics (`Windows Imaging Tools`).
+  - Hardware bypasses (`BypassTPMCheck`, `BypassSecureBootCheck`, `BypassRAMCheck`, `BypassCPUCheck`, `BypassStorageCheck`) are now written directly into `sources/boot.wim` Index 2's offline `SYSTEM` registry hive—matching official Rufus (`pbatard/rufus/src/wue.c`).
+- **Genuine Microsoft WinPE Setup Flow Preserved:**
+  - Removed automatic USB-root `autounattend.xml` injection for standard builds; OOBE/Specialize tweaks now live strictly in `sources/$OEM$/$$/Panther/unattend.xml` (no `windowsPE` pass).
+  - Windows 11 24H2/25H2/26H2 Setup now shows the complete official Microsoft wizard: Language → Select Setup Option (**with *"Previous version of Setup"* visible**) → Product Key → Edition → **License Terms (*"I accept"*)** → Select Disk.
+  - USB-root `autounattend.xml` is only written if the user explicitly picks a Pre-Selected Edition, enables Full Unattended Skip OOBE, or if offline `boot.wim` patching is unavailable.
+- **Clean Pure-XML Rufus Defaults & Builder Polish:**
+  - Defaulted `qolImprovements = false` and separated `needsSpecializeScript()` so pure Rufus-style builds stage **zero `.cmd` scripts** (`PocketBoot_Specialize.cmd` / `SetupComplete.cmd` are only staged when QoL/Classic Menu/Sponsored Bloat/WinUtil/Custom Script is toggled ON).
+  - Gated `<HideEULAPage>true</HideEULAPage>` strictly to `skipOobe`, wired bundled `libmkfs_fat.so` into the FAT32 fallback, tracked PID on loop-mount fallback copy, and removed dead `WindowsBuildConfig` fields & unused `xmlEscape()`.

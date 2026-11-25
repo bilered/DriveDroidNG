@@ -28,9 +28,10 @@ enum class BuildThermalProfile(
 
 data class WindowsToolsStatus(
     val sevenZip: String?,
-    val wimlib: String?
+    val wimlib: String?,
+    val chntpw: String? = null
 ) {
-    val ready: Boolean get() = sevenZip != null && wimlib != null
+    val ready: Boolean get() = sevenZip != null && wimlib != null && chntpw != null
 }
 
 /**
@@ -228,6 +229,7 @@ object BuildThermalHelper {
 
     fun inspectWindowsTools(context: Context): WindowsToolsStatus = WindowsToolsStatus(
         sevenZip = WindowsImageBuilder.findBundledBinary(context, "lib7zzs.so", listOf("7zzs", "7zz", "7z")),
-        wimlib = WindowsImageBuilder.findBundledBinary(context, "libwimlib_imagex.so", listOf("wimlib-imagex"))
+        wimlib = WindowsImageBuilder.findBundledBinary(context, "libwimlib_imagex.so", listOf("wimlib-imagex")),
+        chntpw = WindowsImageBuilder.findBundledBinary(context, "libchntpw.so", listOf("chntpw", "reged"))
     )
 }

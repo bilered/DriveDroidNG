@@ -1,3 +1,12 @@
+## v4.6.4 (2026-11-25)
+- **True Official Rufus Parity in Windows USB Builder (`WindowsImageBuilder.kt`, `WindowsCustomization.kt`, `build-apk.yml`):**
+  - Re-bundled static ARM64 `libchntpw.so` (`reged-static`) to patch the 5 `Setup\LabConfig` hardware bypass keys directly into `sources/boot.wim` Index 2 offline `SYSTEM` hive.
+  - Stopped writing USB-root `autounattend.xml` for standard builds—staging OOBE/Specialize tweaks solely in `sources/$OEM$/$$/Panther/unattend.xml` (`includeWindowsPePass = false`). Restores ***"Previous version of Setup"***, Product Key, Edition picker, and the ***"I accept"*** License Terms screen in Windows 11 24H2/25H2/26H2 Setup.
+  - Defaulted `qolImprovements` to `false` and added `needsSpecializeScript()` so standard Rufus-style builds inject pure XML with zero `.cmd` scripts (`SetupComplete.cmd` / `PocketBoot_Specialize.cmd` are only written when QoL, Classic Menu, Sponsored Bloat, WinUtil, or a Custom Script is opted in).
+  - Scoped `<HideEULAPage>true</HideEULAPage>` strictly to `skipOobe`, wired bundled `libmkfs_fat.so` into the FAT32 fallback, tracked PID on loop-mount fallback copy, updated Preview XML & Pre-Select Edition helper text, and removed dead `WindowsBuildConfig` fields and unused `xmlEscape()`.
+- **Diagnostics & Credits (`BuildThermalHelper.kt`, `DiagnosticsSheet.kt`, `SettingsScreen.kt`):**
+  - Added `reged` (`libchntpw.so`) check to **Pre-Flight Diagnostics → Windows Imaging Tools** and credited `chntpw / reged (GPLv2)` in Open-Source Credits.
+
 ## v4.6.3 (2026-11-25)
 - **Android 15 Lifecycle & Edge-to-Edge Fixes (`AndroidManifest.xml`, `FastIsoDownloader.kt`, all 10 UI files):**
   - Preserved `MainActivity` across orientation/screen-size/keyboard config changes so rotating the phone never kills active USB or Ventoy builds.

@@ -885,7 +885,7 @@ fun SettingsScreen(
                             Icon(Icons.Rounded.Usb, null, tint = PocketColors.onAccent, modifier = Modifier.size(22.dp))
                         }
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("PocketBoot v4.6.3", style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary)
+                            Text("PocketBoot v4.6.4", style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary)
                             Text(
                                 text = "${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE}",
                                 style = MaterialTheme.typography.bodySmall,
@@ -896,7 +896,7 @@ fun SettingsScreen(
                         }
                         Surface(
                             modifier = Modifier.bounceClick {
-                                val info = "PocketBoot v4.6.3\nDevice: ${Build.MANUFACTURER} ${Build.MODEL}\nAndroid: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\nRoot: ${status.rootManager}\nSELinux: ${status.selinuxMode}\nUDC: ${status.udcName}\nKernel: ${status.kernelVersion}"
+                                val info = "PocketBoot v4.6.4\nDevice: ${Build.MANUFACTURER} ${Build.MODEL}\nAndroid: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\nRoot: ${status.rootManager}\nSELinux: ${status.selinuxMode}\nUDC: ${status.udcName}\nKernel: ${status.kernelVersion}"
                                 val cm = context.getSystemService(ClipboardManager::class.java)
                                 cm?.setPrimaryClip(ClipData.newPlainText("Device Info", info))
                                 Toast.makeText(context, "Device info copied.", Toast.LENGTH_SHORT).show()
@@ -1230,6 +1230,7 @@ fun SettingsScreen(
                     Text("• exfatprogs (GPLv2) — exFAT filesystem formatter", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
                     Text("• 7-Zip / 7zzs (LGPL / BSD) — ISO archive extractor", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
                     Text("• wimlib (GPLv3/LGPLv3) — WIM/ESD imaging engine", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
+                    Text("• chntpw / reged (GPLv2) — Offline Windows registry editor", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
                     Text("• libsu (Apache 2.0) — Root shell execution", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
                 }
             },

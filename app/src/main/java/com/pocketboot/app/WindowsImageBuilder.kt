@@ -79,17 +79,6 @@ data class WindowsBuildConfig(
     val experience: WindowsExperienceConfig = WindowsExperienceConfig(),
     val winUtil: WinUtilTweaksConfig = WinUtilTweaksConfig(),
     val eiCfgUnlock: Boolean = false,
-    val bypassRequirements: Boolean = experience.bypassRequirements,
-    val bypassMicrosoftAccount: Boolean = experience.bypassMicrosoftAccount,
-    val disableDataCollection: Boolean = experience.disableDataCollection,
-    val disableBitLocker: Boolean = experience.disableBitLocker,
-    val disableSponsoredApps: Boolean = experience.disableSponsoredApps,
-    val classicContextMenu: Boolean = experience.classicContextMenu,
-    val skipWifiSetup: Boolean = experience.skipWifiSetup,
-    val createLocalUser: Boolean = experience.createLocalUser,
-    val localUsername: String = experience.localUsername,
-    val localPassword: String = experience.localPassword,
-    val skipOobe: Boolean = experience.skipOobe,
     val extraDriversDir: String = "", val autoMountAfterBuild: Boolean = true
 )
 
@@ -111,13 +100,6 @@ object WindowsImageBuilder {
     private fun nowTs(): String = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
 
     private fun shellQuote(value: String): String = "'${value.replace("'", "'\\''")}'"
-
-    private fun xmlEscape(value: String): String = value
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace("\"", "&quot;")
-        .replace("'", "&apos;")
 
     fun isLikelyWindowsName(fileName: String): Boolean =
         IsoInspector.quickGuessByName(fileName) == IsoOsType.WINDOWS
@@ -261,16 +243,19 @@ object WindowsImageBuilder {
     fun generateAutounattendXml(
         config: WindowsBuildConfig,
         includeWindowsPePass: Boolean = true,
-        uiLang: String = ""
+        uiLang: String = "",
+        hasSpecializeScript: Boolean = config.experience.needsSpecializeScript() || config.winUtil.hasAnyActive(),
+        includeLabConfigInPe: Boolean = true
     ): String = WindowsCustomizationEngine.generateAutounattendXml(
         experience = config.experience,
         winUtil = config.winUtil,
         arch = config.arch,
         selectedEditionIndex = config.selectedEditionIndex,
-        hasSpecializeScript = config.experience.hasUnattendTweaks() || config.winUtil.hasAnyActive(),
+        hasSpecializeScript = hasSpecializeScript,
         hasOemUpdates = false,
         includeWindowsPePass = includeWindowsPePass,
-        uiLang = uiLang
+        uiLang = uiLang,
+        includeLabConfigInPe = includeLabConfigInPe
     )
 
     private fun loadUefiNtfsImage(context: Context): ByteArray? {
@@ -531,18 +516,13 @@ object WindowsImageBuilder {
                     "$qFmt -F -Q -L POCKETBOOT -H 255 -S 63 -p ${layout.part1StartLba} $qLoop 2>&1"
                 ).exec()
             } else {
-                Shell.cmd(
-                    """
-                    if command -v mkfs.vfat >/dev/null 2>&1; then
-                        mkfs.vfat -F 32 -n POCKETBOOT $qLoop 2>&1 || mkfs.vfat $qLoop 2>&1
-                    elif command -v newfs_msdos >/dev/null 2>&1; then
-                        newfs_msdos -F 32 -L POCKETBOOT $qLoop 2>&1
-                    else
-                        echo "No FAT32 formatter found"
-                        exit 1
-                    fi
-                    """.trimIndent()
-                ).exec()
+                val mkFatBin = findBundledBinary(context, "libmkfs_fat.so", listOf("mkfs.vfat", "mkfs.fat", "newfs_msdos"))
+                val fatCmd = when {
+                    mkFatBin != null && mkFatBin.contains("newfs_msdos") -> "${shellQuote(mkFatBin)} -F 32 -L POCKETBOOT $qLoop 2>&1"
+                    mkFatBin != null -> "${shellQuote(mkFatBin)} -F 32 -n POCKETBOOT $qLoop 2>&1"
+                    else -> "echo 'No FAT32 formatter found'; exit 1"
+                }
+                Shell.cmd(fatCmd).exec()
             }
             if (!fmtRes.isSuccess) {
                 val errTxt = (fmtRes.out + fmtRes.err).joinToString(" ").take(260)
@@ -619,13 +599,18 @@ object WindowsImageBuilder {
                     trackPid = true
                 )
             } else {
-                Shell.cmd(
+                BuildThermalHelper.runIsolatedRootScript(
+                    context,
+                    "winusb_loopcp",
                     """
-                    mkdir -p $TEMP_ISO_MNT &&
-                    (mount -t udf -o loop,ro $qIso $TEMP_ISO_MNT 2>&1 || mount -t iso9660 -o loop,ro $qIso $TEMP_ISO_MNT 2>&1 || mount -o loop,ro $qIso $TEMP_ISO_MNT 2>&1) &&
-                    cp -rf $TEMP_ISO_MNT/. $TEMP_MNT/ 2>&1
-                    """.trimIndent()
-                ).exec()
+                    set -e
+                    ${BuildThermalHelper.thermalExecPrefix(usbProf)}
+                    mkdir -p $TEMP_ISO_MNT
+                    (mount -t udf -o loop,ro $qIso $TEMP_ISO_MNT 2>&1 || mount -t iso9660 -o loop,ro $qIso $TEMP_ISO_MNT 2>&1 || mount -o loop,ro $qIso $TEMP_ISO_MNT 2>&1)
+                    ${'$'}THERM_PFX cp -rf $TEMP_ISO_MNT/. $TEMP_MNT/ 2>&1
+                    """.trimIndent(),
+                    trackPid = true
+                )
             }
             if (!isActive || BuildThermalHelper.isBuildCancelled()) {
                 cleanup(deletePartial = true)
@@ -652,26 +637,125 @@ object WindowsImageBuilder {
                 Shell.cmd(WindowsCustomizationEngine.applyCa2023BootloadersSnippet(shellQuote(wimBin), shellQuote(installWimCandidate), TEMP_MNT)).exec()
                     .out.filter { it.startsWith("LOG|") }.forEach { l -> val p = l.split("|", limit = 3); if (p.size == 3) entries.add(LogEntry(ts, p[1], p[2])) }
             }
-            val anyBypass = config.experience.hasUnattendTweaks() || config.winUtil.hasAnyActive() || config.selectedEditionIndex != null
-            if (anyBypass) {
-                onProgress(WindowsBuildProgress("Applying Windows tweaks...", "Writing autounattend.xml & scripts", 0.85f, false))
+            // Official Rufus-parity Step A: Patch LabConfig hardware bypasses directly into sources/boot.wim Index 2
+            // offline SYSTEM registry hive so USB-root autounattend.xml is NOT needed (keeps "Previous version of Setup" & EULA!)
+            val chntpwBin = findBundledBinary(context, "libchntpw.so", listOf("chntpw", "reged"))
+            var bootWimLabConfigPatched = false
+            if (config.experience.bypassRequirements && wimBin != null && chntpwBin != null) {
+                onProgress(WindowsBuildProgress("Patching boot.wim (Rufus-style)...", "Writing LabConfig bypasses into WinPE SYSTEM hive", 0.84f, false))
+                val tmpLabReg = File(context.cacheDir, "pb_labconfig.reg").apply {
+                    writeText(WindowsCustomizationEngine.buildLabConfigRegContent(), Charsets.US_ASCII)
+                }
+                try {
+                    val patchRes = BuildThermalHelper.runIsolatedRootScript(
+                        context,
+                        "winusb_bootlab",
+                        WindowsCustomizationEngine.patchBootWimLabConfigSnippet(
+                            shellQuote(wimBin),
+                            shellQuote(chntpwBin),
+                            qSourcesDir,
+                            shellQuote(tmpLabReg.absolutePath)
+                        ),
+                        trackPid = true
+                    )
+                    patchRes.out.filter { it.startsWith("LOG|") }.forEach { l ->
+                        val p = l.split("|", limit = 3)
+                        if (p.size == 3) entries.add(LogEntry(ts, p[1], p[2]))
+                    }
+                    bootWimLabConfigPatched = patchRes.isSuccess && patchRes.out.any { it.trim() == "PATCHED_OK" }
+                } finally {
+                    tmpLabReg.delete()
+                }
+                if (!bootWimLabConfigPatched) {
+                    entries.add(LogEntry(ts, "labconfig", "Offline boot.wim patch unavailable; falling back to root autounattend.xml for LabConfig", true))
+                }
+            }
+
+            // Official Rufus-parity Step B:
+            // - Place OOBE/Specialize tweaks ONLY in sources/$OEM$/$$/Panther/unattend.xml (never on USB root!)
+            // - Only write USB-root autounattend.xml if user explicitly pre-selected an edition, enabled Skip OOBE,
+            //   or if offline boot.wim LabConfig patching was unavailable.
+            // - Only stage PocketBoot_Specialize.cmd / SetupComplete.cmd when non-XML tweaks (QoL/Classic Menu/WinUtil/Custom) are active.
+            val needRootXml = (config.selectedEditionIndex != null) ||
+                config.experience.skipOobe ||
+                (config.experience.bypassRequirements && !bootWimLabConfigPatched)
+            val needPantherXml = config.experience.hasPostSetupTweaks() || config.winUtil.hasAnyActive()
+            val needScripts = config.experience.needsSpecializeScript() || config.winUtil.hasAnyActive()
+
+            if (needRootXml || needPantherXml) {
+                onProgress(WindowsBuildProgress("Applying Windows tweaks...", if (needRootXml) "Writing autounattend.xml" else "Writing Panther/unattend.xml (Rufus-style)", 0.87f, false))
                 val langIniPath = Shell.cmd("find $qSourcesDir -maxdepth 1 -type f -iname 'lang.ini' 2>/dev/null | head -n 1").exec().out.firstOrNull().orEmpty().trim()
                 val detectedLang = if (langIniPath.isNotBlank()) {
                     Shell.cmd("grep -iE '^[a-z]{2,3}(-[a-z0-9]{2,4}){1,2}[[:space:]]*=' ${shellQuote(langIniPath)} 2>/dev/null | head -n 1 | cut -d= -f1 | tr -d ' \\r\\n'").exec().out.firstOrNull().orEmpty().trim()
                 } else ""
-                val tmpXml = File(context.cacheDir, "autounattend.xml").apply { writeText(generateAutounattendXml(config, includeWindowsPePass = true, uiLang = detectedLang), Charsets.UTF_8) }
-                val tmpPantherXml = File(context.cacheDir, "panther_unattend.xml").apply { writeText(generateAutounattendXml(config, includeWindowsPePass = false, uiLang = detectedLang), Charsets.UTF_8) }
                 val oemPanther = "$sourcesDir/\$OEM\$/\$\$/Panther"
                 val oemScripts = "$sourcesDir/\$OEM\$/\$\$/Setup/Scripts"
                 val oemCustom = "$sourcesDir/\$OEM\$/\$\$/Setup/Custom"
-                val tmpSpec = File(context.cacheDir, "PocketBoot_Specialize.cmd").apply { writeText(WindowsCustomizationEngine.buildSpecializeScript(config.experience, config.winUtil), Charsets.UTF_8) }
-                val customPath = config.experience.customPostInstallScriptPath.trim()
-                val customFileName = if (customPath.isNotBlank()) customPath.substringAfterLast('/') else ""
-                val tmpComp = File(context.cacheDir, "SetupComplete.cmd").apply { writeText(WindowsCustomizationEngine.buildSetupCompleteScript(false, customFileName.isNotBlank(), customFileName), Charsets.UTF_8) }
-                val customCopyCmd = if (customPath.isNotBlank()) "mkdir -p ${shellQuote(oemCustom)} && cp -f ${shellQuote(UsbGadgetEngine.resolveDirectPath(customPath))} ${shellQuote(oemCustom)}/ 2>/dev/null || true" else "true"
-                Shell.cmd("cp -f ${shellQuote(tmpXml.absolutePath)} $TEMP_MNT/autounattend.xml && mkdir -p ${shellQuote(oemPanther)} ${shellQuote(oemScripts)} && cp -f ${shellQuote(tmpPantherXml.absolutePath)} ${shellQuote("$oemPanther/unattend.xml")} && cp -f ${shellQuote(tmpSpec.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_Specialize.cmd")} && cp -f ${shellQuote(tmpComp.absolutePath)} ${shellQuote("$oemScripts/SetupComplete.cmd")} && $customCopyCmd").exec()
-                tmpXml.delete(); tmpPantherXml.delete(); tmpSpec.delete(); tmpComp.delete()
-                entries.add(LogEntry(ts, "win-build", "Injected autounattend.xml (${config.arch}, Exp=${config.experience.activeCount()}, WinUtil=${config.winUtil.activeCount()})"))
+
+                val cmds = mutableListOf<String>()
+                val tempFiles = mutableListOf<File>()
+
+                if (needRootXml) {
+                    val tmpXml = File(context.cacheDir, "autounattend.xml").apply {
+                        writeText(
+                            generateAutounattendXml(
+                                config,
+                                includeWindowsPePass = true,
+                                uiLang = detectedLang,
+                                hasSpecializeScript = needScripts,
+                                includeLabConfigInPe = !bootWimLabConfigPatched
+                            ),
+                            Charsets.UTF_8
+                        )
+                    }
+                    tempFiles.add(tmpXml)
+                    cmds.add("cp -f ${shellQuote(tmpXml.absolutePath)} $TEMP_MNT/autounattend.xml")
+                }
+
+                if (needPantherXml) {
+                    val tmpPantherXml = File(context.cacheDir, "panther_unattend.xml").apply {
+                        writeText(
+                            generateAutounattendXml(
+                                config,
+                                includeWindowsPePass = false,
+                                uiLang = detectedLang,
+                                hasSpecializeScript = needScripts,
+                                includeLabConfigInPe = false
+                            ),
+                            Charsets.UTF_8
+                        )
+                    }
+                    tempFiles.add(tmpPantherXml)
+                    cmds.add("mkdir -p ${shellQuote(oemPanther)} && cp -f ${shellQuote(tmpPantherXml.absolutePath)} ${shellQuote("$oemPanther/unattend.xml")}")
+                }
+
+                if (needScripts) {
+                    val customPath = config.experience.customPostInstallScriptPath.trim()
+                    val customFileName = if (customPath.isNotBlank()) customPath.substringAfterLast('/') else ""
+                    val tmpSpec = File(context.cacheDir, "PocketBoot_Specialize.cmd").apply {
+                        writeText(WindowsCustomizationEngine.buildSpecializeScript(config.experience, config.winUtil), Charsets.UTF_8)
+                    }
+                    val tmpComp = File(context.cacheDir, "SetupComplete.cmd").apply {
+                        writeText(WindowsCustomizationEngine.buildSetupCompleteScript(false, customFileName.isNotBlank(), customFileName), Charsets.UTF_8)
+                    }
+                    tempFiles.add(tmpSpec); tempFiles.add(tmpComp)
+                    cmds.add("mkdir -p ${shellQuote(oemScripts)} && cp -f ${shellQuote(tmpSpec.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_Specialize.cmd")} && cp -f ${shellQuote(tmpComp.absolutePath)} ${shellQuote("$oemScripts/SetupComplete.cmd")}")
+                    if (customPath.isNotBlank()) {
+                        cmds.add("mkdir -p ${shellQuote(oemCustom)} && cp -f ${shellQuote(UsbGadgetEngine.resolveDirectPath(customPath))} ${shellQuote(oemCustom)}/ 2>/dev/null || true")
+                    }
+                }
+
+                try {
+                    if (cmds.isNotEmpty()) Shell.cmd(cmds.joinToString(" && ")).exec()
+                } finally {
+                    tempFiles.forEach { it.delete() }
+                }
+                val modeDesc = when {
+                    needRootXml && needPantherXml -> "root autounattend.xml + Panther/unattend.xml"
+                    needRootXml -> "root autounattend.xml"
+                    else -> "Panther/unattend.xml only (Rufus-style: Previous Setup & EULA preserved)"
+                }
+                entries.add(LogEntry(ts, "win-build", "Applied $modeDesc (${config.arch}, scripts=${if (needScripts) "yes" else "none"}, Exp=${config.experience.activeCount()}, WinUtil=${config.winUtil.activeCount()})"))
             }
             if (config.selectedEditionIndex != null || config.eiCfgUnlock) {
                 val tmpEi = File(context.cacheDir, "ei.cfg").apply { writeText(if (config.eiCfgUnlock && config.selectedEditionIndex == null) "[Channel]\r\nRetail\r\n" else "[Channel]\r\n_Default\r\n[VL]\r\n0\r\n", Charsets.UTF_8) }
@@ -870,6 +954,13 @@ fun WindowsBuilderSheet(
                                     Text(ed.name, modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp), style = MaterialTheme.typography.labelSmall, color = if (sel) PocketColors.accentSoft else PocketColors.textPrimary)
                                 }
                             }
+                        }
+                        if (selectedEditionIndex != null) {
+                            Text(
+                                text = "Pre-selecting an edition writes a root autounattend.xml and skips Product Key, Edition & EULA prompts. Keep \"Ask during Setup\" for full official Rufus Setup UI.",
+                                fontSize = 10.5.sp,
+                                color = PocketColors.textSecondary
+                            )
                         }
                     }
                 }
