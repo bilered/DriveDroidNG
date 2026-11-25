@@ -1,3 +1,14 @@
+## v4.6.6 (2026-11-25)
+- **Versioned USB Volume Labels (`WindowsImageBuilder.kt`):**
+  - Probed Windows version and exact `BUILD.SPBUILD` from the source ISO's WIM XML header (with filename and PID-tracked `boot.wim` fallbacks) to label NTFS Partition 1 as **`POCKETBOOT- Win 11 -26300.9974`** (up to 32 chars; FAT32 fallback `PB11-26300`).
+- **Exact Rufus OOBE & Local Admin Account Parity (`WindowsCustomization.kt`):**
+  - Decoupled `Bypass Online Microsoft Account` from `HideWirelessSetupInOOBE` (so turning OFF *Skip Wi-Fi Setup* is respected) and gated `HideLocalAccountScreen` + `HideOnlineAccountScreens` strictly to pre-created local accounts (preventing OOBE dead-ends when *Full Unattended OOBE Skip* is enabled without a username, with an inline UI tip).
+  - Added `<HideLocalAccountScreen>true</HideLocalAccountScreen>` and `<FirstLogonCommands>` (`net accounts /maxpwage:unlimited`, disabling 42-day password expiry) for pre-created Local Admin accounts, with strict alphabetical XSD child element ordering across `Microsoft-Windows-Shell-Setup`, `<OOBE>`, `<AutoLogon>`, `<FirstLogonCommands>`, and `<LocalAccount>`.
+- **Single-Pass `boot.wim` Update, Tracked Cancel & Accurate Preview (`WindowsCustomization.kt`, `WindowsImageBuilder.kt`):**
+  - Unified `LabConfig` hive patching and `/Autounattend.xml` injection into a single `wimlib-imagex update` pass (`patchBootWimSnippet`), fixed the Unattended Mode fallback so replacement `Autounattend.xml` (with `LabConfig`) cleanly overwrites `/Autounattend.xml` in `boot.wim` if `reged` fails, and updated the Activity Log to `Part2 UEFI:NTFS`.
+  - Routed Win 7 UEFI, CA 2023 bootloaders (with `sources/boot.wim` Index 2 fallback), Step 3 label-probe `7zzs`, and `/Drivers` `cp -rf` through `BuildThermalHelper.runIsolatedRootScript(..., trackPid = true)` with instant cancel checks.
+  - Passed `selectedEditionIndex` into `WindowsTwoPaneCustomizer` so **Preview XML** accurately displays `boot.wim\Autounattend.xml`, `Panther\unattend.xml`, or a clean Pure Stock note.
+
 ## v4.6.5 (2026-11-25)
 - **Fixed Windows Setup `PrepareSystemVolume` (`0x80004005`) Failure (`DiskPartitioner.kt`):**
   - Changed Windows USB GPT Partition 2 (`UEFI:NTFS`) from `GUID_ESP` (`Type: System`) to **Microsoft Basic Data Partition (`GUID_BASIC_DATA`)** with GPT attributes `0x9000000000000000` (`NO_DRIVE_LETTER | READ_ONLY`) and name `UEFI:NTFS`, matching official Rufus byte-for-byte.

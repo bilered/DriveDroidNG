@@ -236,6 +236,176 @@ object WindowsImageBuilder {
         }
     }
 
+    /**
+     * Builds the custom PocketBoot USB volume labels with detected Windows version & exact build:
+     * NTFS (<= 32 chars): e.g. "POCKETBOOT- Win 11 -26300.9974" (or "POCKETBOOT- Win 11" if build unknown)
+     * FAT32 (<= 11 chars): e.g. "PB11-26300" (or "PB-WIN11")
+     */
+    internal fun formatPocketBootVolumeLabels(
+        osKind: WindowsOsKind,
+        buildNumber: String?,
+        spBuild: String? = null,
+        editionNameHint: String = ""
+    ): Pair<String, String> {
+        val cleanBuild = buildNumber?.trim()?.takeIf { it.matches(Regex("^\\d{4,6}$")) }.orEmpty()
+        val cleanSp = spBuild?.trim()?.takeIf { it.matches(Regex("^\\d{1,6}$")) && it != "0" }.orEmpty()
+        val buildInt = cleanBuild.toIntOrNull()
+        val buildTag = when {
+            cleanBuild.isNotEmpty() && cleanSp.isNotEmpty() -> "$cleanBuild.$cleanSp"
+            cleanBuild.isNotEmpty() -> cleanBuild
+            else -> ""
+        }
+        val lowHint = editionNameHint.lowercase(Locale.US)
+        val osShort = when {
+            lowHint.contains("server") || osKind == WindowsOsKind.SERVER -> "Win Srv"
+            buildInt != null && buildInt >= 22000 -> "Win 11"
+            buildInt != null && buildInt in 10000..21999 -> "Win 10"
+            buildInt == 9600 -> "Win 8.1"
+            buildInt == 9200 -> "Win 8"
+            buildInt in 7600..7601 -> "Win 7"
+            osKind == WindowsOsKind.WIN11 -> "Win 11"
+            osKind == WindowsOsKind.WIN10 -> "Win 10"
+            osKind == WindowsOsKind.WIN81 -> "Win 8.1"
+            osKind == WindowsOsKind.WIN7 -> "Win 7"
+            else -> "Windows"
+        }
+        val ntfsLabel = (if (buildTag.isNotEmpty()) "POCKETBOOT- $osShort -$buildTag" else "POCKETBOOT- $osShort")
+            .take(32)
+            .trimEnd()
+        val fatOsCode = when (osShort) {
+            "Win 11" -> "11"
+            "Win 10" -> "10"
+            "Win 8.1" -> "81"
+            "Win 8" -> "8"
+            "Win 7" -> "7"
+            "Win Srv" -> "SRV"
+            else -> "WIN"
+        }
+        val fatLabel = (if (cleanBuild.isNotEmpty()) "PB$fatOsCode-${cleanBuild.take(5)}" else "PB-$fatOsCode")
+            .uppercase(Locale.US)
+            .take(11)
+        return ntfsLabel to fatLabel
+    }
+
+    private fun probeWindowsUsbVolumeLabels(
+        context: Context,
+        resolvedIso: String,
+        isoFileName: String,
+        fallbackOsKind: WindowsOsKind,
+        selectedEditionIndex: Int?,
+        sevenZip: String?,
+        wimBin: String?
+    ): Pair<String, String> {
+        var detectedBuild = ""
+        var detectedSp = ""
+        var detectedName = ""
+
+        // 1. Fast ~50ms WIM XML header probe via read-only loop-mount (install.wim/esd/swm -> boot.wim)
+        val qIso = shellQuote(resolvedIso)
+        val hdrTmp = File(context.cacheDir, "pb_lbl_hdr_${System.nanoTime()}.bin")
+        val xmlTmp = File(context.cacheDir, "pb_lbl_xml_${System.nanoTime()}.bin")
+        try {
+            val mounted = Shell.cmd(
+                """
+                mkdir -p $TEMP_EDITION_MNT && umount $TEMP_EDITION_MNT 2>/dev/null || true
+                mount -t udf -o loop,ro $qIso $TEMP_EDITION_MNT 2>/dev/null || \
+                mount -t iso9660 -o loop,ro $qIso $TEMP_EDITION_MNT 2>/dev/null || \
+                mount -o loop,ro $qIso $TEMP_EDITION_MNT 2>/dev/null
+                """.trimIndent()
+            ).exec().isSuccess
+            if (mounted) {
+                val wimPath = Shell.cmd(
+                    "find $TEMP_EDITION_MNT -maxdepth 2 -type f \\( -iname 'install.wim' -o -iname 'install.esd' -o -iname 'install.swm' \\) 2>/dev/null | head -n 1"
+                ).exec().out.firstOrNull().orEmpty().trim().ifBlank {
+                    Shell.cmd("find $TEMP_EDITION_MNT -maxdepth 2 -type f -iname 'boot.wim' 2>/dev/null | head -n 1").exec().out.firstOrNull().orEmpty().trim()
+                }
+                if (wimPath.isNotBlank()) {
+                    val qWim = shellQuote(wimPath)
+                    val qHdr = shellQuote(hdrTmp.absolutePath)
+                    if (Shell.cmd("dd if=$qWim of=$qHdr bs=1 count=208 2>/dev/null && chmod 0644 $qHdr").exec().isSuccess && hdrTmp.length() >= 104L) {
+                        val hdr = hdrTmp.readBytes()
+                        val magic = String(hdr, 0, 5, Charsets.US_ASCII)
+                        if (magic == "MSWIM" || magic == "WLPWM") {
+                            var xmlSize = 0L
+                            for (i in 0 until 7) xmlSize = xmlSize or ((hdr[72 + i].toLong() and 0xFFL) shl (8 * i))
+                            val xmlOffset = ByteBuffer.wrap(hdr, 80, 8).order(ByteOrder.LITTLE_ENDIAN).long
+                            if (xmlOffset > 0L && xmlSize in 17L..(2L * 1024L * 1024L)) {
+                                val skipBlocks = xmlOffset / 512L
+                                val leadBytes = (xmlOffset % 512L).toInt()
+                                val blockCount = (leadBytes + xmlSize + 511L) / 512L
+                                val qXml = shellQuote(xmlTmp.absolutePath)
+                                if (Shell.cmd("dd if=$qWim of=$qXml bs=512 skip=$skipBlocks count=$blockCount 2>/dev/null && chmod 0644 $qXml").exec().isSuccess && xmlTmp.exists()) {
+                                    val rawAll = xmlTmp.readBytes()
+                                    if (rawAll.size >= leadBytes + 4) {
+                                        val xmlText = String(rawAll, leadBytes, minOf(xmlSize.toInt(), rawAll.size - leadBytes), Charsets.UTF_16LE)
+                                        val imgRegex = Regex("""<IMAGE\s+INDEX="(\d+)"[^>]*>(.*?)</IMAGE>""", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
+                                        val allImgs = imgRegex.findAll(xmlText).toList()
+                                        val targetBody = (selectedEditionIndex?.let { idx -> allImgs.firstOrNull { it.groupValues[1].toIntOrNull() == idx } }
+                                            ?: allImgs.firstOrNull())?.groupValues?.get(2).orEmpty()
+                                        if (targetBody.isNotEmpty()) {
+                                            detectedBuild = Regex("""<BUILD>(\d+)</BUILD>""", RegexOption.IGNORE_CASE).find(targetBody)?.groupValues?.get(1).orEmpty()
+                                            detectedSp = Regex("""<SPBUILD>(\d+)</SPBUILD>""", RegexOption.IGNORE_CASE).find(targetBody)?.groupValues?.get(1).orEmpty()
+                                            detectedName = (Regex("""<DISPLAYNAME>(.*?)</DISPLAYNAME>""", RegexOption.IGNORE_CASE).find(targetBody)?.groupValues?.get(1)
+                                                ?: Regex("""<NAME>(.*?)</NAME>""", RegexOption.IGNORE_CASE).find(targetBody)?.groupValues?.get(1)).orEmpty()
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        } finally {
+            hdrTmp.delete()
+            xmlTmp.delete()
+            Shell.cmd("umount $TEMP_EDITION_MNT 2>/dev/null || umount -l $TEMP_EDITION_MNT 2>/dev/null; rm -rf $TEMP_EDITION_MNT 2>/dev/null").exec()
+        }
+
+        // 2. Fallback: parse build(.spbuild) from ISO filename (e.g. Win11_26H2_26300.9974_x64.iso)
+        if (detectedBuild.isBlank()) {
+            val fnMatch = Regex("""(?:^|[^0-9])(2\d{4}|1\d{4}|9600|9200|760[01])(?:\.(\d{1,5}))?(?:[^0-9]|$)""").find(isoFileName)
+            if (fnMatch != null) {
+                detectedBuild = fnMatch.groupValues[1]
+                detectedSp = fnMatch.groupValues[2]
+            }
+        }
+
+        // 3. Fallback for loop-restricted kernels without build in filename: quick boot.wim peek via 7zzs + wimlib
+        if (detectedBuild.isBlank() && sevenZip != null && wimBin != null) {
+            val probeDir = File(context.cacheDir, "pb_lbl_probe_${System.nanoTime()}").apply { mkdirs() }
+            try {
+                val q7z = shellQuote(sevenZip)
+                val qWim = shellQuote(wimBin)
+                val qTmp = shellQuote(probeDir.absolutePath)
+                val bootRel = Shell.cmd("$q7z l -ba $qIso 2>/dev/null | awk '{print \$NF}' | grep -iE '(^|/)sources/boot\\.wim$' | head -n 1")
+                    .exec().out.firstOrNull().orEmpty().trim()
+                if (bootRel.isNotBlank() && !BuildThermalHelper.isBuildCancelled() && BuildThermalHelper.runIsolatedRootScript(
+                        context,
+                        "winusb_lbl_7z",
+                        "set -e\nexport TMPDIR=$qTmp\n$q7z e -y -o$qTmp $qIso ${shellQuote(bootRel)} >/dev/null 2>&1",
+                        trackPid = true
+                    ).isSuccess) {
+                    val extracted = probeDir.listFiles()?.firstOrNull { it.isFile && it.length() > 1024L }
+                    if (extracted != null) {
+                        val infoLines = Shell.cmd("export TMPDIR=$qTmp && $qWim info ${shellQuote(extracted.absolutePath)} 2>/dev/null").exec().out
+                        infoLines.forEach { raw ->
+                            val line = raw.trim()
+                            if (detectedBuild.isBlank() && line.startsWith("Build:")) detectedBuild = line.substringAfter(':').trim()
+                            if (detectedSp.isBlank() && line.startsWith("Service Pack Build:")) detectedSp = line.substringAfter(':').trim()
+                            if (detectedName.isBlank() && line.startsWith("Display Name:")) detectedName = line.substringAfter(':').trim()
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            } finally {
+                probeDir.deleteRecursively()
+            }
+        }
+
+        return formatPocketBootVolumeLabels(fallbackOsKind, detectedBuild, detectedSp, detectedName)
+    }
+
     fun cancelActiveBuild() {
         BuildThermalHelper.cancelActiveBuildProcess()
     }
@@ -480,7 +650,7 @@ object WindowsImageBuilder {
                     ts,
                     "win-build",
                     "Wrote ${config.scheme.label}: Part1 ${if (useNtfs) "NTFS" else "FAT32"} LBA=${layout.part1StartLba}" +
-                        if (includeUefiPart) " + Part2 UEFI_NTFS LBA=${layout.part2StartLba}" else ""
+                        if (includeUefiPart) " + Part2 UEFI:NTFS LBA=${layout.part2StartLba}" else ""
                 )
             )
 
@@ -510,12 +680,20 @@ object WindowsImageBuilder {
             }
             val qLoop = shellQuote(loopDev)
 
-            val rawIsoVolLabel = Shell.cmd(
-                "MAG=\$(dd if=$qIso bs=1 skip=32769 count=5 2>/dev/null | tr -cd 'A-Z0-9'); " +
-                    "if [ \"\$MAG\" = \"CD001\" ]; then dd if=$qIso bs=1 skip=32808 count=32 2>/dev/null | tr -cd 'A-Za-z0-9 _-'; fi"
-            ).exec().out.firstOrNull().orEmpty().trim()
-            val ntfsLabel = rawIsoVolLabel.take(32).trim().ifBlank { "POCKETBOOT" }
-            val fatLabel = rawIsoVolLabel.replace(" ", "_").uppercase(Locale.US).take(11).ifBlank { "POCKETBOOT" }
+            val wimBinEarly = findBundledBinary(context, "libwimlib_imagex.so", listOf("wimlib-imagex"))
+            val (ntfsLabel, fatLabel) = probeWindowsUsbVolumeLabels(
+                context = context,
+                resolvedIso = srcIsoPath,
+                isoFileName = config.isoFile.name,
+                fallbackOsKind = config.osKind,
+                selectedEditionIndex = config.selectedEditionIndex,
+                sevenZip = sevenZip,
+                wimBin = wimBinEarly
+            )
+            if (!isActive || BuildThermalHelper.isBuildCancelled()) {
+                cleanup(deletePartial = true)
+                return@withContext ActionResult(false, "Build cancelled.", entries = entries)
+            }
 
             val fmtRes = if (useNtfs) {
                 val qFmt = shellQuote(ntfsFormatter!!)
@@ -631,88 +809,131 @@ object WindowsImageBuilder {
             }
             entries.add(LogEntry(ts, "win-build", "Extracted Windows ISO contents into Partition 1"))
 
-            val wimBin = findBundledBinary(context, "libwimlib_imagex.so", listOf("wimlib-imagex"))
+            val wimBin = wimBinEarly ?: findBundledBinary(context, "libwimlib_imagex.so", listOf("wimlib-imagex"))
             val sourcesDir = Shell.cmd("find $TEMP_MNT -maxdepth 1 -mindepth 1 -type d -iname 'sources' 2>/dev/null | head -n 1").exec().out.firstOrNull().orEmpty().trim().ifBlank { "$TEMP_MNT/sources" }
             val qSourcesDir = shellQuote(sourcesDir)
             val installWimCandidate = Shell.cmd("find $qSourcesDir -maxdepth 1 -type f \\( -iname 'install.wim' -o -iname 'install.esd' -o -iname 'install.swm' \\) 2>/dev/null | head -n 1").exec().out.firstOrNull().orEmpty().trim()
+            val bootWimCandidate = Shell.cmd("find $qSourcesDir -maxdepth 1 -type f -iname 'boot.wim' 2>/dev/null | head -n 1").exec().out.firstOrNull().orEmpty().trim()
+
             if (wimBin != null && installWimCandidate.isNotBlank()) {
-                Shell.cmd(WindowsCustomizationEngine.applyWin7UefiFixSnippet(shellQuote(wimBin), shellQuote(installWimCandidate), TEMP_MNT)).exec()
-                    .out.filter { it.startsWith("LOG|") }.forEach { l -> val p = l.split("|", limit = 3); if (p.size == 3) entries.add(LogEntry(ts, p[1], p[2])) }
-            }
-            if ((config.experience.useCa2023Bootloaders || config.experience.applySkuSiPolicy) && wimBin != null && installWimCandidate.isNotBlank()) {
-                onProgress(WindowsBuildProgress("Applying CA 2023 bootloaders...", "Extracting bootmgfw_EX.efi", 0.83f, false))
-                Shell.cmd(WindowsCustomizationEngine.applyCa2023BootloadersSnippet(shellQuote(wimBin), shellQuote(installWimCandidate), TEMP_MNT)).exec()
-                    .out.filter { it.startsWith("LOG|") }.forEach { l -> val p = l.split("|", limit = 3); if (p.size == 3) entries.add(LogEntry(ts, p[1], p[2])) }
-            }
-            // Official Rufus-parity Step A: Patch LabConfig hardware bypasses directly into sources/boot.wim Index 2
-            // offline SYSTEM registry hive so USB-root autounattend.xml is NOT needed (keeps "Previous version of Setup" & EULA!)
-            val chntpwBin = findBundledBinary(context, "libchntpw.so", listOf("chntpw", "reged"))
-            var bootWimLabConfigPatched = false
-            if (config.experience.bypassRequirements && wimBin != null && chntpwBin != null) {
-                onProgress(WindowsBuildProgress("Patching boot.wim (Rufus-style)...", "Writing LabConfig bypasses into WinPE SYSTEM hive", 0.84f, false))
-                val tmpLabReg = File(context.cacheDir, "pb_labconfig.reg").apply {
-                    writeText(WindowsCustomizationEngine.buildLabConfigRegContent(), Charsets.US_ASCII)
+                val w7Res = BuildThermalHelper.runIsolatedRootScript(
+                    context,
+                    "winusb_win7efi",
+                    WindowsCustomizationEngine.applyWin7UefiFixSnippet(shellQuote(wimBin), shellQuote(installWimCandidate), TEMP_MNT),
+                    trackPid = true
+                )
+                if (!isActive || BuildThermalHelper.isBuildCancelled()) {
+                    cleanup(deletePartial = true)
+                    return@withContext ActionResult(false, "Build cancelled.", entries = entries)
                 }
-                try {
+                w7Res.out.filter { it.startsWith("LOG|") }.forEach { l -> val p = l.split("|", limit = 3); if (p.size == 3) entries.add(LogEntry(ts, p[1], p[2])) }
+            }
+            if ((config.experience.useCa2023Bootloaders || config.experience.applySkuSiPolicy) && wimBin != null && (installWimCandidate.isNotBlank() || bootWimCandidate.isNotBlank())) {
+                onProgress(WindowsBuildProgress("Applying CA 2023 bootloaders...", "Extracting bootmgfw_EX.efi", 0.82f, false))
+                val caRes = BuildThermalHelper.runIsolatedRootScript(
+                    context,
+                    "winusb_ca2023",
+                    WindowsCustomizationEngine.applyCa2023BootloadersSnippet(
+                        shellQuote(wimBin),
+                        if (installWimCandidate.isNotBlank()) shellQuote(installWimCandidate) else "''",
+                        TEMP_MNT,
+                        if (bootWimCandidate.isNotBlank()) shellQuote(bootWimCandidate) else ""
+                    ),
+                    trackPid = true
+                )
+                if (!isActive || BuildThermalHelper.isBuildCancelled()) {
+                    cleanup(deletePartial = true)
+                    return@withContext ActionResult(false, "Build cancelled.", entries = entries)
+                }
+                caRes.out.filter { it.startsWith("LOG|") }.forEach { l -> val p = l.split("|", limit = 3); if (p.size == 3) entries.add(LogEntry(ts, p[1], p[2])) }
+            }
+
+            // Official Rufus-parity Single-Pass boot.wim + Answer File Injection:
+            // - Default Rufus Native Mode: patch LabConfig directly into boot.wim Index 2 SYSTEM hive,
+            //   and write OOBE/Specialize tweaks ONLY into sources/$OEM$/$$/Panther/unattend.xml.
+            // - Unattended WinPE Mode (pre-selected edition or Skip OOBE): patch LabConfig + inject
+            //   /Autounattend.xml into boot.wim Index 2 in ONE wimlib-imagex update call (no double rewrite,
+            //   no duplicate Panther/unattend.xml conflict).
+            val chntpwBin = findBundledBinary(context, "libchntpw.so", listOf("chntpw", "reged"))
+            val wantsUnattendedWinPe = (config.selectedEditionIndex != null) || config.experience.skipOobe
+            val needScripts = config.experience.needsSpecializeScript() || config.winUtil.hasAnyActive()
+            val langIniPath = Shell.cmd("find $qSourcesDir -maxdepth 1 -type f -iname 'lang.ini' 2>/dev/null | head -n 1").exec().out.firstOrNull().orEmpty().trim()
+            val detectedLang = if (langIniPath.isNotBlank()) {
+                Shell.cmd("grep -iE '^[a-z]{2,3}(-[a-z0-9]{2,4}){1,2}[[:space:]]*=' ${shellQuote(langIniPath)} 2>/dev/null | head -n 1 | cut -d= -f1 | tr -d ' \\r\\n'").exec().out.firstOrNull().orEmpty().trim()
+            } else ""
+
+            var bootWimLabConfigPatched = false
+            var bootWimAutoInjected = false
+            val tempFiles = mutableListOf<File>()
+            try {
+                val wantLabPatch = config.experience.bypassRequirements && wimBin != null && chntpwBin != null
+                val tmpLabReg = if (wantLabPatch) {
+                    File(context.cacheDir, "pb_labconfig.reg").apply {
+                        writeText(WindowsCustomizationEngine.buildLabConfigRegContent(), Charsets.US_ASCII)
+                    }.also { tempFiles.add(it) }
+                } else null
+                val tmpUnattendedXml = if (wantsUnattendedWinPe) {
+                    File(context.cacheDir, "Autounattend.xml").apply {
+                        writeText(
+                            generateAutounattendXml(
+                                config,
+                                includeWindowsPePass = true,
+                                uiLang = detectedLang,
+                                hasSpecializeScript = needScripts,
+                                includeLabConfigInPe = config.experience.bypassRequirements && !wantLabPatch
+                            ),
+                            Charsets.UTF_8
+                        )
+                    }.also { tempFiles.add(it) }
+                } else null
+
+                if (wimBin != null && (tmpLabReg != null || tmpUnattendedXml != null)) {
+                    val stageDetail = when {
+                        tmpLabReg != null && tmpUnattendedXml != null -> "Writing LabConfig hive & Autounattend.xml in single pass"
+                        tmpLabReg != null -> "Writing LabConfig bypasses into WinPE SYSTEM hive"
+                        else -> "Injecting Autounattend.xml into boot.wim Index 2"
+                    }
+                    onProgress(WindowsBuildProgress("Patching boot.wim (Rufus-style)...", stageDetail, 0.85f, false))
                     val patchRes = BuildThermalHelper.runIsolatedRootScript(
                         context,
-                        "winusb_bootlab",
-                        WindowsCustomizationEngine.patchBootWimLabConfigSnippet(
-                            shellQuote(wimBin),
-                            shellQuote(chntpwBin),
-                            qSourcesDir,
-                            shellQuote(tmpLabReg.absolutePath)
+                        "winusb_bootpatch",
+                        WindowsCustomizationEngine.patchBootWimSnippet(
+                            qWimBin = shellQuote(wimBin),
+                            qSourcesDir = qSourcesDir,
+                            qChntpwBin = if (tmpLabReg != null) shellQuote(chntpwBin!!) else null,
+                            qRegFile = tmpLabReg?.let { shellQuote(it.absolutePath) },
+                            qXmlFile = tmpUnattendedXml?.let { shellQuote(it.absolutePath) }
                         ),
                         trackPid = true
                     )
+                    if (!isActive || BuildThermalHelper.isBuildCancelled()) {
+                        cleanup(deletePartial = true)
+                        return@withContext ActionResult(false, "Build cancelled.", entries = entries)
+                    }
                     patchRes.out.filter { it.startsWith("LOG|") }.forEach { l ->
                         val p = l.split("|", limit = 3)
                         if (p.size == 3) entries.add(LogEntry(ts, p[1], p[2]))
                     }
-                    bootWimLabConfigPatched = patchRes.isSuccess && patchRes.out.any { it.trim() == "PATCHED_OK" }
-                } finally {
-                    tmpLabReg.delete()
+                    bootWimLabConfigPatched = patchRes.isSuccess && patchRes.out.any { it.trim() == "PATCHED_LAB_OK" }
+                    bootWimAutoInjected = patchRes.isSuccess && patchRes.out.any { it.trim() == "PATCHED_AU_OK" }
                 }
-                if (!bootWimLabConfigPatched) {
-                    entries.add(LogEntry(ts, "labconfig", "Offline boot.wim patch unavailable; falling back to root autounattend.xml for LabConfig", true))
+
+                // Fallback only if bypassRequirements was requested and offline LabConfig hive patch could not run
+                val needLabFallbackXml = config.experience.bypassRequirements && !bootWimLabConfigPatched
+                val needWinPeXml = wantsUnattendedWinPe || needLabFallbackXml
+                val needPantherXml = !needWinPeXml && (config.experience.hasPostSetupTweaks() || config.winUtil.hasAnyActive())
+
+                if (needLabFallbackXml) {
+                    entries.add(LogEntry(ts, "labconfig", "Offline boot.wim LabConfig patch unavailable; falling back to Autounattend.xml", true))
                 }
-            }
 
-            // Official Rufus-parity Step B:
-            // - Default Rufus Native Mode: place OOBE/Specialize tweaks ONLY in sources/$OEM$/$$/Panther/unattend.xml.
-            // - Unattended WinPE Mode (pre-selected edition, Skip OOBE, or LabConfig fallback): inject /Autounattend.xml
-            //   directly into sources/boot.wim Index 2 root (exact official Rufus method; falls back to USB root only if
-            //   boot.wim update fails), and avoid writing a conflicting duplicate Panther/unattend.xml.
-            // - Only stage PocketBoot_Specialize.cmd / SetupComplete.cmd when non-XML tweaks (QoL/Classic Menu/WinUtil/Custom) are active.
-            val needWinPeXml = (config.selectedEditionIndex != null) ||
-                config.experience.skipOobe ||
-                (config.experience.bypassRequirements && !bootWimLabConfigPatched)
-            val needPantherXml = !needWinPeXml && (config.experience.hasPostSetupTweaks() || config.winUtil.hasAnyActive())
-            val needScripts = config.experience.needsSpecializeScript() || config.winUtil.hasAnyActive()
-
-            if (needWinPeXml || needPantherXml) {
-                onProgress(
-                    WindowsBuildProgress(
-                        "Applying Windows tweaks...",
-                        if (needWinPeXml) "Injecting Autounattend.xml into boot.wim (Rufus-style)" else "Writing Panther/unattend.xml (Rufus-style)",
-                        0.87f,
-                        false
-                    )
-                )
-                val langIniPath = Shell.cmd("find $qSourcesDir -maxdepth 1 -type f -iname 'lang.ini' 2>/dev/null | head -n 1").exec().out.firstOrNull().orEmpty().trim()
-                val detectedLang = if (langIniPath.isNotBlank()) {
-                    Shell.cmd("grep -iE '^[a-z]{2,3}(-[a-z0-9]{2,4}){1,2}[[:space:]]*=' ${shellQuote(langIniPath)} 2>/dev/null | head -n 1 | cut -d= -f1 | tr -d ' \\r\\n'").exec().out.firstOrNull().orEmpty().trim()
-                } else ""
                 val oemPanther = "$sourcesDir/\$OEM\$/\$\$/Panther"
                 val oemScripts = "$sourcesDir/\$OEM\$/\$\$/Setup/Scripts"
                 val oemCustom = "$sourcesDir/\$OEM\$/\$\$/Setup/Custom"
-
                 val cmds = mutableListOf<String>()
-                val tempFiles = mutableListOf<File>()
-                var bootWimAutoInjected = false
 
-                if (needWinPeXml) {
-                    val tmpXml = File(context.cacheDir, "Autounattend.xml").apply {
+                if (needWinPeXml && (!bootWimAutoInjected || needLabFallbackXml)) {
+                    val fallbackXml = File(context.cacheDir, "Autounattend_fallback.xml").apply {
                         writeText(
                             generateAutounattendXml(
                                 config,
@@ -723,29 +944,31 @@ object WindowsImageBuilder {
                             ),
                             Charsets.UTF_8
                         )
-                    }
-                    tempFiles.add(tmpXml)
+                    }.also { tempFiles.add(it) }
+                    var fallbackInBootWim = false
                     if (wimBin != null) {
                         val auRes = BuildThermalHelper.runIsolatedRootScript(
                             context,
-                            "winusb_bootau",
-                            WindowsCustomizationEngine.injectBootWimAutounattendSnippet(
-                                shellQuote(wimBin),
-                                qSourcesDir,
-                                shellQuote(tmpXml.absolutePath)
+                            "winusb_bootau_fb",
+                            WindowsCustomizationEngine.patchBootWimSnippet(
+                                qWimBin = shellQuote(wimBin),
+                                qSourcesDir = qSourcesDir,
+                                qXmlFile = shellQuote(fallbackXml.absolutePath)
                             ),
                             trackPid = true
                         )
-                        auRes.out.filter { it.startsWith("LOG|") }.forEach { l ->
-                            val p = l.split("|", limit = 3)
-                            if (p.size == 3) entries.add(LogEntry(ts, p[1], p[2]))
+                        if (!isActive || BuildThermalHelper.isBuildCancelled()) {
+                            cleanup(deletePartial = true)
+                            return@withContext ActionResult(false, "Build cancelled.", entries = entries)
                         }
-                        bootWimAutoInjected = auRes.isSuccess && auRes.out.any { it.trim() == "BOOT_AU_OK" }
+                        fallbackInBootWim = auRes.isSuccess && auRes.out.any { it.trim() == "PATCHED_AU_OK" }
                     }
-                    if (!bootWimAutoInjected) {
-                        cmds.add("cp -f ${shellQuote(tmpXml.absolutePath)} $TEMP_MNT/autounattend.xml")
+                    bootWimAutoInjected = fallbackInBootWim
+                    if (!fallbackInBootWim) {
+                        cmds.add("cp -f ${shellQuote(fallbackXml.absolutePath)} $TEMP_MNT/autounattend.xml")
                     }
                 } else if (needPantherXml) {
+                    onProgress(WindowsBuildProgress("Applying Windows tweaks...", "Writing Panther/unattend.xml (Rufus-style)", 0.87f, false))
                     val tmpPantherXml = File(context.cacheDir, "panther_unattend.xml").apply {
                         writeText(
                             generateAutounattendXml(
@@ -757,8 +980,7 @@ object WindowsImageBuilder {
                             ),
                             Charsets.UTF_8
                         )
-                    }
-                    tempFiles.add(tmpPantherXml)
+                    }.also { tempFiles.add(it) }
                     cmds.add("mkdir -p ${shellQuote(oemPanther)} && cp -f ${shellQuote(tmpPantherXml.absolutePath)} ${shellQuote("$oemPanther/unattend.xml")}")
                 }
 
@@ -767,28 +989,29 @@ object WindowsImageBuilder {
                     val customFileName = if (customPath.isNotBlank()) customPath.substringAfterLast('/') else ""
                     val tmpSpec = File(context.cacheDir, "PocketBoot_Specialize.cmd").apply {
                         writeText(WindowsCustomizationEngine.buildSpecializeScript(config.experience, config.winUtil), Charsets.UTF_8)
-                    }
+                    }.also { tempFiles.add(it) }
                     val tmpComp = File(context.cacheDir, "SetupComplete.cmd").apply {
                         writeText(WindowsCustomizationEngine.buildSetupCompleteScript(false, customFileName.isNotBlank(), customFileName), Charsets.UTF_8)
-                    }
-                    tempFiles.add(tmpSpec); tempFiles.add(tmpComp)
+                    }.also { tempFiles.add(it) }
                     cmds.add("mkdir -p ${shellQuote(oemScripts)} && cp -f ${shellQuote(tmpSpec.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_Specialize.cmd")} && cp -f ${shellQuote(tmpComp.absolutePath)} ${shellQuote("$oemScripts/SetupComplete.cmd")}")
                     if (customPath.isNotBlank()) {
                         cmds.add("mkdir -p ${shellQuote(oemCustom)} && cp -f ${shellQuote(UsbGadgetEngine.resolveDirectPath(customPath))} ${shellQuote(oemCustom)}/ 2>/dev/null || true")
                     }
                 }
 
-                try {
-                    if (cmds.isNotEmpty()) Shell.cmd(cmds.joinToString(" && ")).exec()
-                } finally {
-                    tempFiles.forEach { it.delete() }
+                if (cmds.isNotEmpty()) Shell.cmd(cmds.joinToString(" && ")).exec()
+
+                if (needWinPeXml || needPantherXml || bootWimLabConfigPatched) {
+                    val modeDesc = when {
+                        needWinPeXml && bootWimAutoInjected -> "boot.wim/Autounattend.xml (Rufus Unattended Mode)"
+                        needWinPeXml -> "USB-root autounattend.xml (fallback)"
+                        needPantherXml -> "Panther/unattend.xml only (Rufus Native Mode: Previous Setup & EULA preserved)"
+                        else -> "boot.wim LabConfig only (Rufus Native Mode)"
+                    }
+                    entries.add(LogEntry(ts, "win-build", "Applied $modeDesc (${config.arch}, scripts=${if (needScripts) "yes" else "none"}, Exp=${config.experience.activeCount()}, WinUtil=${config.winUtil.activeCount()})"))
                 }
-                val modeDesc = when {
-                    needWinPeXml && bootWimAutoInjected -> "boot.wim/Autounattend.xml (Rufus Unattended Mode)"
-                    needWinPeXml -> "USB-root autounattend.xml (fallback)"
-                    else -> "Panther/unattend.xml only (Rufus Native Mode: Previous Setup & EULA preserved)"
-                }
-                entries.add(LogEntry(ts, "win-build", "Applied $modeDesc (${config.arch}, scripts=${if (needScripts) "yes" else "none"}, Exp=${config.experience.activeCount()}, WinUtil=${config.winUtil.activeCount()})"))
+            } finally {
+                tempFiles.forEach { it.delete() }
             }
             if (config.selectedEditionIndex != null || config.eiCfgUnlock) {
                 val eiContent = if (config.eiCfgUnlock && config.selectedEditionIndex == null) {
@@ -806,7 +1029,16 @@ object WindowsImageBuilder {
                 val drvSrc = UsbGadgetEngine.resolveDirectPath(config.extraDriversDir)
                 val qDrv = shellQuote(drvSrc)
                 onProgress(WindowsBuildProgress("Copying Drivers / Apps...", UsbGadgetEngine.friendlyFolderName(drvSrc), 0.90f, true))
-                val drvRes = Shell.cmd("if [ -d $qDrv ]; then mkdir -p $TEMP_MNT/Drivers && cp -rf $qDrv/. $TEMP_MNT/Drivers/ 2>&1; fi").exec()
+                val drvRes = BuildThermalHelper.runIsolatedRootScript(
+                    context,
+                    "winusb_drivers",
+                    "set -e\n${BuildThermalHelper.thermalExecPrefix(usbProf)}\nif [ -d $qDrv ]; then mkdir -p $TEMP_MNT/Drivers && \$THERM_PFX cp -rf $qDrv/. $TEMP_MNT/Drivers/ 2>&1; fi",
+                    trackPid = true
+                )
+                if (!isActive || BuildThermalHelper.isBuildCancelled()) {
+                    cleanup(deletePartial = true)
+                    return@withContext ActionResult(false, "Build cancelled.", entries = entries)
+                }
                 if (drvRes.isSuccess) {
                     entries.add(LogEntry(ts, "win-build", "Injected Drivers/Apps folder from $drvSrc into /Drivers"))
                 } else {
@@ -1027,7 +1259,7 @@ fun WindowsBuilderSheet(
                 }
                 WindowsTwoPaneCustomizer(
                     osKind = detectedOs, arch = detectedArch, experience = experience, winUtil = winUtil, presets = presets,
-                    showCa2023Option = true, showCustomScriptOption = true, defaultBrowseDir = defaultDir,
+                    showCa2023Option = true, showCustomScriptOption = true, defaultBrowseDir = defaultDir, selectedEditionIndex = selectedEditionIndex,
                     onExperienceChange = { experience = it }, onWinUtilChange = { winUtil = it },
                     onApplyPreset = { p ->
                         scheme = runCatching { PartitionScheme.valueOf(p.schemeName) }.getOrDefault(scheme)

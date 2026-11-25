@@ -1,15 +1,16 @@
 # PocketBoot Development Progress
 
-## Current Milestone: v4.6.5 (Full Official Rufus Parity & PrepareSystemVolume Fix)
-- **Fixed Windows Setup `PrepareSystemVolume` Error (`0x80004005`) (`DiskPartitioner.kt`):**
-  - Changed GPT Partition 2 (`UEFI:NTFS`) on Windows USB images from `GUID_ESP` (`Type: System`) to **`GUID_BASIC_DATA`** (`EBD0A0A2-B9E5-4433-87C0-68B6B72699C7`) with GPT attributes **`0x9000000000000000`** (`NO_DRIVE_LETTER | READ_ONLY`) and name `UEFI:NTFS`, while preserving `GUID_ESP` explicitly for Ventoy `VTOYEFI`.
-- **Phase 1 — Core Rufus Engine Parity (`WindowsCustomization.kt`, `WindowsImageBuilder.kt`):**
-  - Exported `TMPDIR`, `HOME`, and `WIMLIB_IMAGEX_IGNORE_CASE=1` across all offline `wimlib-imagex` helpers (`patchBootWimLabConfigSnippet`, `injectBootWimAutounattendSnippet`, `applyCa2023BootloadersSnippet`, `applyWin7UefiFixSnippet`) and added `>= 4096 B` hive validation before/after `reged`.
-  - Injected `/Autounattend.xml` directly into `sources/boot.wim` Index 2 root (official Rufus method) when WinPE unattended mode is needed, eliminating duplicate USB-root + `Panther/unattend.xml` conflicts.
-  - Added `sanitizeWindowsUsername()` (Rufus `#2991` parity) to strip `&` and illegal characters and block reserved Windows names (`Administrator`, `Guest`, `CON`, `NUL`, etc.).
-  - Updated `applyCa2023BootloadersSnippet()` to also patch `efi/microsoft/boot/bootmgfw.efi` when present and auto-enforce `useCa2023Bootloaders = true` whenever `applySkuSiPolicy` is enabled.
-- **Phase 2 — Filesystem & OEM Compatibility (`WindowsImageBuilder.kt`):**
-  - Formatted NTFS Partition 1 with explicit 4 KB clusters (`mkntfs -c 4096`) and preserved the source ISO's PVD volume label (fallback `POCKETBOOT`) on both NTFS and FAT32.
-  - Upgraded `sources/ei.cfg` unlock template to include blank `[EditionID]` + `[Channel] Retail` + `[VL] 0` so OEM Home-keyed laptops reliably display all Windows editions.
-- **Phase 3 — UI/UX Transparency (`WindowsCustomization.kt`, `WindowsImageBuilder.kt`):**
-  - Added a live **Setup Mode Indicator** pill in `WindowsBuilderSheet` (*Pure Stock ISO* vs *Rufus Native Mode* vs *Unattended Mode*), a one-tap **"Stock (No Tweaks)"** chip, live username validation warnings, CA 2023 ↔ `SkuSiPolicy` toggle interlocking, and wired-Ethernet OOBE guidance on `Bypass Online Microsoft Account`.
+## Current Milestone: v4.6.6 (100% Rufus Parity Polish & Versioned USB Volume Labels)
+- **Versioned PocketBoot USB Volume Labels (`WindowsImageBuilder.kt`):**
+  - Automatically probes the Windows ISO's WIM XML header (`<BUILD>` + `<SPBUILD>` + OS version, with filename & `boot.wim` fallbacks) and formats the NTFS Partition 1 label as **`POCKETBOOT- Win 11 -26300.9974`** (clamped safely to 32 chars; FAT32 fallback `PB11-26300`, <= 11 chars).
+- **Exact OOBE & Local Admin Account Parity (`WindowsCustomization.kt`):**
+  - Decoupled **Bypass Online Microsoft Account** (`BypassNRO`) from **Skip Wi-Fi Setup** (`HideWirelessSetupInOOBE`) and gated `HideOnlineAccountScreens` strictly to pre-created local accounts / `skipOobe` (never emits an empty `<OOBE>` block).
+  - Added `<HideLocalAccountScreen>true</HideLocalAccountScreen>` and `<FirstLogonCommands>` (`net accounts /maxpwage:unlimited`) for pre-created local admin accounts, and reordered `Microsoft-Windows-Shell-Setup` and `<OOBE>` elements into strict Microsoft XSD alphabetical order.
+- **Single-Pass `boot.wim` Updates & Tracked Bootloader Helpers (`WindowsCustomization.kt`, `WindowsImageBuilder.kt`):**
+  - Merged `LabConfig` hive patching and `/Autounattend.xml` injection into a single `wimlib-imagex update` pass (`patchBootWimSnippet`), eliminating double rewrites on Unattended Mode builds and clarifying fallback logs.
+  - Routed Win 7 UEFI and CA 2023 bootloader extraction through `BuildThermalHelper.runIsolatedRootScript(..., trackPid = true)` for instant cancellation, and added `sources/boot.wim` Index 2 fallback for CA 2023 extraction.
+  - Passed `selectedEditionIndex` into `WindowsTwoPaneCustomizer` so **Preview XML** reflects edition-locked `boot.wim\Autounattend.xml` accurately.
+- **Post-Audit Edge-Case Hardening (`WindowsImageBuilder.kt`, `WindowsCustomization.kt`):**
+  - Fixed Unattended Mode `LabConfig` fallback so if offline `reged` fails while `Autounattend.xml` succeeds, the replacement `Autounattend.xml` (containing `LabConfig`) overwrites `/Autounattend.xml` inside `boot.wim` (or falls back to USB root) instead of being skipped.
+  - Prevented OOBE dead-end when `Full Unattended OOBE Skip` is toggled ON without a Local Admin username (kept account screens visible + added inline UI hint).
+  - Sorted inner child elements of `<AutoLogon>`, `<FirstLogonCommands>`, and `<LocalAccount>` into strict Microsoft XSD alphabetical order, routed `/Drivers` copy and Step 3 `7zzs` label fallback through `BuildThermalHelper.runIsolatedRootScript(..., trackPid = true)`, clarified Pure Stock **Preview XML**, and fixed the `Part2 UEFI:NTFS` log label.

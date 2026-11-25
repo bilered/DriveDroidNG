@@ -243,7 +243,7 @@ object WindowsCustomizationEngine {
         sb.appendLine("if exist \"%PB_FLAG%\" exit /b 0")
         sb.appendLine("mkdir \"C:\\Windows\\Setup\\Scripts\" >nul 2>&1")
         sb.appendLine("echo [PocketBoot] Specialize configuration started...")
-        sb.appendLine("echo [PocketBoot v4.6.5] Specialize started %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.6.6] Specialize started %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("set \"PB_BUILD=0\"")
         sb.appendLine("for /f \"tokens=3\" %%B in ('reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\" /v CurrentBuildNumber 2^>nul ^| findstr /i CurrentBuildNumber') do set \"PB_BUILD=%%B\"")
         if (experience.bypassMicrosoftAccount) sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\OOBE\" /v BypassNRO /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
@@ -398,7 +398,7 @@ object WindowsCustomizationEngine {
         // Register SetupComplete.cmd under FirstBoot\PostOobe so it executes right after OOBE on every machine (guarded by .pb_setupcomplete_done so it runs strictly once).
         sb.appendLine("if exist \"C:\\Windows\\Setup\\Scripts\\SetupComplete.cmd\" reg add \"HKLM\\SYSTEM\\Setup\\FirstBoot\\PostOobe\" /v \"00\" /t REG_SZ /d \"cmd.exe /c C:\\Windows\\Setup\\Scripts\\SetupComplete.cmd & exit /b 0\" /f >> \"%PB_LOG%\" 2>&1")
         sb.appendLine("echo done > \"%PB_FLAG%\"")
-        sb.appendLine("echo [PocketBoot v4.6.5] Specialize finished %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.6.6] Specialize finished %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("exit /b 0")
         return sb.toString().replace("\r\n", "\n").replace("\n", "\r\n")
     }
@@ -431,7 +431,7 @@ object WindowsCustomizationEngine {
             sb.appendLine("dism /Online /Cleanup-Image /StartComponentCleanup /ResetBase >> \"%PB_LOG%\" 2>&1")
         }
         sb.appendLine("if exist \"C:\\Windows\\Setup\\Custom\" rmdir /s /q \"C:\\Windows\\Setup\\Custom\" >nul 2>&1")
-        sb.appendLine("echo [PocketBoot v4.6.5] SetupComplete finished %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.6.6] SetupComplete finished %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("start \"\" /b cmd /c \"ping -n 4 127.0.0.1 >nul & rmdir /s /q C:\\Windows\\Setup\\Scripts >nul 2>&1\"")
         sb.appendLine("exit /b 0")
         return sb.toString().replace("\r\n", "\n").replace("\n", "\r\n")
@@ -457,7 +457,7 @@ object WindowsCustomizationEngine {
             if (experience.disableSponsoredApps || experience.qolImprovements) specCommands.add(Triple("Disable Consumer Features", """reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\CloudContent" /v DisableWindowsConsumerFeatures /t REG_DWORD /d 1 /f""", false))
         }
         val cleanUser = experience.sanitizedLocalUsername
-        val needOobePass = experience.disableDataCollection || experience.bypassMicrosoftAccount || experience.skipWifiSetup || experience.skipOobe || cleanUser.isNotEmpty()
+        val needOobePass = experience.skipOobe || experience.disableDataCollection || experience.skipWifiSetup || cleanUser.isNotEmpty()
         val sb = StringBuilder()
         sb.appendLine("""<?xml version="1.0" encoding="utf-8"?>""")
         sb.appendLine("""<unattend xmlns="urn:schemas-microsoft-com:unattend">""")
@@ -501,17 +501,23 @@ object WindowsCustomizationEngine {
         if (needOobePass) {
             sb.appendLine("""  <settings pass="oobeSystem">""")
             sb.appendLine("""    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="$safeArch" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">""")
+            val safeUser = if (cleanUser.isNotEmpty()) xmlEscape(cleanUser) else ""
+            val safePass = if (cleanUser.isNotEmpty()) xmlEscape(experience.localPassword.take(32)) else ""
+            if (cleanUser.isNotEmpty()) {
+                sb.appendLine("""      <AutoLogon><Enabled>true</Enabled><LogonCount>${autoLogonCount.coerceIn(1, 10)}</LogonCount><Password><Value>$safePass</Value><PlainText>true</PlainText></Password><Username>$safeUser</Username></AutoLogon>""")
+                sb.appendLine("""      <FirstLogonCommands><SynchronousCommand wcm:action="add"><CommandLine>net accounts /maxpwage:unlimited</CommandLine><Description>Disable local account password expiration</Description><Order>1</Order></SynchronousCommand></FirstLogonCommands>""")
+            }
             sb.appendLine("""      <OOBE>""")
             if (experience.skipOobe) sb.appendLine("""        <HideEULAPage>true</HideEULAPage>""")
-            if (experience.disableDataCollection || experience.skipOobe) sb.appendLine("""        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen><ProtectYourPC>3</ProtectYourPC>""")
-            if (experience.bypassMicrosoftAccount || experience.skipOobe) sb.appendLine("""        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>""")
-            if (experience.skipWifiSetup || experience.bypassMicrosoftAccount || experience.skipOobe) sb.appendLine("""        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>""")
+            if (cleanUser.isNotEmpty()) sb.appendLine("""        <HideLocalAccountScreen>true</HideLocalAccountScreen>""")
+            if (experience.disableDataCollection || experience.skipOobe) sb.appendLine("""        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>""")
+            if (cleanUser.isNotEmpty()) sb.appendLine("""        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>""")
+            if (experience.skipWifiSetup || experience.skipOobe) sb.appendLine("""        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>""")
+            if (experience.disableDataCollection || experience.skipOobe) sb.appendLine("""        <ProtectYourPC>3</ProtectYourPC>""")
             if (experience.skipOobe && cleanUser.isNotEmpty()) sb.appendLine("""        <SkipMachineOOBE>true</SkipMachineOOBE><SkipUserOOBE>true</SkipUserOOBE>""")
             sb.appendLine("""      </OOBE>""")
             if (cleanUser.isNotEmpty()) {
-                val safeUser = xmlEscape(cleanUser); val safePass = xmlEscape(experience.localPassword.take(32))
-                sb.appendLine("""      <UserAccounts><LocalAccounts><LocalAccount wcm:action="add"><Name>$safeUser</Name><DisplayName>$safeUser</DisplayName><Group>Administrators</Group><Password><Value>$safePass</Value><PlainText>true</PlainText></Password></LocalAccount></LocalAccounts></UserAccounts>""")
-                sb.appendLine("""      <AutoLogon><Enabled>true</Enabled><LogonCount>${autoLogonCount.coerceIn(1, 10)}</LogonCount><Username>$safeUser</Username><Password><Value>$safePass</Value><PlainText>true</PlainText></Password></AutoLogon>""")
+                sb.appendLine("""      <UserAccounts><LocalAccounts><LocalAccount wcm:action="add"><DisplayName>$safeUser</DisplayName><Group>Administrators</Group><Name>$safeUser</Name><Password><Value>$safePass</Value><PlainText>true</PlainText></Password></LocalAccount></LocalAccounts></UserAccounts>""")
             }
             sb.appendLine("""    </component>""")
             sb.appendLine("""  </settings>""")
@@ -545,98 +551,118 @@ object WindowsCustomizationEngine {
             "\"BypassCPUCheck\"=dword:00000001\r\n" +
             "\"BypassStorageCheck\"=dword:00000001\r\n\r\n"
 
-    fun patchBootWimLabConfigSnippet(
-        qWimBin: String,
-        qChntpwBin: String,
-        qSourcesDir: String,
-        qRegFile: String
-    ): String = """
-        set -e
-        HIVE_TMP="/data/local/tmp/pb_boot_labcfg"
-        rm -rf "${'$'}HIVE_TMP" && mkdir -p "${'$'}HIVE_TMP"
-        export TMPDIR="${'$'}HIVE_TMP" HOME="${'$'}HIVE_TMP" WIMLIB_IMAGEX_IGNORE_CASE=1
-        BOOT_WIM=${'$'}(find $qSourcesDir -maxdepth 1 -type f -iname 'boot.wim' 2>/dev/null | head -n 1)
-        if [ -z "${'$'}BOOT_WIM" ] || [ ! -s "${'$'}BOOT_WIM" ]; then
-            rm -rf "${'$'}HIVE_TMP"
-            echo "LOG|labconfig|boot.wim not found in sources/; falling back to Autounattend.xml"
-            exit 1
-        fi
-        IDX_CNT=${'$'}($qWimBin info "${'$'}BOOT_WIM" 2>/dev/null | grep -c '^Index:' || echo 0)
-        BOOT_IDX=2
-        if [ "${'$'}{IDX_CNT:-0}" -lt 2 ]; then BOOT_IDX=1; fi
-        $qWimBin extract "${'$'}BOOT_WIM" "${'$'}BOOT_IDX" "/Windows/System32/config/SYSTEM" --dest-dir="${'$'}HIVE_TMP" --no-acls --no-attributes >/dev/null 2>&1 || \
-            $qWimBin extract "${'$'}BOOT_WIM" "${'$'}BOOT_IDX" "/windows/system32/config/system" --dest-dir="${'$'}HIVE_TMP" --no-acls --no-attributes >/dev/null 2>&1 || true
-        SYS_HIVE=${'$'}(find "${'$'}HIVE_TMP" -maxdepth 1 -type f -iname 'system' | head -n 1)
-        HIVE_SZ=${'$'}(stat -c '%s' "${'$'}SYS_HIVE" 2>/dev/null || echo 0)
-        if [ -z "${'$'}SYS_HIVE" ] || [ "${'$'}{HIVE_SZ:-0}" -lt 4096 ]; then
-            rm -rf "${'$'}HIVE_TMP"
-            echo "LOG|labconfig|Could not extract valid SYSTEM hive from boot.wim index ${'$'}BOOT_IDX"
-            exit 1
-        fi
-        set +e
-        printf 'y\n' | $qChntpwBin -C -I "${'$'}SYS_HIVE" 'HKEY_LOCAL_MACHINE\SYSTEM' $qRegFile >/dev/null 2>&1
-        REG_RC=${'$'}?
-        set -e
-        AFTER_SZ=${'$'}(stat -c '%s' "${'$'}SYS_HIVE" 2>/dev/null || echo 0)
-        if [ "${'$'}{AFTER_SZ:-0}" -lt 4096 ]; then
-            rm -rf "${'$'}HIVE_TMP"
-            echo "LOG|labconfig|reged hive patch failed (rc=${'$'}REG_RC, size=${'$'}AFTER_SZ)"
-            exit 1
-        fi
-        $qWimBin update "${'$'}BOOT_WIM" "${'$'}BOOT_IDX" --command="add '${'$'}SYS_HIVE' /Windows/System32/config/SYSTEM" >/dev/null 2>&1
-        rm -rf "${'$'}HIVE_TMP"
-        echo "LOG|labconfig|Patched LabConfig hardware bypasses directly into boot.wim Index ${'$'}BOOT_IDX (Rufus-style; WinPE Setup UI preserved)"
-        echo "PATCHED_OK"
-    """.trimIndent()
-
     /**
-     * Official Rufus-parity WinPE Autounattend injection: places /Autounattend.xml directly inside
-     * sources/boot.wim Index 2 root (instead of leaving duplicate root + Panther XML files on the USB).
+     * Unified single-pass boot.wim Index 2 updater (exact official Rufus parity):
+     * patches LabConfig into /Windows/System32/config/SYSTEM (when regFile + chntpw provided)
+     * and/or injects /Autounattend.xml (when xmlFile provided) in ONE wimlib-imagex update call.
      */
-    fun injectBootWimAutounattendSnippet(
+    fun patchBootWimSnippet(
         qWimBin: String,
         qSourcesDir: String,
-        qXmlFile: String
-    ): String = """
+        qChntpwBin: String? = null,
+        qRegFile: String? = null,
+        qXmlFile: String? = null
+    ): String {
+        val wantLab = !qChntpwBin.isNullOrBlank() && !qRegFile.isNullOrBlank()
+        val wantAu = !qXmlFile.isNullOrBlank()
+        val labBlock = if (wantLab) {
+            """
+            $qWimBin extract "${'$'}BOOT_WIM" "${'$'}BOOT_IDX" "/Windows/System32/config/SYSTEM" --dest-dir="${'$'}BOOT_TMP" --no-acls --no-attributes >/dev/null 2>&1 || \
+                $qWimBin extract "${'$'}BOOT_WIM" "${'$'}BOOT_IDX" "/windows/system32/config/system" --dest-dir="${'$'}BOOT_TMP" --no-acls --no-attributes >/dev/null 2>&1 || true
+            SYS_HIVE=${'$'}(find "${'$'}BOOT_TMP" -maxdepth 1 -type f -iname 'system' | head -n 1)
+            HIVE_SZ=${'$'}(stat -c '%s' "${'$'}SYS_HIVE" 2>/dev/null || echo 0)
+            if [ -n "${'$'}SYS_HIVE" ] && [ "${'$'}{HIVE_SZ:-0}" -ge 4096 ]; then
+                set +e
+                printf 'y\n' | $qChntpwBin -C -I "${'$'}SYS_HIVE" 'HKEY_LOCAL_MACHINE\SYSTEM' $qRegFile >/dev/null 2>&1
+                REG_RC=${'$'}?
+                set -e
+                AFTER_SZ=${'$'}(stat -c '%s' "${'$'}SYS_HIVE" 2>/dev/null || echo 0)
+                if [ "${'$'}{AFTER_SZ:-0}" -ge 4096 ]; then
+                    echo "add '${'$'}SYS_HIVE' /Windows/System32/config/SYSTEM" >> "${'$'}UPD_CMD"
+                    LAB_READY=1
+                else
+                    echo "LOG|labconfig|reged hive patch failed (rc=${'$'}REG_RC, size=${'$'}AFTER_SZ)"
+                fi
+            else
+                echo "LOG|labconfig|Could not extract valid SYSTEM hive from boot.wim index ${'$'}BOOT_IDX"
+            fi
+            """.trimIndent()
+        } else ""
+        val auBlock = if (wantAu) {
+            """
+            echo "delete --force /Autounattend.xml" >> "${'$'}UPD_CMD"
+            echo "add $qXmlFile /Autounattend.xml" >> "${'$'}UPD_CMD"
+            AU_READY=1
+            """.trimIndent()
+        } else ""
+        return """
         set -e
-        AU_TMP="/data/local/tmp/pb_boot_au"
-        rm -rf "${'$'}AU_TMP" && mkdir -p "${'$'}AU_TMP"
-        export TMPDIR="${'$'}AU_TMP" HOME="${'$'}AU_TMP" WIMLIB_IMAGEX_IGNORE_CASE=1
+        BOOT_TMP="/data/local/tmp/pb_boot_patch"
+        rm -rf "${'$'}BOOT_TMP" && mkdir -p "${'$'}BOOT_TMP"
+        export TMPDIR="${'$'}BOOT_TMP" HOME="${'$'}BOOT_TMP" WIMLIB_IMAGEX_IGNORE_CASE=1
         BOOT_WIM=${'$'}(find $qSourcesDir -maxdepth 1 -type f -iname 'boot.wim' 2>/dev/null | head -n 1)
         if [ -z "${'$'}BOOT_WIM" ] || [ ! -s "${'$'}BOOT_WIM" ]; then
-            rm -rf "${'$'}AU_TMP"
+            rm -rf "${'$'}BOOT_TMP"
+            echo "LOG|labconfig|boot.wim not found in sources/"
             exit 1
         fi
         IDX_CNT=${'$'}($qWimBin info "${'$'}BOOT_WIM" 2>/dev/null | grep -c '^Index:' || echo 0)
         BOOT_IDX=2
         if [ "${'$'}{IDX_CNT:-0}" -lt 2 ]; then BOOT_IDX=1; fi
-        $qWimBin update "${'$'}BOOT_WIM" "${'$'}BOOT_IDX" --command="add $qXmlFile /Autounattend.xml" >/dev/null 2>&1
-        rm -rf "${'$'}AU_TMP"
-        echo "LOG|win-build|Injected /Autounattend.xml into boot.wim Index ${'$'}BOOT_IDX (Rufus-style)"
-        echo "BOOT_AU_OK"
-    """.trimIndent()
+        UPD_CMD="${'$'}BOOT_TMP/update_cmds.txt"
+        : > "${'$'}UPD_CMD"
+        LAB_READY=0
+        AU_READY=0
+        $labBlock
+        $auBlock
+        if [ ! -s "${'$'}UPD_CMD" ]; then
+            rm -rf "${'$'}BOOT_TMP"
+            exit 1
+        fi
+        $qWimBin update "${'$'}BOOT_WIM" "${'$'}BOOT_IDX" < "${'$'}UPD_CMD" >/dev/null 2>&1
+        rm -rf "${'$'}BOOT_TMP"
+        if [ "${'$'}LAB_READY" = "1" ]; then
+            echo "LOG|labconfig|Patched LabConfig hardware bypasses directly into boot.wim Index ${'$'}BOOT_IDX (Rufus-style)"
+            echo "PATCHED_LAB_OK"
+        fi
+        if [ "${'$'}AU_READY" = "1" ]; then
+            echo "LOG|win-build|Injected /Autounattend.xml into boot.wim Index ${'$'}BOOT_IDX (Rufus-style)"
+            echo "PATCHED_AU_OK"
+        fi
+        """.trimIndent()
+    }
 
-    fun applyCa2023BootloadersSnippet(qWimBin: String, qInstallFile: String, qIsoRoot: String): String = """
+    fun applyCa2023BootloadersSnippet(qWimBin: String, qInstallFile: String, qIsoRoot: String, qBootWim: String = ""): String = """
         CA_TMP="/data/local/tmp/pb_ca2023"
         rm -rf "${'$'}CA_TMP" && mkdir -p "${'$'}CA_TMP"
         export TMPDIR="${'$'}CA_TMP" HOME="${'$'}CA_TMP" WIMLIB_IMAGEX_IGNORE_CASE=1
         CA_APPLIED=""
         INST_SRC=$qInstallFile
+        BOOT_WIM_SRC=${qBootWim.ifBlank { "''" }}
         ISO_ROOT=$qIsoRoot
         extract_wim_file() {
             local rel_path="${'$'}1"
+            local out_name=${'$'}(basename "${'$'}rel_path")
+            rm -f "${'$'}CA_TMP/${'$'}out_name"
             case "${'$'}INST_SRC" in
                 *.swm|*.SWM)
                     local wdir=${'$'}(dirname "${'$'}INST_SRC")
                     local wbase=${'$'}(basename "${'$'}INST_SRC")
                     local wpre="${'$'}{wbase%.*}"
                     local wext="${'$'}{wbase##*.}"
-                    $qWimBin extract "${'$'}INST_SRC" 1 "${'$'}rel_path" --ref="${'$'}{wdir}/${'$'}{wpre}*.${'$'}{wext}" --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null
+                    $qWimBin extract "${'$'}INST_SRC" 1 "${'$'}rel_path" --ref="${'$'}{wdir}/${'$'}{wpre}*.${'$'}{wext}" --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null || true
                     ;;
                 *)
-                    $qWimBin extract "${'$'}INST_SRC" 1 "${'$'}rel_path" --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null
+                    if [ -n "${'$'}INST_SRC" ] && [ -s "${'$'}INST_SRC" ]; then
+                        $qWimBin extract "${'$'}INST_SRC" 1 "${'$'}rel_path" --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null || true
+                    fi
                     ;;
             esac
+            if [ ! -s "${'$'}CA_TMP/${'$'}out_name" ] && [ -n "${'$'}BOOT_WIM_SRC" ] && [ -s "${'$'}BOOT_WIM_SRC" ]; then
+                $qWimBin extract "${'$'}BOOT_WIM_SRC" 2 "${'$'}rel_path" --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null || \
+                    $qWimBin extract "${'$'}BOOT_WIM_SRC" 1 "${'$'}rel_path" --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null || true
+            fi
+            [ -s "${'$'}CA_TMP/${'$'}out_name" ]
         }
         resolve_ci_dir() {
             local base="${'$'}1"; local child="${'$'}2"
@@ -718,7 +744,7 @@ object WindowsCustomizationEngine {
 fun WindowsTwoPaneCustomizer(
     osKind: WindowsOsKind, arch: String = "amd64", experience: WindowsExperienceConfig, winUtil: WinUtilTweaksConfig,
     presets: List<AutounattendPreset>, showCa2023Option: Boolean = true, showCustomScriptOption: Boolean = true,
-    defaultBrowseDir: String = "/data/media/0/Download",
+    defaultBrowseDir: String = "/data/media/0/Download", selectedEditionIndex: Int? = null,
     onExperienceChange: (WindowsExperienceConfig) -> Unit, onWinUtilChange: (WinUtilTweaksConfig) -> Unit,
     onApplyPreset: (AutounattendPreset) -> Unit, onSavePreset: (String) -> Unit, onDeletePreset: (String) -> Unit
 ) {
@@ -803,6 +829,13 @@ fun WindowsTwoPaneCustomizer(
                             }
                         }
                         CustomSwitchRow("Full Unattended OOBE Skip", "SkipMachineOOBE + SkipUserOOBE", experience.skipOobe) { onExperienceChange(experience.copy(skipOobe = it)) }
+                        if (experience.skipOobe && experience.sanitizedLocalUsername.isEmpty()) {
+                            Text(
+                                text = "Tip: Enable \"Create Local Admin Account\" above to skip account screens completely; otherwise OOBE will still ask for a username.",
+                                fontSize = 10.5.sp,
+                                color = PocketColors.warning
+                            )
+                        }
                         if (showCa2023Option) CustomSwitchRow("Use 'Windows CA 2023' Signed Bootloaders", "Caution: target PC BIOS must support UEFI CA 2023", experience.useCa2023Bootloaders, warningAccent = true) { onExperienceChange(experience.copy(useCa2023Bootloaders = it, applySkuSiPolicy = if (!it) false else experience.applySkuSiPolicy)) }
                         CustomSwitchRow("Apply SkuSiPolicy.p7b (KB5042562)", "Auto-enables CA 2023 bootloaders · revokes pre-2023 boot media on target PC", experience.applySkuSiPolicy, warningAccent = true) { onExperienceChange(experience.copy(applySkuSiPolicy = it, useCa2023Bootloaders = if (it) true else experience.useCa2023Bootloaders)) }
                         if (showCustomScriptOption) {
@@ -850,18 +883,32 @@ fun WindowsTwoPaneCustomizer(
     }
     if (showPreviewDialog) {
         var previewTab by remember { mutableIntStateOf(0) }
+        val previewUnattended = selectedEditionIndex != null || experience.skipOobe
+        val previewHasXml = previewUnattended || experience.hasPostSetupTweaks() || winUtil.hasAnyActive()
         val previewNeedsScript = experience.needsSpecializeScript() || winUtil.hasAnyActive()
-        val xmlText = remember(experience, winUtil, arch) {
-            WindowsCustomizationEngine.generateAutounattendXml(
-                experience, winUtil, arch,
-                hasSpecializeScript = previewNeedsScript,
-                includeWindowsPePass = experience.skipOobe,
-                includeLabConfigInPe = false
-            )
+        val xmlText = remember(experience, winUtil, arch, selectedEditionIndex) {
+            if (!previewHasXml) {
+                if (experience.bypassRequirements) {
+                    "<!-- boot.wim LabConfig patch only — no unattend.xml or scripts written (100% native Windows Setup & OOBE) -->"
+                } else {
+                    "<!-- Pure Stock ISO — no unattend.xml, boot.wim patch, or scripts written (100% untouched Microsoft Setup & OOBE) -->"
+                }
+            } else {
+                WindowsCustomizationEngine.generateAutounattendXml(
+                    experience, winUtil, arch,
+                    selectedEditionIndex = selectedEditionIndex,
+                    hasSpecializeScript = previewNeedsScript,
+                    includeWindowsPePass = previewUnattended,
+                    includeLabConfigInPe = false
+                )
+            }
         }
         val scriptText = remember(experience, winUtil) {
-            if (previewNeedsScript) WindowsCustomizationEngine.buildSpecializeScript(experience, winUtil)
-            else "; No Specialize.cmd needed (pure Rufus-style Panther\\unattend.xml + boot.wim LabConfig patch)"
+            when {
+                previewNeedsScript -> WindowsCustomizationEngine.buildSpecializeScript(experience, winUtil)
+                !previewHasXml && !experience.bypassRequirements -> "; No Specialize.cmd needed (Pure Stock ISO — zero scripts injected)"
+                else -> "; No Specialize.cmd needed (pure Rufus-style Panther\\unattend.xml + boot.wim LabConfig patch)"
+            }
         }
         AlertDialog(
             onDismissRequest = { showPreviewDialog = false }, containerColor = PocketColors.surfaceCard,
@@ -869,7 +916,7 @@ fun WindowsTwoPaneCustomizer(
             text = {
                 Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        listOf(if (experience.skipOobe) "boot.wim\\Autounattend.xml" else "Panther\\unattend.xml", "Specialize.cmd").forEachIndexed { idx, lbl ->
+                        listOf(if (previewUnattended) "boot.wim\\Autounattend.xml" else "Panther\\unattend.xml", "Specialize.cmd").forEachIndexed { idx, lbl ->
                             val sel = previewTab == idx
                             Surface(modifier = Modifier.weight(1f).bounceClick { previewTab = idx }, shape = RoundedCornerShape(8.dp), color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput, border = BorderStroke(0.75.dp, if (sel) PocketColors.accent else PocketColors.border)) {
                                 Box(modifier = Modifier.padding(vertical = 6.dp), contentAlignment = Alignment.Center) { Text(lbl, style = MaterialTheme.typography.labelSmall, color = if (sel) PocketColors.accentSoft else PocketColors.textSecondary) }
