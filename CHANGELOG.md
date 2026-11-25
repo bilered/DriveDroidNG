@@ -1,3 +1,18 @@
+## v4.6.5 (2026-11-25)
+- **Fixed Windows Setup `PrepareSystemVolume` (`0x80004005`) Failure (`DiskPartitioner.kt`):**
+  - Changed Windows USB GPT Partition 2 (`UEFI:NTFS`) from `GUID_ESP` (`Type: System`) to **Microsoft Basic Data Partition (`GUID_BASIC_DATA`)** with GPT attributes `0x9000000000000000` (`NO_DRIVE_LETTER | READ_ONLY`) and name `UEFI:NTFS`, matching official Rufus byte-for-byte.
+  - Resolves *"Windows could not prepare the computer to boot into the next phase of installation"* across both Windows 11 Setup and *"Previous version of Setup"*, while keeping `GUID_ESP` explicitly enabled for Ventoy `VTOYEFI`.
+- **Core Rufus Engine Parity (`WindowsCustomization.kt`, `WindowsImageBuilder.kt`):**
+  - Exported `TMPDIR`, `HOME`, and `WIMLIB_IMAGEX_IGNORE_CASE=1` in all offline `wimlib-imagex` helpers (`boot.wim` LabConfig patch, `Autounattend.xml` injection, CA 2023 bootloaders, Win 7 UEFI fix) and added `>= 4096 B` hive integrity checks before/after `reged`.
+  - Injected `/Autounattend.xml` directly into `sources/boot.wim` Index 2 root (official Rufus method) whenever WinPE unattended mode is needed (pre-selected edition, Skip OOBE, or LabConfig fallback), eliminating duplicate USB-root + `Panther/unattend.xml` conflicts.
+  - Added `WindowsCustomizationEngine.sanitizeWindowsUsername()` (Rufus `#2991` parity) to strip `&` and Windows-illegal characters and reject reserved names (`Administrator`, `Guest`, `CON`, `NUL`, etc.) so OOBE account creation never fails.
+  - Updated CA 2023 bootloader patching to also replace `efi/microsoft/boot/bootmgfw.efi` when present, and automatically enforced CA 2023 bootloaders whenever `Apply SkuSiPolicy.p7b` is enabled.
+- **Filesystem & OEM Compatibility (`WindowsImageBuilder.kt`):**
+  - Added explicit 4 KB cluster sizing (`mkntfs -c 4096`) and preserved the source ISO's PVD volume label (fallback `POCKETBOOT`) when formatting Partition 1 on NTFS and FAT32.
+  - Upgraded `sources/ei.cfg` unlock template to `[EditionID]` (blank) + `[Channel] Retail` + `[VL] 0` so OEM Home-keyed laptops reliably show all Windows editions.
+- **UI/UX Transparency (`WindowsCustomization.kt`, `WindowsImageBuilder.kt`):**
+  - Added a live Setup Mode pill in `WindowsBuilderSheet` (*Pure Stock ISO*, *Rufus Native Mode*, or *Unattended Mode*), a one-tap **"Stock (No Tweaks)"** chip, live reserved-username error feedback, CA 2023 ↔ `SkuSiPolicy` switch interlocking, dynamic Preview XML tab title, and wired-Ethernet OOBE guidance on `Bypass Online Microsoft Account`.
+
 ## v4.6.4 (2026-11-25)
 - **True Official Rufus Parity in Windows USB Builder (`WindowsImageBuilder.kt`, `WindowsCustomization.kt`, `build-apk.yml`):**
   - Re-bundled static ARM64 `libchntpw.so` (`reged-static`) to patch the 5 `Setup\LabConfig` hardware bypass keys directly into `sources/boot.wim` Index 2 offline `SYSTEM` hive.

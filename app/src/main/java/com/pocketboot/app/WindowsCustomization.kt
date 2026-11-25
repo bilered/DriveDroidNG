@@ -81,10 +81,12 @@ data class WindowsExperienceConfig(
     val skipOobe: Boolean = false, val useCa2023Bootloaders: Boolean = false,
     val applySkuSiPolicy: Boolean = false, val customPostInstallScriptPath: String = ""
 ) {
+    val sanitizedLocalUsername: String
+        get() = if (createLocalUser) WindowsCustomizationEngine.sanitizeWindowsUsername(localUsername) else ""
     /** Post-WinPE tweaks applied via Panther\unattend.xml (specialize/oobeSystem). */
     fun hasPostSetupTweaks(): Boolean = bypassMicrosoftAccount || disableDataCollection || disableBitLocker ||
         qolImprovements || disableSponsoredApps || classicContextMenu || skipWifiSetup || skipOobe ||
-        (createLocalUser && localUsername.isNotBlank()) || applySkuSiPolicy || customPostInstallScriptPath.isNotBlank()
+        sanitizedLocalUsername.isNotEmpty() || applySkuSiPolicy || customPostInstallScriptPath.isNotBlank()
     /** Tweaks that require staging PocketBoot_Specialize.cmd / SetupComplete.cmd beyond pure XML. */
     fun needsSpecializeScript(): Boolean = qolImprovements || disableSponsoredApps || classicContextMenu ||
         applySkuSiPolicy || customPostInstallScriptPath.isNotBlank()
@@ -92,13 +94,17 @@ data class WindowsExperienceConfig(
     fun hasAnyActive(): Boolean = hasUnattendTweaks() || useCa2023Bootloaders
     fun activeCount(): Int = listOf(bypassRequirements, bypassMicrosoftAccount, disableDataCollection, disableBitLocker,
         qolImprovements, disableSponsoredApps, classicContextMenu, skipWifiSetup, skipOobe,
-        createLocalUser && localUsername.isNotBlank(), useCa2023Bootloaders, applySkuSiPolicy, customPostInstallScriptPath.isNotBlank()).count { it }
+        sanitizedLocalUsername.isNotEmpty(), useCa2023Bootloaders, applySkuSiPolicy, customPostInstallScriptPath.isNotBlank()).count { it }
     companion object {
+        fun stock(): WindowsExperienceConfig = WindowsExperienceConfig(
+            bypassRequirements = false, bypassMicrosoftAccount = false, disableDataCollection = false,
+            disableBitLocker = false, qolImprovements = false, skipWifiSetup = false
+        )
         fun defaultForOs(osKind: WindowsOsKind): WindowsExperienceConfig = when (osKind) {
             WindowsOsKind.WIN11, WindowsOsKind.UNKNOWN -> WindowsExperienceConfig()
             WindowsOsKind.WIN10 -> WindowsExperienceConfig(bypassRequirements = false, bypassMicrosoftAccount = true, disableDataCollection = true, disableBitLocker = true, qolImprovements = false, skipWifiSetup = true)
             WindowsOsKind.SERVER -> WindowsExperienceConfig(bypassRequirements = false, bypassMicrosoftAccount = false, disableDataCollection = true, disableBitLocker = false, qolImprovements = false, skipWifiSetup = false)
-            WindowsOsKind.WIN81, WindowsOsKind.WIN7 -> WindowsExperienceConfig(bypassRequirements = false, bypassMicrosoftAccount = false, disableDataCollection = false, disableBitLocker = false, qolImprovements = false, skipWifiSetup = false)
+            WindowsOsKind.WIN81, WindowsOsKind.WIN7 -> stock()
         }
     }
 }
@@ -174,6 +180,37 @@ data class WinUtilTweaksConfig(
 }
 
 object WindowsCustomizationEngine {
+
+    private val RESERVED_WINDOWS_USERNAMES = setOf(
+        "administrator", "guest", "defaultaccount", "wdagutilityaccount",
+        "system", "localservice", "networkservice", "none", "users", "everyone",
+        "con", "prn", "aux", "nul",
+        "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+        "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"
+    )
+
+    /**
+     * Sanitizes a Windows local account username (matches official Rufus #2991 rules):
+     * strips illegal characters including '&', trims leading/trailing dots & spaces, clamps to 20 chars,
+     * and rejects reserved Windows built-in / DOS device names so oobeSystem never fails.
+     */
+    private const val ILLEGAL_USERNAME_CHARS = "/\\[]:;|=,+*?<>\"&@"
+
+    fun filterUsernameInput(raw: String): String = raw
+        .filter { ch -> ch.code >= 0x20 && ch !in ILLEGAL_USERNAME_CHARS }
+        .take(20)
+
+    fun sanitizeWindowsUsername(raw: String): String {
+        val cleaned = filterUsernameInput(raw)
+            .trim()
+            .trim('.')
+            .trim()
+            .take(20)
+            .trimEnd('.', ' ')
+        if (cleaned.isEmpty()) return ""
+        if (cleaned.lowercase() in RESERVED_WINDOWS_USERNAMES) return ""
+        return cleaned
+    }
     fun xmlEscape(value: String): String = value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&apos;")
     fun detectWindowsOsKind(nameOrLabel: String): WindowsOsKind {
         val low = nameOrLabel.lowercase()
@@ -206,7 +243,7 @@ object WindowsCustomizationEngine {
         sb.appendLine("if exist \"%PB_FLAG%\" exit /b 0")
         sb.appendLine("mkdir \"C:\\Windows\\Setup\\Scripts\" >nul 2>&1")
         sb.appendLine("echo [PocketBoot] Specialize configuration started...")
-        sb.appendLine("echo [PocketBoot v4.6.4] Specialize started %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.6.5] Specialize started %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("set \"PB_BUILD=0\"")
         sb.appendLine("for /f \"tokens=3\" %%B in ('reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\" /v CurrentBuildNumber 2^>nul ^| findstr /i CurrentBuildNumber') do set \"PB_BUILD=%%B\"")
         if (experience.bypassMicrosoftAccount) sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\OOBE\" /v BypassNRO /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
@@ -361,7 +398,7 @@ object WindowsCustomizationEngine {
         // Register SetupComplete.cmd under FirstBoot\PostOobe so it executes right after OOBE on every machine (guarded by .pb_setupcomplete_done so it runs strictly once).
         sb.appendLine("if exist \"C:\\Windows\\Setup\\Scripts\\SetupComplete.cmd\" reg add \"HKLM\\SYSTEM\\Setup\\FirstBoot\\PostOobe\" /v \"00\" /t REG_SZ /d \"cmd.exe /c C:\\Windows\\Setup\\Scripts\\SetupComplete.cmd & exit /b 0\" /f >> \"%PB_LOG%\" 2>&1")
         sb.appendLine("echo done > \"%PB_FLAG%\"")
-        sb.appendLine("echo [PocketBoot v4.6.4] Specialize finished %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.6.5] Specialize finished %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("exit /b 0")
         return sb.toString().replace("\r\n", "\n").replace("\n", "\r\n")
     }
@@ -394,7 +431,7 @@ object WindowsCustomizationEngine {
             sb.appendLine("dism /Online /Cleanup-Image /StartComponentCleanup /ResetBase >> \"%PB_LOG%\" 2>&1")
         }
         sb.appendLine("if exist \"C:\\Windows\\Setup\\Custom\" rmdir /s /q \"C:\\Windows\\Setup\\Custom\" >nul 2>&1")
-        sb.appendLine("echo [PocketBoot v4.6.4] SetupComplete finished %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.6.5] SetupComplete finished %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("start \"\" /b cmd /c \"ping -n 4 127.0.0.1 >nul & rmdir /s /q C:\\Windows\\Setup\\Scripts >nul 2>&1\"")
         sb.appendLine("exit /b 0")
         return sb.toString().replace("\r\n", "\n").replace("\n", "\r\n")
@@ -419,7 +456,7 @@ object WindowsCustomizationEngine {
             if (experience.disableDataCollection) specCommands.add(Triple("Disable Telemetry", """reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection" /v AllowTelemetry /t REG_DWORD /d 0 /f""", false))
             if (experience.disableSponsoredApps || experience.qolImprovements) specCommands.add(Triple("Disable Consumer Features", """reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\CloudContent" /v DisableWindowsConsumerFeatures /t REG_DWORD /d 1 /f""", false))
         }
-        val cleanUser = if (experience.createLocalUser) experience.localUsername.trim().take(20) else ""
+        val cleanUser = experience.sanitizedLocalUsername
         val needOobePass = experience.disableDataCollection || experience.bypassMicrosoftAccount || experience.skipWifiSetup || experience.skipOobe || cleanUser.isNotEmpty()
         val sb = StringBuilder()
         sb.appendLine("""<?xml version="1.0" encoding="utf-8"?>""")
@@ -515,31 +552,35 @@ object WindowsCustomizationEngine {
         qRegFile: String
     ): String = """
         set -e
-        export WIMLIB_IMAGEX_IGNORE_CASE=1
+        HIVE_TMP="/data/local/tmp/pb_boot_labcfg"
+        rm -rf "${'$'}HIVE_TMP" && mkdir -p "${'$'}HIVE_TMP"
+        export TMPDIR="${'$'}HIVE_TMP" HOME="${'$'}HIVE_TMP" WIMLIB_IMAGEX_IGNORE_CASE=1
         BOOT_WIM=${'$'}(find $qSourcesDir -maxdepth 1 -type f -iname 'boot.wim' 2>/dev/null | head -n 1)
         if [ -z "${'$'}BOOT_WIM" ] || [ ! -s "${'$'}BOOT_WIM" ]; then
-            echo "LOG|labconfig|boot.wim not found in sources/; falling back to autounattend.xml"
+            rm -rf "${'$'}HIVE_TMP"
+            echo "LOG|labconfig|boot.wim not found in sources/; falling back to Autounattend.xml"
             exit 1
         fi
         IDX_CNT=${'$'}($qWimBin info "${'$'}BOOT_WIM" 2>/dev/null | grep -c '^Index:' || echo 0)
         BOOT_IDX=2
         if [ "${'$'}{IDX_CNT:-0}" -lt 2 ]; then BOOT_IDX=1; fi
-        HIVE_TMP="/data/local/tmp/pb_boot_labcfg"
-        rm -rf "${'$'}HIVE_TMP" && mkdir -p "${'$'}HIVE_TMP"
-        $qWimBin extract "${'$'}BOOT_WIM" "${'$'}BOOT_IDX" "/Windows/System32/config/SYSTEM" --dest-dir="${'$'}HIVE_TMP" --no-acls --no-attributes >/dev/null 2>&1 ||             $qWimBin extract "${'$'}BOOT_WIM" "${'$'}BOOT_IDX" "/windows/system32/config/system" --dest-dir="${'$'}HIVE_TMP" --no-acls --no-attributes >/dev/null 2>&1 || true
+        $qWimBin extract "${'$'}BOOT_WIM" "${'$'}BOOT_IDX" "/Windows/System32/config/SYSTEM" --dest-dir="${'$'}HIVE_TMP" --no-acls --no-attributes >/dev/null 2>&1 || \
+            $qWimBin extract "${'$'}BOOT_WIM" "${'$'}BOOT_IDX" "/windows/system32/config/system" --dest-dir="${'$'}HIVE_TMP" --no-acls --no-attributes >/dev/null 2>&1 || true
         SYS_HIVE=${'$'}(find "${'$'}HIVE_TMP" -maxdepth 1 -type f -iname 'system' | head -n 1)
-        if [ -z "${'$'}SYS_HIVE" ] || [ ! -s "${'$'}SYS_HIVE" ]; then
+        HIVE_SZ=${'$'}(stat -c '%s' "${'$'}SYS_HIVE" 2>/dev/null || echo 0)
+        if [ -z "${'$'}SYS_HIVE" ] || [ "${'$'}{HIVE_SZ:-0}" -lt 4096 ]; then
             rm -rf "${'$'}HIVE_TMP"
-            echo "LOG|labconfig|Could not extract SYSTEM hive from boot.wim index ${'$'}BOOT_IDX"
+            echo "LOG|labconfig|Could not extract valid SYSTEM hive from boot.wim index ${'$'}BOOT_IDX"
             exit 1
         fi
         set +e
         printf 'y\n' | $qChntpwBin -C -I "${'$'}SYS_HIVE" 'HKEY_LOCAL_MACHINE\SYSTEM' $qRegFile >/dev/null 2>&1
         REG_RC=${'$'}?
         set -e
-        if [ ! -s "${'$'}SYS_HIVE" ]; then
+        AFTER_SZ=${'$'}(stat -c '%s' "${'$'}SYS_HIVE" 2>/dev/null || echo 0)
+        if [ "${'$'}{AFTER_SZ:-0}" -lt 4096 ]; then
             rm -rf "${'$'}HIVE_TMP"
-            echo "LOG|labconfig|reged hive patch failed (rc=${'$'}REG_RC)"
+            echo "LOG|labconfig|reged hive patch failed (rc=${'$'}REG_RC, size=${'$'}AFTER_SZ)"
             exit 1
         fi
         $qWimBin update "${'$'}BOOT_WIM" "${'$'}BOOT_IDX" --command="add '${'$'}SYS_HIVE' /Windows/System32/config/SYSTEM" >/dev/null 2>&1
@@ -548,9 +589,37 @@ object WindowsCustomizationEngine {
         echo "PATCHED_OK"
     """.trimIndent()
 
+    /**
+     * Official Rufus-parity WinPE Autounattend injection: places /Autounattend.xml directly inside
+     * sources/boot.wim Index 2 root (instead of leaving duplicate root + Panther XML files on the USB).
+     */
+    fun injectBootWimAutounattendSnippet(
+        qWimBin: String,
+        qSourcesDir: String,
+        qXmlFile: String
+    ): String = """
+        set -e
+        AU_TMP="/data/local/tmp/pb_boot_au"
+        rm -rf "${'$'}AU_TMP" && mkdir -p "${'$'}AU_TMP"
+        export TMPDIR="${'$'}AU_TMP" HOME="${'$'}AU_TMP" WIMLIB_IMAGEX_IGNORE_CASE=1
+        BOOT_WIM=${'$'}(find $qSourcesDir -maxdepth 1 -type f -iname 'boot.wim' 2>/dev/null | head -n 1)
+        if [ -z "${'$'}BOOT_WIM" ] || [ ! -s "${'$'}BOOT_WIM" ]; then
+            rm -rf "${'$'}AU_TMP"
+            exit 1
+        fi
+        IDX_CNT=${'$'}($qWimBin info "${'$'}BOOT_WIM" 2>/dev/null | grep -c '^Index:' || echo 0)
+        BOOT_IDX=2
+        if [ "${'$'}{IDX_CNT:-0}" -lt 2 ]; then BOOT_IDX=1; fi
+        $qWimBin update "${'$'}BOOT_WIM" "${'$'}BOOT_IDX" --command="add $qXmlFile /Autounattend.xml" >/dev/null 2>&1
+        rm -rf "${'$'}AU_TMP"
+        echo "LOG|win-build|Injected /Autounattend.xml into boot.wim Index ${'$'}BOOT_IDX (Rufus-style)"
+        echo "BOOT_AU_OK"
+    """.trimIndent()
+
     fun applyCa2023BootloadersSnippet(qWimBin: String, qInstallFile: String, qIsoRoot: String): String = """
         CA_TMP="/data/local/tmp/pb_ca2023"
         rm -rf "${'$'}CA_TMP" && mkdir -p "${'$'}CA_TMP"
+        export TMPDIR="${'$'}CA_TMP" HOME="${'$'}CA_TMP" WIMLIB_IMAGEX_IGNORE_CASE=1
         CA_APPLIED=""
         INST_SRC=$qInstallFile
         ISO_ROOT=$qIsoRoot
@@ -589,6 +658,9 @@ object WindowsCustomizationEngine {
             else
                 copy_ci_file "${'$'}CA_TMP/bootmgfw_EX.efi" "${'$'}EFI_BOOT_DIR" "bootx64.efi"
             fi
+            if find "${'$'}EFI_MS_BOOT_DIR" -maxdepth 1 -type f -iname 'bootmgfw.efi' 2>/dev/null | grep -q .; then
+                copy_ci_file "${'$'}CA_TMP/bootmgfw_EX.efi" "${'$'}EFI_MS_BOOT_DIR" "bootmgfw.efi"
+            fi
             CA_APPLIED="bootmgfw_EX.efi"
         fi
         if extract_wim_file /Windows/Boot/EFI_EX/bootmgr_EX.efi && [ -s "${'$'}CA_TMP/bootmgr_EX.efi" ]; then
@@ -617,6 +689,7 @@ object WindowsCustomizationEngine {
         if ! find "${'$'}ISO_ROOT" -maxdepth 3 -type f \( -iname 'bootx64.efi' -o -iname 'bootaa64.efi' \) 2>/dev/null | grep -q .; then
             W7_TMP="/data/local/tmp/pb_win7_efi"
             rm -rf "${'$'}W7_TMP" && mkdir -p "${'$'}W7_TMP"
+            export TMPDIR="${'$'}W7_TMP" HOME="${'$'}W7_TMP" WIMLIB_IMAGEX_IGNORE_CASE=1
             W7_OK=0
             case "${'$'}INST_SRC" in
                 *.swm|*.SWM)
@@ -669,6 +742,20 @@ fun WindowsTwoPaneCustomizer(
                     Icon(Icons.Rounded.Preview, null, tint = PocketColors.textSecondary, modifier = Modifier.size(14.dp)); Text("Preview XML", style = MaterialTheme.typography.labelSmall, color = PocketColors.textPrimary)
                 }
             }
+            val isStock = expCount == 0 && winUtilCount == 0
+            Surface(
+                modifier = Modifier.bounceClick { onExperienceChange(WindowsExperienceConfig.stock()); onWinUtilChange(WinUtilTweaksConfig()) },
+                shape = RoundedCornerShape(9.dp),
+                color = if (isStock) PocketColors.successBg else PocketColors.surfaceInput,
+                border = BorderStroke(0.75.dp, if (isStock) PocketColors.success else PocketColors.border)
+            ) {
+                Text(
+                    text = "Stock (No Tweaks)",
+                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (isStock) PocketColors.success else PocketColors.textSecondary
+                )
+            }
             presets.forEach { preset ->
                 Surface(shape = RoundedCornerShape(9.dp), color = PocketColors.surfaceSubtle, border = BorderStroke(0.75.dp, PocketColors.border)) {
                     Row(modifier = Modifier.padding(start = 9.dp, end = 4.dp, top = 5.dp, bottom = 5.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -695,7 +782,7 @@ fun WindowsTwoPaneCustomizer(
                     Column(modifier = Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
                         PocketHairlineDivider()
                         if (osKind == WindowsOsKind.WIN11 || osKind == WindowsOsKind.UNKNOWN) CustomSwitchRow("Bypass 4GB+ RAM, Secure Boot & TPM 2.0", "LabConfig hardware checks in WinPE", experience.bypassRequirements) { onExperienceChange(experience.copy(bypassRequirements = it)) }
-                        if (osKind != WindowsOsKind.WIN7 && osKind != WindowsOsKind.WIN81 && osKind != WindowsOsKind.SERVER) CustomSwitchRow("Bypass Online Microsoft Account", "Offline local account (BypassNRO)", experience.bypassMicrosoftAccount) { onExperienceChange(experience.copy(bypassMicrosoftAccount = it)) }
+                        if (osKind != WindowsOsKind.WIN7 && osKind != WindowsOsKind.WIN81 && osKind != WindowsOsKind.SERVER) CustomSwitchRow("Bypass Online Microsoft Account", "Offline local account (unplug Ethernet in OOBE, or create Local Admin below)", experience.bypassMicrosoftAccount) { onExperienceChange(experience.copy(bypassMicrosoftAccount = it)) }
                         CustomSwitchRow("Disable Data Collection", "Skip privacy questions & telemetry prompts", experience.disableDataCollection) { onExperienceChange(experience.copy(disableDataCollection = it)) }
                         CustomSwitchRow("Disable Automatic BitLocker Encryption", "PreventDeviceEncryption = 1", experience.disableBitLocker) { onExperienceChange(experience.copy(disableBitLocker = it)) }
                         CustomSwitchRow("QoL Improvements Bundle", "No Fast Startup, Copilot, OneDrive nag, Outlook, Widgets/Bing · show file extensions", experience.qolImprovements) { onExperienceChange(experience.copy(qolImprovements = it)) }
@@ -704,14 +791,20 @@ fun WindowsTwoPaneCustomizer(
                         CustomSwitchRow("Skip Wi-Fi / Network Setup Screen", "HideWirelessSetupInOOBE", experience.skipWifiSetup) { onExperienceChange(experience.copy(skipWifiSetup = it)) }
                         CustomSwitchRow("Create Local Admin Account", "Pre-create account & auto-logon once", experience.createLocalUser) { onExperienceChange(experience.copy(createLocalUser = it)) }
                         AnimatedVisibility(visible = experience.createLocalUser) {
-                            Row(modifier = Modifier.fillMaxWidth().padding(top = 2.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                OutlinedTextField(value = experience.localUsername, onValueChange = { onExperienceChange(experience.copy(localUsername = it.take(20))) }, label = { Text("Username") }, singleLine = true, modifier = Modifier.weight(1f), shape = RoundedCornerShape(10.dp), colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = PocketColors.accent, unfocusedBorderColor = PocketColors.border, focusedTextColor = PocketColors.textPrimary, unfocusedTextColor = PocketColors.textPrimary))
-                                OutlinedTextField(value = experience.localPassword, onValueChange = { onExperienceChange(experience.copy(localPassword = it.take(32))) }, label = { Text("Password (opt)") }, singleLine = true, modifier = Modifier.weight(1f), shape = RoundedCornerShape(10.dp), colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = PocketColors.accent, unfocusedBorderColor = PocketColors.border, focusedTextColor = PocketColors.textPrimary, unfocusedTextColor = PocketColors.textPrimary))
+                            val userInvalid = experience.localUsername.isNotBlank() && experience.sanitizedLocalUsername.isEmpty()
+                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Row(modifier = Modifier.fillMaxWidth().padding(top = 2.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    OutlinedTextField(value = experience.localUsername, onValueChange = { onExperienceChange(experience.copy(localUsername = WindowsCustomizationEngine.filterUsernameInput(it))) }, label = { Text("Username") }, singleLine = true, isError = userInvalid, modifier = Modifier.weight(1f), shape = RoundedCornerShape(10.dp), colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = PocketColors.accent, unfocusedBorderColor = PocketColors.border, focusedTextColor = PocketColors.textPrimary, unfocusedTextColor = PocketColors.textPrimary))
+                                    OutlinedTextField(value = experience.localPassword, onValueChange = { onExperienceChange(experience.copy(localPassword = it.take(32))) }, label = { Text("Password (opt)") }, singleLine = true, modifier = Modifier.weight(1f), shape = RoundedCornerShape(10.dp), colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = PocketColors.accent, unfocusedBorderColor = PocketColors.border, focusedTextColor = PocketColors.textPrimary, unfocusedTextColor = PocketColors.textPrimary))
+                                }
+                                if (userInvalid) {
+                                    Text("Reserved or invalid Windows username (avoid Administrator, Guest, CON, NUL, or symbols).", fontSize = 10.5.sp, color = PocketColors.warning)
+                                }
                             }
                         }
                         CustomSwitchRow("Full Unattended OOBE Skip", "SkipMachineOOBE + SkipUserOOBE", experience.skipOobe) { onExperienceChange(experience.copy(skipOobe = it)) }
-                        if (showCa2023Option) CustomSwitchRow("Use 'Windows CA 2023' Signed Bootloaders", "Caution: target PC BIOS must support UEFI CA 2023", experience.useCa2023Bootloaders, warningAccent = true) { onExperienceChange(experience.copy(useCa2023Bootloaders = it)) }
-                        CustomSwitchRow("Apply SkuSiPolicy.p7b (KB5042562)", "Caution: revokes pre-2023 Windows boot media on target PC", experience.applySkuSiPolicy, warningAccent = true) { onExperienceChange(experience.copy(applySkuSiPolicy = it)) }
+                        if (showCa2023Option) CustomSwitchRow("Use 'Windows CA 2023' Signed Bootloaders", "Caution: target PC BIOS must support UEFI CA 2023", experience.useCa2023Bootloaders, warningAccent = true) { onExperienceChange(experience.copy(useCa2023Bootloaders = it, applySkuSiPolicy = if (!it) false else experience.applySkuSiPolicy)) }
+                        CustomSwitchRow("Apply SkuSiPolicy.p7b (KB5042562)", "Auto-enables CA 2023 bootloaders · revokes pre-2023 boot media on target PC", experience.applySkuSiPolicy, warningAccent = true) { onExperienceChange(experience.copy(applySkuSiPolicy = it, useCa2023Bootloaders = if (it) true else experience.useCa2023Bootloaders)) }
                         if (showCustomScriptOption) {
                             Surface(modifier = Modifier.fillMaxWidth().bounceClick { showScriptPicker = true }, shape = RoundedCornerShape(10.dp), color = PocketColors.surfaceCard, border = BorderStroke(0.75.dp, if (experience.customPostInstallScriptPath.isNotBlank()) PocketColors.accent else PocketColors.border)) {
                                 Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 11.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -776,7 +869,7 @@ fun WindowsTwoPaneCustomizer(
             text = {
                 Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        listOf("Panther\\unattend.xml", "Specialize.cmd").forEachIndexed { idx, lbl ->
+                        listOf(if (experience.skipOobe) "boot.wim\\Autounattend.xml" else "Panther\\unattend.xml", "Specialize.cmd").forEachIndexed { idx, lbl ->
                             val sel = previewTab == idx
                             Surface(modifier = Modifier.weight(1f).bounceClick { previewTab = idx }, shape = RoundedCornerShape(8.dp), color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput, border = BorderStroke(0.75.dp, if (sel) PocketColors.accent else PocketColors.border)) {
                                 Box(modifier = Modifier.padding(vertical = 6.dp), contentAlignment = Alignment.Center) { Text(lbl, style = MaterialTheme.typography.labelSmall, color = if (sel) PocketColors.accentSoft else PocketColors.textSecondary) }

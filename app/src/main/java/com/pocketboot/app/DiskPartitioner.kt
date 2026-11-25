@@ -39,6 +39,9 @@ object DiskPartitioner {
     // EFI System Partition: C12A7328-F81F-11D2-BA4B-00A0C93EC93B
     private val GUID_ESP = uuidToMixedEndianBytes("C12A7328-F81F-11D2-BA4B-00A0C93EC93B")
 
+    // Official Rufus GPT attributes for UEFI:NTFS (0x9000000000000000 = NO_DRIVE_LETTER | READ_ONLY)
+    private const val GPT_ATTR_NO_DRIVE_LETTER_RO: Long = -0x7000000000000000L
+
     // Standard minimal x86 MBR chainloader (relocates 0x7C00 -> 0x0600, scans partition table for 0x80 active flag,
     // loads VBR via INT 13h AH=42h LBA Extended Read to 0x7C00, and jumps to 0000:7C00)
     private val STANDARD_MBR_BOOTCODE = byteArrayOf(
@@ -147,7 +150,9 @@ object DiskPartitioner {
             layout = layout,
             includeUefiPart = true,
             part1Name = "PocketBoot",
-            part2Name = "VTOYEFI"
+            part2Name = "VTOYEFI",
+            part2IsEsp = true,
+            part2Attributes = 0L
         )
         // Patch Ventoy boot.img (446 bytes) into LBA 0 Protective MBR + GPT core.img start LBA marker (0x22 = LBA 34) at offset 92
         val copyLen = bootImgBytes.size.coerceAtMost(446)
@@ -159,8 +164,10 @@ object DiskPartitioner {
     fun buildGptBuffers(
         layout: DiskLayoutSpec,
         includeUefiPart: Boolean,
-        part1Name: String = "PocketBoot Windows",
-        part2Name: String = "UEFI_NTFS"
+        part1Name: String = "Main Data Partition",
+        part2Name: String = "UEFI:NTFS",
+        part2IsEsp: Boolean = false,
+        part2Attributes: Long = GPT_ATTR_NO_DRIVE_LETTER_RO
     ): GptBuffers {
         val totalSectors = layout.totalSectors
         val firstUsableLba = 34L
@@ -194,16 +201,18 @@ object DiskPartitioner {
             lastLba = layout.part1StartLba + layout.part1Sectors - 1L,
             name = part1Name
         )
-        // Entry 1: UEFI:NTFS EFI System Partition (required when Partition 1 is exFAT)
+        // Entry 1: UEFI:NTFS (Microsoft Basic Data + 0x9000000000000000 like official Rufus so Windows Setup
+        // never mistakes the 1 MB USB partition for a target EFI System Partition; Ventoy explicitly sets part2IsEsp = true)
         if (includeUefiPart) {
             writeGptEntry(
                 target = entriesBytes,
                 index = 1,
-                typeGuid = GUID_ESP,
+                typeGuid = if (part2IsEsp) GUID_ESP else GUID_BASIC_DATA,
                 uniqueGuid = randomMixedEndianGuid(),
                 firstLba = layout.part2StartLba,
                 lastLba = layout.part2StartLba + layout.part2Sectors - 1L,
-                name = part2Name
+                name = part2Name,
+                attributes = part2Attributes
             )
         }
 
@@ -274,7 +283,8 @@ object DiskPartitioner {
         uniqueGuid: ByteArray,
         firstLba: Long,
         lastLba: Long,
-        name: String
+        name: String,
+        attributes: Long = 0L
     ) {
         val base = index * 128
         System.arraycopy(typeGuid, 0, target, base, 16)
@@ -283,7 +293,7 @@ object DiskPartitioner {
         val buf = ByteBuffer.wrap(target).order(ByteOrder.LITTLE_ENDIAN)
         buf.putLong(base + 32, firstLba)
         buf.putLong(base + 40, lastLba)
-        buf.putLong(base + 48, 0L) // attributes
+        buf.putLong(base + 48, attributes)
         val chars = name.take(35)
         for (i in chars.indices) {
             buf.putShort(base + 56 + i * 2, chars[i].code.toShort())

@@ -1,13 +1,15 @@
 # PocketBoot Development Progress
 
-## Current Milestone: v4.6.4 (Official Rufus-Parity Windows USB Builder)
-- **Offline `boot.wim` Index 2 `LabConfig` Patching (`WindowsCustomization.kt`, `WindowsImageBuilder.kt`, `build-apk.yml`):**
-  - Re-bundled static ARM64 `libchntpw.so` (`reged-static`, ~200 KB) in CI and Pre-Flight Diagnostics (`Windows Imaging Tools`).
-  - Hardware bypasses (`BypassTPMCheck`, `BypassSecureBootCheck`, `BypassRAMCheck`, `BypassCPUCheck`, `BypassStorageCheck`) are now written directly into `sources/boot.wim` Index 2's offline `SYSTEM` registry hive—matching official Rufus (`pbatard/rufus/src/wue.c`).
-- **Genuine Microsoft WinPE Setup Flow Preserved:**
-  - Removed automatic USB-root `autounattend.xml` injection for standard builds; OOBE/Specialize tweaks now live strictly in `sources/$OEM$/$$/Panther/unattend.xml` (no `windowsPE` pass).
-  - Windows 11 24H2/25H2/26H2 Setup now shows the complete official Microsoft wizard: Language → Select Setup Option (**with *"Previous version of Setup"* visible**) → Product Key → Edition → **License Terms (*"I accept"*)** → Select Disk.
-  - USB-root `autounattend.xml` is only written if the user explicitly picks a Pre-Selected Edition, enables Full Unattended Skip OOBE, or if offline `boot.wim` patching is unavailable.
-- **Clean Pure-XML Rufus Defaults & Builder Polish:**
-  - Defaulted `qolImprovements = false` and separated `needsSpecializeScript()` so pure Rufus-style builds stage **zero `.cmd` scripts** (`PocketBoot_Specialize.cmd` / `SetupComplete.cmd` are only staged when QoL/Classic Menu/Sponsored Bloat/WinUtil/Custom Script is toggled ON).
-  - Gated `<HideEULAPage>true</HideEULAPage>` strictly to `skipOobe`, wired bundled `libmkfs_fat.so` into the FAT32 fallback, tracked PID on loop-mount fallback copy, and removed dead `WindowsBuildConfig` fields & unused `xmlEscape()`.
+## Current Milestone: v4.6.5 (Full Official Rufus Parity & PrepareSystemVolume Fix)
+- **Fixed Windows Setup `PrepareSystemVolume` Error (`0x80004005`) (`DiskPartitioner.kt`):**
+  - Changed GPT Partition 2 (`UEFI:NTFS`) on Windows USB images from `GUID_ESP` (`Type: System`) to **`GUID_BASIC_DATA`** (`EBD0A0A2-B9E5-4433-87C0-68B6B72699C7`) with GPT attributes **`0x9000000000000000`** (`NO_DRIVE_LETTER | READ_ONLY`) and name `UEFI:NTFS`, while preserving `GUID_ESP` explicitly for Ventoy `VTOYEFI`.
+- **Phase 1 — Core Rufus Engine Parity (`WindowsCustomization.kt`, `WindowsImageBuilder.kt`):**
+  - Exported `TMPDIR`, `HOME`, and `WIMLIB_IMAGEX_IGNORE_CASE=1` across all offline `wimlib-imagex` helpers (`patchBootWimLabConfigSnippet`, `injectBootWimAutounattendSnippet`, `applyCa2023BootloadersSnippet`, `applyWin7UefiFixSnippet`) and added `>= 4096 B` hive validation before/after `reged`.
+  - Injected `/Autounattend.xml` directly into `sources/boot.wim` Index 2 root (official Rufus method) when WinPE unattended mode is needed, eliminating duplicate USB-root + `Panther/unattend.xml` conflicts.
+  - Added `sanitizeWindowsUsername()` (Rufus `#2991` parity) to strip `&` and illegal characters and block reserved Windows names (`Administrator`, `Guest`, `CON`, `NUL`, etc.).
+  - Updated `applyCa2023BootloadersSnippet()` to also patch `efi/microsoft/boot/bootmgfw.efi` when present and auto-enforce `useCa2023Bootloaders = true` whenever `applySkuSiPolicy` is enabled.
+- **Phase 2 — Filesystem & OEM Compatibility (`WindowsImageBuilder.kt`):**
+  - Formatted NTFS Partition 1 with explicit 4 KB clusters (`mkntfs -c 4096`) and preserved the source ISO's PVD volume label (fallback `POCKETBOOT`) on both NTFS and FAT32.
+  - Upgraded `sources/ei.cfg` unlock template to include blank `[EditionID]` + `[Channel] Retail` + `[VL] 0` so OEM Home-keyed laptops reliably display all Windows editions.
+- **Phase 3 — UI/UX Transparency (`WindowsCustomization.kt`, `WindowsImageBuilder.kt`):**
+  - Added a live **Setup Mode Indicator** pill in `WindowsBuilderSheet` (*Pure Stock ISO* vs *Rufus Native Mode* vs *Unattended Mode*), a one-tap **"Stock (No Tweaks)"** chip, live username validation warnings, CA 2023 ↔ `SkuSiPolicy` toggle interlocking, and wired-Ethernet OOBE guidance on `Bypass Online Microsoft Account`.
