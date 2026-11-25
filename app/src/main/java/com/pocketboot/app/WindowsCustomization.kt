@@ -87,14 +87,6 @@ data class WindowsExperienceConfig(
         qolImprovements, disableSponsoredApps, classicContextMenu, skipWifiSetup, skipOobe,
         createLocalUser && localUsername.isNotBlank(), useCa2023Bootloaders, applySkuSiPolicy, customPostInstallScriptPath.isNotBlank()).count { it }
     companion object {
-        fun cleanStock(): WindowsExperienceConfig = WindowsExperienceConfig(
-            bypassRequirements = false,
-            bypassMicrosoftAccount = false,
-            disableDataCollection = false,
-            disableBitLocker = false,
-            qolImprovements = false,
-            skipWifiSetup = false
-        )
         fun defaultForOs(osKind: WindowsOsKind): WindowsExperienceConfig = when (osKind) {
             WindowsOsKind.WIN11, WindowsOsKind.UNKNOWN -> WindowsExperienceConfig()
             WindowsOsKind.WIN10 -> WindowsExperienceConfig(bypassRequirements = false, bypassMicrosoftAccount = true, disableDataCollection = true, disableBitLocker = true, qolImprovements = true, skipWifiSetup = true)
@@ -207,7 +199,7 @@ object WindowsCustomizationEngine {
         sb.appendLine("if exist \"%PB_FLAG%\" exit /b 0")
         sb.appendLine("mkdir \"C:\\Windows\\Setup\\Scripts\" >nul 2>&1")
         sb.appendLine("echo [PocketBoot] Specialize configuration started...")
-        sb.appendLine("echo [PocketBoot v4.6.1] Specialize started %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.6.2] Specialize started %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("set \"PB_BUILD=0\"")
         sb.appendLine("for /f \"tokens=3\" %%B in ('reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\" /v CurrentBuildNumber 2^>nul ^| findstr /i CurrentBuildNumber') do set \"PB_BUILD=%%B\"")
         if (experience.bypassMicrosoftAccount) sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\OOBE\" /v BypassNRO /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
@@ -362,7 +354,7 @@ object WindowsCustomizationEngine {
         // Register SetupComplete.cmd under FirstBoot\PostOobe so it executes right after OOBE on every machine (guarded by .pb_setupcomplete_done so it runs strictly once).
         sb.appendLine("if exist \"C:\\Windows\\Setup\\Scripts\\SetupComplete.cmd\" reg add \"HKLM\\SYSTEM\\Setup\\FirstBoot\\PostOobe\" /v \"00\" /t REG_SZ /d \"cmd.exe /c C:\\Windows\\Setup\\Scripts\\SetupComplete.cmd & exit /b 0\" /f >> \"%PB_LOG%\" 2>&1")
         sb.appendLine("echo done > \"%PB_FLAG%\"")
-        sb.appendLine("echo [PocketBoot v4.6.1] Specialize finished %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.6.2] Specialize finished %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("exit /b 0")
         return sb.toString().replace("\r\n", "\n").replace("\n", "\r\n")
     }
@@ -395,7 +387,7 @@ object WindowsCustomizationEngine {
             sb.appendLine("dism /Online /Cleanup-Image /StartComponentCleanup /ResetBase >> \"%PB_LOG%\" 2>&1")
         }
         sb.appendLine("if exist \"C:\\Windows\\Setup\\Custom\" rmdir /s /q \"C:\\Windows\\Setup\\Custom\" >nul 2>&1")
-        sb.appendLine("echo [PocketBoot v4.6.1] SetupComplete finished %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.6.2] SetupComplete finished %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("start \"\" /b cmd /c \"ping -n 4 127.0.0.1 >nul & rmdir /s /q C:\\Windows\\Setup\\Scripts >nul 2>&1\"")
         sb.appendLine("exit /b 0")
         return sb.toString().replace("\r\n", "\n").replace("\n", "\r\n")

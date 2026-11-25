@@ -349,7 +349,7 @@ fun SettingsScreen(
                         ) {
                             SettingsIconBadge(Icons.Rounded.DeviceThermostat, PocketColors.infoBlue, PocketColors.infoBlueBg)
                             Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
-                                Text("Build & Slimmer Thermal Profile", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                                Text("USB Builder Thermal Profile", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
                                 Text(settings.buildThermalProfile.subtitle, style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary)
                             }
                         }
@@ -385,7 +385,7 @@ fun SettingsScreen(
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Text("Auto Thermal Cooldown", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
-                                Text("Pauses between ISO Slimmer & USB Builder steps if battery gets hot", fontSize = 11.sp, color = PocketColors.textSecondary)
+                                Text("Pauses between USB Builder steps if battery gets hot", fontSize = 11.sp, color = PocketColors.textSecondary)
                             }
                             PocketSwitch(
                                 checked = settings.autoThermalCooldown,
@@ -882,7 +882,7 @@ fun SettingsScreen(
                             Icon(Icons.Rounded.Usb, null, tint = PocketColors.onAccent, modifier = Modifier.size(22.dp))
                         }
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("PocketBoot v4.6.1", style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary)
+                            Text("PocketBoot v4.6.2", style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary)
                             Text(
                                 text = "${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE}",
                                 style = MaterialTheme.typography.bodySmall,
@@ -893,7 +893,7 @@ fun SettingsScreen(
                         }
                         Surface(
                             modifier = Modifier.bounceClick {
-                                val info = "PocketBoot v4.6.1\nDevice: ${Build.MANUFACTURER} ${Build.MODEL}\nAndroid: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\nRoot: ${status.rootManager}\nSELinux: ${status.selinuxMode}\nUDC: ${status.udcName}\nKernel: ${status.kernelVersion}"
+                                val info = "PocketBoot v4.6.2\nDevice: ${Build.MANUFACTURER} ${Build.MODEL}\nAndroid: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\nRoot: ${status.rootManager}\nSELinux: ${status.selinuxMode}\nUDC: ${status.udcName}\nKernel: ${status.kernelVersion}"
                                 val cm = context.getSystemService(ClipboardManager::class.java)
                                 cm?.setPrimaryClip(ClipData.newPlainText("Device Info", info))
                                 Toast.makeText(context, "Device info copied.", Toast.LENGTH_SHORT).show()
@@ -1225,7 +1225,6 @@ fun SettingsScreen(
                     Text("• exfatprogs (GPLv2) — exFAT filesystem formatter", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
                     Text("• 7-Zip / 7zzs (LGPL / BSD) — ISO archive extractor", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
                     Text("• wimlib (GPLv3/LGPLv3) — WIM/ESD imaging engine", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
-                    Text("• GNU xorriso (GPLv3) — UEFI/BIOS bootable ISO creator", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
                     Text("• libsu (Apache 2.0) — Root shell execution", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
                 }
             },

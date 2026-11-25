@@ -15,30 +15,27 @@ enum class BuildThermalProfile(
     val label: String,
     val shortLabel: String,
     val subtitle: String,
-    val wimThreads: Int,
-    val esdThreads: Int,
     val sevenZipThreads: Int,
     val niceLevel: Int,
     val ionicePrio: Int,
     val cooldownTriggerC: Float,
     val cooldownResumeC: Float
 ) {
-    COOL("Cool", "Cool", "2 threads · avoids Prime core · auto-cooldown @ 41.5°C", 2, 1, 2, 15, 7, 41.5f, 38.5f),
-    BALANCED("Balanced", "Balanced", "4 threads · low priority · auto-cooldown @ 43.0°C", 4, 2, 4, 10, 5, 43.0f, 39.0f),
-    MAX("Max Speed", "Max", "All cores · normal priority · no auto-cooldown", 0, 4, 0, 0, 0, 0f, 0f)
+    COOL("Cool", "Cool", "2 threads · avoids Prime core · auto-cooldown @ 41.5°C", 2, 15, 7, 41.5f, 38.5f),
+    BALANCED("Balanced", "Balanced", "4 threads · low priority · auto-cooldown @ 43.0°C", 4, 10, 5, 43.0f, 39.0f),
+    MAX("Max Speed", "Max", "All cores · normal priority · no auto-cooldown", 0, 0, 0, 0f, 0f)
 }
 
-data class IsoToolsStatus(
+data class WindowsToolsStatus(
     val sevenZip: String?,
-    val wimlib: String?,
-    val xorriso: String?
+    val wimlib: String?
 ) {
-    val canSlimIso: Boolean get() = sevenZip != null && wimlib != null && xorriso != null
+    val ready: Boolean get() = sevenZip != null && wimlib != null
 }
 
 /**
- * Process-scoped thermal & CPU affinity helper used by Windows ISO Slimmer and Windows USB Builder.
- * Wraps only heavy native build binaries (7zzs, wimlib-imagex, xorriso) and never touches USB Gadget mounting.
+ * Process-scoped thermal & CPU affinity helper used by Windows USB Builder.
+ * Wraps only heavy native build binaries (7zzs) and never touches USB Gadget mounting.
  */
 object BuildThermalHelper {
     private const val ACTIVE_BUILD_PID_FILE = "/data/local/tmp/pb_active_build_pid"
@@ -55,7 +52,7 @@ object BuildThermalHelper {
     fun isBuildCancelled(): Boolean = buildCancelledFlag.get()
 
     /**
-     * Immediately terminates the currently tracked native build binary (7zzs, wimlib-imagex, xorriso)
+     * Immediately terminates the currently tracked native build binary (7zzs)
      * and its parent wrapper shell so cancelling a build stops CPU/storage work instantly.
      */
     fun cancelActiveBuildProcess() {
@@ -171,11 +168,6 @@ object BuildThermalHelper {
         return parts.joinToString("; ")
     }
 
-    internal fun wimThreadArgFor(profile: BuildThermalProfile, isSolidEsd: Boolean = false): String {
-        val t = if (isSolidEsd) profile.esdThreads else profile.wimThreads
-        return if (t > 0) "--threads=$t" else ""
-    }
-
     internal fun sevenZipThreadArgFor(profile: BuildThermalProfile): String =
         if (profile.sevenZipThreads > 0) "-mmt=${profile.sevenZipThreads}" else ""
 
@@ -234,9 +226,8 @@ object BuildThermalHelper {
         }
     }
 
-    fun inspectIsoTools(context: Context): IsoToolsStatus = IsoToolsStatus(
+    fun inspectWindowsTools(context: Context): WindowsToolsStatus = WindowsToolsStatus(
         sevenZip = WindowsImageBuilder.findBundledBinary(context, "lib7zzs.so", listOf("7zzs", "7zz", "7z")),
-        wimlib = WindowsImageBuilder.findBundledBinary(context, "libwimlib_imagex.so", listOf("wimlib-imagex")),
-        xorriso = WindowsImageBuilder.findBundledBinary(context, "libxorriso.so", listOf("xorriso"))
+        wimlib = WindowsImageBuilder.findBundledBinary(context, "libwimlib_imagex.so", listOf("wimlib-imagex"))
     )
 }

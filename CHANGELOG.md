@@ -1,3 +1,7 @@
+## v4.6.2 (2026-11-25)
+- **Removed Windows ISO Slimmer (`WindowsIsoSlimmer.kt`):** Completely removed `WindowsIsoSlimmer.kt`, its File Info action card, bottom sheet, and coroutine state in `MainActivity.kt`, plus unused `cleanStock()` in `WindowsCustomization.kt`.
+- **Dropped Unused `GNU xorriso` Binary (`build-apk.yml`, `BuildThermalHelper.kt`, `DiagnosticsSheet.kt`, `SettingsScreen.kt`):** Removed `libxorriso.so` cross-compilation and `XOR_SMOKE` from GitHub Actions CI, removed `xorriso` from open-source credits and diagnostics (`Windows Imaging Tools` now checks `7zzs` and `wimlib`), and simplified `BuildThermalHelper.kt` for **Windows USB Builder**.
+
 ## v4.6.1 (2026-11-25)
 - **ISO Slimmer Official-ISO Parity (`WindowsIsoSlimmer.kt`):**
   - Added case-insensitive resolution for `sources/`, `efi/`, and `boot/` folders plus full split-WIM (`install.swm` `--ref`) source support.

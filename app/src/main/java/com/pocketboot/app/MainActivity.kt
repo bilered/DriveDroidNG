@@ -58,7 +58,6 @@ import androidx.compose.material.icons.rounded.AddToHomeScreen
 import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material.icons.rounded.Build
 import androidx.compose.material.icons.rounded.CleaningServices
-import androidx.compose.material.icons.rounded.Compress
 import androidx.compose.material.icons.rounded.Star
 import androidx.compose.material.icons.rounded.StarBorder
 import androidx.compose.material.icons.rounded.CheckCircle
@@ -225,10 +224,6 @@ fun PocketBootApp(initialShortcutPath: String = "") {
     var renameTargetFile by remember { mutableStateOf<ImageFile?>(null) }
     var confirmDeleteFile by remember { mutableStateOf<ImageFile?>(null) }
     var showQuickDiagnostics by remember { mutableStateOf(false) }
-    var slimmerTargetFile by remember { mutableStateOf<ImageFile?>(null) }
-    var slimmerJob by remember { mutableStateOf<Job?>(null) }
-    var slimmerProgress by remember { mutableStateOf(WindowsBuildProgress()) }
-    var slimmerCompletedMsg by remember { mutableStateOf<String?>(null) }
     var handledShortcut by remember { mutableStateOf(false) }
     var refreshJob by remember { mutableStateOf<Job?>(null) }
     var drivesFreeBytes by remember { mutableStateOf(0L) }
@@ -236,7 +231,7 @@ fun PocketBootApp(initialShortcutPath: String = "") {
 
     val isLightSurface = settings.surfaceMode == SurfaceMode.LIGHT
     val anyBuildOrDlActive = windowsBuildJob != null || linuxBuildJob != null ||
-        ventoyBuildJob != null || slimmerJob != null
+        ventoyBuildJob != null
     val keepScreenAwake = settings.keepScreenAwakeDuringBuilds && anyBuildOrDlActive
 
     SideEffect {
@@ -255,7 +250,7 @@ fun PocketBootApp(initialShortcutPath: String = "") {
         BuildThermalHelper.configureThermal(settings.buildThermalProfile, settings.autoThermalCooldown)
     }
 
-    LaunchedEffect(images.size, settings.defaultDir, windowsBuildJob != null, slimmerJob != null, ventoyBuildJob != null) {
+    LaunchedEffect(images.size, settings.defaultDir, windowsBuildJob != null, ventoyBuildJob != null) {
         withContext(Dispatchers.IO) {
             drivesFreeBytes = UsbGadgetEngine.getFreeSpaceBytes(settings.defaultDir)
             tempCacheBytes = UsbGadgetEngine.getTempStorageStats(context, settings.scanDirs + settings.defaultDir).totalBytes
@@ -1148,10 +1143,6 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                     selectedInfoFile = null
                     windowsBuilderTarget = file
                 },
-                onOpenWindowsSlimmer = {
-                    selectedInfoFile = null
-                    slimmerTargetFile = file
-                },
                 onOpenLinuxBuilder = {
                     selectedInfoFile = null
                     linuxBuilderTarget = file
@@ -1302,52 +1293,6 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                 dismissButton = {
                     TextButton(onClick = { confirmDeleteFile = null }) {
                         Text("Cancel", color = PocketColors.textSecondary)
-                    }
-                }
-            )
-        }
-        slimmerTargetFile?.let { targetIso ->
-            WindowsIsoSlimmerSheet(
-                isoFile = targetIso,
-                defaultDir = settings.defaultDir,
-                presets = settings.autounattendPresets,
-                building = slimmerJob != null,
-                progress = slimmerProgress,
-                completedMessage = slimmerCompletedMsg,
-                onDismiss = { slimmerTargetFile = null; slimmerCompletedMsg = null },
-                onSavePreset = { preset ->
-                    val updatedPresets = settings.autounattendPresets.filterNot { it.name.equals(preset.name, true) } + preset
-                    updateSettings(settings.copy(autounattendPresets = updatedPresets), rescan = false)
-                    showFeedback("Saved preset \"${preset.name}\".", false)
-                },
-                onDeletePreset = { presetName ->
-                    val updatedPresets = settings.autounattendPresets.filterNot { it.name == presetName }
-                    updateSettings(settings.copy(autounattendPresets = updatedPresets), rescan = false)
-                    showFeedback("Deleted preset \"$presetName\".", false)
-                },
-                onCancel = {
-                    WindowsIsoSlimmer.cancelActiveSlim()
-                    slimmerJob?.cancel()
-                    slimmerJob = null
-                    showFeedback("Cancelled Windows ISO Slimmer.")
-                },
-                onStartSlim = { cfg ->
-                    slimmerCompletedMsg = null
-                    slimmerProgress = WindowsBuildProgress("Preparing...", cfg.sourceIso.name, 0.04f, true)
-                    slimmerJob = scope.launch {
-                        val res = WindowsIsoSlimmer.slimWindowsIso(context, cfg) { p -> slimmerProgress = p }
-                        slimmerJob = null
-                        if (res.success && res.createdPath != null) {
-                            slimmerCompletedMsg = res.userMessage
-                            val updated = settings.copy(
-                                pinnedFiles = (settings.pinnedFiles + res.createdPath).distinct(),
-                                hiddenFiles = settings.hiddenFiles - res.createdPath
-                            )
-                            updateSettings(updated, rescan = true)
-                            showFeedback(res.userMessage, false)
-                        } else {
-                            showFeedback(res.userMessage, true)
-                        }
                     }
                 }
             )
@@ -1858,7 +1803,6 @@ private fun FileInfoBottomSheet(
     onOpenMountSheet: () -> Unit,
     onUnmountThis: (Int) -> Unit,
     onOpenWindowsBuilder: () -> Unit,
-    onOpenWindowsSlimmer: () -> Unit,
     onOpenLinuxBuilder: () -> Unit,
     onOpenVentoyManager: () -> Unit,
 
@@ -1960,16 +1904,6 @@ private fun FileInfoBottomSheet(
                         highlighted = false,
                         onClick = onOpenWindowsBuilder
                     )
-                    if (isIso) {
-                        MountActionCard(
-                            icon = Icons.Rounded.Compress,
-                            title = "Windows ISO Slimmer",
-                            badge = "Save 1.5 GB+",
-                            subtitle = "Keep selected edition(s) & compact WIM to ESD",
-                            highlighted = false,
-                            onClick = onOpenWindowsSlimmer
-                        )
-                    }
                 }
                 IsoOsType.LINUX, IsoOsType.UTILITY -> {
                     MountActionCard(

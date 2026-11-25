@@ -205,7 +205,7 @@ jobs:
             ls -lh app/src/main/assets/ventoy/
           ) || echo "::warning::Could not bundle Ventoy boot files; users can download them in-app"
 
-          # 7. Cross-compile minimal STATIC ARM64 libxml2 + wimlib-imagex -> libwimlib_imagex.so (ISO Slimmer & Edition Inspector)
+          # 7. Cross-compile minimal STATIC ARM64 libxml2 + wimlib-imagex -> libwimlib_imagex.so (Edition Inspector & Bootloader Extractor)
           (
             set -e
             SYSROOT="/tmp/arm64-sysroot"
@@ -253,82 +253,9 @@ jobs:
             fi
           ) || echo "::warning::Could not bundle static wimlib-imagex"
 
-          # 8. Cross-compile STATIC ARM64 GNU xorriso -> libxorriso.so (UEFI+BIOS bootable ISO creator)
-          (
-            set -e
-            curl -fSL "https://ftp.gnu.org/gnu/xorriso/xorriso-1.5.6.pl02.tar.gz" -o /tmp/xorriso.tar.gz || \
-              curl -fSL "https://mirror.eu.ossplanet.net/gnu/xorriso/xorriso-1.5.6.pl02.tar.gz" -o /tmp/xorriso.tar.gz
-            mkdir -p /tmp/xorriso-src
-            tar -xzf /tmp/xorriso.tar.gz --strip-components=1 -C /tmp/xorriso-src
-            cd /tmp/xorriso-src
-            ac_cv_func_malloc_0_nonnull=yes ac_cv_func_realloc_0_nonnull=yes \
-              ./configure --host=aarch64-linux-gnu --enable-static --disable-shared \
-              --disable-libacl --disable-xattr --disable-zlib --disable-libbz2 --disable-libreadline \
-              CFLAGS="-O2 -std=gnu17" LDFLAGS="-static"
-            make -j"$(nproc)" LDFLAGS="-all-static"
-            XOR_BIN="xorriso/xorriso"
-            [ -f "xorriso/.libs/xorriso" ] && XOR_BIN="xorriso/.libs/xorriso"
-            if aarch64-linux-gnu-readelf -l "$XOR_BIN" 2>/dev/null | grep -q INTERP; then
-              echo "Libtool linked xorriso dynamically; re-linking directly with -static..."
-              XOBJS=$(find xorriso libisoburn libisofs libjte libburn -name 'xorriso_xorriso-*.o')
-              aarch64-linux-gnu-gcc -static -O2 $XOBJS -lpthread -lm -o /tmp/xorriso-static
-              XOR_BIN="/tmp/xorriso-static"
-            fi
-            file "$XOR_BIN"
-            if ! aarch64-linux-gnu-readelf -l "$XOR_BIN" 2>/dev/null | grep -q INTERP; then
-              aarch64-linux-gnu-strip "$XOR_BIN"
-              cp "$XOR_BIN" "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libxorriso.so"
-              chmod 755 "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libxorriso.so"
-            fi
-          ) || echo "::warning::Could not bundle static xorriso"
-
-          # 11. Smoke-test bundled static ARM64 xorriso + 7zzs under qemu-aarch64 (verifies zero 0-byte corruption!)
-          (
-            set -e
-            test -x "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libxorriso.so"
-            test -x "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/lib7zzs.so"
-            sudo apt-get install -y -qq qemu-user >/dev/null 2>&1 || true
-            QEMU_BIN=$(command -v qemu-aarch64 || command -v qemu-aarch64-static || echo "")
-            if [ -n "$QEMU_BIN" ]; then
-              TDIR="/tmp/pb_xor_smoke"
-              rm -rf "$TDIR" /tmp/pb_xor_smoke.iso
-              mkdir -p "$TDIR/boot" "$TDIR/efi/microsoft/boot" "$TDIR/sources/\$OEM\$/\$\$/Setup/Scripts" "$TDIR/support/logging/en-us"
-              dd if=/dev/zero of="$TDIR/boot/etfsboot.com" bs=512 count=8 status=none
-              dd if=/dev/zero of="$TDIR/efi/microsoft/boot/efisys.bin" bs=1024 count=16 status=none
-              printf 'WIM_HEADER_TEST_DATA\n' > "$TDIR/sources/install.wim"
-              printf '@echo off\r\necho ok\r\n' > "$TDIR/sources/\$OEM\$/\$\$/Setup/Scripts/PocketBoot_Specialize.cmd"
-              printf 'ETW_MANIFEST_DATA\n' > "$TDIR/support/logging/en-us/actionqueueetw.dll.mui"
-              (
-                cd "$TDIR"
-                "$QEMU_BIN" "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libxorriso.so" -as mkisofs                   --stdio_sync 16m -iso-level 3 -full-iso9660-filenames -J -joliet-long -c boot/boot.cat                   -volid "PB_XOR_TEST"                   -b "boot/etfsboot.com" -no-emul-boot -boot-load-size 8                   -eltorito-alt-boot -e "efi/microsoft/boot/efisys.bin" -no-emul-boot                   -o /tmp/pb_xor_smoke.iso .
-              )
-              file /tmp/pb_xor_smoke.iso
-              "$QEMU_BIN" "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/lib7zzs.so" l -slt /tmp/pb_xor_smoke.iso | awk '
-                BEGIN { path=""; folder=""; sz=-1; files=0; zeros=0; seen=0 }
-                function flush_rec() {
-                  if (!seen) return
-                  if (folder != "+") {
-                    lp = tolower(path)
-                    if (lp !~ /(^|[\/\\])boot\.cat(alog)?$/ && lp !~ /^\[boot\]/) {
-                      files++
-                      if (sz == 0) zeros++
-                    }
-                  }
-                  path=""; folder=""; sz=-1; seen=0
-                }
-                /^Path = / { flush_rec(); path=substr($0, 8); seen=1; next }
-                /^Folder = / { folder=substr($0, 10); next }
-                /^Size = / { sz=substr($0, 8)+0; next }
-                /^$/ { flush_rec(); next }
-                END {
-                  flush_rec()
-                  printf "XOR_SMOKE|files=%d|zeros=%d\n", files, zeros
-                  if (files < 5 || zeros > 0) exit 1
-                }
-              '
-              rm -rf "$TDIR" /tmp/pb_xor_smoke.iso
-            fi
-          )
+          # 8. Verify bundled static ARM64 binaries are present and executable
+          test -x "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/lib7zzs.so"
+          test -x "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libwimlib_imagex.so"
 
           ls -lh app/src/main/assets/uefi-ntfs.img app/src/main/jniLibs/arm64-v8a/
           file app/src/main/jniLibs/arm64-v8a/*.so
