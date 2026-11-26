@@ -79,7 +79,7 @@ data class WindowsBuildConfig(
     val experience: WindowsExperienceConfig = WindowsExperienceConfig(),
     val winUtil: WinUtilTweaksConfig = WinUtilTweaksConfig(),
     val eiCfgUnlock: Boolean = false,
-    val extraDriversDir: String = "", val autoMountAfterBuild: Boolean = true,
+    val extraDriversDir: String = "", val extraDriverPackDirs: List<String> = emptyList(), val autoMountAfterBuild: Boolean = true,
     val volumeLabel: String = ""
 )
 
@@ -384,9 +384,9 @@ object WindowsImageBuilder {
             if (isoSize <= 0L) {
                 return@withContext ActionResult(false, "Source ISO not found or empty.", entries = entries)
             }
-            val extraDriversBytes = if (config.extraDriversDir.isNotBlank()) {
-                UsbGadgetEngine.queryDirSizeBytes(config.extraDriversDir)
-            } else 0L
+            val allDriverDirs = (config.extraDriverPackDirs + listOf(config.extraDriversDir))
+                .map { it.trim() }.filter { it.isNotBlank() }.distinct()
+            val extraDriversBytes = allDriverDirs.sumOf { UsbGadgetEngine.queryDirSizeBytes(it) }
 
             val uefiNtfsBytes = loadUefiNtfsImage(context)
             val layout = DiskPartitioner.calculateLayout(isoSize + extraDriversBytes, uefiNtfsBytes?.size?.toLong() ?: (1024L * 1024L))
@@ -892,27 +892,32 @@ object WindowsImageBuilder {
                 entries.add(LogEntry(ts, "win-build", "Wrote OEM-compatible sources/ei.cfg"))
             }
 
-            if (config.extraDriversDir.isNotBlank()) {
-                val drvSrc = UsbGadgetEngine.resolveDirectPath(config.extraDriversDir)
-                val qDrv = shellQuote(drvSrc)
-                onProgress(WindowsBuildProgress("Copying Drivers / Apps...", UsbGadgetEngine.friendlyFolderName(drvSrc), 0.90f, true))
-                val drvRes = BuildThermalHelper.runIsolatedRootScript(
-                    context,
-                    "winusb_drivers",
-                    "set -e\n${BuildThermalHelper.thermalExecPrefix(usbProf)}\nif [ -d $qDrv ]; then mkdir -p $TEMP_MNT/Drivers && \$THERM_PFX cp -rf $qDrv/. $TEMP_MNT/Drivers/ 2>&1; fi",
-                    trackPid = true
-                )
-                if (!isActive || BuildThermalHelper.isBuildCancelled()) {
-                    cleanup(deletePartial = true)
-                    return@withContext ActionResult(false, "Build cancelled.", entries = entries)
-                }
-                if (drvRes.isSuccess) {
-                    entries.add(LogEntry(ts, "win-build", "Injected Drivers/Apps folder from $drvSrc into /Drivers"))
-                } else {
-                    val drvErr = (drvRes.out + drvRes.err).joinToString(" ").take(140).trim()
-                    entries.add(LogEntry(ts, "win-build", "Driver folder copy failed: $drvErr", true))
-                    cleanup(deletePartial = true)
-                    return@withContext ActionResult(false, "Failed to copy Drivers/Apps folder into Windows USB: ${drvErr.ifBlank { "check folder access & free space" }}", entries = entries)
+            if (allDriverDirs.isNotEmpty()) {
+                onProgress(WindowsBuildProgress("Copying Drivers / Apps...", "${allDriverDirs.size} source(s)", 0.90f, true))
+                for (rawDrvDir in allDriverDirs) {
+                    val drvSrc = UsbGadgetEngine.resolveDirectPath(rawDrvDir).trimEnd('/')
+                    val isPack = rawDrvDir in config.extraDriverPackDirs
+                    val subDest = if (isPack) "$TEMP_MNT/Drivers/${DriverPackManager.sanitizePackSlug(drvSrc.substringAfterLast('/'))}" else "$TEMP_MNT/Drivers"
+                    val qDrv = shellQuote(drvSrc)
+                    val qSub = shellQuote(subDest)
+                    val drvRes = BuildThermalHelper.runIsolatedRootScript(
+                        context,
+                        "winusb_drivers",
+                        "set -e\n${BuildThermalHelper.thermalExecPrefix(usbProf)}\nif [ -d $qDrv ]; then mkdir -p $qSub && \$THERM_PFX cp -rf $qDrv/. $qSub/ 2>&1; fi",
+                        trackPid = true
+                    )
+                    if (!isActive || BuildThermalHelper.isBuildCancelled()) {
+                        cleanup(deletePartial = true)
+                        return@withContext ActionResult(false, "Build cancelled.", entries = entries)
+                    }
+                    if (drvRes.isSuccess) {
+                        entries.add(LogEntry(ts, "win-build", "Injected drivers from $drvSrc into /Drivers"))
+                    } else {
+                        val drvErr = (drvRes.out + drvRes.err).joinToString(" ").take(140).trim()
+                        entries.add(LogEntry(ts, "win-build", "Driver folder copy failed: $drvErr", true))
+                        cleanup(deletePartial = true)
+                        return@withContext ActionResult(false, "Failed to copy Drivers/Apps folder into Windows USB: ${drvErr.ifBlank { "check folder access & free space" }}", entries = entries)
+                    }
                 }
             }
 
@@ -1039,6 +1044,10 @@ fun WindowsBuilderSheet(
     var winUtil by remember(isoFile.path) { mutableStateOf(WinUtilTweaksConfig()) }
     var eiCfgUnlock by remember(isoFile.path) { mutableStateOf(false) }
     var extraDriversDir by remember(isoFile.path) { mutableStateOf("") }
+    var savedDriverPacks by remember { mutableStateOf<List<DriverPackItem>>(emptyList()) }
+    var selectedDriverPackDirs by remember(isoFile.path) { mutableStateOf<Set<String>>(emptySet()) }
+    var showDriverPackManager by remember { mutableStateOf(false) }
+    var driverPackReloadNonce by remember { mutableIntStateOf(0) }
     var showDriversFolderPicker by remember { mutableStateOf(false) }
     var autoMount by remember { mutableStateOf(true) }
 
@@ -1061,10 +1070,15 @@ fun WindowsBuilderSheet(
         }
         inspectingEditions = false
     }
-    LaunchedEffect(extraDriversDir) {
-        driversBytes = if (extraDriversDir.isBlank()) 0L else withContext(Dispatchers.IO) {
+    LaunchedEffect(defaultDir, driverPackReloadNonce) {
+        savedDriverPacks = DriverPackManager.listPacks(defaultDir)
+    }
+    LaunchedEffect(extraDriversDir, selectedDriverPackDirs, savedDriverPacks) {
+        val packBytes = savedDriverPacks.filter { it.dirPath in selectedDriverPackDirs }.sumOf { it.sizeBytes }
+        val manualBytes = if (extraDriversDir.isBlank()) 0L else withContext(Dispatchers.IO) {
             UsbGadgetEngine.queryDirSizeBytes(extraDriversDir)
         }
+        driversBytes = packBytes + manualBytes
     }
     LaunchedEffect(defaultDir, resolvedOutName) {
         targetExists = UsbGadgetEngine.fileExistsInDir(defaultDir, resolvedOutName)
@@ -1188,6 +1202,14 @@ fun WindowsBuilderSheet(
                         PocketSwitch(checked = eiCfgUnlock, onCheckedChange = { eiCfgUnlock = it }, activeColor = PocketColors.accent)
                     }
                 }
+                DriverPackMultiSelectorSection(
+                    packs = savedDriverPacks,
+                    selectedPackDirs = selectedDriverPackDirs,
+                    onTogglePack = { dir ->
+                        selectedDriverPackDirs = if (dir in selectedDriverPackDirs) selectedDriverPackDirs - dir else selectedDriverPackDirs + dir
+                    },
+                    onOpenManager = { showDriverPackManager = true }
+                )
                 Surface(modifier = Modifier.fillMaxWidth().bounceClick { showDriversFolderPicker = true }, shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.75.dp, if (extraDriversDir.isNotBlank()) PocketColors.accent else PocketColors.border)) {
                     Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 11.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         Icon(Icons.Rounded.FolderOpen, null, tint = PocketColors.accentSoft, modifier = Modifier.size(19.dp))
@@ -1244,7 +1266,7 @@ fun WindowsBuilderSheet(
                         }
                     }
                 }
-                Button(onClick = { onStartBuild(WindowsBuildConfig(isoFile, defaultDir, outputName.trim().ifBlank { baseName }, scheme, selectedEditionIndex, editions.firstOrNull { it.index == selectedEditionIndex }?.name, effectiveOs, detectedArch, experience, winUtil, eiCfgUnlock, extraDriversDir = extraDriversDir, autoMountAfterBuild = autoMount, volumeLabel = volumeLabel.trim().ifBlank { defaultVolLabel })) }, enabled = outputName.trim().isNotEmpty() && !lowSpace, modifier = Modifier.fillMaxWidth().height(48.dp), shape = RoundedCornerShape(12.dp), colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)) {
+                Button(onClick = { onStartBuild(WindowsBuildConfig(isoFile, defaultDir, outputName.trim().ifBlank { baseName }, scheme, selectedEditionIndex, editions.firstOrNull { it.index == selectedEditionIndex }?.name, effectiveOs, detectedArch, experience, winUtil, eiCfgUnlock, extraDriversDir = extraDriversDir, extraDriverPackDirs = selectedDriverPackDirs.toList(), autoMountAfterBuild = autoMount, volumeLabel = volumeLabel.trim().ifBlank { defaultVolLabel })) }, enabled = outputName.trim().isNotEmpty() && !lowSpace, modifier = Modifier.fillMaxWidth().height(48.dp), shape = RoundedCornerShape(12.dp), colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)) {
                     Text("Build Bootable Windows USB (.img)", fontWeight = FontWeight.SemiBold)
                 }
             }
@@ -1252,4 +1274,12 @@ fun WindowsBuilderSheet(
         }
     }
     if (showDriversFolderPicker) RootFolderPickerSheet("Select Drivers / Apps Folder", "Files inside will be copied to /Drivers on the Windows USB", extraDriversDir.ifBlank { defaultDir }, { showDriversFolderPicker = false }) { extraDriversDir = it; showDriversFolderPicker = false }
+    if (showDriverPackManager) {
+        DriverPackManagerSheet(
+            defaultDir = defaultDir,
+            onDismiss = { showDriverPackManager = false },
+            onPacksChanged = { driverPackReloadNonce++ },
+            onMessage = { _, _ -> }
+        )
+    }
 }

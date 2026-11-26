@@ -28,6 +28,15 @@ data class SystemTweaksPreset(
     val tweaksJson: String
 )
 
+data class DualLunCombo(
+    val id: String,
+    val name: String,
+    val lun0Path: String,
+    val lun0Mode: String = MountMode.AUTO.name,
+    val lun1Path: String,
+    val lun1Mode: String = MountMode.USB_RW.name
+)
+
 data class AppSettings(
     val hasCompletedSetup: Boolean = false,
     val defaultDir: String = "/data/media/0/Download",
@@ -54,7 +63,8 @@ data class AppSettings(
     val autoVerifySha256: Boolean = true,
     val buildThermalProfile: BuildThermalProfile = BuildThermalProfile.BALANCED,
     val autoThermalCooldown: Boolean = true,
-    val keepScreenAwakeDuringBuilds: Boolean = false
+    val keepScreenAwakeDuringBuilds: Boolean = false,
+    val dualLunCombos: List<DualLunCombo> = emptyList()
 ) {
     companion object {
         const val DEFAULT_ACCENT_HEX = 0xFF15F5ABL
@@ -148,6 +158,7 @@ class AppPrefs(context: Context) {
                 }
             }
         }
+        val dualLunCombos = parseDualLunCombosJson(prefs.getString("dual_lun_combos_json", "").orEmpty())
         val surfaceMode = runCatching { SurfaceMode.valueOf(prefs.getString("surface_mode", SurfaceMode.DARK.name).orEmpty()) }.getOrDefault(SurfaceMode.DARK)
 
         var accentHex = prefs.getLong("accent_hex", AppSettings.DEFAULT_ACCENT_HEX)
@@ -190,7 +201,8 @@ class AppPrefs(context: Context) {
                 BuildThermalProfile.valueOf(prefs.getString("build_thermal_profile", BuildThermalProfile.BALANCED.name).orEmpty())
             }.getOrDefault(BuildThermalProfile.BALANCED),
             autoThermalCooldown = prefs.getBoolean("auto_thermal_cooldown", true),
-            keepScreenAwakeDuringBuilds = prefs.getBoolean("keep_screen_awake_builds", false)
+            keepScreenAwakeDuringBuilds = prefs.getBoolean("keep_screen_awake_builds", false),
+            dualLunCombos = dualLunCombos
         )
     }
 
@@ -219,6 +231,7 @@ class AppPrefs(context: Context) {
         }
         val historyArr = JSONArray()
         settings.systemTweaksSearchHistory.take(AppSettings.MAX_TWEAKS_SEARCH_HISTORY).forEach { historyArr.put(it) }
+        val combosArr = encodeDualLunCombosJson(settings.dualLunCombos)
         prefs.edit()
             .putBoolean("setup_done", settings.hasCompletedSetup)
             .putString("default_dir", settings.defaultDir)
@@ -247,10 +260,49 @@ class AppPrefs(context: Context) {
             .putString("build_thermal_profile", settings.buildThermalProfile.name)
             .putBoolean("auto_thermal_cooldown", settings.autoThermalCooldown)
             .putBoolean("keep_screen_awake_builds", settings.keepScreenAwakeDuringBuilds)
+            .putString("dual_lun_combos_json", combosArr.toString())
             .apply()
     }
 
     companion object {
+        fun encodeDualLunCombosJson(combos: List<DualLunCombo>): JSONArray {
+            val arr = JSONArray()
+            combos.forEach { c ->
+                if (c.name.isNotBlank() && c.lun0Path.isNotBlank() && c.lun1Path.isNotBlank()) {
+                    arr.put(JSONObject().apply {
+                        put("id", c.id)
+                        put("name", c.name)
+                        put("lun0Path", c.lun0Path)
+                        put("lun0Mode", c.lun0Mode)
+                        put("lun1Path", c.lun1Path)
+                        put("lun1Mode", c.lun1Mode)
+                    })
+                }
+            }
+            return arr
+        }
+
+        fun parseDualLunCombosJson(raw: String): List<DualLunCombo> {
+            if (raw.isBlank()) return emptyList()
+            val out = mutableListOf<DualLunCombo>()
+            runCatching {
+                val arr = JSONArray(raw)
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val name = o.optString("name", "").trim()
+                    val l0 = o.optString("lun0Path", "").trim()
+                    val l1 = o.optString("lun1Path", "").trim()
+                    if (name.isNotEmpty() && l0.isNotEmpty() && l1.isNotEmpty()) {
+                        val id = o.optString("id", "").trim().ifBlank { "combo_${i}_${name.hashCode()}" }
+                        val m0 = o.optString("lun0Mode", MountMode.AUTO.name).trim().ifBlank { MountMode.AUTO.name }
+                        val m1 = o.optString("lun1Mode", MountMode.USB_RW.name).trim().ifBlank { MountMode.USB_RW.name }
+                        out.add(DualLunCombo(id = id, name = name, lun0Path = l0, lun0Mode = m0, lun1Path = l1, lun1Mode = m1))
+                    }
+                }
+            }
+            return out
+        }
+
         fun migrateLegacyClassicMenuJson(rawTweaksJson: String, legacyClassicContextMenu: Boolean): String {
             if (!legacyClassicContextMenu) return rawTweaksJson
             return runCatching {
@@ -292,7 +344,7 @@ class AppPrefs(context: Context) {
             val modesObj = JSONObject()
             settings.fileModes.forEach { (k, v) -> modesObj.put(k, v) }
             return JSONObject().apply {
-                put("pocketbootBackupVersion", 3); put("defaultDir", settings.defaultDir)
+                put("pocketbootBackupVersion", 4); put("defaultDir", settings.defaultDir)
                 put("downloadTargetMultiBootPath", settings.downloadTargetMultiBootPath)
                 put("favoriteQuickMountPath", settings.favoriteQuickMountPath)
                 put("keepAdbActive", settings.keepAdbActive); put("autoPatchSelinux", settings.autoPatchSelinux)
@@ -304,6 +356,7 @@ class AppPrefs(context: Context) {
                 put("fileModes", modesObj); put("autounattendPresets", presetsArr)
                 put("systemTweaksPresets", tweaksPresetsArr)
                 put("systemTweaksSearchHistory", JSONArray(settings.systemTweaksSearchHistory.take(AppSettings.MAX_TWEAKS_SEARCH_HISTORY)))
+                put("dualLunCombos", encodeDualLunCombosJson(settings.dualLunCombos))
             }.toString(2)
         }
 
@@ -369,7 +422,8 @@ class AppPrefs(context: Context) {
                 fileModes = modesMap,
                 autounattendPresets = presets,
                 systemTweaksPresets = if (obj.has("systemTweaksPresets")) tweaksPresets else current.systemTweaksPresets,
-                systemTweaksSearchHistory = if (obj.has("systemTweaksSearchHistory")) parsedHistory.take(AppSettings.MAX_TWEAKS_SEARCH_HISTORY) else current.systemTweaksSearchHistory
+                systemTweaksSearchHistory = if (obj.has("systemTweaksSearchHistory")) parsedHistory.take(AppSettings.MAX_TWEAKS_SEARCH_HISTORY) else current.systemTweaksSearchHistory,
+                dualLunCombos = if (obj.has("dualLunCombos")) parseDualLunCombosJson(obj.optJSONArray("dualLunCombos")?.toString().orEmpty()) else current.dualLunCombos
             )
         }.getOrNull()
     }

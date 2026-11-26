@@ -49,6 +49,7 @@ import androidx.compose.material.icons.rounded.HealthAndSafety
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Layers
 import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.Memory
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Palette
 import androidx.compose.material.icons.rounded.RestartAlt
@@ -80,6 +81,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -148,6 +150,13 @@ fun SettingsScreen(
     var cleaningTemp by remember { mutableStateOf(false) }
     var checkingUpdate by remember { mutableStateOf(false) }
     var availableRelease by remember { mutableStateOf<AppReleaseInfo?>(null) }
+    var showDriverPackSheet by remember { mutableStateOf(false) }
+    var driverPackCount by remember { mutableIntStateOf(0) }
+    var driverPackRefreshNonce by remember { mutableIntStateOf(0) }
+
+    LaunchedEffect(settings.defaultDir, driverPackRefreshNonce) {
+        driverPackCount = DriverPackManager.listPacks(settings.defaultDir).size
+    }
 
     val exportBackupLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/json")
@@ -414,6 +423,28 @@ fun SettingsScreen(
                                 activeColor = PocketColors.accent
                             )
                         }
+                    }
+
+                    PocketHairlineDivider()
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .bounceClick { showDriverPackSheet = true }
+                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        SettingsIconBadge(Icons.Rounded.Memory, PocketColors.infoBlue, PocketColors.infoBlueBg)
+                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                            Text("Driver Pack Library", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                            Text(
+                                text = if (driverPackCount > 0) "$driverPackCount saved pack(s) · Intel VMD, AMD RAID, Wi-Fi/LAN" else "Import reusable .inf folders or .zip/.7z packs",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = PocketColors.textSecondary
+                            )
+                        }
+                        Icon(Icons.Rounded.ChevronRight, null, tint = PocketColors.textMuted, modifier = Modifier.size(18.dp))
                     }
 
                     PocketHairlineDivider()
@@ -887,7 +918,7 @@ fun SettingsScreen(
                             Icon(Icons.Rounded.Usb, null, tint = PocketColors.onAccent, modifier = Modifier.size(22.dp))
                         }
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("PocketBoot v4.7.1", style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary)
+                            Text("PocketBoot v4.7.2", style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary)
                             Text(
                                 text = "${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE}",
                                 style = MaterialTheme.typography.bodySmall,
@@ -898,7 +929,7 @@ fun SettingsScreen(
                         }
                         Surface(
                             modifier = Modifier.bounceClick {
-                                val info = "PocketBoot v4.7.1\nDevice: ${Build.MANUFACTURER} ${Build.MODEL}\nAndroid: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\nRoot: ${status.rootManager}\nSELinux: ${status.selinuxMode}\nUDC: ${status.udcName}\nKernel: ${status.kernelVersion}"
+                                val info = "PocketBoot v4.7.2\nDevice: ${Build.MANUFACTURER} ${Build.MODEL}\nAndroid: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\nRoot: ${status.rootManager}\nSELinux: ${status.selinuxMode}\nUDC: ${status.udcName}\nKernel: ${status.kernelVersion}"
                                 val cm = context.getSystemService(ClipboardManager::class.java)
                                 cm?.setPrimaryClip(ClipData.newPlainText("Device Info", info))
                                 Toast.makeText(context, "Device info copied.", Toast.LENGTH_SHORT).show()
@@ -957,7 +988,7 @@ fun SettingsScreen(
                             onClick = {
                                 scope.launch {
                                     checkingUpdate = true
-                                    val res = AppUpdateChecker.checkForUpdate("4.7.1")
+                                    val res = AppUpdateChecker.checkForUpdate("4.7.2")
                                     checkingUpdate = false
                                     if (res.success && res.updateAvailable && res.release != null) {
                                         availableRelease = res.release
@@ -1010,7 +1041,7 @@ fun SettingsScreen(
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text("Update Available · ${rel.tagName}", color = PocketColors.textPrimary)
                     if (rel.publishedAt.isNotBlank()) {
-                        Text("Published ${rel.publishedAt} · Current v4.7.1", style = PocketColors.monoStyle, color = PocketColors.textMuted)
+                        Text("Published ${rel.publishedAt} · Current v4.7.2", style = PocketColors.monoStyle, color = PocketColors.textMuted)
                     }
                 }
             },
@@ -1047,6 +1078,15 @@ fun SettingsScreen(
                     Text("Later", color = PocketColors.textSecondary)
                 }
             }
+        )
+    }
+
+    if (showDriverPackSheet) {
+        DriverPackManagerSheet(
+            defaultDir = settings.defaultDir,
+            onDismiss = { showDriverPackSheet = false },
+            onPacksChanged = { driverPackRefreshNonce++ },
+            onMessage = { msg, _ -> Toast.makeText(context, msg, Toast.LENGTH_LONG).show() }
         )
     }
 

@@ -233,6 +233,7 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
     var ventoyManagerBusy by remember { mutableStateOf(false) }
     var imageExplorerTarget by remember { mutableStateOf<ImageFile?>(null) }
     var imageExplorerBusy by remember { mutableStateOf(false) }
+    var showDualLunCombosSheet by remember { mutableStateOf(false) }
     var selectedInfoFile by remember { mutableStateOf<ImageFile?>(null) }
     var renameTargetFile by remember { mutableStateOf<ImageFile?>(null) }
     var confirmDeleteFile by remember { mutableStateOf<ImageFile?>(null) }
@@ -463,6 +464,26 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
             } catch (e: Exception) {
                 logs.add(LogEntry("now", "crash-guard", e.message ?: "Mount failed", true))
                 showFeedback("Mount failed: ${e.message}", true)
+            } finally {
+                busy = false
+            }
+        }
+    }
+
+    fun mountCombo(combo: DualLunCombo) {
+        scope.launch {
+            busy = true
+            try {
+                val res = UsbGadgetEngine.mountDualLunCombo(combo, settings)
+                logs.addAll(res.entries)
+                status = UsbGadgetEngine.getStatus()
+                if (res.success) {
+                    syncKeepAlive(status, forceRestart = true)
+                }
+                showFeedback(res.userMessage, !res.success)
+            } catch (e: Exception) {
+                logs.add(LogEntry("now", "crash-guard", e.message ?: "Dual-LUN mount failed", true))
+                showFeedback("Dual-LUN mount failed: ${e.message}", true)
             } finally {
                 busy = false
             }
@@ -761,6 +782,9 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
                                 showVentoyBuilder = true
                             },
                             onOpenBrowse = { showRootBrowserSheet = true },
+                            dualLunCombos = settings.dualLunCombos,
+                            onMountDualLunCombo = { combo -> mountCombo(combo) },
+                            onOpenDualLunCombos = { showDualLunCombosSheet = true },
                             onTapFileCard = { img -> selectedInfoFile = img },
                             freeSpaceBytes = drivesFreeBytes
                         )
@@ -1060,6 +1084,30 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
         }
 
         // In-App Ventoy ISO Manager Sheet (Add / Remove ISOs anytime)
+        if (showDualLunCombosSheet) {
+            DualLunCombosSheet(
+                combos = settings.dualLunCombos,
+                images = images,
+                multiLunSupported = status.multiLunSupported,
+                busy = busy,
+                onDismiss = { showDualLunCombosSheet = false },
+                onMountCombo = { combo ->
+                    showDualLunCombosSheet = false
+                    mountCombo(combo)
+                },
+                onSaveCombo = { newCombo ->
+                    val updated = settings.dualLunCombos.filterNot { it.id == newCombo.id } + newCombo
+                    updateSettings(settings.copy(dualLunCombos = updated), rescan = false)
+                    showFeedback("Saved Dual-LUN combo '${newCombo.name}'.")
+                },
+                onDeleteCombo = { comboId ->
+                    val updated = settings.dualLunCombos.filterNot { it.id == comboId }
+                    updateSettings(settings.copy(dualLunCombos = updated), rescan = false)
+                    showFeedback("Removed Dual-LUN combo.")
+                }
+            )
+        }
+
         imageExplorerTarget?.let { expFile ->
             val expMountedLun = status.mountedLunFor(expFile.path)
             ImageExplorerSheet(
@@ -2251,6 +2299,9 @@ private fun HomeScreen(
     onOpenCreateBlank: () -> Unit,
     onOpenCreateVentoy: () -> Unit,
     onOpenBrowse: () -> Unit,
+    dualLunCombos: List<DualLunCombo> = emptyList(),
+    onMountDualLunCombo: (DualLunCombo) -> Unit = {},
+    onOpenDualLunCombos: () -> Unit = {},
     onTapFileCard: (ImageFile) -> Unit,
     freeSpaceBytes: Long = 0L
 ) {
@@ -2471,6 +2522,78 @@ private fun HomeScreen(
                 )
             }
 
+            // Dual-LUN Quick-Mount Combos Bar (Wave 3)
+            Surface(
+                modifier = Modifier.fillMaxWidth().bounceClick { onOpenDualLunCombos() },
+                shape = RoundedCornerShape(13.dp),
+                color = PocketColors.surfaceCard,
+                border = BorderStroke(0.5.dp, PocketColors.border)
+            ) {
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(9.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier.size(32.dp).clip(RoundedCornerShape(9.dp)).background(PocketColors.accentBg),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(Icons.Rounded.SwapHoriz, null, tint = PocketColors.accentSoft, modifier = Modifier.size(18.dp))
+                        }
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Dual-LUN Combos", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                            Text(
+                                text = when {
+                                    !status.multiLunSupported -> "Kernel lacks LUN 1 support · tap for details"
+                                    dualLunCombos.isEmpty() -> "Pair LUN 0 + LUN 1 for 1-tap atomic mount"
+                                    else -> "${dualLunCombos.size} saved combo(s) · single USB rebind"
+                                },
+                                fontSize = 11.sp,
+                                color = PocketColors.textSecondary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        Text(
+                            text = if (dualLunCombos.isEmpty()) "Create" else "Manage",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = PocketColors.accentSoft
+                        )
+                    }
+                    if (status.multiLunSupported && dualLunCombos.isNotEmpty()) {
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                            items(dualLunCombos, key = { it.id }) { combo ->
+                                Surface(
+                                    modifier = Modifier.bounceClick(enabled = !busy) { onMountDualLunCombo(combo) },
+                                    shape = RoundedCornerShape(9.dp),
+                                    color = PocketColors.accentBg,
+                                    border = BorderStroke(0.75.dp, PocketColors.accent.copy(alpha = 0.6f))
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                    ) {
+                                        Icon(Icons.Rounded.Bolt, null, tint = PocketColors.accentSoft, modifier = Modifier.size(14.dp))
+                                        Text(
+                                            text = combo.name,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = PocketColors.accentSoft,
+                                            maxLines = 1
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Drives Section
@@ -3449,6 +3572,246 @@ private fun TelemetryLine(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.padding(start = 12.dp)
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun DualLunCombosSheet(
+    combos: List<DualLunCombo>,
+    images: List<ImageFile>,
+    multiLunSupported: Boolean,
+    busy: Boolean,
+    onDismiss: () -> Unit,
+    onMountCombo: (DualLunCombo) -> Unit,
+    onSaveCombo: (DualLunCombo) -> Unit,
+    onDeleteCombo: (String) -> Unit
+) {
+    var showCreateDialog by remember { mutableStateOf(false) }
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        containerColor = PocketColors.surfaceCard
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .imePadding()
+                .padding(horizontal = 20.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            PocketSheetHeader(
+                icon = Icons.Rounded.SwapHoriz,
+                tint = PocketColors.accentSoft,
+                iconBg = PocketColors.accentBg,
+                title = "Dual-LUN Quick-Mount Combos",
+                subtitle = "Mount two images (LUN 0 + LUN 1) in a single USB rebind"
+            )
+
+            if (!multiLunSupported) {
+                Surface(shape = RoundedCornerShape(12.dp), color = PocketColors.warningBg, border = BorderStroke(0.75.dp, PocketColors.warning)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(9.dp)
+                    ) {
+                        Icon(Icons.Rounded.WarningAmber, null, tint = PocketColors.warning, modifier = Modifier.size(18.dp))
+                        Text(
+                            "Your phone kernel reported single-LUN only. Dual-LUN mounting requires a kernel that allows creating mass_storage/lun.1.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = PocketColors.textPrimary
+                        )
+                    }
+                }
+            }
+
+            Button(
+                onClick = { showCreateDialog = true },
+                enabled = images.size >= 2,
+                modifier = Modifier.fillMaxWidth().height(46.dp),
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)
+            ) {
+                Icon(Icons.Rounded.AddCircleOutline, null, modifier = Modifier.size(17.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(if (images.size < 2) "Add at least 2 images to create a combo" else "New Dual-LUN Combo", fontWeight = FontWeight.SemiBold)
+            }
+
+            if (combos.isEmpty()) {
+                Surface(shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
+                    Text(
+                        "No saved combos yet. Example: Pair Windows 11 ISO on LUN 0 (CD-ROM) with a Writable Drivers/Tools .img on LUN 1.",
+                        modifier = Modifier.padding(14.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = PocketColors.textSecondary
+                    )
+                }
+            } else {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    combos.forEach { combo ->
+                        val l0Name = combo.lun0Path.substringAfterLast('/')
+                        val l1Name = combo.lun1Path.substringAfterLast('/')
+                        val m0Label = runCatching { MountMode.valueOf(combo.lun0Mode).shortLabel }.getOrDefault("Auto")
+                        val m1Label = runCatching { MountMode.valueOf(combo.lun1Mode).shortLabel }.getOrDefault("USB RW")
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = PocketColors.surfaceInput,
+                            border = BorderStroke(0.5.dp, PocketColors.border)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    Text(combo.name, style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Text("LUN 0 ($m0Label): $l0Name", fontSize = 11.sp, color = PocketColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Text("LUN 1 ($m1Label): $l1Name", fontSize = 11.sp, color = PocketColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                                Button(
+                                    onClick = { onMountCombo(combo) },
+                                    enabled = !busy && multiLunSupported,
+                                    shape = RoundedCornerShape(9.dp),
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)
+                                ) {
+                                    Text("Mount", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                                }
+                                IconButton(
+                                    onClick = { onDeleteCombo(combo.id) },
+                                    modifier = Modifier.size(32.dp)
+                                ) {
+                                    Icon(Icons.Rounded.DeleteOutline, "Delete combo", tint = PocketColors.danger, modifier = Modifier.size(18.dp))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(20.dp))
+        }
+    }
+
+    if (showCreateDialog && images.size >= 2) {
+        var comboName by remember { mutableStateOf("") }
+        var lun0Path by remember { mutableStateOf(images[0].path) }
+        var lun1Path by remember { mutableStateOf(images[1].path) }
+        var lun0Mode by remember { mutableStateOf(MountMode.AUTO) }
+        var lun1Mode by remember { mutableStateOf(MountMode.USB_RW) }
+        val validationErr = UsbGadgetEngine.validateDualLunComboPaths(lun0Path, lun1Path)
+        val canSave = comboName.trim().isNotEmpty() && validationErr == null
+
+        AlertDialog(
+            onDismissRequest = { showCreateDialog = false },
+            containerColor = PocketColors.surfaceCard,
+            title = { Text("Create Dual-LUN Combo", color = PocketColors.textPrimary) },
+            text = {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    OutlinedTextField(
+                        value = comboName,
+                        onValueChange = { comboName = it.take(32) },
+                        label = { Text("Combo Name") },
+                        placeholder = { Text("e.g., Win11 + Drivers") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    Text("LUN 0 (Primary Boot Drive)", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        images.take(8).forEach { img ->
+                            val sel = lun0Path == img.path
+                            Surface(
+                                modifier = Modifier.fillMaxWidth().bounceClick { lun0Path = img.path },
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput,
+                                border = BorderStroke(if (sel) 1.25.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                            ) {
+                                Text(img.name, modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp), fontSize = 11.5.sp, color = if (sel) PocketColors.accentSoft else PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                    }
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf(MountMode.AUTO, MountMode.CDROM, MountMode.USB_RW).forEach { m ->
+                            val sel = lun0Mode == m
+                            Surface(
+                                modifier = Modifier.weight(1f).bounceClick { lun0Mode = m },
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput,
+                                border = BorderStroke(if (sel) 1.25.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                            ) {
+                                Box(modifier = Modifier.padding(vertical = 7.dp), contentAlignment = Alignment.Center) {
+                                    Text(m.shortLabel, fontSize = 10.5.sp, fontWeight = FontWeight.SemiBold, color = if (sel) PocketColors.accentSoft else PocketColors.textPrimary)
+                                }
+                            }
+                        }
+                    }
+
+                    Text("LUN 1 (Secondary Data / Tools Drive)", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        images.take(8).forEach { img ->
+                            val sel = lun1Path == img.path
+                            Surface(
+                                modifier = Modifier.fillMaxWidth().bounceClick { lun1Path = img.path },
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput,
+                                border = BorderStroke(if (sel) 1.25.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                            ) {
+                                Text(img.name, modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp), fontSize = 11.5.sp, color = if (sel) PocketColors.accentSoft else PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                    }
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf(MountMode.USB_RW, MountMode.USB_RO, MountMode.CDROM).forEach { m ->
+                            val sel = lun1Mode == m
+                            Surface(
+                                modifier = Modifier.weight(1f).bounceClick { lun1Mode = m },
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput,
+                                border = BorderStroke(if (sel) 1.25.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                            ) {
+                                Box(modifier = Modifier.padding(vertical = 7.dp), contentAlignment = Alignment.Center) {
+                                    Text(m.shortLabel, fontSize = 10.5.sp, fontWeight = FontWeight.SemiBold, color = if (sel) PocketColors.accentSoft else PocketColors.textPrimary)
+                                }
+                            }
+                        }
+                    }
+
+                    if (validationErr != null) {
+                        Text(validationErr, fontSize = 11.sp, color = PocketColors.danger)
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val trimmed = comboName.trim()
+                        showCreateDialog = false
+                        onSaveCombo(
+                            DualLunCombo(
+                                id = "combo_${System.currentTimeMillis()}",
+                                name = trimmed,
+                                lun0Path = lun0Path,
+                                lun0Mode = lun0Mode.name,
+                                lun1Path = lun1Path,
+                                lun1Mode = lun1Mode.name
+                            )
+                        )
+                    },
+                    enabled = canSave,
+                    colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)
+                ) { Text("Save Combo", fontWeight = FontWeight.SemiBold) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCreateDialog = false }) { Text("Cancel", color = PocketColors.textSecondary) }
+            }
         )
     }
 }

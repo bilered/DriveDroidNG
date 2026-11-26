@@ -1,3 +1,15 @@
+## v4.7.2 (2026-11-27) — Wave 3: Driver Pack Library & Dual-LUN Quick-Mount Combos
+- **Storage & Wi-Fi Driver Pack Manager (`DriverPackManager.kt`, `WindowsImageBuilder.kt`, `VentoyImageBuilder.kt`, `SettingsScreen.kt`):**
+  - Added a reusable **Driver Pack Library** (`<defaultDir>/PocketBoot_Drivers/`) reachable from **Settings → Driver Pack Library** and directly inside **Windows USB Builder** and **Multi-Boot Builder / Manager**.
+  - Import packs from extracted folders or `.zip`/`.7z`/`.tar`/`.gz` archives (using bundled `lib7zzs.so`) with automatic `.inf` validation (fail-closed if zero `.inf` files exist), automatic category tagging (**Intel VMD/RST**, **AMD RAID**, **Wi-Fi / LAN**, **Custom**), file/size stats, and one-tap deletion.
+  - Select multiple saved driver packs at once in **Windows USB Builder** (merged cleanly into `/Drivers/<pack>/`) and **Multi-Boot Builder / Manager** (merged into verified `drivers_inject.zip` alongside `VentoyAutoRun.bat`).
+- **Dual-LUN Quick-Mount Combos (`AppPrefs.kt`, `UsbGadgetEngine.kt`, `MainActivity.kt`):**
+  - Added `DualLunCombo` presets persisted in `AppPrefs` and included in **Backup & Restore JSON** (`pocketbootBackupVersion = 4`, backward-compatible).
+  - Added `UsbGadgetEngine.mountDualLunCombo()` to configure both `lun.0` and `lun.1` in a **single atomic USB ConfigFS controller rebind** (avoiding double PC disconnect/reconnect chimes), with path validation and clean fallback when a kernel lacks LUN 1 support.
+  - Added the **Dual-LUN Combos** bar and creator/manager sheet on the Home tab for 1-tap combo mounting.
+- **Wave 3 JVM Unit Tests (`Wave3FeaturesTest.kt`):**
+  - Added unit tests covering `DriverPackManager` slug sanitization & category detection, `DualLunCombo` backup JSON round-trip, and `UsbGadgetEngine.validateDualLunComboPaths()`.
+
 ## v4.7.1 (2026-11-27) — Wave 2: Multi-Boot Power Features & On-Phone `.img` Explorer
 - **Linux Persistence Inside Multi-Boot Drives (`VentoyPersistenceHelper.kt`, `VentoyImageBuilder.kt`):**
   - Attach ext4 `.dat` persistence volumes (`1–16 GB`, Ubuntu/Mint `casper-rw` or Debian/Kali `persistence` with `/ union` `persistence.conf`) to any Linux ISO inside a Multi-Boot drive (`/ventoy/persistence/*.dat` + `ventoy.json` `"persistence"` array) with fail-closed Partition 1 & host storage checks, clean loop teardown, and one-tap removal.

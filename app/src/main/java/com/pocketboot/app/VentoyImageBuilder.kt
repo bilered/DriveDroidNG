@@ -175,6 +175,7 @@ data class VentoyBuildConfig(
     val experience: WindowsExperienceConfig = WindowsExperienceConfig(bypassRequirements = win11BypassCheck, bypassMicrosoftAccount = win11BypassNro),
     val winUtil: WinUtilTweaksConfig = WinUtilTweaksConfig(),
     val driversDir: String = "",
+    val extraDriverPackDirs: List<String> = emptyList(),
     val initialIsoToAdd: ImageFile? = null,
     val moveInitialIso: Boolean = false,
     val autoMountAfterBuild: Boolean = true,
@@ -710,22 +711,27 @@ object VentoyImageBuilder {
             .map { "/$it" }.distinct().sorted()
     }
 
-    private fun packDriversInjectionOnMounted(context: Context, driversDir: String): Boolean {
-        if (driversDir.isBlank()) return false
-        val srcDir = UsbGadgetEngine.resolveDirectPath(driversDir).trimEnd('/')
-        val sevenZip = WindowsImageBuilder.findBundledBinary(context, "lib7zzs.so", listOf("7zz", "7z")) ?: return false
+    private fun packDriversInjectionOnMounted(context: Context, driversDirs: List<String>): Boolean {
+        val cleanDirs = driversDirs.map { UsbGadgetEngine.resolveDirectPath(it).trimEnd('/') }
+            .filter { it.isNotBlank() }.distinct()
+        if (cleanDirs.isEmpty()) return false
+        val sevenZip = WindowsImageBuilder.findBundledBinary(context, "lib7zzs.so", listOf("7zzs", "7zz", "7z")) ?: return false
         val stageDir = "/data/local/tmp/pb_vtoy_drv_stage"; val tmpZip = "/data/local/tmp/pb_vtoy_drivers.zip"
         val dstZip = "$TEMP_VENTOY_MNT/ventoy/drivers_inject.zip"
         val tmpBat = File(context.cacheDir, "VentoyAutoRun.bat").apply {
             writeText("@echo off\r\nif exist \"X:\\Drivers\" (for /r \"X:\\Drivers\" %%F in (*.inf) do drvload \"%%~fF\" >nul 2>&1)\r\nexit /b 0\r\n", Charsets.UTF_8)
         }
+        val copyBlocks = cleanDirs.mapIndexed { idx, srcDir ->
+            val subSlug = DriverPackManager.sanitizePackSlug(srcDir.substringAfterLast('/'))
+            val dstSub = if (cleanDirs.size == 1) "$stageDir/Drivers" else "$stageDir/Drivers/${idx + 1}_$subSlug"
+            "[ -d ${shellQuote(srcDir)} ] && mkdir -p ${shellQuote(dstSub)} && cp -rf ${shellQuote(srcDir)}/. ${shellQuote(dstSub)}/"
+        }.joinToString("\n                    ")
         return try {
             val res = Shell.cmd("""
                 (
                     set -e
-                    [ -d ${shellQuote(srcDir)} ]
                     rm -rf $stageDir $tmpZip && mkdir -p $stageDir/Drivers
-                    cp -rf ${shellQuote(srcDir)}/. $stageDir/Drivers/
+                    $copyBlocks
                     cp -f ${shellQuote(tmpBat.absolutePath)} $stageDir/VentoyAutoRun.bat
                     cd $stageDir && ${shellQuote(sevenZip)} a -tzip -y $tmpZip . >/dev/null 2>&1
                     SRC_SZ=${'$'}(stat -c '%s' $tmpZip 2>/dev/null || echo 0)
@@ -826,7 +832,8 @@ object VentoyImageBuilder {
         driversDir: String? = null,
         excludedAutoInstallIsos: Set<String>? = null,
         isoProfileIds: Map<String, List<String>>? = null,
-        savedCustomProfiles: Map<String, String>? = null
+        savedCustomProfiles: Map<String, String>? = null,
+        extraDriverPackDirs: List<String>? = null
     ): Boolean {
         var driversOk = true
         val existingRaw = Shell.cmd("cat $TEMP_VENTOY_MNT/ventoy/ventoy.json 2>/dev/null").exec().out.joinToString("\n")
@@ -918,9 +925,11 @@ object VentoyImageBuilder {
             val tmpMeta = File(context.cacheDir, "pb_vtoy_meta.json").apply { writeText(metaObj.toString(), Charsets.UTF_8) }
             try { Shell.cmd("mkdir -p $TEMP_VENTOY_MNT/ventoy && cp -f ${shellQuote(tmpMeta.absolutePath)} $TEMP_VENTOY_MNT/ventoy/pocketboot_meta.json").exec() } finally { tmpMeta.delete() }
         }
-        if (driversDir != null) {
-            if (driversDir.isNotBlank()) {
-                driversOk = packDriversInjectionOnMounted(context, driversDir)
+        if (driversDir != null || extraDriverPackDirs != null) {
+            val combinedDrivers = (extraDriverPackDirs.orEmpty() + listOfNotNull(driversDir))
+                .map { it.trim() }.filter { it.isNotBlank() }.distinct()
+            if (combinedDrivers.isNotEmpty()) {
+                driversOk = packDriversInjectionOnMounted(context, combinedDrivers)
             } else {
                 Shell.cmd("rm -f $TEMP_VENTOY_MNT/ventoy/drivers_inject.zip 2>/dev/null").exec()
             }
@@ -1097,9 +1106,9 @@ object VentoyImageBuilder {
             } else {
                 "${config.sizeMb} MB"
             }
-            val drvSizeBytes = if (config.driversDir.isNotBlank()) {
-                UsbGadgetEngine.queryDirSizeBytes(config.driversDir)
-            } else 0L
+            val allDriverDirs = (config.extraDriverPackDirs + listOf(config.driversDir))
+                .map { it.trim() }.filter { it.isNotBlank() }.distinct()
+            val drvSizeBytes = allDriverDirs.sumOf { UsbGadgetEngine.queryDirSizeBytes(it) }
             config.initialIsoToAdd?.let { initIso ->
                 val resolvedInit = UsbGadgetEngine.resolveDirectPath(initIso.path)
                 val actualIsoSize = Shell.cmd("stat -c '%s' ${shellQuote(resolvedInit)} 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: initIso.sizeBytes
@@ -1330,8 +1339,8 @@ object VentoyImageBuilder {
                 }
                 entries.add(LogEntry(ts, "multiboot", "${if (config.moveInitialIso) "Moved" else "Copied"} $destName (${UsbGadgetEngine.formatBytes(copiedBytes)} verified) into Multi-Boot drive"))
             }
-            val driversPackedOk = writeVentoyJsonOnMounted(context, config.experience.bypassRequirements, config.experience.bypassMicrosoftAccount, config.experience, config.winUtil, config.driversDir)
-            if (!driversPackedOk && config.driversDir.isNotBlank()) {
+            val driversPackedOk = writeVentoyJsonOnMounted(context, config.experience.bypassRequirements, config.experience.bypassMicrosoftAccount, config.experience, config.winUtil, config.driversDir, extraDriverPackDirs = config.extraDriverPackDirs)
+            if (!driversPackedOk && allDriverDirs.isNotEmpty()) {
                 entries.add(LogEntry(ts, "multiboot", "Warning: Drivers folder could not be packed into drivers_inject.zip.", true))
             }
             entries.add(LogEntry(ts, "multiboot", "Mounted Partition 1 via $mntType ($volLabel) and synced Windows boot config & drivers"))
@@ -1347,7 +1356,7 @@ object VentoyImageBuilder {
             IsoInspector.invalidate(outPath)
 
             onProgress(WindowsBuildProgress("Done!", safeName, 1f, false))
-            val drvWarn = if (!driversPackedOk && config.driversDir.isNotBlank()) " (warning: Drivers folder failed to pack)" else ""
+            val drvWarn = if (!driversPackedOk && allDriverDirs.isNotEmpty()) " (warning: Drivers failed to pack)" else ""
             ActionResult(
                 success = true,
                 userMessage = "Created Multi-Boot drive: $safeName ($sizeLabel sparse, ${if (useExfat) "exFAT" else "NTFS"})$drvWarn.",
@@ -1605,7 +1614,14 @@ object VentoyImageBuilder {
         }
     }
 
-    suspend fun updateVentoyCustomization(context: Context, ventoyImgPath: String, experience: WindowsExperienceConfig, winUtil: WinUtilTweaksConfig, driversDir: String? = null): ActionResult = withContext(Dispatchers.IO) {
+    suspend fun updateVentoyCustomization(
+        context: Context,
+        ventoyImgPath: String,
+        experience: WindowsExperienceConfig,
+        winUtil: WinUtilTweaksConfig,
+        driversDir: String? = null,
+        extraDriverPackDirs: List<String>? = null
+    ): ActionResult = withContext(Dispatchers.IO) {
         val resolvedImg = UsbGadgetEngine.resolveDirectPath(ventoyImgPath)
         mountedGuardError(resolvedImg, "updating tweaks or drivers")?.let { return@withContext ActionResult(false, it) }
         val info = probeVentoyImage(resolvedImg) ?: return@withContext ActionResult(false, "Not a valid Multi-Boot image.")
@@ -1613,9 +1629,18 @@ object VentoyImageBuilder {
         if (loopDev.isBlank() || !loopDev.startsWith("/dev/")) return@withContext ActionResult(false, "Could not attach Multi-Boot partition.")
         return@withContext try {
             mountVentoyPartition1(context, loopDev) ?: return@withContext ActionResult(false, "Could not mount Multi-Boot partition.")
-            val driversPackedOk = writeVentoyJsonOnMounted(context, experience.bypassRequirements, experience.bypassMicrosoftAccount, experience, winUtil, driversDir)
-            if (!driversPackedOk && !driversDir.isNullOrBlank()) {
-                ActionResult(false, "Saved tweaks, but failed to pack the selected Drivers folder (check folder access & free space).")
+            val driversPackedOk = writeVentoyJsonOnMounted(
+                context = context,
+                bypassCheck = experience.bypassRequirements,
+                bypassNro = experience.bypassMicrosoftAccount,
+                experience = experience,
+                winUtil = winUtil,
+                driversDir = driversDir,
+                extraDriverPackDirs = extraDriverPackDirs
+            )
+            val requestedAnyDrivers = !driversDir.isNullOrBlank() || !extraDriverPackDirs.isNullOrEmpty()
+            if (!driversPackedOk && requestedAnyDrivers) {
+                ActionResult(false, "Saved tweaks, but failed to pack the selected Drivers (check folder access & free space).")
             } else {
                 ActionResult(true, "Saved Windows Experience, System Tweaks & drivers to Multi-Boot drive.")
             }
@@ -2210,16 +2235,25 @@ fun VentoyBuilderSheet(
     var experience by remember { mutableStateOf(WindowsExperienceConfig()) }
     var winUtil by remember { mutableStateOf(WinUtilTweaksConfig()) }
     var driversDir by remember { mutableStateOf("") }
+    var savedDriverPacks by remember { mutableStateOf<List<DriverPackItem>>(emptyList()) }
+    var selectedDriverPackDirs by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var showBuilderPackManager by remember { mutableStateOf(false) }
+    var builderPackReloadNonce by remember { mutableIntStateOf(0) }
     var driversBytes by remember { mutableStateOf(0L) }
     var showDriversPicker by remember { mutableStateOf(false) }
     var includeInitial by remember(initialIso?.path) { mutableStateOf(initialIso != null) }
     var moveInitial by remember { mutableStateOf(false) }
     var autoMount by remember { mutableStateOf(true) }
 
-    LaunchedEffect(driversDir) {
-        driversBytes = if (driversDir.isBlank()) 0L else withContext(Dispatchers.IO) {
+    LaunchedEffect(defaultDir, builderPackReloadNonce) {
+        savedDriverPacks = DriverPackManager.listPacks(defaultDir)
+    }
+    LaunchedEffect(driversDir, selectedDriverPackDirs, savedDriverPacks) {
+        val packBytes = savedDriverPacks.filter { it.dirPath in selectedDriverPackDirs }.sumOf { it.sizeBytes }
+        val manualBytes = if (driversDir.isBlank()) 0L else withContext(Dispatchers.IO) {
             UsbGadgetEngine.queryDirSizeBytes(driversDir)
         }
+        driversBytes = packBytes + manualBytes
     }
 
     val effectiveSizeMb = if (isCustomSize) {
@@ -2736,6 +2770,14 @@ fun VentoyBuilderSheet(
                     onDeleteSystemTweaksPreset = onDeleteSystemTweaksPreset,
                     onUpdateSearchHistory = onUpdateSearchHistory
                 )
+                DriverPackMultiSelectorSection(
+                    packs = savedDriverPacks,
+                    selectedPackDirs = selectedDriverPackDirs,
+                    onTogglePack = { dir ->
+                        selectedDriverPackDirs = if (dir in selectedDriverPackDirs) selectedDriverPackDirs - dir else selectedDriverPackDirs + dir
+                    },
+                    onOpenManager = { showBuilderPackManager = true }
+                )
                 Surface(modifier = Modifier.fillMaxWidth().bounceClick { showDriversPicker = true }, shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.75.dp, if (driversDir.isNotBlank()) PocketColors.accent else PocketColors.border)) {
                     Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 11.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         Icon(Icons.Rounded.FolderOpen, null, tint = PocketColors.accentSoft, modifier = Modifier.size(18.dp))
@@ -2867,6 +2909,7 @@ fun VentoyBuilderSheet(
                                 experience = experience,
                                 winUtil = winUtil,
                                 driversDir = driversDir,
+                                extraDriverPackDirs = selectedDriverPackDirs.toList(),
                                 initialIsoToAdd = if (includeInitial) initialIso else null,
                                 moveInitialIso = moveInitial,
                                 autoMountAfterBuild = autoMount,
@@ -2891,6 +2934,14 @@ fun VentoyBuilderSheet(
     }
 
     if (showDriversPicker) RootFolderPickerSheet("Select Drivers Folder (WinPE)", "Packed into driver archive for Windows ISOs", driversDir.ifBlank { defaultDir }, { showDriversPicker = false }) { driversDir = it; showDriversPicker = false }
+    if (showBuilderPackManager) {
+        DriverPackManagerSheet(
+            defaultDir = defaultDir,
+            onDismiss = { showBuilderPackManager = false },
+            onPacksChanged = { builderPackReloadNonce++ },
+            onMessage = onMessage
+        )
+    }
 }
 
 
@@ -2923,6 +2974,10 @@ fun VentoyManagerSheet(
     var mgrExp by remember { mutableStateOf(WindowsExperienceConfig()) }
     var mgrWinUtil by remember { mutableStateOf(WinUtilTweaksConfig()) }
     var mgrDriversDir by remember { mutableStateOf("") }
+    var mgrSavedPacks by remember { mutableStateOf<List<DriverPackItem>>(emptyList()) }
+    var mgrSelectedPackDirs by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var showMgrPackManager by remember { mutableStateOf(false) }
+    var mgrPackReloadNonce by remember { mutableIntStateOf(0) }
     var showMgrDriversPicker by remember { mutableStateOf(false) }
     var showMgrTweaksPanel by remember { mutableStateOf(false) }
     var opProgress by remember { mutableStateOf(WindowsBuildProgress()) }
@@ -2958,6 +3013,10 @@ fun VentoyManagerSheet(
 
     LaunchedEffect(opBusy) {
         onBusyChanged(opBusy)
+    }
+
+    LaunchedEffect(defaultDir, mgrPackReloadNonce) {
+        mgrSavedPacks = DriverPackManager.listPacks(defaultDir)
     }
 
     LaunchedEffect(ventoyFile.path, isMountedToPc) {
@@ -3511,6 +3570,14 @@ fun VentoyManagerSheet(
                         onDeleteSystemTweaksPreset = onDeleteSystemTweaksPreset,
                         onUpdateSearchHistory = onUpdateSearchHistory
                     )
+                    DriverPackMultiSelectorSection(
+                        packs = mgrSavedPacks,
+                        selectedPackDirs = mgrSelectedPackDirs,
+                        onTogglePack = { dir ->
+                            mgrSelectedPackDirs = if (dir in mgrSelectedPackDirs) mgrSelectedPackDirs - dir else mgrSelectedPackDirs + dir
+                        },
+                        onOpenManager = { showMgrPackManager = true }
+                    )
                     Surface(modifier = Modifier.fillMaxWidth().bounceClick { showMgrDriversPicker = true }, shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.75.dp, if (mgrDriversDir.isNotBlank()) PocketColors.accent else PocketColors.border)) {
                         Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             Icon(Icons.Rounded.FolderOpen, null, tint = PocketColors.accentSoft, modifier = Modifier.size(18.dp))
@@ -3525,7 +3592,14 @@ fun VentoyManagerSheet(
                         onClick = {
                             scope.launch {
                                 opBusy = true; opProgress = WindowsBuildProgress("Applying Windows tweaks & drivers...", ventoyFile.name, 0.5f, true)
-                                val res = VentoyImageBuilder.updateVentoyCustomization(context, ventoyFile.path, mgrExp, mgrWinUtil, mgrDriversDir.ifBlank { null })
+                                val res = VentoyImageBuilder.updateVentoyCustomization(
+                                    context = context,
+                                    ventoyImgPath = ventoyFile.path,
+                                    experience = mgrExp,
+                                    winUtil = mgrWinUtil,
+                                    driversDir = mgrDriversDir.ifBlank { null },
+                                    extraDriverPackDirs = mgrSelectedPackDirs.toList().takeIf { it.isNotEmpty() }
+                                )
                                 opBusy = false; onMessage(res.userMessage, !res.success); reloadContents()
                             }
                         },
@@ -3733,6 +3807,14 @@ fun VentoyManagerSheet(
     }
 
     if (showMgrDriversPicker) RootFolderPickerSheet("Select Drivers Folder (WinPE)", "Packed into driver archive for Windows ISOs", mgrDriversDir.ifBlank { defaultDir }, { showMgrDriversPicker = false }) { mgrDriversDir = it; showMgrDriversPicker = false }
+    if (showMgrPackManager) {
+        DriverPackManagerSheet(
+            defaultDir = defaultDir,
+            onDismiss = { showMgrPackManager = false },
+            onPacksChanged = { mgrPackReloadNonce++ },
+            onMessage = onMessage
+        )
+    }
 
     // Boot Menu Alias Dialog (Feature 2.2)
     aliasEditTarget?.let { item ->

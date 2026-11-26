@@ -1312,6 +1312,231 @@ object UsbGadgetEngine {
         }
     }
 
+    fun validateDualLunComboPaths(lun0Path: String, lun1Path: String): String? {
+        val p0 = resolveDirectPath(lun0Path).trim()
+        val p1 = resolveDirectPath(lun1Path).trim()
+        if (p0.isEmpty() || p1.isEmpty()) return "Select both a LUN 0 and a LUN 1 image."
+        if (p0 == p1) return "LUN 0 and LUN 1 must be two different image files."
+        return null
+    }
+
+    /**
+     * Atomically mounts both LUN 0 and LUN 1 in a single USB ConfigFS controller rebind,
+     * avoiding double disconnect/reconnect chimes on the host PC.
+     */
+    suspend fun mountDualLunCombo(
+        combo: DualLunCombo,
+        settings: AppSettings
+    ): ActionResult = withContext(Dispatchers.IO) {
+        clearAbortWatchdog()
+        val ts = nowTs()
+        val entries = mutableListOf<LogEntry>()
+        validateDualLunComboPaths(combo.lun0Path, combo.lun1Path)?.let { err ->
+            return@withContext ActionResult(false, err, entries = entries)
+        }
+        return@withContext runCatching {
+            val img0 = resolveDirectPath(combo.lun0Path)
+            val img1 = resolveDirectPath(combo.lun1Path)
+            val reqMode0 = runCatching { MountMode.valueOf(combo.lun0Mode) }.getOrDefault(MountMode.AUTO)
+            val reqMode1 = runCatching { MountMode.valueOf(combo.lun1Mode) }.getOrDefault(MountMode.USB_RW)
+            val mode0 = reqMode0.resolveForFile(img0, settings.fileModes)
+            val mode1 = reqMode1.resolveForFile(img1, settings.fileModes)
+            val qImg0 = shellQuote(img0)
+            val qImg1 = shellQuote(img1)
+
+            val selinuxBlock = if (settings.autoPatchSelinux) {
+                """
+                if command -v magiskpolicy >/dev/null 2>&1; then
+                    magiskpolicy --live "allow kernel media_rw_data_file file { read write open getattr }" 2>/dev/null
+                    echo "LOG|permissions|Applied SELinux file access policy via magiskpolicy"
+                elif command -v ksud >/dev/null 2>&1; then
+                    ksud sepolicy patch "allow kernel media_rw_data_file file { read write open getattr }" 2>/dev/null
+                    echo "LOG|permissions|Applied SELinux file access policy via ksud"
+                elif command -v apd >/dev/null 2>&1; then
+                    apd sepolicy patch "allow kernel media_rw_data_file file { read write open getattr }" 2>/dev/null
+                    echo "LOG|permissions|Applied SELinux file access policy via apd"
+                fi
+                """.trimIndent()
+            } else {
+                """echo "LOG|permissions|Auto-fix file permissions disabled in settings""""
+            }
+
+            val adbBlock = if (settings.keepAdbActive) {
+                """
+                if [ -d "${'$'}GADGET/functions/ffs.adb" ]; then
+                    start adbd 2>/dev/null || true
+                    ADB_WAIT=0
+                    while [ "${'$'}(getprop sys.usb.ffs.ready 2>/dev/null)" != "1" ] && [ "${'$'}ADB_WAIT" -lt 15 ]; do
+                        sleep 0.1
+                        ADB_WAIT=${'$'}((ADB_WAIT + 1))
+                    done
+                    if [ "${'$'}(getprop sys.usb.ffs.ready 2>/dev/null)" = "1" ]; then
+                        ln -s "${'$'}GADGET/functions/ffs.adb" "${'$'}CFG/f2" 2>/dev/null
+                        echo "LOG|usb|Enabled USB Debugging alongside Dual-LUN combo"
+                    else
+                        echo "LOG|usb|adbd endpoints not ready; mounting Dual-LUN drives only"
+                    fi
+                fi
+                """.trimIndent()
+            } else {
+                """echo "LOG|usb|Linked Dual-LUN virtual drive function""""
+            }
+
+            val script = """
+                set +e
+                pb_mount_combo() {
+                    if [ ! -f $qImg0 ]; then echo "ERR|file|LUN 0 file not found: $img0"; return 1; fi
+                    if [ ! -f $qImg1 ]; then echo "ERR|file|LUN 1 file not found: $img1"; return 1; fi
+
+                    $DETECT_GADGET_SH
+                    if [ -z "${'$'}GADGET" ] || [ -z "${'$'}CFG" ]; then
+                        echo "ERR|usb|ConfigFS USB gadget not found on this device"
+                        return 1
+                    fi
+
+                    UDC=${'$'}(ls /sys/class/udc 2>/dev/null | grep -v '^dummy_udc' | head -n 1)
+                    if [ -z "${'$'}UDC" ]; then
+                        echo "ERR|usb|No physical USB-C controller found"
+                        return 1
+                    fi
+
+                    if [ ! -f "$STATE_FILE" ]; then
+                        CUR_PROP=${'$'}(getprop sys.usb.config 2>/dev/null)
+                        [ -n "${'$'}CUR_PROP" ] && [ "${'$'}CUR_PROP" != "none" ] && echo "${'$'}CUR_PROP" > "$STATE_FILE"
+                    fi
+
+                    $selinuxBlock
+
+                    for p in /sys/bus/platform/devices/*dwc3*/power/control /sys/bus/platform/devices/*ssusb*/power/control /sys/bus/platform/devices/*mtu3*/power/control /sys/bus/platform/devices/*musb*/power/control /sys/class/udc/*/device/power/control; do
+                        [ -f "${'$'}p" ] && echo on > "${'$'}p" 2>/dev/null || true
+                    done
+
+                    if [ "${'$'}(getprop sys.usb.configfs 2>/dev/null)" != "0" ]; then
+                        setprop sys.usb.config none 2>/dev/null
+                        W=0
+                        while [ "${'$'}W" -lt 12 ]; do sleep 0.1; UST=${'$'}(getprop sys.usb.state 2>/dev/null); [ "${'$'}UST" = "none" ] || [ -z "${'$'}UST" ] && break; W=${'$'}((W + 1)); done
+                        setprop sys.usb.configfs 0 2>/dev/null
+                        echo "LOG|usb|Locked ConfigFS against system USB daemon resets"
+                    fi
+
+                    echo "" > "${'$'}GADGET/UDC" 2>/dev/null
+                    rm -f "${'$'}CFG"/f*
+
+                    ACTIVE_FUNC=""
+                    for existing in "${'$'}GADGET"/functions/mass_storage.*; do
+                        if [ -d "${'$'}existing/lun.0" ]; then
+                            ACTIVE_FUNC="${'$'}existing"
+                            break
+                        fi
+                    done
+                    if [ -z "${'$'}ACTIVE_FUNC" ]; then
+                        ACTIVE_FUNC="${'$'}GADGET/functions/mass_storage.0"
+                        mkdir -p "${'$'}ACTIVE_FUNC" 2>/dev/null
+                        if [ ! -d "${'$'}ACTIVE_FUNC/lun.0" ]; then
+                            ALT_FUNC="${'$'}GADGET/functions/mass_storage.usb0"
+                            mkdir -p "${'$'}ALT_FUNC" 2>/dev/null
+                            if [ -d "${'$'}ALT_FUNC/lun.0" ]; then
+                                ACTIVE_FUNC="${'$'}ALT_FUNC"
+                            else
+                                setprop sys.usb.configfs 1 2>/dev/null
+                                echo "ERR|usb|Kernel failed to create mass_storage lun.0"
+                                return 1
+                            fi
+                        fi
+                    fi
+
+                    if [ ! -d "${'$'}ACTIVE_FUNC/lun.1" ]; then
+                        if ! mkdir "${'$'}ACTIVE_FUNC/lun.1" 2>/dev/null; then
+                            setprop sys.usb.configfs 1 2>/dev/null
+                            echo "ERR|usb|This kernel does not support Dual-LUN (LUN 1). Mount images individually on LUN 0."
+                            return 1
+                        fi
+                    fi
+
+                    echo "" > "${'$'}ACTIVE_FUNC/lun.0/file" 2>/dev/null
+                    echo "" > "${'$'}ACTIVE_FUNC/lun.1/file" 2>/dev/null
+
+                    echo 1 > "${'$'}ACTIVE_FUNC/lun.0/removable" 2>/dev/null
+                    echo ${mode0.ro} > "${'$'}ACTIVE_FUNC/lun.0/ro" 2>/dev/null
+                    echo ${mode0.cdrom} > "${'$'}ACTIVE_FUNC/lun.0/cdrom" 2>/dev/null
+                    [ -f "${'$'}ACTIVE_FUNC/lun.0/nofua" ] && echo 1 > "${'$'}ACTIVE_FUNC/lun.0/nofua" 2>/dev/null
+                    if ! echo $qImg0 > "${'$'}ACTIVE_FUNC/lun.0/file" 2>/dev/null; then
+                        setprop sys.usb.configfs 1 2>/dev/null
+                        echo "ERR|permissions|System blocked access to LUN 0 image: $img0"
+                        return 1
+                    fi
+                    echo "LOG|drive|Loaded $img0 on LUN 0 (cdrom=${mode0.cdrom}, ro=${mode0.ro})"
+
+                    echo 1 > "${'$'}ACTIVE_FUNC/lun.1/removable" 2>/dev/null
+                    echo ${mode1.ro} > "${'$'}ACTIVE_FUNC/lun.1/ro" 2>/dev/null
+                    echo ${mode1.cdrom} > "${'$'}ACTIVE_FUNC/lun.1/cdrom" 2>/dev/null
+                    [ -f "${'$'}ACTIVE_FUNC/lun.1/nofua" ] && echo 1 > "${'$'}ACTIVE_FUNC/lun.1/nofua" 2>/dev/null
+                    if ! echo $qImg1 > "${'$'}ACTIVE_FUNC/lun.1/file" 2>/dev/null; then
+                        echo "" > "${'$'}ACTIVE_FUNC/lun.0/file" 2>/dev/null
+                        setprop sys.usb.configfs 1 2>/dev/null
+                        echo "ERR|permissions|System blocked access to LUN 1 image: $img1"
+                        return 1
+                    fi
+                    echo "LOG|drive|Loaded $img1 on LUN 1 (cdrom=${mode1.cdrom}, ro=${mode1.ro})"
+
+                    ln -s "${'$'}ACTIVE_FUNC" "${'$'}CFG/f1"
+                    $adbBlock
+
+                    if ! echo "${'$'}UDC" > "${'$'}GADGET/UDC" 2>/dev/null; then
+                        if [ -e "${'$'}CFG/f2" ]; then
+                            rm -f "${'$'}CFG/f2"
+                            if ! echo "${'$'}UDC" > "${'$'}GADGET/UDC" 2>/dev/null; then
+                                setprop sys.usb.configfs 1 2>/dev/null
+                                echo "ERR|usb|Failed to bind USB controller ${'$'}UDC"
+                                return 1
+                            fi
+                        else
+                            setprop sys.usb.configfs 1 2>/dev/null
+                            echo "ERR|usb|Failed to bind USB controller ${'$'}UDC"
+                            return 1
+                        fi
+                    fi
+                    BOUND=${'$'}(cat "${'$'}GADGET/UDC" 2>/dev/null)
+                    echo "LOG|usb|Mounted Dual-LUN combo on Physical USB-C (${'$'}BOUND)"
+                }
+                pb_mount_combo
+            """.trimIndent()
+
+            val res = Shell.cmd(script).exec()
+            var firstError: String? = null
+            res.out.forEach { line ->
+                when {
+                    line.startsWith("LOG|") -> {
+                        val parts = line.split("|", limit = 3)
+                        if (parts.size == 3) entries.add(LogEntry(ts, parts[1], parts[2], false))
+                    }
+                    line.startsWith("ERR|") -> {
+                        val parts = line.split("|", limit = 3)
+                        if (parts.size == 3) {
+                            if (firstError == null) firstError = parts[2]
+                            entries.add(LogEntry(ts, parts[1], parts[2], true))
+                        }
+                    }
+                    line.isNotBlank() -> entries.add(LogEntry(ts, "system", line, false))
+                }
+            }
+            res.err.filter { it.isNotBlank() }.forEach {
+                if (firstError == null) firstError = it
+                entries.add(LogEntry(ts, "error", it, true))
+            }
+            val ok = res.isSuccess && firstError == null
+            val msg = if (ok) {
+                "Mounted Dual-LUN combo '${combo.name}' (${img0.substringAfterLast('/')} + ${img1.substringAfterLast('/')})."
+            } else {
+                firstError ?: "Could not mount Dual-LUN combo '${combo.name}'."
+            }
+            ActionResult(ok, msg, null, entries)
+        }.getOrElse { e ->
+            entries.add(LogEntry(ts, "crash-guard", "Dual-LUN mount exception: ${e.message}", true))
+            ActionResult(false, "Dual-LUN mount failed: ${e.message ?: "Unexpected error"}", null, entries)
+        }
+    }
+
     suspend fun unmountImage(lunIndex: Int? = null): ActionResult = withContext(Dispatchers.IO) {
         if (lunIndex == null) requestAbortWatchdog()
         val ts = nowTs()
