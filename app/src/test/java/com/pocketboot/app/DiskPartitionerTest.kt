@@ -21,7 +21,7 @@ class DiskPartitionerTest {
         assertEquals(0L, layout.part1Sectors % 2048L)
         assertTrue(layout.part1SizeBytes > isoBytes)
         assertEquals(layout.part1StartLba + layout.part1Sectors, layout.part2StartLba)
-        assertTrue(layout.part2SizeBytes >= uefiBytes)
+        assertTrue(layout.part2Sectors * 512L >= uefiBytes)
         assertTrue(layout.totalSectors > layout.part2StartLba + layout.part2Sectors)
         assertEquals(layout.totalSectors * 512L, layout.totalBytes)
     }
@@ -64,7 +64,7 @@ class DiskPartitionerTest {
 
         // Partition 2 entry (index 1 -> LBA 2 + 128 bytes) must carry hidden UEFI:NTFS attributes
         val p2AttrOffset = 2 * 512 + 128 + 48
-        val p2Attr = ByteBuffer.wrap(gpt.primarySectors, p2AttrOffset, 8).order(ByteOrder.LITTLE_ENDIAN).long
+        val p2Attr = ByteBuffer.wrap(gpt.primarySectors.copyOfRange(p2AttrOffset, p2AttrOffset + 8)).order(ByteOrder.LITTLE_ENDIAN).long
         assertEquals(-0x2FFFFFFFFFFFFFFFL, p2Attr)
 
         // Backup GPT header at end of backupSectors (offset 32 * 512)
