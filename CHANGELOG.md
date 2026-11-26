@@ -1,3 +1,15 @@
+## v4.7.1 (2026-11-27) — Wave 2: Multi-Boot Power Features & On-Phone `.img` Explorer
+- **Linux Persistence Inside Multi-Boot Drives (`VentoyPersistenceHelper.kt`, `VentoyImageBuilder.kt`):**
+  - Attach ext4 `.dat` persistence volumes (`1–16 GB`, Ubuntu/Mint `casper-rw` or Debian/Kali `persistence` with `/ union` `persistence.conf`) to any Linux ISO inside a Multi-Boot drive (`/ventoy/persistence/*.dat` + `ventoy.json` `"persistence"` array) with fail-closed Partition 1 & host storage checks, clean loop teardown, and one-tap removal.
+- **Boot Menu Aliases, Timeout & Built-In GRUB Themes (`VentoyThemeCatalog.kt`, `VentoyImageBuilder.kt`):**
+  - Edit per-ISO boot menu display names (`menu_alias`), configure auto-boot menu timeout (`VTOY_MENU_TIMEOUT`), and switch between **Stock Default**, **PocketBoot Dark**, and **High-Contrast** GRUB2 themes while preserving all sibling `ventoy.json` sections (`control`, `auto_install`, `injection`, `persistence`).
+- **Per-ISO Multi-Template Windows Tweak Profiles (`VentoyImageBuilder.kt`):**
+  - Upgraded `pocketboot_meta.json` (`isoProfileIds` + `savedCustomProfiles`, backward-compatible) so each eligible Windows 10/11 ISO can be set to **Stock**, assigned a single built-in/custom preset, or given **multiple boot-menu templates** (`autosel: 0, timeout: 10`) selectable directly at PC boot time.
+- **Direct `.img` File Explorer (`ImageLoopExplorer.kt`, `MainActivity.kt`):**
+  - Browse, import files from phone storage, export files to phone storage, create folders, and delete entries inside Partition 1 of any `.img` (GPT, MBR, or raw superfloppy) with mounted-to-PC guard, exact copy verification, and guaranteed `unmountAndDetachClean()` teardown on close or dispose.
+- **Wave 2 JVM Unit Tests (`VentoyWave2Test.kt`):**
+  - Added 5 unit test cases validating `VentoyThemeCatalog` JSON preservation, `VentoyPersistenceHelper` path sanitization, multi-template profile serialization, and `ImageLoopExplorer` GPT/MBR/Raw partition slicing + folder name sanitization.
+
 ## v4.7.0 (2026-11-27) — Wave 1: Background Build Reliability, Telemetry, Updater & CI Test Gate
 - **Foreground USB Build Service (`UsbBuildService.kt`, `NotificationHelper.kt`, `MainActivity.kt`, `AndroidManifest.xml`):**
   - Moved Windows, Linux, and Multi-Boot image builds into a dedicated app-scoped `UsbBuildManager` + `UsbBuildService` (`foregroundServiceType="specialUse"`, `PARTIAL_WAKE_LOCK`, fail-safe `stopSelf()` on `startForeground()` error) so switching apps or locking the phone never kills active USB builds.

@@ -26,8 +26,12 @@ import androidx.compose.material.icons.rounded.Album
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.CloudDownload
+import androidx.compose.material.icons.rounded.CheckBox
+import androidx.compose.material.icons.rounded.CheckBoxOutlineBlank
 import androidx.compose.material.icons.rounded.DeleteOutline
+import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.Eject
+import androidx.compose.material.icons.rounded.Palette
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Layers
@@ -143,7 +147,11 @@ data class VentoyDriveContents(
     val savedExperience: WindowsExperienceConfig = WindowsExperienceConfig(bypassRequirements = win11BypassCheck, bypassMicrosoftAccount = win11BypassNro),
     val savedWinUtil: WinUtilTweaksConfig = WinUtilTweaksConfig(),
     val hasDriversZip: Boolean = false,
-    val excludedAutoInstallIsos: Set<String> = emptySet()
+    val excludedAutoInstallIsos: Set<String> = emptySet(),
+    val isoProfileIds: Map<String, List<String>> = emptyMap(),
+    val savedCustomProfiles: Map<String, String> = emptyMap(),
+    val menuConfig: MultiBootMenuConfig = MultiBootMenuConfig(),
+    val persistenceEntries: List<MultiBootPersistenceEntry> = emptyList()
 )
 
 private data class PocketBootDriveMeta(
@@ -151,7 +159,9 @@ private data class PocketBootDriveMeta(
     val experience: WindowsExperienceConfig,
     val winUtil: WinUtilTweaksConfig,
     val hasDriversZip: Boolean,
-    val excludedAutoInstallIsos: Set<String> = emptySet()
+    val excludedAutoInstallIsos: Set<String> = emptySet(),
+    val isoProfileIds: Map<String, List<String>> = emptyMap(),
+    val savedCustomProfiles: Map<String, String> = emptyMap()
 )
 
 data class VentoyBuildConfig(
@@ -174,7 +184,7 @@ data class VentoyBuildConfig(
 object VentoyImageBuilder {
 
     private const val VENTOY_LATEST_API = "https://api.github.com/repos/ventoy/Ventoy/releases/latest"
-    private const val TEMP_VENTOY_MNT = "/data/local/tmp/pb_ventoy_mnt"
+    internal const val TEMP_VENTOY_MNT = "/data/local/tmp/pb_ventoy_mnt"
     private const val ASSET_DIR = "ventoy"
 
     private fun nowTs(): String = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
@@ -575,7 +585,7 @@ object VentoyImageBuilder {
         }
     }
 
-    private fun attachPartition1Loop(imgPath: String, offsetBytes: Long, sizeBytes: Long): String {
+    internal fun attachPartition1Loop(imgPath: String, offsetBytes: Long, sizeBytes: Long): String {
         val qImg = shellQuote(imgPath)
         val cmd = """
             L=${'$'}(losetup -f -s -o $offsetBytes -S $sizeBytes $qImg 2>/dev/null)
@@ -596,7 +606,7 @@ object VentoyImageBuilder {
         return Shell.cmd(cmd).exec().out.lastOrNull().orEmpty().trim()
     }
 
-    private fun mountVentoyPartition1(context: Context, loopDev: String): String? {
+    internal fun mountVentoyPartition1(context: Context, loopDev: String): String? {
         val qLoop = shellQuote(loopDev)
         val procFs = Shell.cmd("cat /proc/filesystems 2>/dev/null").exec().out
             .map { it.trim().substringAfterLast('\t').substringAfterLast(' ').lowercase() }
@@ -630,7 +640,7 @@ object VentoyImageBuilder {
         return null
     }
 
-    private fun unmountVentoyPartition1(loopDev: String) {
+    internal fun unmountVentoyPartition1(loopDev: String) {
         BuildThermalHelper.unmountAndDetachClean(
             mountPoints = listOf(TEMP_VENTOY_MNT),
             loopDevices = if (loopDev.isNotBlank()) listOf(loopDev) else emptyList(),
@@ -643,7 +653,7 @@ object VentoyImageBuilder {
      * Returns (totalBytes, availableBytes) or (-1L, -1L) if unavailable.
      * Avoids relying solely on GNU `df -B1` which is unsupported on many Android toybox builds.
      */
-    private fun queryMountSpaceBytes(mountOrDirPath: String): Pair<Long, Long> {
+    internal fun queryMountSpaceBytes(mountOrDirPath: String): Pair<Long, Long> {
         val qPath = shellQuote(mountOrDirPath)
         val statLine = Shell.cmd("stat -f -c '%b %a %S' $qPath 2>/dev/null").exec().out.firstOrNull().orEmpty().trim()
         val statParts = statLine.split(Regex("\\s+"))
@@ -676,7 +686,7 @@ object VentoyImageBuilder {
         return -1L to -1L
     }
 
-    private fun queryHostFreeSpaceBytes(dirPath: String): Long {
+    internal fun queryHostFreeSpaceBytes(dirPath: String): Long {
         val statFsFree = UsbGadgetEngine.getFreeSpaceBytes(dirPath)
         if (statFsFree > 0L) return statFsFree
         val (_, shellFree) = queryMountSpaceBytes(dirPath)
@@ -740,6 +750,73 @@ object VentoyImageBuilder {
         }
     }
 
+    internal const val PROFILE_ID_DEFAULT = "default"
+    internal const val PROFILE_ID_STANDARD = "builtin:standard"
+    internal const val PROFILE_ID_MINIMAL = "builtin:minimal"
+    internal const val PROFILE_ID_ADVANCED = "builtin:advanced"
+    internal const val PROFILE_ID_DESKTOP = "builtin:desktop"
+    internal const val PROFILE_ID_LAPTOP = "builtin:laptop"
+
+    internal fun profileSlug(profileId: String): String {
+        val clean = profileId.lowercase(Locale.US)
+            .replace(Regex("[^a-z0-9]+"), "_")
+            .trim('_')
+            .take(36)
+        return clean.ifBlank { "default" }
+    }
+
+    internal fun profileDisplayLabel(profileId: String): String = when (profileId) {
+        PROFILE_ID_DEFAULT -> "Drive Default"
+        PROFILE_ID_STANDARD -> "Standard"
+        PROFILE_ID_MINIMAL -> "Minimal"
+        PROFILE_ID_ADVANCED -> "Advanced"
+        PROFILE_ID_DESKTOP -> "Desktop"
+        PROFILE_ID_LAPTOP -> "Laptop"
+        else -> profileId.removePrefix("custom:").ifBlank { "Custom" }
+    }
+
+    internal fun resolveProfileWinUtil(
+        profileId: String,
+        driveWinUtil: WinUtilTweaksConfig,
+        customProfiles: Map<String, String>
+    ): WinUtilTweaksConfig = when (profileId) {
+        PROFILE_ID_DEFAULT -> driveWinUtil
+        PROFILE_ID_STANDARD -> WinUtilTweaksConfig.standardPreset()
+        PROFILE_ID_MINIMAL -> WinUtilTweaksConfig.minimalPreset()
+        PROFILE_ID_ADVANCED -> WinUtilTweaksConfig.advancedPreset()
+        PROFILE_ID_DESKTOP -> WinUtilTweaksConfig.desktopPreset()
+        PROFILE_ID_LAPTOP -> WinUtilTweaksConfig.laptopPreset()
+        else -> customProfiles[profileId]?.let { WinUtilTweaksConfig.fromJsonString(it) } ?: driveWinUtil
+    }
+
+    internal fun parseIsoProfileIdsJson(obj: JSONObject?): Map<String, List<String>> {
+        if (obj == null) return emptyMap()
+        val out = LinkedHashMap<String, List<String>>()
+        val keys = obj.keys()
+        while (keys.hasNext()) {
+            val k = keys.next()
+            val arr = obj.optJSONArray(k) ?: continue
+            val list = mutableListOf<String>()
+            for (i in 0 until arr.length()) {
+                val id = arr.optString(i, "").trim()
+                if (id.isNotEmpty() && id !in list) list.add(id)
+            }
+            if (list.isNotEmpty()) out[normalizeVentoyRelPath(k)] = list
+        }
+        return out
+    }
+
+    internal fun encodeIsoProfileIdsJson(map: Map<String, List<String>>): JSONObject {
+        val obj = JSONObject()
+        map.entries.sortedBy { it.key.lowercase(Locale.US) }.forEach { (k, v) ->
+            val distinct = v.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+            if (distinct.isNotEmpty()) {
+                obj.put(normalizeVentoyRelPath(k), JSONArray(distinct))
+            }
+        }
+        return obj
+    }
+
     private fun writeVentoyJsonOnMounted(
         context: Context,
         bypassCheck: Boolean,
@@ -747,15 +824,14 @@ object VentoyImageBuilder {
         experience: WindowsExperienceConfig? = null,
         winUtil: WinUtilTweaksConfig? = null,
         driversDir: String? = null,
-        excludedAutoInstallIsos: Set<String>? = null
+        excludedAutoInstallIsos: Set<String>? = null,
+        isoProfileIds: Map<String, List<String>>? = null,
+        savedCustomProfiles: Map<String, String>? = null
     ): Boolean {
         var driversOk = true
         val existingRaw = Shell.cmd("cat $TEMP_VENTOY_MNT/ventoy/ventoy.json 2>/dev/null").exec().out.joinToString("\n")
         val rootObj = runCatching { if (existingRaw.isNotBlank()) JSONObject(existingRaw) else JSONObject() }.getOrDefault(JSONObject())
-        rootObj.put("control", JSONArray().apply {
-            put(JSONObject().put("VTOY_WIN11_BYPASS_CHECK", if (bypassCheck) "1" else "0"))
-            put(JSONObject().put("VTOY_WIN11_BYPASS_NRO", if (bypassNro) "1" else "0"))
-        })
+        VentoyThemeCatalog.mergeBypassControlPreservingTimeout(rootObj, bypassCheck, bypassNro)
 
         val existingMeta = readPocketBootMetaOnMounted(bypassCheck, bypassNro)
         val winIsos = findWindowsIsoRelPathsOnMounted()
@@ -766,27 +842,50 @@ object VentoyImageBuilder {
         )
         val effWu = winUtil ?: existingMeta.winUtil
         val rawExcluded = excludedAutoInstallIsos ?: existingMeta.excludedAutoInstallIsos
-        // Prune excluded paths that no longer exist on the drive (while keeping any user-set entries when drive has matching ISOs)
         val effExcluded = rawExcluded.map { normalizeVentoyRelPath(it) }.filter { it in winIsoSet }.toSet()
-        val shouldPersistMeta = (experience != null && winUtil != null) || excludedAutoInstallIsos != null || existingMeta.exists
+
+        val rawProfileMap = isoProfileIds ?: existingMeta.isoProfileIds
+        val effProfileMap = rawProfileMap
+            .mapKeys { normalizeVentoyRelPath(it.key) }
+            .filterKeys { it in winIsoSet && it !in effExcluded }
+            .mapValues { it.value.map { id -> id.trim() }.filter { id -> id.isNotEmpty() }.distinct() }
+            .filterValues { it.isNotEmpty() }
+
+        val mergedCustomProfiles = LinkedHashMap<String, String>(existingMeta.savedCustomProfiles)
+        savedCustomProfiles?.forEach { (k, v) -> if (k.isNotBlank() && v.isNotBlank()) mergedCustomProfiles[k] = v }
+
+        val shouldPersistMeta = (experience != null && winUtil != null) ||
+            excludedAutoInstallIsos != null ||
+            isoProfileIds != null ||
+            existingMeta.exists
 
         val eligibleWinIsos = winIsos.filter { rel ->
             isWindowsDesktopAutoInstallEligible(rel.substringAfterLast('/')) && rel !in effExcluded
         }
 
         if (shouldPersistMeta) {
-            val hasTweaksToInject = effExp.hasAnyActive() || effWu.hasAnyActive()
-            // Remove legacy single-arch file and stale arch XMLs before writing active per-arch templates
-            Shell.cmd("rm -f $TEMP_VENTOY_MNT/ventoy/scripts/pocketboot_unattend*.xml 2>/dev/null").exec()
-            if (hasTweaksToInject) {
-                val neededArches = eligibleWinIsos
-                    .map { WindowsCustomizationEngine.detectProcessorArchitecture(it.substringAfterLast('/')) }
-                    .distinct()
-                    .ifEmpty { listOf("amd64") }
-                neededArches.forEach { arch ->
-                    val fileName = "pocketboot_unattend_$arch.xml"
+            Shell.cmd("rm -f $TEMP_VENTOY_MNT/ventoy/scripts/pocketboot_unattend*.xml $TEMP_VENTOY_MNT/ventoy/scripts/pocketboot_profile_*.xml 2>/dev/null").exec()
+
+            val requiredPairs = linkedSetOf<Pair<String, String>>()
+            eligibleWinIsos.forEach { rel ->
+                val arch = WindowsCustomizationEngine.detectProcessorArchitecture(rel.substringAfterLast('/'))
+                val profiles = effProfileMap[rel].orEmpty().ifEmpty { listOf(PROFILE_ID_DEFAULT) }
+                profiles.forEach { pid -> requiredPairs.add(pid to arch) }
+            }
+            if (requiredPairs.isEmpty() && (effExp.hasAnyActive() || effWu.hasAnyActive())) {
+                requiredPairs.add(PROFILE_ID_DEFAULT to "amd64")
+            }
+
+            requiredPairs.forEach { (pid, arch) ->
+                val pWu = resolveProfileWinUtil(pid, effWu, mergedCustomProfiles)
+                if (effExp.hasAnyActive() || pWu.hasAnyActive()) {
+                    val fileName = if (pid == PROFILE_ID_DEFAULT) {
+                        "pocketboot_unattend_$arch.xml"
+                    } else {
+                        "pocketboot_profile_${profileSlug(pid)}_$arch.xml"
+                    }
                     val tmpXml = File(context.cacheDir, fileName).apply {
-                        writeText(WindowsCustomizationEngine.generateVentoySelfContainedXml(effExp, effWu, arch), Charsets.UTF_8)
+                        writeText(WindowsCustomizationEngine.generateVentoySelfContainedXml(effExp, pWu, arch), Charsets.UTF_8)
                     }
                     try {
                         Shell.cmd("mkdir -p $TEMP_VENTOY_MNT/ventoy/scripts && cp -f ${shellQuote(tmpXml.absolutePath)} $TEMP_VENTOY_MNT/ventoy/scripts/$fileName").exec()
@@ -795,6 +894,9 @@ object VentoyImageBuilder {
                     }
                 }
             }
+
+            val customObj = JSONObject()
+            mergedCustomProfiles.forEach { (k, v) -> customObj.put(k, v) }
             val metaObj = JSONObject().apply {
                 put("bypassRequirements", effExp.bypassRequirements)
                 put("bypassMicrosoftAccount", effExp.bypassMicrosoftAccount)
@@ -810,6 +912,8 @@ object VentoyImageBuilder {
                 put("applySkuSiPolicy", effExp.applySkuSiPolicy)
                 put("winUtilJson", effWu.toJsonString())
                 put("excludedAutoInstallIsos", JSONArray(effExcluded.sorted()))
+                put("isoProfileIds", encodeIsoProfileIdsJson(effProfileMap))
+                put("savedCustomProfiles", customObj)
             }
             val tmpMeta = File(context.cacheDir, "pb_vtoy_meta.json").apply { writeText(metaObj.toString(), Charsets.UTF_8) }
             try { Shell.cmd("mkdir -p $TEMP_VENTOY_MNT/ventoy && cp -f ${shellQuote(tmpMeta.absolutePath)} $TEMP_VENTOY_MNT/ventoy/pocketboot_meta.json").exec() } finally { tmpMeta.delete() }
@@ -825,19 +929,31 @@ object VentoyImageBuilder {
         val autoArr = JSONArray()
         eligibleWinIsos.forEach { rel ->
             val arch = WindowsCustomizationEngine.detectProcessorArchitecture(rel.substringAfterLast('/'))
-            val archXml = "/ventoy/scripts/pocketboot_unattend_$arch.xml"
-            val legacyXml = "/ventoy/scripts/pocketboot_unattend.xml"
-            val chosenXml = when {
-                Shell.cmd("[ -f ${shellQuote("$TEMP_VENTOY_MNT$archXml")} ] && echo 1 || echo 0").exec().out.lastOrNull()?.trim() == "1" -> archXml
-                Shell.cmd("[ -f ${shellQuote("$TEMP_VENTOY_MNT$legacyXml")} ] && echo 1 || echo 0").exec().out.lastOrNull()?.trim() == "1" -> legacyXml
-                else -> ""
+            val profiles = effProfileMap[rel].orEmpty().ifEmpty { listOf(PROFILE_ID_DEFAULT) }
+            val templatePaths = mutableListOf<String>()
+            profiles.forEach { pid ->
+                val relXml = if (pid == PROFILE_ID_DEFAULT) {
+                    "/ventoy/scripts/pocketboot_unattend_$arch.xml"
+                } else {
+                    "/ventoy/scripts/pocketboot_profile_${profileSlug(pid)}_$arch.xml"
+                }
+                val exists = Shell.cmd("[ -f ${shellQuote("$TEMP_VENTOY_MNT$relXml")} ] && echo 1 || echo 0").exec().out.lastOrNull()?.trim() == "1"
+                if (exists && relXml !in templatePaths) {
+                    templatePaths.add(relXml)
+                }
             }
-            if (chosenXml.isNotEmpty()) {
+            if (templatePaths.isEmpty()) {
+                val legacyXml = "/ventoy/scripts/pocketboot_unattend.xml"
+                if (Shell.cmd("[ -f ${shellQuote("$TEMP_VENTOY_MNT$legacyXml")} ] && echo 1 || echo 0").exec().out.lastOrNull()?.trim() == "1") {
+                    templatePaths.add(legacyXml)
+                }
+            }
+            if (templatePaths.isNotEmpty()) {
                 autoArr.put(JSONObject().apply {
                     put("image", rel)
-                    put("template", JSONArray().put(chosenXml))
-                    put("autosel", 1)
-                    put("timeout", 3)
+                    put("template", JSONArray(templatePaths))
+                    put("autosel", if (templatePaths.size == 1) 1 else 0)
+                    put("timeout", if (templatePaths.size == 1) 3 else 10)
                 })
             }
         }
@@ -887,12 +1003,24 @@ object VentoyImageBuilder {
                     arr.optString(i, "").trim().takeIf { it.isNotEmpty() }?.let { excluded.add(normalizeVentoyRelPath(it)) }
                 }
             }
+            val profileIds = parseIsoProfileIdsJson(o.optJSONObject("isoProfileIds"))
+            val customMap = LinkedHashMap<String, String>()
+            o.optJSONObject("savedCustomProfiles")?.let { cp ->
+                val keys = cp.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val v = cp.optString(k, "").trim()
+                    if (k.isNotBlank() && v.isNotBlank()) customMap[k] = v
+                }
+            }
             PocketBootDriveMeta(
                 exists = true,
                 experience = exp,
                 winUtil = WinUtilTweaksConfig.fromJsonString(o.optString("winUtilJson", ""), legacyClassicContextMenu = legacyClassic),
                 hasDriversZip = hasDrv,
-                excludedAutoInstallIsos = excluded
+                excludedAutoInstallIsos = excluded,
+                isoProfileIds = profileIds,
+                savedCustomProfiles = customMap
             )
         }.getOrDefault(
             PocketBootDriveMeta(
@@ -1266,6 +1394,14 @@ object VentoyImageBuilder {
 
             val (bypassCheck, bypassNro) = readVentoyJsonOnMounted()
             val meta = readPocketBootMetaOnMounted(bypassCheck, bypassNro)
+            val rawJson = Shell.cmd("cat $TEMP_VENTOY_MNT/ventoy/ventoy.json 2>/dev/null").exec().out.joinToString("\n")
+            val rootJson = runCatching { if (rawJson.isNotBlank()) JSONObject(rawJson) else JSONObject() }.getOrDefault(JSONObject())
+            val menuCfg = VentoyThemeCatalog.readMenuConfig(rootJson)
+            val persList = VentoyThemeCatalog.readPersistenceEntries(rootJson).map { pe ->
+                val datSz = Shell.cmd("stat -c '%s' ${shellQuote("$TEMP_VENTOY_MNT${pe.backendPath}")} 2>/dev/null")
+                    .exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                pe.copy(sizeBytes = datSz)
+            }
             VentoyDriveContents(
                 info = info,
                 fsType = fsLabel,
@@ -1277,14 +1413,18 @@ object VentoyImageBuilder {
                 savedExperience = meta.experience,
                 savedWinUtil = meta.winUtil,
                 hasDriversZip = meta.hasDriversZip,
-                excludedAutoInstallIsos = meta.excludedAutoInstallIsos
+                excludedAutoInstallIsos = meta.excludedAutoInstallIsos,
+                isoProfileIds = meta.isoProfileIds,
+                savedCustomProfiles = meta.savedCustomProfiles,
+                menuConfig = menuCfg,
+                persistenceEntries = persList
             )
         } finally {
             unmountVentoyPartition1(loopDev)
         }
     }
 
-    private suspend fun mountedGuardError(resolvedImg: String, actionLabel: String): String? {
+    internal suspend fun mountedGuardError(resolvedImg: String, actionLabel: String): String? {
         return if (UsbGadgetEngine.getStatus().mountedLunFor(resolvedImg) != null) {
             "${resolvedImg.substringAfterLast('/')} is currently mounted to your PC. Unmount it before $actionLabel."
         } else null
@@ -1409,7 +1549,34 @@ object VentoyImageBuilder {
                 ?: return@withContext ActionResult(false, "Could not mount Multi-Boot partition.")
             val target = "$TEMP_VENTOY_MNT/${relativePath.trimStart('/')}"
             val res = Shell.cmd("rm -f ${shellQuote(target)} 2>&1").exec()
-            if (res.isSuccess) { val (curChk, curNro) = readVentoyJsonOnMounted(); writeVentoyJsonOnMounted(context, curChk, curNro) }
+            if (res.isSuccess) {
+                val normRemoved = normalizeVentoyRelPath(relativePath)
+                val rawJ = Shell.cmd("cat $TEMP_VENTOY_MNT/ventoy/ventoy.json 2>/dev/null").exec().out.joinToString("\n")
+                if (rawJ.isNotBlank()) {
+                    runCatching {
+                        val rootJ = JSONObject(rawJ)
+                        val (_, oldDat) = VentoyThemeCatalog.removePersistenceEntry(rootJ, normRemoved)
+                        if (!oldDat.isNullOrBlank()) {
+                            Shell.cmd("rm -f ${shellQuote("$TEMP_VENTOY_MNT$oldDat")} 2>/dev/null || true").exec()
+                        }
+                        val curMenu = VentoyThemeCatalog.readMenuConfig(rootJ)
+                        if (normRemoved in curMenu.menuAliases) {
+                            VentoyThemeCatalog.applyMenuConfigPreservingAll(
+                                rootJ,
+                                curMenu.copy(menuAliases = curMenu.menuAliases - normRemoved)
+                            )
+                        }
+                        val tmpClean = File(context.cacheDir, "pb_vtoy_rm_clean.json").apply { writeText(rootJ.toString(2), Charsets.UTF_8) }
+                        try {
+                            Shell.cmd("cp -f ${shellQuote(tmpClean.absolutePath)} $TEMP_VENTOY_MNT/ventoy/ventoy.json").exec()
+                        } finally {
+                            tmpClean.delete()
+                        }
+                    }
+                }
+                val (curChk, curNro) = readVentoyJsonOnMounted()
+                writeVentoyJsonOnMounted(context, curChk, curNro)
+            }
             ActionResult(
                 success = res.isSuccess,
                 userMessage = if (res.isSuccess) "Removed ${relativePath.substringAfterLast('/')} from Multi-Boot drive." else "Could not remove file."
@@ -1482,6 +1649,79 @@ object VentoyImageBuilder {
             )
             val isoName = relativePath.substringAfterLast('/')
             ActionResult(true, if (enabled) "Enabled Windows tweaks for $isoName." else "Set $isoName to Stock (no tweaks).")
+        } finally {
+            unmountVentoyPartition1(loopDev)
+        }
+    }
+
+    suspend fun setIsoProfileSelection(
+        context: Context,
+        ventoyImgPath: String,
+        relativePath: String,
+        selectedProfileIds: List<String>,
+        customProfileJsonById: Map<String, String> = emptyMap()
+    ): ActionResult = withContext(Dispatchers.IO) {
+        val resolvedImg = UsbGadgetEngine.resolveDirectPath(ventoyImgPath)
+        mountedGuardError(resolvedImg, "updating per-ISO tweak profiles")?.let { return@withContext ActionResult(false, it) }
+        val info = probeVentoyImage(resolvedImg) ?: return@withContext ActionResult(false, "Not a valid Multi-Boot image.")
+        val loopDev = attachPartition1Loop(resolvedImg, info.part1OffsetBytes, info.part1SizeBytes)
+        if (loopDev.isBlank() || !loopDev.startsWith("/dev/")) return@withContext ActionResult(false, "Could not attach Multi-Boot partition.")
+        return@withContext try {
+            mountVentoyPartition1(context, loopDev) ?: return@withContext ActionResult(false, "Could not mount Multi-Boot partition.")
+            val (curChk, curNro) = readVentoyJsonOnMounted()
+            val meta = readPocketBootMetaOnMounted(curChk, curNro)
+            val normPath = normalizeVentoyRelPath(relativePath)
+            val cleanIds = selectedProfileIds.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+            val updatedExcluded = if (cleanIds.isEmpty()) meta.excludedAutoInstallIsos + normPath else meta.excludedAutoInstallIsos - normPath
+            val updatedMap = LinkedHashMap<String, List<String>>(meta.isoProfileIds)
+            if (cleanIds.isEmpty()) updatedMap.remove(normPath) else updatedMap[normPath] = cleanIds
+            writeVentoyJsonOnMounted(
+                context = context,
+                bypassCheck = curChk,
+                bypassNro = curNro,
+                experience = meta.experience,
+                winUtil = meta.winUtil,
+                driversDir = null,
+                excludedAutoInstallIsos = updatedExcluded,
+                isoProfileIds = updatedMap,
+                savedCustomProfiles = customProfileJsonById
+            )
+            val leaf = relativePath.substringAfterLast('/')
+            val msg = when (cleanIds.size) {
+                0 -> "Set $leaf to Stock (no tweaks)."
+                1 -> "Assigned ${profileDisplayLabel(cleanIds.first())} profile to $leaf."
+                else -> "Attached ${cleanIds.size} boot-menu tweak profiles to $leaf."
+            }
+            ActionResult(true, msg)
+        } finally {
+            unmountVentoyPartition1(loopDev)
+        }
+    }
+
+    suspend fun updateMenuConfig(
+        context: Context,
+        ventoyImgPath: String,
+        menuConfig: MultiBootMenuConfig,
+        existingRelPaths: Set<String>? = null
+    ): ActionResult = withContext(Dispatchers.IO) {
+        val resolvedImg = UsbGadgetEngine.resolveDirectPath(ventoyImgPath)
+        mountedGuardError(resolvedImg, "updating boot menu settings")?.let { return@withContext ActionResult(false, it) }
+        val info = probeVentoyImage(resolvedImg) ?: return@withContext ActionResult(false, "Not a valid Multi-Boot image.")
+        val loopDev = attachPartition1Loop(resolvedImg, info.part1OffsetBytes, info.part1SizeBytes)
+        if (loopDev.isBlank() || !loopDev.startsWith("/dev/")) return@withContext ActionResult(false, "Could not attach Multi-Boot partition.")
+        return@withContext try {
+            mountVentoyPartition1(context, loopDev) ?: return@withContext ActionResult(false, "Could not mount Multi-Boot partition.")
+            val raw = Shell.cmd("cat $TEMP_VENTOY_MNT/ventoy/ventoy.json 2>/dev/null").exec().out.joinToString("\n")
+            val rootObj = runCatching { if (raw.isNotBlank()) JSONObject(raw) else JSONObject() }.getOrDefault(JSONObject())
+            VentoyThemeCatalog.applyMenuConfigPreservingAll(rootObj, menuConfig, existingRelPaths)
+            VentoyThemeCatalog.writeThemeAssetsOnMounted(context, TEMP_VENTOY_MNT, menuConfig.themePreset)
+            val tmpJson = File(context.cacheDir, "pb_vtoy_menu.json").apply { writeText(rootObj.toString(2), Charsets.UTF_8) }
+            try {
+                Shell.cmd("mkdir -p $TEMP_VENTOY_MNT/ventoy && cp -f ${shellQuote(tmpJson.absolutePath)} $TEMP_VENTOY_MNT/ventoy/ventoy.json").exec()
+            } finally {
+                tmpJson.delete()
+            }
+            ActionResult(true, "Saved Multi-Boot menu appearance & aliases.")
         } finally {
             unmountVentoyPartition1(loopDev)
         }
@@ -2690,6 +2930,12 @@ fun VentoyManagerSheet(
     var showResizeDialog by remember { mutableStateOf(false) }
     var moveOnAdd by remember { mutableStateOf(false) }
     var assetInfo by remember { mutableStateOf(VentoyImageBuilder.getInstalledVentoyInfo(context)) }
+    var showMenuAppearancePanel by remember { mutableStateOf(false) }
+    var mgrThemeId by remember { mutableStateOf(MultiBootThemePreset.STOCK.id) }
+    var mgrMenuTimeout by remember { mutableIntStateOf(0) }
+    var aliasEditTarget by remember { mutableStateOf<VentoyIsoItem?>(null) }
+    var profileEditTarget by remember { mutableStateOf<VentoyIsoItem?>(null) }
+    var persistenceEditTarget by remember { mutableStateOf<VentoyIsoItem?>(null) }
 
     fun reloadContents() {
         if (isMountedToPc) {
@@ -2703,6 +2949,8 @@ fun VentoyManagerSheet(
             if (loaded != null) {
                 mgrExp = loaded.savedExperience
                 mgrWinUtil = loaded.savedWinUtil
+                mgrThemeId = loaded.menuConfig.themeId
+                mgrMenuTimeout = loaded.menuConfig.menuTimeoutSec
             }
             loading = false
         }
@@ -2967,10 +3215,18 @@ fun VentoyManagerSheet(
                             val isWinIso = IsoInspector.quickGuessByName(item.name) == IsoOsType.WINDOWS
                             val winKind = if (isWinIso) WindowsCustomizationEngine.detectWindowsOsKind(item.name) else WindowsOsKind.UNKNOWN
                             val eligible = VentoyImageBuilder.isWindowsDesktopAutoInstallEligible(item.name)
+                            val linuxPersistEligible = VentoyPersistenceHelper.isLinuxPersistenceEligible(item.name)
                             val isoArch = if (isWinIso) WindowsCustomizationEngine.detectProcessorArchitecture(item.name) else ""
                             val normRel = VentoyImageBuilder.normalizeVentoyRelPath(item.relativePath)
                             val tweaksOnForIso = eligible && normRel !in c.excludedAutoInstallIsos
+                            val assignedProfiles = if (!tweaksOnForIso) emptyList() else c.isoProfileIds[normRel].orEmpty().ifEmpty { listOf(VentoyImageBuilder.PROFILE_ID_DEFAULT) }
+                            val aliasText = c.menuConfig.menuAliases[normRel].orEmpty()
+                            val persEntry = c.persistenceEntries.firstOrNull { it.imagePath.equals(normRel, ignoreCase = true) }
                             val metaSubtitle = buildString {
+                                if (aliasText.isNotBlank()) {
+                                    append(item.name)
+                                    append(" · ")
+                                }
                                 append(UsbGadgetEngine.formatBytes(item.sizeBytes))
                                 if (eligible) {
                                     append(" · ")
@@ -2981,6 +3237,9 @@ fun VentoyManagerSheet(
                                     append(" · ")
                                     append(winKind.label)
                                     append(" (Stock only)")
+                                } else if (persEntry != null) {
+                                    append(" · Persist ")
+                                    append(if (persEntry.sizeBytes > 0L) UsbGadgetEngine.formatBytes(persEntry.sizeBytes) else persEntry.styleLabel)
                                 }
                             }
                             Surface(
@@ -2989,28 +3248,30 @@ fun VentoyManagerSheet(
                                 border = BorderStroke(0.5.dp, PocketColors.border)
                             ) {
                                 Row(
-                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 9.dp),
                                     verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                                 ) {
-                                    Icon(Icons.Rounded.Album, null, tint = PocketColors.accentSoft, modifier = Modifier.size(20.dp))
+                                    Icon(Icons.Rounded.Album, null, tint = PocketColors.accentSoft, modifier = Modifier.size(19.dp))
                                     Column(modifier = Modifier.weight(1f)) {
-                                        Text(item.name, style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        Text(
+                                            text = aliasText.ifBlank { item.name },
+                                            style = MaterialTheme.typography.labelLarge,
+                                            color = PocketColors.textPrimary,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
                                         Text(metaSubtitle, style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                     }
                                     if (eligible) {
-                                        val activePill = tweaksOnForIso && hasDriveTweaks
+                                        val activePill = assignedProfiles.isNotEmpty() && (assignedProfiles.any { it != VentoyImageBuilder.PROFILE_ID_DEFAULT } || hasDriveTweaks)
+                                        val pillText = when (assignedProfiles.size) {
+                                            0 -> "Stock"
+                                            1 -> if (assignedProfiles.first() == VentoyImageBuilder.PROFILE_ID_DEFAULT) "Tweaks" else VentoyImageBuilder.profileDisplayLabel(assignedProfiles.first()).take(10)
+                                            else -> "${assignedProfiles.size} Profiles"
+                                        }
                                         Surface(
-                                            modifier = Modifier.bounceClick {
-                                                scope.launch {
-                                                    opBusy = true
-                                                    opProgress = WindowsBuildProgress("Updating ISO mode...", item.name, 0.5f, true)
-                                                    val res = VentoyImageBuilder.setIsoAutoInstallEnabled(context, ventoyFile.path, item.relativePath, !tweaksOnForIso)
-                                                    opBusy = false
-                                                    onMessage(res.userMessage, !res.success)
-                                                    reloadContents()
-                                                }
-                                            },
+                                            modifier = Modifier.bounceClick { profileEditTarget = item },
                                             shape = RoundedCornerShape(8.dp),
                                             color = when {
                                                 activePill -> PocketColors.accentBg
@@ -3023,8 +3284,8 @@ fun VentoyManagerSheet(
                                             )
                                         ) {
                                             Text(
-                                                text = if (tweaksOnForIso) "Tweaks" else "Stock",
-                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                                text = pillText,
+                                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
                                                 style = MaterialTheme.typography.labelSmall,
                                                 fontWeight = FontWeight.SemiBold,
                                                 color = when {
@@ -3034,6 +3295,28 @@ fun VentoyManagerSheet(
                                                 }
                                             )
                                         }
+                                    } else if (linuxPersistEligible) {
+                                        val hasPers = persEntry != null
+                                        Surface(
+                                            modifier = Modifier.bounceClick { persistenceEditTarget = item },
+                                            shape = RoundedCornerShape(8.dp),
+                                            color = if (hasPers) PocketColors.successBg else PocketColors.surfaceCard,
+                                            border = BorderStroke(0.75.dp, if (hasPers) PocketColors.success else PocketColors.border)
+                                        ) {
+                                            Text(
+                                                text = if (hasPers) "Persist" else "+ Persist",
+                                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = if (hasPers) PocketColors.success else PocketColors.textSecondary
+                                            )
+                                        }
+                                    }
+                                    IconButton(
+                                        onClick = { aliasEditTarget = item },
+                                        modifier = Modifier.size(32.dp)
+                                    ) {
+                                        Icon(Icons.Rounded.Edit, "Boot menu alias", tint = PocketColors.textSecondary, modifier = Modifier.size(16.dp))
                                     }
                                     IconButton(
                                         onClick = {
@@ -3045,9 +3328,10 @@ fun VentoyManagerSheet(
                                                 onMessage(res.userMessage, !res.success)
                                                 reloadContents()
                                             }
-                                        }
+                                        },
+                                        modifier = Modifier.size(32.dp)
                                     ) {
-                                        Icon(Icons.Rounded.DeleteOutline, "Remove", tint = PocketColors.danger, modifier = Modifier.size(20.dp))
+                                        Icon(Icons.Rounded.DeleteOutline, "Remove", tint = PocketColors.danger, modifier = Modifier.size(18.dp))
                                     }
                                 }
                             }
@@ -3114,6 +3398,89 @@ fun VentoyManagerSheet(
                                 },
                                 activeColor = PocketColors.success
                             )
+                        }
+                    }
+                }
+
+                // Boot Menu Theme & Timeout Card (Feature 2.2)
+                Surface(
+                    modifier = Modifier.fillMaxWidth().bounceClick { showMenuAppearancePanel = !showMenuAppearancePanel },
+                    shape = RoundedCornerShape(12.dp),
+                    color = PocketColors.surfaceInput,
+                    border = BorderStroke(0.5.dp, PocketColors.border)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 11.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Rounded.Palette, null, tint = PocketColors.infoBlue, modifier = Modifier.size(19.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Boot Menu Theme & Timeout", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                            Text(
+                                "${MultiBootThemePreset.fromId(mgrThemeId).label} · ${if (mgrMenuTimeout > 0) "${mgrMenuTimeout}s timeout" else "No auto-boot timeout"} · ${c.menuConfig.menuAliases.size} alias(es)",
+                                fontSize = 11.sp,
+                                color = PocketColors.textSecondary
+                            )
+                        }
+                        Text(if (showMenuAppearancePanel) "Hide" else "Edit", style = MaterialTheme.typography.labelSmall, color = PocketColors.accentSoft)
+                    }
+                }
+                if (showMenuAppearancePanel) {
+                    Surface(shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
+                        Column(modifier = Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text("GRUB Menu Theme", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                MultiBootThemePreset.entries.forEach { preset ->
+                                    val sel = mgrThemeId == preset.id
+                                    Surface(
+                                        modifier = Modifier.weight(1f).bounceClick { mgrThemeId = preset.id },
+                                        shape = RoundedCornerShape(9.dp),
+                                        color = if (sel) PocketColors.accentBg else PocketColors.surfaceCard,
+                                        border = BorderStroke(if (sel) 1.5.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                                    ) {
+                                        Box(modifier = Modifier.padding(horizontal = 6.dp, vertical = 9.dp), contentAlignment = Alignment.Center) {
+                                            Text(preset.label, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = if (sel) PocketColors.accentSoft else PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        }
+                                    }
+                                }
+                            }
+                            Text("Menu Timeout", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                listOf(0 to "Off", 5 to "5s", 10 to "10s", 15 to "15s", 30 to "30s").forEach { (sec, lbl) ->
+                                    val sel = mgrMenuTimeout == sec
+                                    Surface(
+                                        modifier = Modifier.weight(1f).bounceClick { mgrMenuTimeout = sec },
+                                        shape = RoundedCornerShape(9.dp),
+                                        color = if (sel) PocketColors.accentBg else PocketColors.surfaceCard,
+                                        border = BorderStroke(if (sel) 1.5.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                                    ) {
+                                        Box(modifier = Modifier.padding(vertical = 8.dp), contentAlignment = Alignment.Center) {
+                                            Text(lbl, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = if (sel) PocketColors.accentSoft else PocketColors.textPrimary)
+                                        }
+                                    }
+                                }
+                            }
+                            Button(
+                                onClick = {
+                                    scope.launch {
+                                        opBusy = true
+                                        opProgress = WindowsBuildProgress("Applying boot menu theme...", MultiBootThemePreset.fromId(mgrThemeId).label, 0.5f, true)
+                                        val nextCfg = c.menuConfig.copy(themeId = mgrThemeId, menuTimeoutSec = mgrMenuTimeout)
+                                        val existingRels = c.files.map { VentoyImageBuilder.normalizeVentoyRelPath(it.relativePath) }.toSet()
+                                        val res = VentoyImageBuilder.updateMenuConfig(context, ventoyFile.path, nextCfg, existingRels)
+                                        opBusy = false
+                                        onMessage(res.userMessage, !res.success)
+                                        reloadContents()
+                                    }
+                                },
+                                enabled = !opBusy,
+                                modifier = Modifier.fillMaxWidth().height(42.dp),
+                                shape = RoundedCornerShape(10.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)
+                            ) {
+                                Text("Save Menu Theme & Timeout", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                            }
                         }
                     }
                 }
@@ -3366,4 +3733,294 @@ fun VentoyManagerSheet(
     }
 
     if (showMgrDriversPicker) RootFolderPickerSheet("Select Drivers Folder (WinPE)", "Packed into driver archive for Windows ISOs", mgrDriversDir.ifBlank { defaultDir }, { showMgrDriversPicker = false }) { mgrDriversDir = it; showMgrDriversPicker = false }
+
+    // Boot Menu Alias Dialog (Feature 2.2)
+    aliasEditTarget?.let { item ->
+        val cNow = contents
+        val normRel = VentoyImageBuilder.normalizeVentoyRelPath(item.relativePath)
+        var aliasInput by remember(item.relativePath) { mutableStateOf(cNow?.menuConfig?.menuAliases?.get(normRel).orEmpty()) }
+        AlertDialog(
+            onDismissRequest = { aliasEditTarget = null },
+            containerColor = PocketColors.surfaceCard,
+            title = { Text("Boot Menu Display Name", color = PocketColors.textPrimary) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Set a friendly name shown on your PC's Multi-Boot menu for ${item.name} (leave blank to use filename).",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = PocketColors.textSecondary
+                    )
+                    OutlinedTextField(
+                        value = aliasInput,
+                        onValueChange = { aliasInput = it.take(80) },
+                        label = { Text("Menu Alias") },
+                        placeholder = { Text("e.g., Windows 11 Pro (Clean)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val targetItem = item
+                        val newAlias = aliasInput.trim()
+                        aliasEditTarget = null
+                        if (cNow != null) {
+                            scope.launch {
+                                opBusy = true
+                                opProgress = WindowsBuildProgress("Saving boot alias...", targetItem.name, 0.5f, true)
+                                val nextAliases = cNow.menuConfig.menuAliases.toMutableMap().apply {
+                                    if (newAlias.isEmpty()) remove(normRel) else put(normRel, newAlias)
+                                }
+                                val existingRels = cNow.files.map { VentoyImageBuilder.normalizeVentoyRelPath(it.relativePath) }.toSet()
+                                val res = VentoyImageBuilder.updateMenuConfig(
+                                    context,
+                                    ventoyFile.path,
+                                    cNow.menuConfig.copy(menuAliases = nextAliases),
+                                    existingRels
+                                )
+                                opBusy = false
+                                onMessage(res.userMessage, !res.success)
+                                reloadContents()
+                            }
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)
+                ) { Text("Save", fontWeight = FontWeight.SemiBold) }
+            },
+            dismissButton = {
+                TextButton(onClick = { aliasEditTarget = null }) { Text("Cancel", color = PocketColors.textSecondary) }
+            }
+        )
+    }
+
+    // Per-ISO Multi-Template Tweak Profile Picker Dialog (Feature 2.3)
+    profileEditTarget?.let { item ->
+        val cNow = contents
+        val normRel = VentoyImageBuilder.normalizeVentoyRelPath(item.relativePath)
+        val initialSelected = remember(item.relativePath, cNow) {
+            if (cNow == null || normRel in cNow.excludedAutoInstallIsos) emptySet()
+            else cNow.isoProfileIds[normRel].orEmpty().ifEmpty { listOf(VentoyImageBuilder.PROFILE_ID_DEFAULT) }.toSet()
+        }
+        var selectedIds by remember(item.relativePath) { mutableStateOf(initialSelected) }
+        val builtInProfiles = listOf(
+            VentoyImageBuilder.PROFILE_ID_DEFAULT to "Drive Default (uses your configured drive tweaks)",
+            VentoyImageBuilder.PROFILE_ID_STANDARD to "Standard Preset (balanced privacy & clean UI)",
+            VentoyImageBuilder.PROFILE_ID_MINIMAL to "Minimal Preset (lightweight safe tweaks)",
+            VentoyImageBuilder.PROFILE_ID_ADVANCED to "Advanced Preset (deep debloat & services)",
+            VentoyImageBuilder.PROFILE_ID_DESKTOP to "Desktop Preset (performance & power plan)",
+            VentoyImageBuilder.PROFILE_ID_LAPTOP to "Laptop Preset (battery-friendly defaults)"
+        )
+        val customMap = remember(systemTweaksPresets) {
+            systemTweaksPresets.associate { "custom:${it.name}" to it.tweaksJson }
+        }
+
+        AlertDialog(
+            onDismissRequest = { profileEditTarget = null },
+            containerColor = PocketColors.surfaceCard,
+            title = { Text("Boot-Menu Tweak Profiles", color = PocketColors.textPrimary) },
+            text = {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        "Pick 0 profiles for Stock install, 1 for auto-apply, or 2+ to choose the tweak profile right at your PC boot menu for ${item.name}.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = PocketColors.textSecondary
+                    )
+                    Surface(
+                        modifier = Modifier.fillMaxWidth().bounceClick { selectedIds = emptySet() },
+                        shape = RoundedCornerShape(10.dp),
+                        color = if (selectedIds.isEmpty()) PocketColors.warningBg else PocketColors.surfaceInput,
+                        border = BorderStroke(if (selectedIds.isEmpty()) 1.25.dp else 0.5.dp, if (selectedIds.isEmpty()) PocketColors.warning else PocketColors.border)
+                    ) {
+                        Row(modifier = Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Icon(if (selectedIds.isEmpty()) Icons.Rounded.CheckBox else Icons.Rounded.CheckBoxOutlineBlank, null, tint = if (selectedIds.isEmpty()) PocketColors.warning else PocketColors.textMuted, modifier = Modifier.size(18.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Stock (No Auto-Unattend)", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                                Text("Boot untouched ISO without injecting scripts", fontSize = 11.sp, color = PocketColors.textSecondary)
+                            }
+                        }
+                    }
+                    builtInProfiles.forEach { (pid, desc) ->
+                        val checked = pid in selectedIds
+                        Surface(
+                            modifier = Modifier.fillMaxWidth().bounceClick {
+                                selectedIds = if (checked) selectedIds - pid else selectedIds + pid
+                            },
+                            shape = RoundedCornerShape(10.dp),
+                            color = if (checked) PocketColors.accentBg else PocketColors.surfaceInput,
+                            border = BorderStroke(if (checked) 1.25.dp else 0.5.dp, if (checked) PocketColors.accent else PocketColors.border)
+                        ) {
+                            Row(modifier = Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Icon(if (checked) Icons.Rounded.CheckBox else Icons.Rounded.CheckBoxOutlineBlank, null, tint = if (checked) PocketColors.accent else PocketColors.textMuted, modifier = Modifier.size(18.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(VentoyImageBuilder.profileDisplayLabel(pid), style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                                    Text(desc, fontSize = 11.sp, color = PocketColors.textSecondary)
+                                }
+                            }
+                        }
+                    }
+                    systemTweaksPresets.forEach { preset ->
+                        val pid = "custom:${preset.name}"
+                        val checked = pid in selectedIds
+                        Surface(
+                            modifier = Modifier.fillMaxWidth().bounceClick {
+                                selectedIds = if (checked) selectedIds - pid else selectedIds + pid
+                            },
+                            shape = RoundedCornerShape(10.dp),
+                            color = if (checked) PocketColors.accentBg else PocketColors.surfaceInput,
+                            border = BorderStroke(if (checked) 1.25.dp else 0.5.dp, if (checked) PocketColors.accent else PocketColors.border)
+                        ) {
+                            Row(modifier = Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Icon(if (checked) Icons.Rounded.CheckBox else Icons.Rounded.CheckBoxOutlineBlank, null, tint = if (checked) PocketColors.accent else PocketColors.textMuted, modifier = Modifier.size(18.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(preset.name, style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                                    Text("Saved System Tweaks preset", fontSize = 11.sp, color = PocketColors.textSecondary)
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val targetItem = item
+                        val chosen = selectedIds.toList()
+                        profileEditTarget = null
+                        scope.launch {
+                            opBusy = true
+                            opProgress = WindowsBuildProgress("Writing boot templates...", targetItem.name, 0.5f, true)
+                            val res = VentoyImageBuilder.setIsoProfileSelection(context, ventoyFile.path, targetItem.relativePath, chosen, customMap)
+                            opBusy = false
+                            onMessage(res.userMessage, !res.success)
+                            reloadContents()
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)
+                ) { Text("Apply (${selectedIds.size})", fontWeight = FontWeight.SemiBold) }
+            },
+            dismissButton = {
+                TextButton(onClick = { profileEditTarget = null }) { Text("Cancel", color = PocketColors.textSecondary) }
+            }
+        )
+    }
+
+    // Linux Persistence Dialog Inside Multi-Boot (Feature 2.1)
+    persistenceEditTarget?.let { item ->
+        val cNow = contents
+        val normRel = VentoyImageBuilder.normalizeVentoyRelPath(item.relativePath)
+        val existingPers = cNow?.persistenceEntries?.firstOrNull { it.imagePath.equals(normRel, ignoreCase = true) }
+        val defaultStyle = remember(item.name) { LinuxPersistenceStyle.guessForIso(item.name) }
+        var persStyle by remember(item.relativePath) { mutableStateOf(defaultStyle) }
+        var persSizeGb by remember(item.relativePath) { mutableIntStateOf(4) }
+
+        AlertDialog(
+            onDismissRequest = { persistenceEditTarget = null },
+            containerColor = PocketColors.surfaceCard,
+            title = { Text("Linux Live Persistence", color = PocketColors.textPrimary) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        "Attach an ext4 persistence .dat volume inside Multi-Boot for ${item.name} so installed packages and files survive reboots.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = PocketColors.textSecondary
+                    )
+                    if (existingPers != null) {
+                        Surface(shape = RoundedCornerShape(9.dp), color = PocketColors.successBg, border = BorderStroke(0.5.dp, PocketColors.success)) {
+                            Text(
+                                "Active: ${existingPers.backendPath.substringAfterLast('/')} (${if (existingPers.sizeBytes > 0L) UsbGadgetEngine.formatBytes(existingPers.sizeBytes) else existingPers.styleLabel})",
+                                modifier = Modifier.fillMaxWidth().padding(9.dp),
+                                fontSize = 11.sp,
+                                color = PocketColors.textPrimary
+                            )
+                        }
+                    }
+                    Text("Distro Format", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf(
+                            LinuxPersistenceStyle.UBUNTU_MINT to "Ubuntu / Mint",
+                            LinuxPersistenceStyle.DEBIAN_KALI to "Debian / Kali"
+                        ).forEach { (st, lbl) ->
+                            val sel = persStyle == st
+                            Surface(
+                                modifier = Modifier.weight(1f).bounceClick { persStyle = st },
+                                shape = RoundedCornerShape(9.dp),
+                                color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput,
+                                border = BorderStroke(if (sel) 1.5.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                            ) {
+                                Box(modifier = Modifier.padding(vertical = 9.dp), contentAlignment = Alignment.Center) {
+                                    Text(lbl, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = if (sel) PocketColors.accentSoft else PocketColors.textPrimary)
+                                }
+                            }
+                        }
+                    }
+                    Text("Persistence Size", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf(1, 2, 4, 8, 16).forEach { gb ->
+                            val sel = persSizeGb == gb
+                            Surface(
+                                modifier = Modifier.weight(1f).bounceClick { persSizeGb = gb },
+                                shape = RoundedCornerShape(9.dp),
+                                color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput,
+                                border = BorderStroke(if (sel) 1.5.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                            ) {
+                                Box(modifier = Modifier.padding(vertical = 8.dp), contentAlignment = Alignment.Center) {
+                                    Text("${gb}G", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = if (sel) PocketColors.accentSoft else PocketColors.textPrimary)
+                                }
+                            }
+                        }
+                    }
+                    if (existingPers != null) {
+                        OutlinedButton(
+                            onClick = {
+                                val targetItem = item
+                                persistenceEditTarget = null
+                                scope.launch {
+                                    opBusy = true
+                                    opProgress = WindowsBuildProgress("Removing persistence...", targetItem.name, 0.5f, true)
+                                    val res = VentoyPersistenceHelper.removePersistenceForIso(context, ventoyFile.path, targetItem.relativePath)
+                                    opBusy = false
+                                    onMessage(res.userMessage, !res.success)
+                                    if (res.success) onLibraryChanged()
+                                    reloadContents()
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth().height(40.dp),
+                            shape = RoundedCornerShape(9.dp),
+                            border = BorderStroke(0.5.dp, PocketColors.danger)
+                        ) {
+                            Text("Remove Existing Persistence", fontSize = 12.sp, color = PocketColors.danger)
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val targetItem = item
+                        val gb = persSizeGb
+                        val st = persStyle
+                        persistenceEditTarget = null
+                        scope.launch {
+                            opBusy = true
+                            opProgress = WindowsBuildProgress("Creating ${gb} GB persistence...", targetItem.name, 0.2f, true)
+                            val res = VentoyPersistenceHelper.createPersistenceForIso(context, ventoyFile.path, targetItem.relativePath, gb, st) { opProgress = it }
+                            opBusy = false
+                            onMessage(res.userMessage, !res.success)
+                            if (res.success) onLibraryChanged()
+                            reloadContents()
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)
+                ) { Text(if (existingPers != null) "Replace (${persSizeGb} GB)" else "Create (${persSizeGb} GB)", fontWeight = FontWeight.SemiBold) }
+            },
+            dismissButton = {
+                TextButton(onClick = { persistenceEditTarget = null }) { Text("Cancel", color = PocketColors.textSecondary) }
+            }
+        )
+    }
 }

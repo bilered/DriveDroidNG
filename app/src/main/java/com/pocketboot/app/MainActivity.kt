@@ -231,6 +231,8 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
     var ventoyBuilderInitialIso by remember { mutableStateOf<ImageFile?>(null) }
     var ventoyManagerTarget by remember { mutableStateOf<ImageFile?>(null) }
     var ventoyManagerBusy by remember { mutableStateOf(false) }
+    var imageExplorerTarget by remember { mutableStateOf<ImageFile?>(null) }
+    var imageExplorerBusy by remember { mutableStateOf(false) }
     var selectedInfoFile by remember { mutableStateOf<ImageFile?>(null) }
     var renameTargetFile by remember { mutableStateOf<ImageFile?>(null) }
     var confirmDeleteFile by remember { mutableStateOf<ImageFile?>(null) }
@@ -244,7 +246,7 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
     val activeTurboDl by FastIsoDownloader.state.collectAsState()
     val activeUsbBuild by UsbBuildManager.state.collectAsState()
     val usbBuildCompletion by UsbBuildManager.completion.collectAsState()
-    val anyBuildActive = activeUsbBuild != null || ventoyManagerBusy
+    val anyBuildActive = activeUsbBuild != null || ventoyManagerBusy || imageExplorerBusy
     val anyBuildOrDlActive = anyBuildActive || (activeTurboDl != null && activeTurboDl?.isPaused != true)
     val keepScreenAwake = settings.keepScreenAwakeDuringBuilds && anyBuildOrDlActive
 
@@ -1058,6 +1060,27 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
         }
 
         // In-App Ventoy ISO Manager Sheet (Add / Remove ISOs anytime)
+        imageExplorerTarget?.let { expFile ->
+            val expMountedLun = status.mountedLunFor(expFile.path)
+            ImageExplorerSheet(
+                imgFile = expFile,
+                isMountedToPc = expMountedLun != null,
+                defaultExportDir = settings.defaultDir,
+                onDismiss = {
+                    imageExplorerBusy = false
+                    imageExplorerTarget = null
+                },
+                onUnmountFirst = { unmountSlot(expMountedLun) },
+                onImageModified = {
+                    scope.launch {
+                        images = UsbGadgetEngine.scanImages(settings.scanDirs, settings.pinnedFiles, settings.hiddenFiles)
+                    }
+                },
+                onMessage = { msg, err -> showFeedback(msg, err) },
+                onBusyChanged = { imageExplorerBusy = it }
+            )
+        }
+
         ventoyManagerTarget?.let { vFile ->
             val vMountedLun = status.mountedLunFor(vFile.path)
             VentoyManagerSheet(
@@ -1202,7 +1225,10 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
                     selectedInfoFile = null
                     ventoyManagerTarget = file
                 },
-
+                onOpenImageExplorer = {
+                    selectedInfoFile = null
+                    imageExplorerTarget = file
+                },
                 onClearRememberedMode = {
                     updateSettings(settings.copy(fileModes = settings.fileModes - file.path), rescan = false)
                     showFeedback("Cleared 1-tap quick mount mode for ${file.name}.")
@@ -1861,7 +1887,7 @@ private fun FileInfoBottomSheet(
     onOpenWindowsBuilder: () -> Unit,
     onOpenLinuxBuilder: () -> Unit,
     onOpenVentoyManager: () -> Unit,
-
+    onOpenImageExplorer: () -> Unit,
     onClearRememberedMode: () -> Unit,
     onRequestRename: () -> Unit,
     onRemoveFromList: () -> Unit,
@@ -1984,6 +2010,17 @@ private fun FileInfoBottomSheet(
                     )
                 }
                 else -> {}
+            }
+
+            if (file.name.endsWith(".img", ignoreCase = true)) {
+                MountActionCard(
+                    icon = Icons.Rounded.FolderOpen,
+                    title = "Explore / Edit Files Inside .img",
+                    badge = "On-Phone",
+                    subtitle = "Mount Partition 1 on your phone to browse, import, export, or delete files",
+                    highlighted = false,
+                    onClick = onOpenImageExplorer
+                )
             }
 
             // Boot Readiness Inspector Card

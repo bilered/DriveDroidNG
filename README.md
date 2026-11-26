@@ -1,4 +1,4 @@
-# PocketBoot v4.7.0
+# PocketBoot v4.7.1
 
 Rooted Android USB Gadget ISO/IMG boot utility, multi-boot Ventoy drive manager, official OS downloader, and Rufus-style Windows & Linux bootable USB builder.
 
@@ -9,4 +9,4 @@ Rooted Android USB Gadget ISO/IMG boot utility, multi-boot Ventoy drive manager,
 - **Rufus-Style Windows USB Builder (`WindowsImageBuilder.kt`):** Convert any Windows ISO into a bootable GPT/MBR NTFS or UEFI:NTFS `.img` with TPM/RAM/Secure Boot bypass, local account creation, WinUtil tweaks, custom drivers, CA 2023 bootloaders, and Win 7 UEFI fix.
 - **Foreground USB Build Service & Thermal Control (`UsbBuildService.kt`, `BuildThermalHelper.kt`):** Background-safe foreground service with wake lock, live notification + Cancel action, and Cool / Balanced / Max Speed CPU core-affinity & Auto Thermal Cooldown.
 - **In-App Release Updater & Automated JVM Tests (`AppUpdateChecker.kt`, `app/src/test`):** HTTPS-enforced GitHub release checks against `bilered/PocketBoot` and JUnit regression tests in CI.
-- **Ventoy Multi-Boot & Disk Tools (`VentoyImageBuilder.kt`, `DiskPartitioner.kt`):** Create, resize, and manage Ventoy multi-boot virtual drives directly on-device.
+- **Ventoy Multi-Boot & Disk Tools (`VentoyImageBuilder.kt`, `VentoyPersistenceHelper.kt`, `VentoyThemeCatalog.kt`, `ImageLoopExplorer.kt`, `DiskPartitioner.kt`):** Create, resize, reclaim sparse space, attach per-ISO Linux ext4 persistence `.dat` volumes, customize boot menu aliases/timeouts/GRUB themes, assign per-ISO multi-template Windows tweak profiles, and explore/edit Partition 1 of any `.img` directly on-phone.
