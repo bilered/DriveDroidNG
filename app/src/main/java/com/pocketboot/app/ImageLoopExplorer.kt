@@ -104,6 +104,12 @@ object ImageLoopExplorer {
 
     private fun shellQuote(value: String): String = "'${value.replace("'", "'\\''")}'"
 
+    internal fun isSelfImportPath(hostFilePath: String, sessionImgPath: String): Boolean {
+        val a = UsbGadgetEngine.resolveDirectPath(hostFilePath).trimEnd('/')
+        val b = UsbGadgetEngine.resolveDirectPath(sessionImgPath).trimEnd('/')
+        return a.isNotEmpty() && a == b
+    }
+
     internal fun sanitizeFolderName(raw: String): String = raw
         .replace('/', ' ')
         .replace('\\', ' ')
@@ -294,7 +300,7 @@ object ImageLoopExplorer {
             val fullDir = safeInsidePath(session, relDir)
             val qDir = shellQuote(fullDir)
             val cleanRelDir = relDir.trim('/')
-            val out = Shell.cmd("if [ -d $qDir ]; then stat -c '%F|%s|%n' $qDir/* 2>/dev/null || true; fi").exec().out
+            val out = Shell.cmd("if [ -d $qDir ]; then find $qDir -mindepth 1 -maxdepth 1 -exec stat -c '%F|%s|%n' {} + 2>/dev/null || true; fi").exec().out
             val items = out.mapNotNull { line ->
                 val p = line.split("|", limit = 3)
                 if (p.size < 3) return@mapNotNull null
@@ -349,6 +355,9 @@ object ImageLoopExplorer {
         withContext(Dispatchers.IO) {
             if (session.readOnly) return@withContext ActionResult(false, "Image is mounted read-only.")
             val resolvedSrc = UsbGadgetEngine.resolveDirectPath(hostFilePath)
+            if (isSelfImportPath(resolvedSrc, session.imgPath)) {
+                return@withContext ActionResult(false, "Cannot import an image file into itself.")
+            }
             val qSrc = shellQuote(resolvedSrc)
             val srcSize = Shell.cmd("stat -c '%s' $qSrc 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: -1L
             if (srcSize < 0L) return@withContext ActionResult(false, "Source file not found.")
@@ -364,6 +373,15 @@ object ImageLoopExplorer {
                 return@withContext ActionResult(
                     false,
                     "Not enough free space inside image (need ${UsbGadgetEngine.formatBytes(srcSize)}, only ${UsbGadgetEngine.formatBytes(effFree)} free)."
+                )
+            }
+            val imgParentDir = session.imgPath.substringBeforeLast('/')
+            val rawHostFree = UsbGadgetEngine.getFreeSpaceBytes(imgParentDir)
+            val effHostFree = if (rawHostFree > 0L) rawHostFree + existingDst else -1L
+            if (effHostFree in 1L until (srcSize + (64L * 1024L * 1024L))) {
+                return@withContext ActionResult(
+                    false,
+                    "Not enough free phone storage (${UsbGadgetEngine.formatBytes(effHostFree)} free) to grow this sparse image by ${UsbGadgetEngine.formatBytes(srcSize)}."
                 )
             }
             val cpOk = Shell.cmd("cp -f $qSrc $qDst 2>&1").exec().isSuccess
@@ -387,13 +405,15 @@ object ImageLoopExplorer {
         val srcSize = Shell.cmd("stat -c '%s' $qSrc 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: -1L
         if (srcSize < 0L) return@withContext ActionResult(false, "File not found inside image.")
         val safeDir = UsbGadgetEngine.resolveDirectPath(destHostDir).trimEnd('/')
-        val freeHost = UsbGadgetEngine.getFreeSpaceBytes(safeDir)
-        if (freeHost in 1L until (srcSize + (32L * 1024L * 1024L))) {
-            return@withContext ActionResult(false, "Not enough free phone storage (${UsbGadgetEngine.formatBytes(freeHost)} free).")
-        }
         val fileName = relFilePath.substringAfterLast('/')
         val dst = "$safeDir/$fileName"
         val qDst = shellQuote(dst)
+        val existingHostDst = Shell.cmd("stat -c '%s' $qDst 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+        val rawFreeHost = UsbGadgetEngine.getFreeSpaceBytes(safeDir)
+        val effFreeHost = if (rawFreeHost > 0L) rawFreeHost + existingHostDst else 0L
+        if (effFreeHost in 1L until (srcSize + (32L * 1024L * 1024L))) {
+            return@withContext ActionResult(false, "Not enough free phone storage (${UsbGadgetEngine.formatBytes(effFreeHost)} free).")
+        }
         val cpOk = Shell.cmd("mkdir -p ${shellQuote(safeDir)} && cp -f $qSrc $qDst 2>&1").exec().isSuccess
         val copiedSz = Shell.cmd("stat -c '%s' $qDst 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: -1L
         if (!cpOk || copiedSz != srcSize) {

@@ -77,7 +77,7 @@ data class DirectReleaseGroup(
     val arm64Release: DirectWindowsRelease?
 ) {
     val defaultRelease: DirectWindowsRelease
-        get() = x64Release ?: arm64Release!!
+        get() = x64Release ?: requireNotNull(arm64Release)
 }
 
 data class DirectLanguageSku(
@@ -206,8 +206,8 @@ object WindowsDirectCatalog {
                 orderedKeys[key] = x64 to arm
             }
         }
-        return orderedKeys.entries.map { (shortKey, pair) ->
-            val primary = pair.first ?: pair.second!!
+        return orderedKeys.entries.mapNotNull { (shortKey, pair) ->
+            val primary = pair.first ?: pair.second ?: return@mapNotNull null
             DirectReleaseGroup(
                 osFamily = primary.osFamily,
                 releaseLabel = primary.releaseLabel,

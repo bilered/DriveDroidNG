@@ -1,6 +1,7 @@
 package com.pocketboot.app
 
 import android.content.Context
+import android.widget.Toast
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -553,7 +554,11 @@ object WindowsImageBuilder {
             )
 
             val fmtRes = if (useNtfs) {
-                val qFmt = shellQuote(ntfsFormatter!!)
+                val activeNtfsFormatter = ntfsFormatter ?: run {
+                cleanup(deletePartial = true)
+                return@withContext ActionResult(false, "NTFS formatter unavailable on device.", entries = entries)
+            }
+            val qFmt = shellQuote(activeNtfsFormatter)
                 Shell.cmd(
                     "$qFmt -F -Q -c 4096 -L ${shellQuote(ntfsLabel)} -H 255 -S 63 -p ${layout.part1StartLba} $qLoop 2>&1"
                 ).exec()
@@ -762,7 +767,7 @@ object WindowsImageBuilder {
                         WindowsCustomizationEngine.patchBootWimSnippet(
                             qWimBin = shellQuote(wimBin),
                             qSourcesDir = qSourcesDir,
-                            qChntpwBin = if (tmpLabReg != null) shellQuote(chntpwBin!!) else null,
+                            qChntpwBin = if (tmpLabReg != null && chntpwBin != null) shellQuote(chntpwBin) else null,
                             qRegFile = tmpLabReg?.let { shellQuote(it.absolutePath) },
                             qXmlFile = tmpUnattendedXml?.let { shellQuote(it.absolutePath) }
                         ),
@@ -1072,7 +1077,10 @@ fun WindowsBuilderSheet(
         inspectingEditions = false
     }
     LaunchedEffect(defaultDir, driverPackReloadNonce) {
-        savedDriverPacks = DriverPackManager.listPacks(defaultDir)
+        val loaded = DriverPackManager.listPacks(defaultDir)
+        savedDriverPacks = loaded
+        val validDirs = loaded.map { it.dirPath }.toSet()
+        selectedDriverPackDirs = selectedDriverPackDirs.intersect(validDirs)
     }
     LaunchedEffect(extraDriversDir, selectedDriverPackDirs, savedDriverPacks) {
         val packBytes = savedDriverPacks.filter { it.dirPath in selectedDriverPackDirs }.sumOf { it.sizeBytes }
@@ -1280,7 +1288,7 @@ fun WindowsBuilderSheet(
             defaultDir = defaultDir,
             onDismiss = { showDriverPackManager = false },
             onPacksChanged = { driverPackReloadNonce++ },
-            onMessage = { _, _ -> }
+            onMessage = { msg, _ -> Toast.makeText(context, msg, Toast.LENGTH_LONG).show() }
         )
     }
 }

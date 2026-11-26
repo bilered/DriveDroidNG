@@ -1411,6 +1411,19 @@ object UsbGadgetEngine {
                         [ -f "${'$'}p" ] && echo on > "${'$'}p" 2>/dev/null || true
                     done
 
+                    pb_restore_usb_on_err() {
+                        [ -n "${'$'}ACTIVE_FUNC" ] && echo "" > "${'$'}ACTIVE_FUNC/lun.0/file" 2>/dev/null || true
+                        [ -n "${'$'}ACTIVE_FUNC" ] && [ -f "${'$'}ACTIVE_FUNC/lun.1/file" ] && echo "" > "${'$'}ACTIVE_FUNC/lun.1/file" 2>/dev/null || true
+                        PREV_CFG="mtp"
+                        if [ -f "$STATE_FILE" ]; then
+                            READ_CFG=${'$'}(cat "$STATE_FILE" 2>/dev/null)
+                            [ -n "${'$'}READ_CFG" ] && [ "${'$'}READ_CFG" != "none" ] && PREV_CFG="${'$'}READ_CFG"
+                            rm -f "$STATE_FILE" 2>/dev/null || true
+                        fi
+                        setprop sys.usb.configfs 1 2>/dev/null || true
+                        setprop sys.usb.config "${'$'}PREV_CFG" 2>/dev/null || true
+                    }
+
                     if [ "${'$'}(getprop sys.usb.configfs 2>/dev/null)" != "0" ]; then
                         setprop sys.usb.config none 2>/dev/null
                         W=0
@@ -1438,7 +1451,7 @@ object UsbGadgetEngine {
                             if [ -d "${'$'}ALT_FUNC/lun.0" ]; then
                                 ACTIVE_FUNC="${'$'}ALT_FUNC"
                             else
-                                setprop sys.usb.configfs 1 2>/dev/null
+                                pb_restore_usb_on_err
                                 echo "ERR|usb|Kernel failed to create mass_storage lun.0"
                                 return 1
                             fi
@@ -1447,7 +1460,7 @@ object UsbGadgetEngine {
 
                     if [ ! -d "${'$'}ACTIVE_FUNC/lun.1" ]; then
                         if ! mkdir "${'$'}ACTIVE_FUNC/lun.1" 2>/dev/null; then
-                            setprop sys.usb.configfs 1 2>/dev/null
+                            pb_restore_usb_on_err
                             echo "ERR|usb|This kernel does not support Dual-LUN (LUN 1). Mount images individually on LUN 0."
                             return 1
                         fi
@@ -1461,7 +1474,7 @@ object UsbGadgetEngine {
                     echo ${mode0.cdrom} > "${'$'}ACTIVE_FUNC/lun.0/cdrom" 2>/dev/null
                     [ -f "${'$'}ACTIVE_FUNC/lun.0/nofua" ] && echo 1 > "${'$'}ACTIVE_FUNC/lun.0/nofua" 2>/dev/null
                     if ! echo $qImg0 > "${'$'}ACTIVE_FUNC/lun.0/file" 2>/dev/null; then
-                        setprop sys.usb.configfs 1 2>/dev/null
+                        pb_restore_usb_on_err
                         echo "ERR|permissions|System blocked access to LUN 0 image: $img0"
                         return 1
                     fi
@@ -1472,8 +1485,7 @@ object UsbGadgetEngine {
                     echo ${mode1.cdrom} > "${'$'}ACTIVE_FUNC/lun.1/cdrom" 2>/dev/null
                     [ -f "${'$'}ACTIVE_FUNC/lun.1/nofua" ] && echo 1 > "${'$'}ACTIVE_FUNC/lun.1/nofua" 2>/dev/null
                     if ! echo $qImg1 > "${'$'}ACTIVE_FUNC/lun.1/file" 2>/dev/null; then
-                        echo "" > "${'$'}ACTIVE_FUNC/lun.0/file" 2>/dev/null
-                        setprop sys.usb.configfs 1 2>/dev/null
+                        pb_restore_usb_on_err
                         echo "ERR|permissions|System blocked access to LUN 1 image: $img1"
                         return 1
                     fi
@@ -1486,12 +1498,12 @@ object UsbGadgetEngine {
                         if [ -e "${'$'}CFG/f2" ]; then
                             rm -f "${'$'}CFG/f2"
                             if ! echo "${'$'}UDC" > "${'$'}GADGET/UDC" 2>/dev/null; then
-                                setprop sys.usb.configfs 1 2>/dev/null
+                                pb_restore_usb_on_err
                                 echo "ERR|usb|Failed to bind USB controller ${'$'}UDC"
                                 return 1
                             fi
                         else
-                            setprop sys.usb.configfs 1 2>/dev/null
+                            pb_restore_usb_on_err
                             echo "ERR|usb|Failed to bind USB controller ${'$'}UDC"
                             return 1
                         fi

@@ -1240,10 +1240,20 @@ object VentoyImageBuilder {
             }
             val qVolLbl = shellQuote(volLabel)
             val fmtRes = if (useExfat) {
-                val qFmt = shellQuote(exfatFormatter!!)
+                val fmtBin = exfatFormatter ?: run {
+                    unmountVentoyPartition1(loopDev)
+                    Shell.cmd("rm -f $qOut 2>/dev/null").exec()
+                    return@withContext ActionResult(false, "exFAT formatter unavailable on device.", entries = entries)
+                }
+                val qFmt = shellQuote(fmtBin)
                 Shell.cmd("$qFmt -L $qVolLbl $qLoop 2>&1 || $qFmt -n $qVolLbl $qLoop 2>&1 || $qFmt $qLoop 2>&1").exec()
             } else {
-                val qFmt = shellQuote(ntfsFormatter!!)
+                val fmtBin = ntfsFormatter ?: run {
+                    unmountVentoyPartition1(loopDev)
+                    Shell.cmd("rm -f $qOut 2>/dev/null").exec()
+                    return@withContext ActionResult(false, "NTFS formatter unavailable on device.", entries = entries)
+                }
+                val qFmt = shellQuote(fmtBin)
                 Shell.cmd("$qFmt -F -Q -c 4096 -L $qVolLbl -H 255 -S 63 -p ${layout.part1StartLba} $qLoop 2>&1").exec()
             }
             if (!fmtRes.isSuccess) {
@@ -2246,7 +2256,10 @@ fun VentoyBuilderSheet(
     var autoMount by remember { mutableStateOf(true) }
 
     LaunchedEffect(defaultDir, builderPackReloadNonce) {
-        savedDriverPacks = DriverPackManager.listPacks(defaultDir)
+        val loaded = DriverPackManager.listPacks(defaultDir)
+        savedDriverPacks = loaded
+        val validDirs = loaded.map { it.dirPath }.toSet()
+        selectedDriverPackDirs = selectedDriverPackDirs.intersect(validDirs)
     }
     LaunchedEffect(driversDir, selectedDriverPackDirs, savedDriverPacks) {
         val packBytes = savedDriverPacks.filter { it.dirPath in selectedDriverPackDirs }.sumOf { it.sizeBytes }
@@ -3016,7 +3029,10 @@ fun VentoyManagerSheet(
     }
 
     LaunchedEffect(defaultDir, mgrPackReloadNonce) {
-        mgrSavedPacks = DriverPackManager.listPacks(defaultDir)
+        val loaded = DriverPackManager.listPacks(defaultDir)
+        mgrSavedPacks = loaded
+        val validDirs = loaded.map { it.dirPath }.toSet()
+        mgrSelectedPackDirs = mgrSelectedPackDirs.intersect(validDirs)
     }
 
     LaunchedEffect(ventoyFile.path, isMountedToPc) {
@@ -3585,7 +3601,29 @@ fun VentoyManagerSheet(
                                 Text("Inject Drivers Folder (WinPE)", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
                                 Text(when { mgrDriversDir.isNotBlank() -> mgrDriversDir.replace("/data/media/0", "/sdcard"); c.hasDriversZip -> "Active (Driver archive ready) · Tap to replace"; else -> "Tap to browse folder" }, fontSize = 11.sp, color = PocketColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             }
-                            Text("Browse", style = MaterialTheme.typography.labelSmall, color = PocketColors.accentSoft)
+                            if (mgrDriversDir.isNotBlank()) {
+                                IconButton(onClick = { mgrDriversDir = "" }, modifier = Modifier.size(28.dp)) {
+                                    Icon(Icons.Rounded.Close, "Clear selected folder", tint = PocketColors.textMuted, modifier = Modifier.size(15.dp))
+                                }
+                            } else if (c.hasDriversZip) {
+                                TextButton(
+                                    onClick = {
+                                        scope.launch {
+                                            opBusy = true
+                                            opProgress = WindowsBuildProgress("Removing drivers archive...", ventoyFile.name, 0.5f, true)
+                                            val res = VentoyImageBuilder.updateVentoyCustomization(context, ventoyFile.path, mgrExp, mgrWinUtil, driversDir = "", extraDriverPackDirs = emptyList())
+                                            opBusy = false
+                                            onMessage(if (res.success) "Removed WinPE drivers archive from Multi-Boot drive." else res.userMessage, !res.success)
+                                            reloadContents()
+                                        }
+                                    },
+                                    enabled = !opBusy
+                                ) {
+                                    Text("Clear", fontSize = 11.sp, color = PocketColors.danger)
+                                }
+                            } else {
+                                Text("Browse", style = MaterialTheme.typography.labelSmall, color = PocketColors.accentSoft)
+                            }
                         }
                     }
                     Button(

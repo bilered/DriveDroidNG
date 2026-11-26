@@ -51,6 +51,14 @@ object VentoyPersistenceHelper {
         return "/ventoy/persistence/${safeStem}_${style.volumeLabel}.dat"
     }
 
+    private const val FAT32_MAX_FILE_BYTES = 4_294_967_295L
+
+    internal fun isFat32PersistenceTooLarge(fsLabel: String, sizeBytes: Long): Boolean {
+        val low = fsLabel.lowercase()
+        val isFat = (low.contains("fat32") || low.contains("vfat")) && !low.contains("exfat")
+        return isFat && sizeBytes > FAT32_MAX_FILE_BYTES
+    }
+
     internal fun hasValidExt4SuperblockMagic(headerAt1080: ByteArray): Boolean =
         headerAt1080.size >= 2 &&
             headerAt1080[0] == 0x53.toByte() &&
@@ -138,6 +146,14 @@ object VentoyPersistenceHelper {
             onProgress(WindowsBuildProgress("Opening Multi-Boot drive...", "Mounting Partition 1", 0.10f, true))
             val fsLabel = VentoyImageBuilder.mountVentoyPartition1(context, partLoop)
                 ?: return@withContext ActionResult(false, "Could not mount Multi-Boot Partition 1.")
+
+            if (isFat32PersistenceTooLarge(fsLabel, sizeBytes)) {
+                cleanupAll(deleteDat = false)
+                return@withContext ActionResult(
+                    false,
+                    "FAT32 cannot store files >= 4 GB. Pick 1 GB or 2 GB persistence, or recreate the Multi-Boot drive with exFAT/NTFS."
+                )
+            }
 
             val existingRaw = Shell.cmd("cat ${VentoyImageBuilder.TEMP_VENTOY_MNT}/ventoy/ventoy.json 2>/dev/null")
                 .exec().out.joinToString("\n")

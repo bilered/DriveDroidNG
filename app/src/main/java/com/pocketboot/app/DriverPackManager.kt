@@ -94,6 +94,16 @@ object DriverPackManager {
         return "$base/$LIBRARY_FOLDER_NAME"
     }
 
+    fun validateImportPaths(sourceDir: String, destDir: String): String? {
+        val src = UsbGadgetEngine.resolveDirectPath(sourceDir).trimEnd('/')
+        val dst = UsbGadgetEngine.resolveDirectPath(destDir).trimEnd('/')
+        if (src.isEmpty() || dst.isEmpty()) return "Invalid source or destination folder."
+        if (src == dst) return null // Already in place
+        if (dst.startsWith("$src/")) return "Cannot import a parent folder that contains PocketBoot_Drivers itself (would cause recursive copy)."
+        if (src.startsWith("$dst/")) return "Source folder is already inside the destination pack."
+        return null
+    }
+
     fun sanitizePackSlug(raw: String): String {
         val clean = raw.trim()
             .replace('\\', '/')
@@ -174,6 +184,9 @@ object DriverPackManager {
 
         val slug = sanitizePackSlug(packName.ifBlank { src.substringAfterLast('/') })
         val dst = "$libDir/$slug"
+        validateImportPaths(src, dst)?.let { err ->
+            return@withContext ActionResult(false, err)
+        }
         if (dst == src) {
             return@withContext ActionResult(true, "Driver pack $slug is already in your PocketBoot Drivers library ($infCount .inf file(s)).")
         }

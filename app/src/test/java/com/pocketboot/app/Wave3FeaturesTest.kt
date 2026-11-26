@@ -3,6 +3,7 @@ package com.pocketboot.app
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -69,5 +70,41 @@ class Wave3FeaturesTest {
         )
         assertNotNull(sameErr)
         assertTrue(sameErr!!.contains("different", ignoreCase = true))
+    }
+
+    @Test
+    fun auditGuards_preventRecursiveDriverImportSelfImageImportAndFat32Overflow() {
+        assertNotNull(
+            DriverPackManager.validateImportPaths(
+                "/data/media/0/Download",
+                "/data/media/0/Download/PocketBoot_Drivers/Download"
+            )
+        )
+        assertNull(
+            DriverPackManager.validateImportPaths(
+                "/data/media/0/Drivers/IntelVMD",
+                "/data/media/0/Download/PocketBoot_Drivers/IntelVMD"
+            )
+        )
+
+        assertTrue(
+            ImageLoopExplorer.isSelfImportPath(
+                "/sdcard/Download/MultiBoot.img",
+                "/data/media/0/Download/MultiBoot.img"
+            )
+        )
+        assertFalse(
+            ImageLoopExplorer.isSelfImportPath(
+                "/sdcard/Download/drivers.zip",
+                "/data/media/0/Download/MultiBoot.img"
+            )
+        )
+
+        val fourGb = 4L * 1024L * 1024L * 1024L
+        val twoGb = 2L * 1024L * 1024L * 1024L
+        assertTrue(VentoyPersistenceHelper.isFat32PersistenceTooLarge("FAT32", fourGb))
+        assertFalse(VentoyPersistenceHelper.isFat32PersistenceTooLarge("FAT32", twoGb))
+        assertFalse(VentoyPersistenceHelper.isFat32PersistenceTooLarge("exFAT", fourGb))
+        assertFalse(VentoyPersistenceHelper.isFat32PersistenceTooLarge("NTFS (ntfs3)", fourGb))
     }
 }
