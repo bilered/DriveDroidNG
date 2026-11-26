@@ -1282,6 +1282,11 @@ object WindowsCustomizationEngine {
             "\"BypassCPUCheck\"=dword:00000001\r\n" +
             "\"BypassStorageCheck\"=dword:00000001\r\n\r\n"
 
+    /**
+     * Unified single-pass boot.wim Index 2 updater (Native Setup single-pass):
+     * patches LabConfig into /Windows/System32/config/SYSTEM (when regFile + chntpw provided)
+     * and/or injects /Autounattend.xml (when xmlFile provided) in ONE wimlib-imagex update call.
+     */
     fun patchBootWimSnippet(
         qWimBin: String,
         qSourcesDir: String,
@@ -1329,62 +1334,140 @@ object WindowsCustomizationEngine {
         BOOT_WIM=${'$'}(find $qSourcesDir -maxdepth 1 -type f -iname 'boot.wim' 2>/dev/null | head -n 1)
         if [ -z "${'$'}BOOT_WIM" ] || [ ! -s "${'$'}BOOT_WIM" ]; then
             rm -rf "${'$'}BOOT_TMP"
-            exit 0
+            echo "LOG|labconfig|boot.wim not found in sources/"
+            exit 1
         fi
-        BOOT_CNT=${'$'}($qWimBin info "${'$'}BOOT_WIM" 2>/dev/null | grep -i "^Image Count:" | awk '{print ${'$'}3}' | head -n 1)
-        if [ "${'$'}{BOOT_CNT:-1}" -ge 2 ]; then BOOT_IDX=2; else BOOT_IDX=1; fi
-        UPD_CMD="${'$'}BOOT_TMP/upd.txt"
+        IDX_CNT=${'$'}($qWimBin info "${'$'}BOOT_WIM" 2>/dev/null | grep -c '^Index:' || echo 0)
+        BOOT_IDX=2
+        if [ "${'$'}{IDX_CNT:-0}" -lt 2 ]; then BOOT_IDX=1; fi
+        UPD_CMD="${'$'}BOOT_TMP/update_cmds.txt"
         : > "${'$'}UPD_CMD"
         LAB_READY=0
         AU_READY=0
         $labBlock
         $auBlock
-        if [ -s "${'$'}UPD_CMD" ]; then
-            if $qWimBin update "${'$'}BOOT_WIM" "${'$'}BOOT_IDX" --command-file="${'$'}UPD_CMD" >/dev/null 2>&1; then
-                if [ "${'$'}LAB_READY" = "1" ]; then
-                    echo "PATCHED_LAB_OK"
-                    echo "LOG|labconfig|Patched LabConfig hardware bypasses directly into boot.wim Index ${'$'}BOOT_IDX (Native Mode)"
-                fi
-                if [ "${'$'}AU_READY" = "1" ]; then
-                    echo "PATCHED_AU_OK"
-                    echo "LOG|win-build|Injected /Autounattend.xml into boot.wim Index ${'$'}BOOT_IDX (Unattended Mode)"
-                fi
-            else
-                echo "LOG|win-build|boot.wim Index ${'$'}BOOT_IDX update failed"
-            fi
+        if [ ! -s "${'$'}UPD_CMD" ]; then
+            rm -rf "${'$'}BOOT_TMP"
+            exit 1
         fi
+        $qWimBin update "${'$'}BOOT_WIM" "${'$'}BOOT_IDX" < "${'$'}UPD_CMD" >/dev/null 2>&1
         rm -rf "${'$'}BOOT_TMP"
+        if [ "${'$'}LAB_READY" = "1" ]; then
+            echo "LOG|labconfig|Patched LabConfig hardware bypasses directly into boot.wim Index ${'$'}BOOT_IDX (Native Mode)"
+            echo "PATCHED_LAB_OK"
+        fi
+        if [ "${'$'}AU_READY" = "1" ]; then
+            echo "LOG|win-build|Injected /Autounattend.xml into boot.wim Index ${'$'}BOOT_IDX (Unattended Mode)"
+            echo "PATCHED_AU_OK"
+        fi
         """.trimIndent()
     }
 
-    fun applyCa2023BootloadersSnippet(qWimBin: String, qMnt: String, qSourcesDir: String): String = """
-        set -e
+    fun applyCa2023BootloadersSnippet(qWimBin: String, qInstallFile: String, qIsoRoot: String, qBootWim: String = ""): String = """
         CA_TMP="/data/local/tmp/pb_ca2023"
         rm -rf "${'$'}CA_TMP" && mkdir -p "${'$'}CA_TMP"
-        export TMPDIR="${'$'}CA_TMP" HOME="${'$'}CA_TMP"
-        IMG_SRC=${'$'}(find $qSourcesDir -maxdepth 1 -type f \( -iname 'install.wim' -o -iname 'install.esd' \) 2>/dev/null | head -n 1)
-        if [ -z "${'$'}IMG_SRC" ]; then
-            echo "LOG|ca2023|No install.wim/esd found for CA 2023 extraction"
-            rm -rf "${'$'}CA_TMP"
-            exit 0
-        fi
-        for FP in "/Windows/Boot/EFI_EX/bootmgfw_EX.efi" "/Windows/Boot/EFI_EX/bootx64_EX.efi" "/Windows/Boot/EFI_EX/bootaa64_EX.efi" "/Windows/Boot/PCAT_EX/bootmgr_EX"; do
-            $qWimBin extract "${'$'}IMG_SRC" 1 "${'$'}FP" --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes >/dev/null 2>&1 || true
-        done
-        if [ -s "${'$'}CA_TMP/bootmgfw_EX.efi" ]; then
-            mkdir -p $qMnt/efi/boot
-            if [ -f $qMnt/efi/boot/bootaa64.efi ] && [ -s "${'$'}CA_TMP/bootaa64_EX.efi" ]; then
-                cp -f "${'$'}CA_TMP/bootaa64_EX.efi" $qMnt/efi/boot/bootaa64.efi
-            else
-                cp -f "${'$'}CA_TMP/bootmgfw_EX.efi" $qMnt/efi/boot/bootx64.efi
+        export TMPDIR="${'$'}CA_TMP" HOME="${'$'}CA_TMP" WIMLIB_IMAGEX_IGNORE_CASE=1
+        CA_APPLIED=""
+        INST_SRC=$qInstallFile
+        BOOT_WIM_SRC=${qBootWim.ifBlank { "''" }}
+        ISO_ROOT=$qIsoRoot
+        extract_wim_file() {
+            local rel_path="${'$'}1"
+            local out_name=${'$'}(basename "${'$'}rel_path")
+            rm -f "${'$'}CA_TMP/${'$'}out_name"
+            case "${'$'}INST_SRC" in
+                *.swm|*.SWM)
+                    local wdir=${'$'}(dirname "${'$'}INST_SRC")
+                    local wbase=${'$'}(basename "${'$'}INST_SRC")
+                    local wpre="${'$'}{wbase%.*}"
+                    local wext="${'$'}{wbase##*.}"
+                    $qWimBin extract "${'$'}INST_SRC" 1 "${'$'}rel_path" --ref="${'$'}{wdir}/${'$'}{wpre}*.${'$'}{wext}" --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null || true
+                    ;;
+                *)
+                    if [ -n "${'$'}INST_SRC" ] && [ -s "${'$'}INST_SRC" ]; then
+                        $qWimBin extract "${'$'}INST_SRC" 1 "${'$'}rel_path" --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null || true
+                    fi
+                    ;;
+            esac
+            if [ ! -s "${'$'}CA_TMP/${'$'}out_name" ] && [ -n "${'$'}BOOT_WIM_SRC" ] && [ -s "${'$'}BOOT_WIM_SRC" ]; then
+                $qWimBin extract "${'$'}BOOT_WIM_SRC" 2 "${'$'}rel_path" --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null || \
+                    $qWimBin extract "${'$'}BOOT_WIM_SRC" 1 "${'$'}rel_path" --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null || true
             fi
-            [ -f $qMnt/efi/microsoft/boot/bootmgfw.efi ] && cp -f "${'$'}CA_TMP/bootmgfw_EX.efi" $qMnt/efi/microsoft/boot/bootmgfw.efi || true
-            [ -s "${'$'}CA_TMP/bootmgr_EX" ] && [ -f $qMnt/bootmgr ] && cp -f "${'$'}CA_TMP/bootmgr_EX" $qMnt/bootmgr || true
-            echo "LOG|ca2023|Installed Windows UEFI CA 2023 signed bootloaders from install image"
+            [ -s "${'$'}CA_TMP/${'$'}out_name" ]
+        }
+        resolve_ci_dir() {
+            local base="${'$'}1"; local child="${'$'}2"
+            local hit=${'$'}(find "${'$'}base" -maxdepth 1 -mindepth 1 -type d -iname "${'$'}child" 2>/dev/null | head -n 1)
+            if [ -n "${'$'}hit" ]; then printf '%s' "${'$'}hit"; else mkdir -p "${'$'}base/${'$'}child"; printf '%s' "${'$'}base/${'$'}child"; fi
+        }
+        copy_ci_file() {
+            local src="${'$'}1"; local dir="${'$'}2"; local name="${'$'}3"
+            local existing=${'$'}(find "${'$'}dir" -maxdepth 1 -mindepth 1 -type f -iname "${'$'}name" 2>/dev/null | head -n 1)
+            if [ -n "${'$'}existing" ]; then cp -f "${'$'}src" "${'$'}existing"; else cp -f "${'$'}src" "${'$'}dir/${'$'}name"; fi
+        }
+        EFI_DIR=${'$'}(resolve_ci_dir "${'$'}ISO_ROOT" "efi")
+        EFI_BOOT_DIR=${'$'}(resolve_ci_dir "${'$'}EFI_DIR" "boot")
+        EFI_MS_DIR=${'$'}(resolve_ci_dir "${'$'}EFI_DIR" "microsoft")
+        EFI_MS_BOOT_DIR=${'$'}(resolve_ci_dir "${'$'}EFI_MS_DIR" "boot")
+        if extract_wim_file /Windows/Boot/EFI_EX/bootmgfw_EX.efi && [ -s "${'$'}CA_TMP/bootmgfw_EX.efi" ]; then
+            if find "${'$'}EFI_BOOT_DIR" -maxdepth 1 -type f -iname 'bootaa64.efi' 2>/dev/null | grep -q . && ! find "${'$'}EFI_BOOT_DIR" -maxdepth 1 -type f -iname 'bootx64.efi' 2>/dev/null | grep -q .; then
+                copy_ci_file "${'$'}CA_TMP/bootmgfw_EX.efi" "${'$'}EFI_BOOT_DIR" "bootaa64.efi"
+            else
+                copy_ci_file "${'$'}CA_TMP/bootmgfw_EX.efi" "${'$'}EFI_BOOT_DIR" "bootx64.efi"
+            fi
+            if find "${'$'}EFI_MS_BOOT_DIR" -maxdepth 1 -type f -iname 'bootmgfw.efi' 2>/dev/null | grep -q .; then
+                copy_ci_file "${'$'}CA_TMP/bootmgfw_EX.efi" "${'$'}EFI_MS_BOOT_DIR" "bootmgfw.efi"
+            fi
+            CA_APPLIED="bootmgfw_EX.efi"
+        fi
+        if extract_wim_file /Windows/Boot/EFI_EX/bootmgr_EX.efi && [ -s "${'$'}CA_TMP/bootmgr_EX.efi" ]; then
+            copy_ci_file "${'$'}CA_TMP/bootmgr_EX.efi" "${'$'}ISO_ROOT" "bootmgr.efi"
+            CA_APPLIED="${'$'}{CA_APPLIED:+${'$'}CA_APPLIED + }bootmgr_EX.efi"
+        fi
+        if extract_wim_file /Windows/Boot/DVD/EFI/efisys_ex.bin && [ -s "${'$'}CA_TMP/efisys_ex.bin" ]; then
+            copy_ci_file "${'$'}CA_TMP/efisys_ex.bin" "${'$'}EFI_MS_BOOT_DIR" "efisys.bin"
+            CA_APPLIED="${'$'}{CA_APPLIED:+${'$'}CA_APPLIED + }efisys_ex.bin"
+        fi
+        if extract_wim_file /Windows/Boot/DVD/EFI/efisys_noprompt_ex.bin && [ -s "${'$'}CA_TMP/efisys_noprompt_ex.bin" ]; then
+            copy_ci_file "${'$'}CA_TMP/efisys_noprompt_ex.bin" "${'$'}EFI_MS_BOOT_DIR" "efisys_noprompt.bin"
+            CA_APPLIED="${'$'}{CA_APPLIED:+${'$'}CA_APPLIED + }efisys_noprompt_ex.bin"
+        fi
+        if [ -n "${'$'}CA_APPLIED" ]; then
+            echo "LOG|ca2023|Applied Windows CA 2023 bootloaders (${'$'}CA_APPLIED)"
         else
-            echo "LOG|ca2023|ISO does not contain EFI_EX CA 2023 bootloaders (kept original bootx64.efi)"
+            echo "LOG|ca2023|Source image lacks EFI_EX CA 2023 bootloaders; kept standard bootloaders"
         fi
         rm -rf "${'$'}CA_TMP"
+    """.trimIndent()
+
+    fun applyWin7UefiFixSnippet(qWimBin: String, qInstallFile: String, qIsoRoot: String): String = """
+        ISO_ROOT=$qIsoRoot
+        INST_SRC=$qInstallFile
+        if ! find "${'$'}ISO_ROOT" -maxdepth 3 -type f \( -iname 'bootx64.efi' -o -iname 'bootaa64.efi' \) 2>/dev/null | grep -q .; then
+            W7_TMP="/data/local/tmp/pb_win7_efi"
+            rm -rf "${'$'}W7_TMP" && mkdir -p "${'$'}W7_TMP"
+            export TMPDIR="${'$'}W7_TMP" HOME="${'$'}W7_TMP" WIMLIB_IMAGEX_IGNORE_CASE=1
+            W7_OK=0
+            case "${'$'}INST_SRC" in
+                *.swm|*.SWM)
+                    WDIR=${'$'}(dirname "${'$'}INST_SRC"); WBASE=${'$'}(basename "${'$'}INST_SRC"); WPRE="${'$'}{WBASE%.*}"; WEXT="${'$'}{WBASE##*.}"
+                    if $qWimBin extract "${'$'}INST_SRC" 1 /Windows/Boot/EFI/bootmgfw.efi --ref="${'$'}{WDIR}/${'$'}{WPRE}*.${'$'}{WEXT}" --dest-dir="${'$'}W7_TMP" --no-acls --no-attributes 2>/dev/null; then W7_OK=1; fi
+                    ;;
+                *)
+                    if $qWimBin extract "${'$'}INST_SRC" 1 /Windows/Boot/EFI/bootmgfw.efi --dest-dir="${'$'}W7_TMP" --no-acls --no-attributes 2>/dev/null; then W7_OK=1; fi
+                    ;;
+            esac
+            if [ "${'$'}W7_OK" = "1" ] && [ -s "${'$'}W7_TMP/bootmgfw.efi" ]; then
+                EFI_DIR=${'$'}(find "${'$'}ISO_ROOT" -maxdepth 1 -mindepth 1 -type d -iname 'efi' 2>/dev/null | head -n 1)
+                [ -z "${'$'}EFI_DIR" ] && EFI_DIR="${'$'}ISO_ROOT/efi"
+                EFI_BOOT_DIR=${'$'}(find "${'$'}EFI_DIR" -maxdepth 1 -mindepth 1 -type d -iname 'boot' 2>/dev/null | head -n 1)
+                [ -z "${'$'}EFI_BOOT_DIR" ] && EFI_BOOT_DIR="${'$'}EFI_DIR/boot"
+                mkdir -p "${'$'}EFI_BOOT_DIR"
+                cp -f "${'$'}W7_TMP/bootmgfw.efi" "${'$'}EFI_BOOT_DIR/bootx64.efi"
+                echo "LOG|win7|Extracted Windows 7 UEFI bootx64.efi from install image"
+            fi
+            rm -rf "${'$'}W7_TMP"
+        fi
     """.trimIndent()
 }
 
