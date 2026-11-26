@@ -2850,47 +2850,86 @@ private fun ConnectionStatusCard(
     var ioBytesPerSec by remember { mutableStateOf(0L) }
     var peakBytesPerSec by remember { mutableStateOf(0L) }
     var sessionTransferredBytes by remember { mutableStateOf(0L) }
+    var hasByteCounter by remember { mutableStateOf(false) }
+    var usbIrqsPerSec by remember { mutableStateOf(0L) }
+    var peakIrqsPerSec by remember { mutableStateOf(0L) }
+    var sessionUsbIrqs by remember { mutableStateOf(0L) }
     var pcReadingActive by remember { mutableStateOf(false) }
     var liveLinkState by remember(status.usbLinkState) { mutableStateOf(status.usbLinkState) }
+    var liveLinkSpeed by remember(status.usbLinkSpeed) { mutableStateOf(status.usbLinkSpeed) }
 
     LaunchedEffect(status.isAnyMounted, status.mountedFile, status.secondaryMountedFile) {
         if (!status.isAnyMounted) {
             ioBytesPerSec = 0L
             peakBytesPerSec = 0L
             sessionTransferredBytes = 0L
+            hasByteCounter = false
+            usbIrqsPerSec = 0L
+            peakIrqsPerSec = 0L
+            sessionUsbIrqs = 0L
             pcReadingActive = false
             return@LaunchedEffect
         }
         ioBytesPerSec = 0L
         peakBytesPerSec = 0L
         sessionTransferredBytes = 0L
+        hasByteCounter = false
+        usbIrqsPerSec = 0L
+        peakIrqsPerSec = 0L
+        sessionUsbIrqs = 0L
         var baselineBytes = -1L
         var prevBytes = -1L
+        var baselineIrqs = -1L
+        var prevIrqs = -1L
+        var prevCpu = -1L
         var prevMs = System.currentTimeMillis()
         while (isActive) {
-            if (busy) { delay(1000L); continue }
+            if (busy) { delay(800L); continue }
             val sample = UsbGadgetEngine.readUsbActivitySample()
             val nowMs = System.currentTimeMillis()
             if (sample.linkState.isNotBlank()) liveLinkState = sample.linkState
-            if (baselineBytes < 0L && sample.ioBytesTotal > 0L) {
-                baselineBytes = sample.ioBytesTotal
+            if (sample.speed.isNotBlank()) liveLinkSpeed = sample.speed
+
+            val dt = (nowMs - prevMs).coerceAtLeast(1L)
+
+            if (sample.ioBytesTotal > 0L) {
+                hasByteCounter = true
+                if (baselineBytes < 0L) baselineBytes = sample.ioBytesTotal
+                if (sample.ioBytesTotal >= baselineBytes) {
+                    sessionTransferredBytes = sample.ioBytesTotal - baselineBytes
+                }
             }
-            if (baselineBytes >= 0L && sample.ioBytesTotal >= baselineBytes) {
-                sessionTransferredBytes = sample.ioBytesTotal - baselineBytes
-            }
+            var byteDelta = 0L
             if (prevBytes >= 0L && sample.ioBytesTotal >= prevBytes) {
-                val dt = (nowMs - prevMs).coerceAtLeast(1L)
-                val delta = sample.ioBytesTotal - prevBytes
-                val rate = (delta * 1000L) / dt
+                byteDelta = sample.ioBytesTotal - prevBytes
+                val rate = (byteDelta * 1000L) / dt
                 ioBytesPerSec = rate
                 if (rate > peakBytesPerSec) peakBytesPerSec = rate
-                pcReadingActive = sample.kernelReadingActive || delta > 4096L
             } else {
-                pcReadingActive = sample.kernelReadingActive
+                ioBytesPerSec = 0L
             }
+
+            var irqDelta = 0L
+            if (sample.usbIrqCount > 0L) {
+                if (baselineIrqs < 0L) baselineIrqs = sample.usbIrqCount
+                if (sample.usbIrqCount >= baselineIrqs) {
+                    sessionUsbIrqs = sample.usbIrqCount - baselineIrqs
+                }
+                if (prevIrqs >= 0L && sample.usbIrqCount >= prevIrqs) {
+                    irqDelta = sample.usbIrqCount - prevIrqs
+                    val irqRate = (irqDelta * 1000L) / dt
+                    usbIrqsPerSec = irqRate
+                    if (irqRate > peakIrqsPerSec) peakIrqsPerSec = irqRate
+                }
+            }
+            val cpuDelta = if (prevCpu >= 0L && sample.threadCpuTicks >= prevCpu) sample.threadCpuTicks - prevCpu else 0L
+            pcReadingActive = sample.kernelReadingActive || byteDelta > 4096L || cpuDelta > 0L || irqDelta > 25L
+
             prevBytes = sample.ioBytesTotal
+            prevIrqs = sample.usbIrqCount
+            prevCpu = sample.threadCpuTicks
             prevMs = nowMs
-            delay(2500L)
+            delay(1500L)
         }
     }
 
@@ -3267,14 +3306,16 @@ private fun ConnectionStatusCard(
                             ) {
                                 TelemetryLine("USB Protocol", status.activeProtocolLabel, PocketColors.success)
                                 val isConfiguredLive = liveLinkState.equals("configured", true)
+                                val liveSpeedLabel = status.copy(usbLinkState = liveLinkState, usbLinkSpeed = liveLinkSpeed).friendlySpeedLabel
                                 TelemetryLine(
                                     label = "Link Speed",
-                                    value = status.friendlySpeedLabel,
+                                    value = liveSpeedLabel,
                                     valueColor = if (isConfiguredLive) PocketColors.success else PocketColors.warning
                                 )
                                 val activityLabel = when {
                                     !isConfiguredLive -> "Waiting for PC host"
-                                    ioBytesPerSec >= 1024L -> "PC Reading · ${FastIsoDownloader.formatSpeed(ioBytesPerSec)}"
+                                    ioBytesPerSec >= 1024L -> "PC Transferring · ${FastIsoDownloader.formatSpeed(ioBytesPerSec)}"
+                                    pcReadingActive && usbIrqsPerSec >= 20L -> "PC Transferring · $usbIrqsPerSec irq/s"
                                     pcReadingActive -> "PC Actively Reading"
                                     else -> "Connected · Idle"
                                 }
@@ -3287,10 +3328,15 @@ private fun ConnectionStatusCard(
                                         else -> PocketColors.success
                                     }
                                 )
-                                if (sessionTransferredBytes >= 1024L || peakBytesPerSec >= 1024L) {
+                                if (isConfiguredLive || sessionTransferredBytes > 0L || sessionUsbIrqs > 0L) {
+                                    val statsValue = if (hasByteCounter || sessionTransferredBytes >= 1024L || peakBytesPerSec >= 1024L) {
+                                        "Session ${UsbGadgetEngine.formatBytes(sessionTransferredBytes)} · Peak ${FastIsoDownloader.formatSpeed(peakBytesPerSec)}"
+                                    } else {
+                                        "USB IRQs: $sessionUsbIrqs · Peak $peakIrqsPerSec/s"
+                                    }
                                     TelemetryLine(
                                         label = "Transfer Stats",
-                                        value = "Session ${UsbGadgetEngine.formatBytes(sessionTransferredBytes)} · Peak ${FastIsoDownloader.formatSpeed(peakBytesPerSec)}",
+                                        value = statsValue,
                                         valueColor = PocketColors.textSecondary
                                     )
                                 }

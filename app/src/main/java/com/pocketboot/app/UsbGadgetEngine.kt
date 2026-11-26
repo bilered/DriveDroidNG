@@ -108,7 +108,9 @@ data class UsbActivitySample(
     val linkState: String = "",
     val speed: String = "",
     val ioBytesTotal: Long = 0L,
-    val kernelReadingActive: Boolean = false
+    val kernelReadingActive: Boolean = false,
+    val threadCpuTicks: Long = 0L,
+    val usbIrqCount: Long = 0L
 )
 
 data class GadgetStatus(
@@ -1010,8 +1012,20 @@ object UsbGadgetEngine {
             val script = """
                 UDC=${'$'}(ls /sys/class/udc 2>/dev/null | grep -v '^dummy_udc' | head -n 1); ST=""; SPD=""
                 if [ -n "${'$'}UDC" ]; then ST=${'$'}(cat "/sys/class/udc/${'$'}UDC/state" 2>/dev/null); SPD=${'$'}(cat "/sys/class/udc/${'$'}UDC/current_speed" 2>/dev/null); fi
-                IO_BYTES=0; ACTIVE=0
-                PIDS=${'$'}(pidof file-storage 2>/dev/null || pgrep -f 'file-storage|f_mass_storage' 2>/dev/null || true)
+                RW_CHARS=0; RW_BYTES=0; ACTIVE=0; CPU_TICKS=0; PIDS=""
+                for cf in /proc/[0-9]*/comm; do
+                    [ -r "${'$'}cf" ] || continue
+                    read -r cname < "${'$'}cf" 2>/dev/null || continue
+                    case "${'$'}cname" in
+                        file-storage*|f_mass_storage*)
+                            p="${'$'}{cf#/proc/}"; p="${'$'}{p%/comm}"
+                            PIDS="${'$'}PIDS ${'$'}p"
+                            ;;
+                    esac
+                done
+                if [ -z "${'$'}PIDS" ]; then
+                    PIDS=${'$'}(pidof file-storage 2>/dev/null || true)
+                fi
                 for pid in ${'$'}PIDS; do
                     [ -r "/proc/${'$'}pid/status" ] || continue
                     PSTATE=""
@@ -1021,21 +1035,65 @@ object UsbGadgetEngine {
                         esac
                     done < "/proc/${'$'}pid/status" 2>/dev/null
                     if [ "${'$'}PSTATE" = "R" ] || [ "${'$'}PSTATE" = "D" ]; then ACTIVE=1; fi
+                    if [ -r "/proc/${'$'}pid/stat" ]; then
+                        read -r stat_raw < "/proc/${'$'}pid/stat" 2>/dev/null || stat_raw=""
+                        rest="${'$'}{stat_raw##*) }"
+                        if [ -n "${'$'}rest" ] && [ "${'$'}rest" != "${'$'}stat_raw" ]; then
+                            set -- ${'$'}rest
+                            # After "(comm) ", field 12=utime, field 13=stime
+                            ut="${'$'}{12:-0}"; st="${'$'}{13:-0}"
+                            case "${'$'}ut" in ''|*[!0-9]*) ut=0 ;; esac
+                            case "${'$'}st" in ''|*[!0-9]*) st=0 ;; esac
+                            CPU_TICKS=${'$'}((CPU_TICKS + ut + st))
+                        fi
+                    fi
                     if [ -r "/proc/${'$'}pid/io" ]; then
                         while IFS= read -r io_line; do
                             case "${'$'}io_line" in
-                                rchar:*|read_bytes:*|wchar:*|write_bytes:*)
+                                rchar:*|wchar:*)
                                     set -- ${'$'}io_line
-                                    case "${'$'}2" in ''|*[!0-9]*) ;; *) IO_BYTES=${'$'}((IO_BYTES + ${'$'}2)) ;; esac
+                                    case "${'$'}2" in ''|*[!0-9]*) ;; *) RW_CHARS=${'$'}((RW_CHARS + ${'$'}2)) ;; esac
+                                    ;;
+                                read_bytes:*|write_bytes:*)
+                                    set -- ${'$'}io_line
+                                    case "${'$'}2" in ''|*[!0-9]*) ;; *) RW_BYTES=${'$'}((RW_BYTES + ${'$'}2)) ;; esac
                                     ;;
                             esac
                         done < "/proc/${'$'}pid/io" 2>/dev/null
                     fi
                 done
-                echo "${'$'}ST|${'$'}SPD|${'$'}IO_BYTES|${'$'}ACTIVE"
+                IO_BYTES="${'$'}RW_CHARS"
+                if [ "${'$'}IO_BYTES" -le 0 ]; then IO_BYTES="${'$'}RW_BYTES"; fi
+                IRQ_TOTAL=0
+                if [ -r /proc/interrupts ]; then
+                    while IFS= read -r irql; do
+                        case "${'$'}irql" in
+                            *dwc3*|*ssusb*|*mtu3*|*musb*|*xhci-hcd*|*a600000*)
+                                set -- ${'$'}irql
+                                shift 2>/dev/null || continue
+                                for tok in "${'$'}@"; do
+                                    case "${'$'}tok" in
+                                        ''|*[!0-9]*) break ;;
+                                        *) IRQ_TOTAL=${'$'}((IRQ_TOTAL + tok)) ;;
+                                    esac
+                                done
+                                ;;
+                        esac
+                    done < /proc/interrupts 2>/dev/null
+                fi
+                echo "OK|${'$'}ST|${'$'}SPD|${'$'}IO_BYTES|${'$'}ACTIVE|${'$'}CPU_TICKS|${'$'}IRQ_TOTAL"
             """.trimIndent()
-            val parts = runIndependentRootScript(script).trim().split("|")
-            UsbActivitySample(parts.getOrNull(0).orEmpty(), parts.getOrNull(1).orEmpty(), parts.getOrNull(2)?.toLongOrNull() ?: 0L, parts.getOrNull(3) == "1")
+            val raw = runIndependentRootScript(script).trim()
+            if (!raw.startsWith("OK|")) return@runCatching UsbActivitySample()
+            val parts = raw.split("|")
+            UsbActivitySample(
+                linkState = parts.getOrNull(1).orEmpty(),
+                speed = parts.getOrNull(2).orEmpty(),
+                ioBytesTotal = parts.getOrNull(3)?.toLongOrNull() ?: 0L,
+                kernelReadingActive = parts.getOrNull(4) == "1",
+                threadCpuTicks = parts.getOrNull(5)?.toLongOrNull() ?: 0L,
+                usbIrqCount = parts.getOrNull(6)?.toLongOrNull() ?: 0L
+            )
         }.getOrDefault(UsbActivitySample())
     }
 
@@ -1095,6 +1153,7 @@ object UsbGadgetEngine {
             }
 
             val script = """
+                set +e
                 pb_mount() {
                     if [ ! -f $qImg ]; then
                         echo "ERR|file|File not found: $img"
@@ -1164,7 +1223,8 @@ object UsbGadgetEngine {
                     if [ "$targetLun" = "1" ] && [ ! -d "${'$'}TARGET_LUN" ]; then
                         if ! mkdir "${'$'}TARGET_LUN" 2>/dev/null; then
                             echo "ERR|usb|This phone kernel does not support Secondary Slot (LUN 1). Mount on Primary (LUN 0) instead."
-                            [ -s "${'$'}ACTIVE_FUNC/lun.0/file" ] && ln -s "${'$'}ACTIVE_FUNC" "${'$'}CFG/f1" 2>/dev/null && echo "${'$'}UDC" > "${'$'}GADGET/UDC" 2>/dev/null
+                            L0_CUR=${'$'}(cat "${'$'}ACTIVE_FUNC/lun.0/file" 2>/dev/null | tr -d '\r\n')
+                            [ -n "${'$'}L0_CUR" ] && ln -s "${'$'}ACTIVE_FUNC" "${'$'}CFG/f1" 2>/dev/null && echo "${'$'}UDC" > "${'$'}GADGET/UDC" 2>/dev/null
                             return 1
                         fi
                     fi
@@ -1260,6 +1320,7 @@ object UsbGadgetEngine {
             val script = if (lunIndex != null) {
                 val otherLun = if (lunIndex == 0) 1 else 0
                 """
+                set +e
                 $DETECT_GADGET_SH
                 ACTIVE_FUNC=""
                 if [ -n "${'$'}GADGET" ]; then
@@ -1268,7 +1329,11 @@ object UsbGadgetEngine {
                     done
                 fi
 
-                if [ -n "${'$'}ACTIVE_FUNC" ] && [ -s "${'$'}ACTIVE_FUNC/lun.$otherLun/file" ]; then
+                OTHER_MOUNTED=""
+                if [ -n "${'$'}ACTIVE_FUNC" ] && [ -f "${'$'}ACTIVE_FUNC/lun.$otherLun/file" ]; then
+                    OTHER_MOUNTED=${'$'}(cat "${'$'}ACTIVE_FUNC/lun.$otherLun/file" 2>/dev/null | tr -d '\r\n')
+                fi
+                if [ -n "${'$'}ACTIVE_FUNC" ] && [ -n "${'$'}OTHER_MOUNTED" ]; then
                     UDC=${'$'}(ls /sys/class/udc 2>/dev/null | grep -v '^dummy_udc' | head -n 1)
                     echo "" > "${'$'}GADGET/UDC" 2>/dev/null
                     [ -f "${'$'}ACTIVE_FUNC/lun.$lunIndex/file" ] && echo "" > "${'$'}ACTIVE_FUNC/lun.$lunIndex/file" 2>/dev/null
@@ -1297,6 +1362,7 @@ object UsbGadgetEngine {
             }
 
             val fullScript = """
+                set +e
                 $DETECT_GADGET_SH
                 if [ -n "${'$'}GADGET" ]; then
                     echo "" > "${'$'}GADGET/UDC" 2>/dev/null
@@ -1378,16 +1444,18 @@ object UsbGadgetEngine {
             val qOut = shellQuote(outPath)
 
             val script = """
-                set -e
-                mkdir -p $qDir
-                rm -f $qOut
-                if command -v truncate >/dev/null 2>&1; then
-                    truncate -s $expectedBytes $qOut 2>&1
-                    echo "LOG|create|Created ${sizeMb} MB sparse drive at $outPath"
-                else
-                    dd if=/dev/zero of=$qOut bs=1M count=0 seek=$sizeMb 2>/dev/null || dd if=/dev/zero of=$qOut bs=1M count=$sizeMb 2>&1
-                    echo "LOG|create|Created ${sizeMb} MB drive at $outPath"
-                fi
+                (
+                    set -e
+                    mkdir -p $qDir
+                    rm -f $qOut
+                    if command -v truncate >/dev/null 2>&1; then
+                        truncate -s $expectedBytes $qOut 2>&1
+                        echo "LOG|create|Created ${sizeMb} MB sparse drive at $outPath"
+                    else
+                        dd if=/dev/zero of=$qOut bs=1M count=0 seek=$sizeMb 2>/dev/null || dd if=/dev/zero of=$qOut bs=1M count=$sizeMb 2>&1
+                        echo "LOG|create|Created ${sizeMb} MB drive at $outPath"
+                    fi
+                )
             """.trimIndent()
 
             val res = Shell.cmd(script).exec()

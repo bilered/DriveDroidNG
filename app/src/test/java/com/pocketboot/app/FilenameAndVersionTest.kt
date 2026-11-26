@@ -1,6 +1,7 @@
 package com.pocketboot.app
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -31,5 +32,14 @@ class FilenameAndVersionTest {
         assertTrue(AppUpdateChecker.compareSemVer("4.6.9", "4.7.0") < 0)
         assertTrue(AppUpdateChecker.compareSemVer("4.7.0", "4.7.0-rc1") > 0)
         assertEquals("https://github.com/bilered/PocketBoot", AppUpdateChecker.REPO_URL)
+    }
+
+    @Test
+    fun ventoyImageBuilder_detectsAllZeroBlocksAccurately() {
+        val zeros = ByteArray(4096)
+        assertTrue(VentoyImageBuilder.isAllZeroBlock(zeros, zeros.size))
+        zeros[2048] = 1
+        assertFalse(VentoyImageBuilder.isAllZeroBlock(zeros, zeros.size))
+        assertTrue(VentoyImageBuilder.isAllZeroBlock(zeros, 2048))
     }
 }

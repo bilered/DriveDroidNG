@@ -81,6 +81,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.ByteBuffer
@@ -710,22 +711,24 @@ object VentoyImageBuilder {
         }
         return try {
             val res = Shell.cmd("""
-                set -e
-                [ -d ${shellQuote(srcDir)} ]
-                rm -rf $stageDir $tmpZip && mkdir -p $stageDir/Drivers
-                cp -rf ${shellQuote(srcDir)}/. $stageDir/Drivers/
-                cp -f ${shellQuote(tmpBat.absolutePath)} $stageDir/VentoyAutoRun.bat
-                cd $stageDir && ${shellQuote(sevenZip)} a -tzip -y $tmpZip . >/dev/null 2>&1
-                SRC_SZ=${'$'}(stat -c '%s' $tmpZip 2>/dev/null || echo 0)
-                [ "${'$'}SRC_SZ" -gt 0 ]
-                mkdir -p $TEMP_VENTOY_MNT/ventoy
-                rm -f $dstZip
-                cp -f $tmpZip $dstZip
-                DST_SZ=${'$'}(stat -c '%s' $dstZip 2>/dev/null || echo 0)
-                if [ "${'$'}DST_SZ" != "${'$'}SRC_SZ" ]; then
+                (
+                    set -e
+                    [ -d ${shellQuote(srcDir)} ]
+                    rm -rf $stageDir $tmpZip && mkdir -p $stageDir/Drivers
+                    cp -rf ${shellQuote(srcDir)}/. $stageDir/Drivers/
+                    cp -f ${shellQuote(tmpBat.absolutePath)} $stageDir/VentoyAutoRun.bat
+                    cd $stageDir && ${shellQuote(sevenZip)} a -tzip -y $tmpZip . >/dev/null 2>&1
+                    SRC_SZ=${'$'}(stat -c '%s' $tmpZip 2>/dev/null || echo 0)
+                    [ "${'$'}SRC_SZ" -gt 0 ]
+                    mkdir -p $TEMP_VENTOY_MNT/ventoy
                     rm -f $dstZip
-                    exit 1
-                fi
+                    cp -f $tmpZip $dstZip
+                    DST_SZ=${'$'}(stat -c '%s' $dstZip 2>/dev/null || echo 0)
+                    if [ "${'$'}DST_SZ" != "${'$'}SRC_SZ" ]; then
+                        rm -f $dstZip
+                        exit 1
+                    fi
+                )
             """.trimIndent()).exec()
             if (!res.isSuccess) {
                 Shell.cmd("rm -f $dstZip 2>/dev/null || true").exec()
@@ -1524,6 +1527,86 @@ object VentoyImageBuilder {
      * holes (`fallocate -d` or sparse `cp --sparse=always`) so Android immediately regains
      * gigabytes freed after deleting ISOs from a Multi-Boot drive.
      */
+    internal fun isAllZeroBlock(buf: ByteArray, len: Int): Boolean {
+        var i = 0
+        while (i < len) {
+            if (buf[i] != 0.toByte()) return false
+            i++
+        }
+        return true
+    }
+
+    /**
+     * Android-universal sparse hole-puncher (works on 100% of Android Toybox ROMs without GNU `fallocate -d` or `cp --sparse=always`).
+     * Streams the image sequentially via root `cat`, writes only non-zero 256 KiB blocks via `RandomAccessFile.seek()`
+     * inside `context.cacheDir` (direct ext4/f2fs `/data` partition — never FUSE), sets exact virtual length,
+     * verifies byte count, and atomically swaps into place.
+     */
+    private fun reclaimViaKotlinSparseCopy(
+        context: Context,
+        resolvedImg: String,
+        expectedBytes: Long,
+        onProgress: (WindowsBuildProgress) -> Unit
+    ): Boolean {
+        val localOut = File(context.applicationContext.cacheDir, "pb_sparse_${System.currentTimeMillis()}.img")
+        val qImg = shellQuote(resolvedImg)
+        val qLocal = shellQuote(localOut.absolutePath)
+        var proc: Process? = null
+        return try {
+            if (localOut.exists()) localOut.delete()
+            proc = ProcessBuilder("su", "-c", "cat $qImg").start()
+            val buf = ByteArray(262_144)
+            var offset = 0L
+            var lastReportMs = 0L
+            RandomAccessFile(localOut, "rw").use { raf ->
+                proc.inputStream.buffered(262_144).use { input ->
+                    while (true) {
+                        var filled = 0
+                        while (filled < buf.size) {
+                            val r = input.read(buf, filled, buf.size - filled)
+                            if (r <= 0) break
+                            filled += r
+                        }
+                        if (filled <= 0) break
+                        if (!isAllZeroBlock(buf, filled)) {
+                            raf.seek(offset)
+                            raf.write(buf, 0, filled)
+                        }
+                        offset += filled.toLong()
+                        val now = System.currentTimeMillis()
+                        if (expectedBytes > 0L && (now - lastReportMs) >= 350L) {
+                            lastReportMs = now
+                            val frac = (offset.toFloat() / expectedBytes.toFloat()).coerceIn(0f, 1f)
+                            onProgress(
+                                WindowsBuildProgress(
+                                    "Punching sparse holes...",
+                                    "${UsbGadgetEngine.formatBytes(offset)} / ${UsbGadgetEngine.formatBytes(expectedBytes)}",
+                                    0.60f + frac * 0.35f,
+                                    false
+                                )
+                            )
+                        }
+                    }
+                }
+                raf.setLength(expectedBytes)
+                raf.fd.sync()
+            }
+            val exitCode = proc.waitFor()
+            if (exitCode != 0 || offset != expectedBytes || localOut.length() != expectedBytes) {
+                return false
+            }
+            val swapOk = Shell.cmd("mv -f $qLocal $qImg 2>/dev/null").exec().isSuccess
+            if (!swapOk) return false
+            val finalSz = Shell.cmd("stat -c '%s' $qImg 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+            finalSz == expectedBytes
+        } catch (_: Exception) {
+            false
+        } finally {
+            runCatching { proc?.destroy() }
+            if (localOut.exists()) runCatching { localOut.delete() }
+        }
+    }
+
     suspend fun reclaimSparseSpace(
         context: Context,
         ventoyImgPath: String,
@@ -1537,54 +1620,83 @@ object VentoyImageBuilder {
         val beforeBlocks = Shell.cmd("stat -c '%b' $qImg 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
         val beforeDisk = beforeBlocks * 512L
 
-        val loopDev = attachPartition1Loop(resolvedImg, info.part1OffsetBytes, info.part1SizeBytes)
+        var loopDev = attachPartition1Loop(resolvedImg, info.part1OffsetBytes, info.part1SizeBytes)
         if (loopDev.isBlank() || !loopDev.startsWith("/dev/")) {
             return@withContext ActionResult(false, "Could not attach Multi-Boot partition.")
         }
 
         return@withContext runCatching {
-            onProgress(WindowsBuildProgress("Scanning free blocks...", "Mounting Partition 1", 0.15f, true))
+            onProgress(WindowsBuildProgress("Scanning free blocks...", "Mounting Partition 1", 0.12f, true))
             val fsLabel = mountVentoyPartition1(context, loopDev)
                 ?: return@withContext ActionResult(false, "Could not mount Multi-Boot partition.")
 
-            // Try fstrim first (instant if supported by kernel loop driver), then zero-fill free space briefly
-            onProgress(WindowsBuildProgress("Trimming deleted ISO blocks...", "Preparing sparse hole punch ($fsLabel)", 0.45f, true))
+            val (partTotalB, partFreeB) = queryMountSpaceBytes(TEMP_VENTOY_MNT)
+            val partUsedB = if (partTotalB > 0L && partFreeB >= 0L) (partTotalB - partFreeB).coerceAtLeast(0L) else -1L
+            // Estimate expected compact disk footprint (used Partition 1 data + 32 MiB VTOYEFI + 48 MiB FS overhead)
+            val alreadyCompact = partUsedB >= 0L && beforeDisk <= (partUsedB + 80L * 1024L * 1024L)
+            if (alreadyCompact) {
+                unmountVentoyPartition1(loopDev)
+                loopDev = ""
+                onProgress(WindowsBuildProgress("Done!", "Now ${UsbGadgetEngine.formatBytes(beforeDisk)} on disk", 1f, false))
+                return@withContext ActionResult(
+                    true,
+                    "Drive already optimized (${UsbGadgetEngine.formatBytes(beforeDisk)} on disk)."
+                )
+            }
+
+            onProgress(WindowsBuildProgress("Trimming deleted ISO blocks...", "Preparing sparse hole punch ($fsLabel)", 0.35f, true))
             val trimmed = Shell.cmd("command -v fstrim >/dev/null 2>&1 && fstrim $TEMP_VENTOY_MNT 2>/dev/null").exec().isSuccess
             if (!trimmed) {
-                Shell.cmd(
-                    "dd if=/dev/zero of=$TEMP_VENTOY_MNT/.pb_zero_reclaim bs=4M 2>/dev/null || true; sync; rm -f $TEMP_VENTOY_MNT/.pb_zero_reclaim; sync"
-                ).exec()
-            }
-            unmountVentoyPartition1(loopDev)
-
-            onProgress(WindowsBuildProgress("Reclaiming Android storage...", "Punching sparse holes in .img", 0.78f, true))
-            val digOk = Shell.cmd("command -v fallocate >/dev/null 2>&1 && fallocate -d $qImg 2>/dev/null").exec().isSuccess
-            if (!digOk) {
-                // Sparse copy fallback inside `<parent>/.pocketboot_tmp` with free-space & exact byte verification
                 val parentDir = resolvedImg.substringBeforeLast('/')
                 val hostFreeB = queryHostFreeSpaceBytes(parentDir)
-                val neededB = beforeDisk + (128L * 1024L * 1024L)
-                if (hostFreeB in 0L until neededB) {
+                val safeZeroBudget = if (partFreeB > 0L && hostFreeB > 0L && hostFreeB >= partFreeB + (256L * 1024L * 1024L)) {
+                    partFreeB
+                } else 0L
+                if (safeZeroBudget > 0L) {
+                    Shell.cmd(
+                        "dd if=/dev/zero of=$TEMP_VENTOY_MNT/.pb_zero_reclaim bs=4M 2>/dev/null || true; sync; rm -f $TEMP_VENTOY_MNT/.pb_zero_reclaim; sync"
+                    ).exec()
+                }
+            }
+            unmountVentoyPartition1(loopDev)
+            loopDev = ""
+
+            onProgress(WindowsBuildProgress("Reclaiming Android storage...", "Punching sparse holes in .img", 0.58f, true))
+            val digOk = Shell.cmd("command -v fallocate >/dev/null 2>&1 && fallocate -d $qImg 2>/dev/null").exec().isSuccess
+            if (!digOk) {
+                val parentDir = resolvedImg.substringBeforeLast('/')
+                val currentDisk = (Shell.cmd("stat -c '%b' $qImg 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: beforeBlocks) * 512L
+                val expectedSparseOut = if (partUsedB >= 0L) (partUsedB + 128L * 1024L * 1024L) else (beforeDisk + 128L * 1024L * 1024L)
+                val hostFreeB = queryHostFreeSpaceBytes(parentDir)
+                val minNeed = minOf(currentDisk, expectedSparseOut).coerceAtLeast(128L * 1024L * 1024L)
+                if (hostFreeB in 0L until minNeed) {
                     return@withContext ActionResult(
                         false,
-                        "Not enough free phone storage for safe sparse reclaim (${UsbGadgetEngine.formatBytes(hostFreeB)} free, need ${UsbGadgetEngine.formatBytes(neededB)})."
+                        "Not enough free phone storage for safe sparse reclaim (${UsbGadgetEngine.formatBytes(hostFreeB)} free, need ${UsbGadgetEngine.formatBytes(minNeed)})."
                     )
                 }
+                // Try GNU cp --sparse=always first; fall back to universal pure-Kotlin RandomAccessFile sparse copy
                 val tmpWork = UsbGadgetEngine.createSafeTempWorkDir(context, parentDir, "reclaim_${System.currentTimeMillis() % 10000}")
                 val qTmpImg = shellQuote("$tmpWork/sparse.img")
                 val cpRes = Shell.cmd("cp --sparse=always $qImg $qTmpImg 2>/dev/null").exec()
                 val tmpSize = if (cpRes.isSuccess) {
                     Shell.cmd("stat -c '%s' $qTmpImg 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
                 } else 0L
-                val swappedOk = cpRes.isSuccess && tmpSize == info.totalBytes &&
+                val gnuSwapped = cpRes.isSuccess && tmpSize == info.totalBytes &&
                     Shell.cmd("mv -f $qTmpImg $qImg 2>/dev/null").exec().isSuccess
                 UsbGadgetEngine.cleanupTempWorkDir(tmpWork)
-                if (!swappedOk) {
-                    return@withContext ActionResult(false, "Sparse reclaim aborted safely (kernel lacks fallocate -d or verified sparse copy).")
+                if (!gnuSwapped) {
+                    val ktOk = reclaimViaKotlinSparseCopy(context, resolvedImg, info.totalBytes, onProgress)
+                    if (!ktOk) {
+                        return@withContext ActionResult(false, "Sparse reclaim aborted safely (could not write verified sparse copy).")
+                    }
                 }
             }
 
-            UsbGadgetEngine.fixUserStoragePermissions(context, resolvedImg, isDir = false); Shell.cmd("stat -c '%s' $qImg 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull()?.takeIf { it > 0L }?.let { UsbGadgetEngine.syncMediaStoreFileSize(context, resolvedImg, it) }
+            UsbGadgetEngine.fixUserStoragePermissions(context, resolvedImg, isDir = false)
+            Shell.cmd("stat -c '%s' $qImg 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull()?.takeIf { it > 0L }?.let {
+                UsbGadgetEngine.syncMediaStoreFileSize(context, resolvedImg, it)
+            }
             IsoInspector.invalidate(resolvedImg)
             val afterBlocks = Shell.cmd("stat -c '%b' $qImg 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: beforeBlocks
             val afterDisk = afterBlocks * 512L
@@ -1599,7 +1711,7 @@ object VentoyImageBuilder {
                 }
             )
         }.getOrElse { e ->
-            unmountVentoyPartition1(loopDev)
+            if (loopDev.isNotEmpty()) unmountVentoyPartition1(loopDev)
             ActionResult(false, "Reclaim failed: ${e.message ?: "Unexpected error"}")
         }
     }

@@ -2,8 +2,12 @@
 - **Foreground USB Build Service (`UsbBuildService.kt`, `NotificationHelper.kt`, `MainActivity.kt`, `AndroidManifest.xml`):**
   - Moved Windows, Linux, and Multi-Boot image builds into a dedicated app-scoped `UsbBuildManager` + `UsbBuildService` (`foregroundServiceType="specialUse"`, `PARTIAL_WAKE_LOCK`, fail-safe `stopSelf()` on `startForeground()` error) so switching apps or locking the phone never kills active USB builds.
   - Added live build progress notifications (`BUILD_NOTIF_ID = 1004`), one-tap **Cancel** notification action (`UsbBuildActionReceiver`), completion alert (`BUILD_DONE_NOTIF_ID = 1005`), and a compact live progress banner on the Home tab whenever a build runs in the background.
-- **Upgraded Live USB Transfer Telemetry (`MainActivity.kt`):**
-  - Extended the existing `readUsbActivitySample()` kernel mass-storage poller (zero extra root shell overhead) to track **Session Transferred Bytes** and **Peak Transfer Speed (MB/s)** alongside live read speed, with automatic reset on unmount or drive switch.
+- **Upgraded Live USB Transfer Telemetry (`UsbGadgetEngine.kt`, `MainActivity.kt`):**
+  - Fixed `readUsbActivitySample()` to discover the `file-storage` kernel thread directly via `/proc/[0-9]*/comm` (Android Toybox `pidof`/`pgrep` skips kernel threads), eliminated `rchar + read_bytes` double-counting, added `file-storage` CPU tick + hardware USB controller IRQ (`/proc/interrupts`) fallbacks for GKI kernels, updated live Link Speed dynamically, and displayed **Transfer Stats** reliably whenever connected.
+- **Fixed Blank `.img` Auto-Mount, Partial Unmount & Multi-Boot Sparse Reclaim (`UsbGadgetEngine.kt`, `VentoyImageBuilder.kt`):**
+  - Wrapped `set -e` inside subshells `( set -e ... )` in `createBlankImage()` and `packDriversInjectionOnMounted()` and added defensive `set +e` to `mountImage()`/`unmountImage()`, preventing libsu's persistent root shell from aborting auto-mount right after locking ConfigFS.
+  - Fixed ConfigFS `[ -s ".../lun.X/file" ]` false-positive on empty 4096-byte sysfs nodes in `unmountImage()` and `mountImage()` so deleting/unmounting a single LUN cleanly restores normal USB.
+  - Added an Android-universal pure-Kotlin `RandomAccessFile` sparse hole-puncher (`reclaimViaKotlinSparseCopy`) + already-compact fast-path and host free-space guard in `reclaimSparseSpace()`, eliminating failures on Toybox ROMs lacking `fallocate -d` and `cp --sparse=always`.
 - **In-App Release Update Checker & Repo Link Fix (`AppUpdateChecker.kt`, `SettingsScreen.kt`, `DownloadScreen.kt`):**
   - Fixed all repository URLs to point to **`https://github.com/bilered/PocketBoot`** (Settings GitHub link, release checker API, and `DISTROS_MANIFEST_URL` raw catalog URL).
   - Added **Settings → About → Updates** with HTTPS-enforced GitHub Releases checking, SemVer comparison, scrollable release notes preview, and one-tap **Download APK** / **Open Release** action.
