@@ -91,6 +91,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.NavigationBar
@@ -136,7 +137,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.withContext
@@ -226,15 +226,9 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
     var showRootBrowserSheet by remember { mutableStateOf(false) }
     var pendingMountFile by remember { mutableStateOf<ImageFile?>(null) }
     var windowsBuilderTarget by remember { mutableStateOf<ImageFile?>(null) }
-    var windowsBuildJob by remember { mutableStateOf<Job?>(null) }
-    var windowsBuildProgress by remember { mutableStateOf(WindowsBuildProgress()) }
     var linuxBuilderTarget by remember { mutableStateOf<ImageFile?>(null) }
-    var linuxBuildJob by remember { mutableStateOf<Job?>(null) }
-    var linuxBuildProgress by remember { mutableStateOf(WindowsBuildProgress()) }
     var showVentoyBuilder by remember { mutableStateOf(false) }
     var ventoyBuilderInitialIso by remember { mutableStateOf<ImageFile?>(null) }
-    var ventoyBuildJob by remember { mutableStateOf<Job?>(null) }
-    var ventoyBuildProgress by remember { mutableStateOf(WindowsBuildProgress()) }
     var ventoyManagerTarget by remember { mutableStateOf<ImageFile?>(null) }
     var ventoyManagerBusy by remember { mutableStateOf(false) }
     var selectedInfoFile by remember { mutableStateOf<ImageFile?>(null) }
@@ -248,8 +242,9 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
 
     val isLightSurface = settings.surfaceMode == SurfaceMode.LIGHT
     val activeTurboDl by FastIsoDownloader.state.collectAsState()
-    val anyBuildActive = windowsBuildJob != null || linuxBuildJob != null ||
-        ventoyBuildJob != null || ventoyManagerBusy
+    val activeUsbBuild by UsbBuildManager.state.collectAsState()
+    val usbBuildCompletion by UsbBuildManager.completion.collectAsState()
+    val anyBuildActive = activeUsbBuild != null || ventoyManagerBusy
     val anyBuildOrDlActive = anyBuildActive || (activeTurboDl != null && activeTurboDl?.isPaused != true)
     val keepScreenAwake = settings.keepScreenAwakeDuringBuilds && anyBuildOrDlActive
 
@@ -269,7 +264,7 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
         BuildThermalHelper.configureThermal(settings.buildThermalProfile, settings.autoThermalCooldown)
     }
 
-    LaunchedEffect(images.size, settings.defaultDir, windowsBuildJob != null, ventoyBuildJob != null) {
+    LaunchedEffect(images.size, settings.defaultDir, activeUsbBuild != null) {
         withContext(Dispatchers.IO) {
             drivesFreeBytes = UsbGadgetEngine.getFreeSpaceBytes(settings.defaultDir)
             tempCacheBytes = UsbGadgetEngine.getTempStorageStats(context, settings.scanDirs + settings.defaultDir).totalBytes
@@ -353,6 +348,38 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
     }
 
     LaunchedEffect(Unit) { refreshAll() }
+
+    LaunchedEffect(usbBuildCompletion?.id) {
+        val evt = usbBuildCompletion ?: return@LaunchedEffect
+        UsbBuildManager.consumeCompletion(evt.id)
+        val res = evt.result
+        logs.addAll(res.entries)
+        if (evt.cancelled) {
+            showFeedback(res.userMessage, false)
+        } else if (res.success && res.createdPath != null) {
+            when (evt.kind) {
+                UsbBuildKind.WINDOWS -> windowsBuilderTarget = null
+                UsbBuildKind.LINUX -> linuxBuilderTarget = null
+                UsbBuildKind.MULTIBOOT -> {
+                    showVentoyBuilder = false
+                    ventoyBuilderInitialIso = null
+                    isoTypes[res.createdPath] = IsoOsType.VENTOY_IMAGE
+                }
+            }
+            val updated = settings.copy(
+                pinnedFiles = (settings.pinnedFiles + res.createdPath).distinct(),
+                hiddenFiles = settings.hiddenFiles - res.createdPath
+            )
+            updateSettings(updated, rescan = true)
+            if (evt.autoMountAfterBuild) {
+                mountPath(res.createdPath, evt.autoMountMode, lunIndex = 0)
+            } else {
+                showFeedback(res.userMessage, false)
+            }
+        } else {
+            showFeedback(res.userMessage, true)
+        }
+    }
 
     fun showFeedback(message: String, isError: Boolean = false) {
         statusBannerError = if (isError) message else null
@@ -704,6 +731,11 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
                         HomeScreen(
                             status = status,
                             watchdogStatus = watchdogStatus,
+                            activeUsbBuild = activeUsbBuild,
+                            onCancelUsbBuild = {
+                                UsbBuildManager.cancelActiveBuild(context)
+                                showFeedback("Cancelling ${activeUsbBuild?.kind?.label ?: "USB"} build...")
+                            },
                             images = images,
                             isoTypes = isoTypes,
                             busy = busy,
@@ -917,14 +949,11 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
                 presets = settings.autounattendPresets,
                 systemTweaksPresets = settings.systemTweaksPresets,
                 systemTweaksSearchHistory = settings.systemTweaksSearchHistory,
-                building = windowsBuildJob != null,
-                progress = windowsBuildProgress,
+                building = activeUsbBuild?.kind == UsbBuildKind.WINDOWS,
+                progress = if (activeUsbBuild?.kind == UsbBuildKind.WINDOWS) activeUsbBuild?.progress ?: WindowsBuildProgress() else WindowsBuildProgress(),
                 onDismiss = { windowsBuilderTarget = null },
                 onCancelBuild = {
-                    BuildThermalHelper.markBuildCancelled()
-                    val activeJob = windowsBuildJob
-                    scope.launch(Dispatchers.IO) { WindowsImageBuilder.cancelActiveBuild() }
-                    activeJob?.cancel()
+                    UsbBuildManager.cancelActiveBuild(context)
                     showFeedback("Cancelling Windows USB build...")
                 },
                 onSavePreset = { preset ->
@@ -951,39 +980,8 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
                     updateSettings(settings.copy(systemTweaksSearchHistory = hist), rescan = false)
                 },
                 onStartBuild = { cfg ->
-                    if (anyBuildActive) {
+                    if (anyBuildActive || !UsbBuildManager.startWindowsBuild(context, cfg)) {
                         showFeedback("Another USB build is already running. Wait or cancel it first.", true)
-                    } else {
-                        windowsBuildProgress = WindowsBuildProgress("Starting...", cfg.isoFile.name, 0.02f, true)
-                        windowsBuildJob = scope.launch {
-                            try {
-                                val res = WindowsImageBuilder.buildWindowsUsbImage(
-                                    context = context,
-                                    config = cfg,
-                                    onProgress = { p -> windowsBuildProgress = p }
-                                )
-                                logs.addAll(res.entries)
-                                if (res.success && res.createdPath != null) {
-                                    windowsBuilderTarget = null
-                                    val updated = settings.copy(
-                                        pinnedFiles = (settings.pinnedFiles + res.createdPath).distinct(),
-                                        hiddenFiles = settings.hiddenFiles - res.createdPath
-                                    )
-                                    updateSettings(updated, rescan = true)
-                                    if (cfg.autoMountAfterBuild) {
-                                        mountPath(res.createdPath, MountMode.USB_RW, lunIndex = 0)
-                                    } else {
-                                        showFeedback(res.userMessage, false)
-                                    }
-                                } else {
-                                    showFeedback(res.userMessage, true)
-                                }
-                            } catch (_: CancellationException) {
-                                showFeedback("Cancelled Windows USB build.")
-                            } finally {
-                                windowsBuildJob = null
-                            }
-                        }
                     }
                 }
             )
@@ -994,51 +992,16 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
             LinuxBuilderSheet(
                 isoFile = isoFile,
                 defaultDir = settings.defaultDir,
-                building = linuxBuildJob != null,
-                progress = linuxBuildProgress,
+                building = activeUsbBuild?.kind == UsbBuildKind.LINUX,
+                progress = if (activeUsbBuild?.kind == UsbBuildKind.LINUX) activeUsbBuild?.progress ?: WindowsBuildProgress() else WindowsBuildProgress(),
                 onDismiss = { linuxBuilderTarget = null },
                 onCancelBuild = {
-                    BuildThermalHelper.markBuildCancelled()
-                    val activeJob = linuxBuildJob
-                    scope.launch(Dispatchers.IO) { LinuxImageBuilder.cancelActiveBuild() }
-                    activeJob?.cancel()
+                    UsbBuildManager.cancelActiveBuild(context)
                     showFeedback("Cancelling Linux USB build...")
                 },
                 onStartBuild = { cfg ->
-                    if (anyBuildActive) {
+                    if (anyBuildActive || !UsbBuildManager.startLinuxBuild(context, cfg)) {
                         showFeedback("Another USB build is already running. Wait or cancel it first.", true)
-                    } else {
-                        linuxBuildProgress = WindowsBuildProgress("Starting...", cfg.isoFile.name, 0.02f, true)
-                        linuxBuildJob = scope.launch {
-                            try {
-                                val res = LinuxImageBuilder.buildLinuxPersistentImage(
-                                    context = context,
-                                    config = cfg,
-                                    onProgress = { p -> linuxBuildProgress = p }
-                                )
-                                logs.addAll(res.entries)
-                                if (res.success && res.createdPath != null) {
-                                    linuxBuilderTarget = null
-                                    val updated = settings.copy(
-                                        pinnedFiles = (settings.pinnedFiles + res.createdPath).distinct(),
-                                        hiddenFiles = settings.hiddenFiles - res.createdPath
-                                    )
-                                    updateSettings(updated, rescan = true)
-                                    if (cfg.autoMountAfterBuild) {
-                                        val targetMode = if (cfg.usbMode == LinuxUsbMode.WITH_PERSISTENCE) MountMode.USB_RW else MountMode.USB_RO
-                                        mountPath(res.createdPath, targetMode, lunIndex = 0)
-                                    } else {
-                                        showFeedback(res.userMessage, false)
-                                    }
-                                } else {
-                                    showFeedback(res.userMessage, true)
-                                }
-                            } catch (_: CancellationException) {
-                                showFeedback("Cancelled Linux USB build.")
-                            } finally {
-                                linuxBuildJob = null
-                            }
-                        }
                     }
                 }
             )
@@ -1052,7 +1015,7 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
                 presets = settings.autounattendPresets,
                 systemTweaksPresets = settings.systemTweaksPresets,
                 systemTweaksSearchHistory = settings.systemTweaksSearchHistory,
-                building = ventoyBuildJob != null,
+                building = activeUsbBuild?.kind == UsbBuildKind.MULTIBOOT,
                 onSavePreset = { preset ->
                     val updatedPresets = (settings.autounattendPresets.filterNot { it.name.equals(preset.name, true) } + preset)
                     updateSettings(settings.copy(autounattendPresets = updatedPresets), rescan = false)
@@ -1076,54 +1039,18 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
                 onUpdateSearchHistory = { hist ->
                     updateSettings(settings.copy(systemTweaksSearchHistory = hist), rescan = false)
                 },
-                progress = ventoyBuildProgress,
+                progress = if (activeUsbBuild?.kind == UsbBuildKind.MULTIBOOT) activeUsbBuild?.progress ?: WindowsBuildProgress() else WindowsBuildProgress(),
                 onDismiss = {
                     showVentoyBuilder = false
                     ventoyBuilderInitialIso = null
                 },
                 onCancelBuild = {
-                    BuildThermalHelper.markBuildCancelled()
-                    val activeJob = ventoyBuildJob
-                    scope.launch(Dispatchers.IO) { VentoyImageBuilder.cancelActiveBuild() }
-                    activeJob?.cancel()
+                    UsbBuildManager.cancelActiveBuild(context)
                     showFeedback("Cancelling Multi-Boot drive build...")
                 },
                 onStartBuild = { cfg ->
-                    if (anyBuildActive) {
+                    if (anyBuildActive || !UsbBuildManager.startMultiBootBuild(context, cfg)) {
                         showFeedback("Another USB build is already running. Wait or cancel it first.", true)
-                    } else {
-                        ventoyBuildProgress = WindowsBuildProgress("Starting...", cfg.outputName, 0.02f, true)
-                        ventoyBuildJob = scope.launch {
-                            try {
-                                val res = VentoyImageBuilder.buildVentoyImage(
-                                    context = context,
-                                    config = cfg,
-                                    onProgress = { p -> ventoyBuildProgress = p }
-                                )
-                                logs.addAll(res.entries)
-                                if (res.success && res.createdPath != null) {
-                                    showVentoyBuilder = false
-                                    ventoyBuilderInitialIso = null
-                                    isoTypes[res.createdPath] = IsoOsType.VENTOY_IMAGE
-                                    val updated = settings.copy(
-                                        pinnedFiles = (settings.pinnedFiles + res.createdPath).distinct(),
-                                        hiddenFiles = settings.hiddenFiles - res.createdPath
-                                    )
-                                    updateSettings(updated, rescan = true)
-                                    if (cfg.autoMountAfterBuild) {
-                                        mountPath(res.createdPath, MountMode.USB_RW, lunIndex = 0)
-                                    } else {
-                                        showFeedback(res.userMessage, false)
-                                    }
-                                } else {
-                                    showFeedback(res.userMessage, true)
-                                }
-                            } catch (_: CancellationException) {
-                                showFeedback("Cancelled Multi-Boot drive build.")
-                            } finally {
-                                ventoyBuildJob = null
-                            }
-                        }
                     }
                 },
                 onMessage = { msg, isErr -> showFeedback(msg, isErr) }
@@ -2268,6 +2195,8 @@ private fun InfoRow(label: String, value: String) {
 private fun HomeScreen(
     status: GadgetStatus,
     watchdogStatus: LinkWatchdogStatus,
+    activeUsbBuild: UsbBuildState? = null,
+    onCancelUsbBuild: () -> Unit = {},
     images: List<ImageFile>,
     isoTypes: Map<String, IsoOsType>,
     busy: Boolean,
@@ -2345,6 +2274,75 @@ private fun HomeScreen(
                             onViewLog()
                         }
                     )
+                }
+            }
+        }
+
+        // Live Background USB Build Progress Banner
+        AnimatedVisibility(
+            visible = activeUsbBuild != null,
+            enter = fadeIn(tween(200)) + expandVertically(),
+            exit = fadeOut(tween(150)) + shrinkVertically()
+        ) {
+            activeUsbBuild?.let { b ->
+                val pct = (b.progress.progress * 100f).toInt().coerceIn(0, 100)
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = PocketColors.surfaceCard,
+                    border = BorderStroke(1.dp, PocketColors.accent)
+                ) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 11.dp),
+                        verticalArrangement = Arrangement.spacedBy(7.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(9.dp)
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp,
+                                color = PocketColors.accent
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = if (b.progress.isIndeterminate) "${b.kind.label} · ${b.progress.stage}" else "${b.kind.label} · $pct%",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = PocketColors.textPrimary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = b.progress.detail.ifBlank { b.targetName },
+                                    style = PocketColors.monoStyle,
+                                    color = PocketColors.textSecondary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            Text(
+                                text = "Cancel",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = PocketColors.danger,
+                                modifier = Modifier.clickable { onCancelUsbBuild() }.padding(horizontal = 4.dp, vertical = 2.dp)
+                            )
+                        }
+                        if (b.progress.isIndeterminate) {
+                            LinearProgressIndicator(
+                                modifier = Modifier.fillMaxWidth().height(5.dp).clip(RoundedCornerShape(999.dp)),
+                                color = PocketColors.accent,
+                                trackColor = PocketColors.surfaceSubtle
+                            )
+                        } else {
+                            LinearProgressIndicator(
+                                progress = { b.progress.progress.coerceIn(0f, 1f) },
+                                modifier = Modifier.fillMaxWidth().height(5.dp).clip(RoundedCornerShape(999.dp)),
+                                color = PocketColors.accent,
+                                trackColor = PocketColors.surfaceSubtle
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -2850,15 +2848,23 @@ private fun ConnectionStatusCard(
 ) {
     var techExpanded by remember { mutableStateOf(false) }
     var ioBytesPerSec by remember { mutableStateOf(0L) }
+    var peakBytesPerSec by remember { mutableStateOf(0L) }
+    var sessionTransferredBytes by remember { mutableStateOf(0L) }
     var pcReadingActive by remember { mutableStateOf(false) }
     var liveLinkState by remember(status.usbLinkState) { mutableStateOf(status.usbLinkState) }
 
-    LaunchedEffect(status.isAnyMounted) {
+    LaunchedEffect(status.isAnyMounted, status.mountedFile, status.secondaryMountedFile) {
         if (!status.isAnyMounted) {
             ioBytesPerSec = 0L
+            peakBytesPerSec = 0L
+            sessionTransferredBytes = 0L
             pcReadingActive = false
             return@LaunchedEffect
         }
+        ioBytesPerSec = 0L
+        peakBytesPerSec = 0L
+        sessionTransferredBytes = 0L
+        var baselineBytes = -1L
         var prevBytes = -1L
         var prevMs = System.currentTimeMillis()
         while (isActive) {
@@ -2866,10 +2872,18 @@ private fun ConnectionStatusCard(
             val sample = UsbGadgetEngine.readUsbActivitySample()
             val nowMs = System.currentTimeMillis()
             if (sample.linkState.isNotBlank()) liveLinkState = sample.linkState
+            if (baselineBytes < 0L && sample.ioBytesTotal > 0L) {
+                baselineBytes = sample.ioBytesTotal
+            }
+            if (baselineBytes >= 0L && sample.ioBytesTotal >= baselineBytes) {
+                sessionTransferredBytes = sample.ioBytesTotal - baselineBytes
+            }
             if (prevBytes >= 0L && sample.ioBytesTotal >= prevBytes) {
                 val dt = (nowMs - prevMs).coerceAtLeast(1L)
                 val delta = sample.ioBytesTotal - prevBytes
-                ioBytesPerSec = (delta * 1000L) / dt
+                val rate = (delta * 1000L) / dt
+                ioBytesPerSec = rate
+                if (rate > peakBytesPerSec) peakBytesPerSec = rate
                 pcReadingActive = sample.kernelReadingActive || delta > 4096L
             } else {
                 pcReadingActive = sample.kernelReadingActive
@@ -3273,6 +3287,13 @@ private fun ConnectionStatusCard(
                                         else -> PocketColors.success
                                     }
                                 )
+                                if (sessionTransferredBytes >= 1024L || peakBytesPerSec >= 1024L) {
+                                    TelemetryLine(
+                                        label = "Transfer Stats",
+                                        value = "Session ${UsbGadgetEngine.formatBytes(sessionTransferredBytes)} · Peak ${FastIsoDownloader.formatSpeed(peakBytesPerSec)}",
+                                        valueColor = PocketColors.textSecondary
+                                    )
+                                }
 
                                 AnimatedVisibility(
                                     visible = techExpanded,

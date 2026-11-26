@@ -1,7 +1,8 @@
 # PocketBoot Pending Tasks
 
-1. **GitHub Actions CI Build:** Push `v4.6.9` (`versionCode = 35`) and verify `:app:compileDebugKotlin`, `:app:processDebugResources` (including `network_security_config.xml`), and `assembleDebug` pass green.
-2. **On-Device & PC/VM Verification:**
-   - **Multi-Boot Builder:** Open on a 9 GB Windows ISO → confirm `8 GB` stays selected (no auto-pick), red inline note appears under **Drive Capacity (Sparse)**, typing `10` in Custom displays **`10 GB`** (not `1 GB`), and building at `16 GB` produces an exact byte-verified ISO.
-   - **Multi-Boot Manager:** Verify **`Tweaks` / `Stock`** pills on Win 10/11 ISOs, Add ISO free-space & oversize warnings, Resize Drive live size, and exFAT resize on a stock drive leaves zero stale unattend scripts.
-   - **Builders, Blank Drive & Downloads:** Verify blank `.img` creation, Linux DD build, Windows Drivers folder injection, cancelling a running build without UI lag, and renaming/deleting ISOs refreshes library badges cleanly.
+1. **GitHub Actions CI Verification (`v4.7.0`, `versionCode = 36`):** Push Wave 1 and verify `gradle testDebugUnitTest --stacktrace` (all 4 JUnit suites) and `gradle assembleDebug --stacktrace` pass green.
+2. **On-Device Smoke Tests (Wave 1):**
+   - Start a Windows/Linux/Multi-Boot USB build, press Home to background PocketBoot, verify live progress notification + Cancel action work cleanly and the build finishes reliably without Android killing it.
+   - Mount an ISO to a PC and verify the mounted hero card displays live **USB-C Activity** + **Transfer Stats (Session / Peak)** while the PC boots/reads.
+   - Open **Settings → About → Updates** and **GitHub** to confirm both point to `https://github.com/bilered/PocketBoot`.
+3. **Wave 2 (`v4.7.1`):** Multi-Boot Linux persistence `.dat`, Boot Menu aliases/themes, per-ISO multi-template profiles, and direct `.img` File Explorer.

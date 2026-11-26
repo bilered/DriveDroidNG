@@ -224,7 +224,7 @@ object PreFlightDiagnostics {
 
     fun formatReport(items: List<DiagCheckItem>): String {
         val sb = StringBuilder()
-        sb.appendLine("PocketBoot v4.6.9 Pre-Flight Diagnostic Report")
+        sb.appendLine("PocketBoot v4.7.0 Pre-Flight Diagnostic Report")
         sb.appendLine("Device: ${Build.MANUFACTURER} ${Build.MODEL} (Android ${Build.VERSION.RELEASE}, API ${Build.VERSION.SDK_INT}, ABI ${Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"})")
         sb.appendLine("---")
         items.forEach { item ->

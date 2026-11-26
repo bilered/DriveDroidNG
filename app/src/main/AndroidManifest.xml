@@ -44,12 +44,25 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <service
+            android:name=".UsbBuildService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="USB bootable image creation wake lock and live build progress notification" />
+        </service>
+
         <receiver
             android:name=".DisconnectReceiver"
             android:exported="false" />
 
         <receiver
             android:name=".TurboDownloadActionReceiver"
+            android:exported="false" />
+
+        <receiver
+            android:name=".UsbBuildActionReceiver"
             android:exported="false" />
 
         <service

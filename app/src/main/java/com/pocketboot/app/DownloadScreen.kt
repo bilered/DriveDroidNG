@@ -152,7 +152,7 @@ data class CuratedIso(
         }
 }
 
-const val DISTROS_MANIFEST_URL = "https://raw.githubusercontent.com/bilered/DriveDroidNG/main/distros.json"
+const val DISTROS_MANIFEST_URL = "https://raw.githubusercontent.com/bilered/PocketBoot/main/distros.json"
 
 private val fallbackIsos: List<CuratedIso> = listOf(
     CuratedIso(

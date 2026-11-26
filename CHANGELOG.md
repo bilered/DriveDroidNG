@@ -1,3 +1,15 @@
+## v4.7.0 (2026-11-27) — Wave 1: Background Build Reliability, Telemetry, Updater & CI Test Gate
+- **Foreground USB Build Service (`UsbBuildService.kt`, `NotificationHelper.kt`, `MainActivity.kt`, `AndroidManifest.xml`):**
+  - Moved Windows, Linux, and Multi-Boot image builds into a dedicated app-scoped `UsbBuildManager` + `UsbBuildService` (`foregroundServiceType="specialUse"`, `PARTIAL_WAKE_LOCK`, fail-safe `stopSelf()` on `startForeground()` error) so switching apps or locking the phone never kills active USB builds.
+  - Added live build progress notifications (`BUILD_NOTIF_ID = 1004`), one-tap **Cancel** notification action (`UsbBuildActionReceiver`), completion alert (`BUILD_DONE_NOTIF_ID = 1005`), and a compact live progress banner on the Home tab whenever a build runs in the background.
+- **Upgraded Live USB Transfer Telemetry (`MainActivity.kt`):**
+  - Extended the existing `readUsbActivitySample()` kernel mass-storage poller (zero extra root shell overhead) to track **Session Transferred Bytes** and **Peak Transfer Speed (MB/s)** alongside live read speed, with automatic reset on unmount or drive switch.
+- **In-App Release Update Checker & Repo Link Fix (`AppUpdateChecker.kt`, `SettingsScreen.kt`, `DownloadScreen.kt`):**
+  - Fixed all repository URLs to point to **`https://github.com/bilered/PocketBoot`** (Settings GitHub link, release checker API, and `DISTROS_MANIFEST_URL` raw catalog URL).
+  - Added **Settings → About → Updates** with HTTPS-enforced GitHub Releases checking, SemVer comparison, scrollable release notes preview, and one-tap **Download APK** / **Open Release** action.
+- **Automated JVM Unit Test Suite & CI Gate (`app/src/test`, `app/build.gradle.kts`, `.github/workflows/build-apk.yml`, `WindowsCustomization.kt`):**
+  - Added JUnit 4 test suites (`DiskPartitionerTest`, `WindowsCustomizationTest`, `AppPrefsBackupTest`, `FilenameAndVersionTest`), switched `WindowsCustomizationEngine.gzipToBase64()` to `java.util.Base64` for pure JVM compatibility, and wired `gradle testDebugUnitTest --stacktrace` into GitHub Actions ahead of `assembleDebug`.
+
 ## v4.6.9 (2026-11-26)
 - **Multi-Boot Capacity Guard & Exact Copy Integrity (`VentoyImageBuilder.kt`):**
   - Added live capacity validation in **Multi-Boot Builder** without auto-changing the user's selected size: if the selected sparse capacity is smaller than the initial ISO (+ drivers + filesystem metadata headroom), shows an explicit danger error banner with a clear note telling you the minimum size required for your ISO and disables the Create button until you increase the drive capacity.

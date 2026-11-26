@@ -146,6 +146,8 @@ fun SettingsScreen(
     var ventoyUpdateText by remember { mutableStateOf("") }
     var tempStats by remember { mutableStateOf(TempStorageStats()) }
     var cleaningTemp by remember { mutableStateOf(false) }
+    var checkingUpdate by remember { mutableStateOf(false) }
+    var availableRelease by remember { mutableStateOf<AppReleaseInfo?>(null) }
 
     val exportBackupLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/json")
@@ -885,7 +887,7 @@ fun SettingsScreen(
                             Icon(Icons.Rounded.Usb, null, tint = PocketColors.onAccent, modifier = Modifier.size(22.dp))
                         }
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("PocketBoot v4.6.9", style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary)
+                            Text("PocketBoot v4.7.0", style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary)
                             Text(
                                 text = "${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE}",
                                 style = MaterialTheme.typography.bodySmall,
@@ -896,7 +898,7 @@ fun SettingsScreen(
                         }
                         Surface(
                             modifier = Modifier.bounceClick {
-                                val info = "PocketBoot v4.6.9\nDevice: ${Build.MANUFACTURER} ${Build.MODEL}\nAndroid: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\nRoot: ${status.rootManager}\nSELinux: ${status.selinuxMode}\nUDC: ${status.udcName}\nKernel: ${status.kernelVersion}"
+                                val info = "PocketBoot v4.7.0\nDevice: ${Build.MANUFACTURER} ${Build.MODEL}\nAndroid: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\nRoot: ${status.rootManager}\nSELinux: ${status.selinuxMode}\nUDC: ${status.udcName}\nKernel: ${status.kernelVersion}"
                                 val cm = context.getSystemService(ClipboardManager::class.java)
                                 cm?.setPrimaryClip(ClipData.newPlainText("Device Info", info))
                                 Toast.makeText(context, "Device info copied.", Toast.LENGTH_SHORT).show()
@@ -950,16 +952,39 @@ fun SettingsScreen(
                         horizontalArrangement = Arrangement.SpaceEvenly,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        TextButton(
+                            enabled = !checkingUpdate,
+                            onClick = {
+                                scope.launch {
+                                    checkingUpdate = true
+                                    val res = AppUpdateChecker.checkForUpdate("4.7.0")
+                                    checkingUpdate = false
+                                    if (res.success && res.updateAvailable && res.release != null) {
+                                        availableRelease = res.release
+                                    } else {
+                                        Toast.makeText(context, res.message, Toast.LENGTH_LONG).show()
+                                    }
+                                }
+                            }
+                        ) {
+                            if (checkingUpdate) {
+                                CircularProgressIndicator(modifier = Modifier.size(13.dp), strokeWidth = 2.dp, color = PocketColors.accent)
+                            } else {
+                                Icon(Icons.Rounded.CloudDownload, null, tint = PocketColors.accentSoft, modifier = Modifier.size(14.dp))
+                            }
+                            Spacer(modifier = Modifier.width(5.dp))
+                            Text(if (checkingUpdate) "Checking..." else "Updates", fontSize = 12.sp, color = PocketColors.accentSoft)
+                        }
                         TextButton(onClick = { showCreditsDialog = true }) {
                             Icon(Icons.Rounded.Info, null, tint = PocketColors.textSecondary, modifier = Modifier.size(14.dp))
                             Spacer(modifier = Modifier.width(5.dp))
-                            Text("Open-Source Credits", fontSize = 12.sp, color = PocketColors.textSecondary)
+                            Text("Credits", fontSize = 12.sp, color = PocketColors.textSecondary)
                         }
                         TextButton(
                             onClick = {
                                 runCatching {
                                     context.startActivity(
-                                        Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/bilered/DriveDroidNG"))
+                                        Intent(Intent.ACTION_VIEW, Uri.parse(AppUpdateChecker.REPO_URL))
                                     )
                                 }
                             }
@@ -974,6 +999,55 @@ fun SettingsScreen(
         }
 
         Spacer(modifier = Modifier.height(16.dp))
+    }
+
+    // App Release Update Dialog
+    availableRelease?.let { rel ->
+        AlertDialog(
+            onDismissRequest = { availableRelease = null },
+            containerColor = PocketColors.surfaceCard,
+            title = {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text("Update Available · ${rel.tagName}", color = PocketColors.textPrimary)
+                    if (rel.publishedAt.isNotBlank()) {
+                        Text("Published ${rel.publishedAt} · Current v4.7.0", style = PocketColors.monoStyle, color = PocketColors.textMuted)
+                    }
+                }
+            },
+            text = {
+                Column(
+                    modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = rel.releaseNotes.ifBlank { "A newer PocketBoot release (${rel.tagName}) is ready on GitHub." }.take(2400),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = PocketColors.textSecondary
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val targetUrl = rel.apkDownloadUrl ?: rel.htmlUrl
+                        availableRelease = null
+                        runCatching {
+                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(targetUrl)))
+                        }.onFailure {
+                            Toast.makeText(context, "Could not open browser for release link.", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)
+                ) {
+                    Text(if (rel.apkDownloadUrl != null) "Download APK" else "Open Release", fontWeight = FontWeight.SemiBold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { availableRelease = null }) {
+                    Text("Later", color = PocketColors.textSecondary)
+                }
+            }
+        )
     }
 
     // Activity Log Bottom Sheet

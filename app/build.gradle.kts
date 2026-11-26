@@ -12,8 +12,8 @@ android {
         applicationId = "com.pocketboot.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 35
-        versionName = "4.6.9"
+        versionCode = 36
+        versionName = "4.7.0"
     }
 
     buildTypes {
@@ -40,6 +40,10 @@ android {
     buildFeatures {
         compose = true
     }
+
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
@@ -54,4 +58,8 @@ dependencies {
 
     // libsu for root shell execution
     implementation("com.github.topjohnwu.libsu:core:5.3.0")
+
+    // JVM unit tests
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }

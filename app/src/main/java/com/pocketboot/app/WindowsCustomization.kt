@@ -1,6 +1,6 @@
 package com.pocketboot.app
 
-import android.util.Base64
+import java.util.Base64
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -590,7 +590,7 @@ object WindowsCustomizationEngine {
         sb.appendLine("if exist \"%PB_FLAG%\" exit /b 0")
         sb.appendLine("mkdir \"C:\\Windows\\Setup\\Scripts\" >nul 2>&1")
         sb.appendLine("echo [PocketBoot] Specialize configuration started...")
-        sb.appendLine("echo [PocketBoot v4.6.9] Specialize started %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.7.0] Specialize started %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("set \"PB_BUILD=0\"")
         sb.appendLine("for /f \"tokens=3\" %%B in ('reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\" /v CurrentBuildNumber 2^>nul ^| findstr /i CurrentBuildNumber') do set \"PB_BUILD=%%B\"")
 
@@ -870,7 +870,7 @@ object WindowsCustomizationEngine {
         // OEM BIOS-keyed laptop safeguard: register SetupComplete.cmd under FirstBoot\PostOobe
         sb.appendLine("if exist \"C:\\Windows\\Setup\\Scripts\\SetupComplete.cmd\" reg add \"HKLM\\SYSTEM\\Setup\\FirstBoot\\PostOobe\" /v \"00\" /t REG_SZ /d \"cmd.exe /c C:\\Windows\\Setup\\Scripts\\SetupComplete.cmd & exit /b 0\" /f >> \"%PB_LOG%\" 2>&1")
         sb.appendLine("echo done > \"%PB_FLAG%\"")
-        sb.appendLine("echo [PocketBoot v4.6.9] Specialize finished %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.7.0] Specialize finished %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("exit /b 0")
         return sb.toString().replace("\r\n", "\n").replace("\n", "\r\n")
     }
@@ -922,7 +922,7 @@ object WindowsCustomizationEngine {
             }
         }
         sb.appendLine("if exist \"C:\\Windows\\Setup\\Custom\" rmdir /s /q \"C:\\Windows\\Setup\\Custom\" >nul 2>&1")
-        sb.appendLine("echo [PocketBoot v4.6.9] SetupComplete finished %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.7.0] SetupComplete finished %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("start \"\" /b cmd /c \"ping -n 4 127.0.0.1 >nul & rmdir /s /q C:\\Windows\\Setup\\Scripts >nul 2>&1\"")
         sb.appendLine("exit /b 0")
         return sb.toString().replace("\r\n", "\n").replace("\n", "\r\n")
@@ -938,7 +938,7 @@ object WindowsCustomizationEngine {
         sb.appendLine("  exit /b 0")
         sb.appendLine(")")
         sb.appendLine("echo =======================================================")
-        sb.appendLine("echo   PocketBoot v4.6.9 - Revert Applied System Tweaks")
+        sb.appendLine("echo   PocketBoot v4.7.0 - Revert Applied System Tweaks")
         sb.appendLine("echo =======================================================")
         sb.appendLine("echo.")
         if (winUtil.disableConsumerFeatures || experience.disableSponsoredApps) {
@@ -1124,7 +1124,7 @@ object WindowsCustomizationEngine {
     private fun gzipToBase64(text: String): String {
         val baos = ByteArrayOutputStream()
         GZIPOutputStream(baos).use { it.write(text.toByteArray(Charsets.UTF_8)) }
-        return Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+        return Base64.getEncoder().encodeToString(baos.toByteArray())
     }
 
     fun generateAutounattendXml(
