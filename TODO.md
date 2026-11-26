@@ -1,9 +1,7 @@
 # PocketBoot Pending Tasks
 
-1. **GitHub Actions CI Build:** Push `v4.6.8` and confirm `:app:compileDebugKotlin` and `assembleDebug` pass with zero errors.
+1. **GitHub Actions CI Build:** Push `v4.6.9` (`versionCode = 35`) and verify `:app:compileDebugKotlin`, `:app:processDebugResources` (including `network_security_config.xml`), and `assembleDebug` pass green.
 2. **On-Device & PC/VM Verification:**
-   - Open **Windows USB Builder** → tap **System Tweaks** → verify dedicated full-screen screen opens cleanly with search bar, history chips, collapsible sections, `ⓘ` info dialogs, preset match badge, and `+ Save Preset`.
-   - Confirm **Classic Right-Click Menu** is gone from Pane 1 and present under **System Tweaks → Advanced**.
-   - Test **Add Undo Script** OFF vs. ON: verify `Preview .cmd` shows `Undo.cmd` tab only when ON and at least 1 tweak is active.
-   - Verify **Disable Windows Update (Store-Safe)** script writes dynamic install-UTC StartTime + `2099-12-31T23:59:59Z` EndTime and omits `DoNotConnectToWindowsUpdateInternetLocations` & `ExcludeWUDriversInQualityUpdate`.
-   - Confirm **Settings → Open-Source Credits** lists **Chris Titus Tech WinUtil (MIT)** while no third-party brand names appear in System Tweaks UI or Activity Logs.
+   - **Multi-Boot Builder:** Open on a 9 GB Windows ISO → confirm `8 GB` stays selected (no auto-pick), red inline note appears under **Drive Capacity (Sparse)**, typing `10` in Custom displays **`10 GB`** (not `1 GB`), and building at `16 GB` produces an exact byte-verified ISO.
+   - **Multi-Boot Manager:** Verify **`Tweaks` / `Stock`** pills on Win 10/11 ISOs, Add ISO free-space & oversize warnings, Resize Drive live size, and exFAT resize on a stock drive leaves zero stale unattend scripts.
+   - **Builders, Blank Drive & Downloads:** Verify blank `.img` creation, Linux DD build, Windows Drivers folder injection, cancelling a running build without UI lag, and renaming/deleting ISOs refreshes library badges cleanly.

@@ -50,6 +50,10 @@ object BuildThermalHelper {
         Shell.cmd("rm -f $ACTIVE_BUILD_PID_FILE 2>/dev/null || true").exec()
     }
 
+    fun markBuildCancelled() {
+        buildCancelledFlag.set(true)
+    }
+
     fun isBuildCancelled(): Boolean = buildCancelledFlag.get()
 
     /**

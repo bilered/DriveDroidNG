@@ -324,7 +324,8 @@ fun WindowsDownloadSheet(
                     }
                 }
 
-                if (directError != null) {
+                val currentDirectError = directError
+                if (currentDirectError != null) {
                     Surface(
                         shape = RoundedCornerShape(12.dp),
                         color = PocketColors.warningBg,
@@ -333,7 +334,7 @@ fun WindowsDownloadSheet(
                         Column(modifier = Modifier.fillMaxWidth().padding(13.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Icon(Icons.Rounded.ErrorOutline, null, tint = PocketColors.warning, modifier = Modifier.size(19.dp))
-                                Text(directError!!, style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
+                                Text(currentDirectError, style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
                             }
                             Button(
                                 onClick = { retryNonce++ },

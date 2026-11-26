@@ -12,8 +12,8 @@ android {
         applicationId = "com.pocketboot.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 34
-        versionName = "4.6.8"
+        versionCode = 35
+        versionName = "4.6.9"
     }
 
     buildTypes {

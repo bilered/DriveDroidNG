@@ -156,7 +156,7 @@ class UsbKeepAliveService : Service() {
         currentKeepAdb = intent?.getBooleanExtra(EXTRA_KEEP_ADB, false) ?: false
 
         val notif = NotificationHelper.buildMountedNotification(this, title, subtitle)
-        runCatching {
+        val promoted = runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 startForeground(
                     NotificationHelper.NOTIF_ID,
@@ -166,6 +166,12 @@ class UsbKeepAliveService : Service() {
             } else {
                 startForeground(NotificationHelper.NOTIF_ID, notif)
             }
+        }.isSuccess
+        if (!promoted) {
+            releaseWakeLock()
+            LinkWatchdogTracker.setActive(false)
+            stopSelf(startId)
+            return START_NOT_STICKY
         }
 
         lastObservedPlugged = isWiredPluggedIn()

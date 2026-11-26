@@ -686,7 +686,8 @@ fun RootFileBrowserSheet(
                         }
                     }
 
-                    if (sha256 != null) {
+                    val resolvedSha = sha256
+                    if (resolvedSha != null) {
                         Surface(
                             shape = RoundedCornerShape(10.dp),
                             color = PocketColors.surfaceInput,
@@ -699,12 +700,12 @@ fun RootFileBrowserSheet(
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text("SHA-256", style = MaterialTheme.typography.labelSmall, color = PocketColors.textMuted)
-                                    Text(sha256!!, style = PocketColors.monoStyle, color = PocketColors.textPrimary)
+                                    Text(resolvedSha, style = PocketColors.monoStyle, color = PocketColors.textPrimary)
                                 }
                                 IconButton(
                                     onClick = {
                                         val cm = context.getSystemService(ClipboardManager::class.java)
-                                        cm?.setPrimaryClip(ClipData.newPlainText("SHA-256", sha256))
+                                        cm?.setPrimaryClip(ClipData.newPlainText("SHA-256", resolvedSha))
                                         Toast.makeText(context, "SHA-256 copied.", Toast.LENGTH_SHORT).show()
                                     }
                                 ) {
@@ -805,7 +806,7 @@ fun RootFileBrowserSheet(
                         renameTarget = null
                         scope.launch {
                             fileOpBusy = true
-                            val res = UsbGadgetEngine.renameImageFile(item.path, newName, isMounted)
+                            val res = UsbGadgetEngine.renameImageFile(item.path, newName, isMounted, context)
                             if (res.success && res.createdPath != null) {
                                 UsbGadgetEngine.fixUserStoragePermissions(context, res.createdPath, isDir = false)
                                 selectedPaths.remove(item.path)
@@ -851,7 +852,7 @@ fun RootFileBrowserSheet(
                         scope.launch {
                             fileOpBusy = true
                             val delLun = if (isMounted) UsbGadgetEngine.getStatus().mountedLunFor(item.path) else null
-                            val res = UsbGadgetEngine.deleteImageFile(item.path, delLun)
+                            val res = UsbGadgetEngine.deleteImageFile(item.path, delLun, context)
                             if (delLun != null && !UsbGadgetEngine.getStatus().isAnyMounted) {
                                 UsbKeepAliveService.stop(context)
                             }
@@ -989,11 +990,15 @@ fun RootFolderPickerSheet(
         }
     }
     if (showNewFolderDialog) {
+        val safeFolderPreview = newFolderName
+            .replace('/', ' ').replace('\\', ' ').replace("..", "")
+            .replace(Regex("[\\x00-\\x1F:*?\"<>|]"), "")
+            .trim().trim('.')
         AlertDialog(
             onDismissRequest = { showNewFolderDialog = false }, containerColor = PocketColors.surfaceCard,
             title = { Text("Create New Folder", color = PocketColors.textPrimary) },
-            text = { OutlinedTextField(value = newFolderName, onValueChange = { newFolderName = it.replace("/", "") }, label = { Text("Folder name") }, placeholder = { Text("e.g., Drivers") }, singleLine = true, modifier = Modifier.fillMaxWidth()) },
-            confirmButton = { Button(onClick = { val c = newFolderName.trim(); if (c.isNotEmpty()) { val t = "${currentDir.trimEnd('/')}/$c"; showNewFolderDialog = false; newFolderName = ""; scope.launch { UsbGadgetEngine.ensureDirectoryExists(t, context); currentDir = t; reloadNonce++ } } }, enabled = newFolderName.trim().isNotEmpty(), colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)) { Text("Create", fontWeight = FontWeight.SemiBold) } },
+            text = { OutlinedTextField(value = newFolderName, onValueChange = { newFolderName = it.replace("/", "").replace("\\", "") }, label = { Text("Folder name") }, placeholder = { Text("e.g., Drivers") }, singleLine = true, modifier = Modifier.fillMaxWidth()) },
+            confirmButton = { Button(onClick = { if (safeFolderPreview.isNotEmpty()) { val t = "${currentDir.trimEnd('/')}/$safeFolderPreview"; showNewFolderDialog = false; newFolderName = ""; scope.launch { UsbGadgetEngine.ensureDirectoryExists(t, context); currentDir = t; reloadNonce++ } } }, enabled = safeFolderPreview.isNotEmpty(), colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)) { Text("Create", fontWeight = FontWeight.SemiBold) } },
             dismissButton = { TextButton(onClick = { showNewFolderDialog = false }) { Text("Cancel", color = PocketColors.textSecondary) } }
         )
     }

@@ -5,7 +5,11 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.webkit.CookieManager as WebCookieManager
+import android.net.http.SslError
 import android.webkit.JavascriptInterface
+import android.webkit.SslErrorHandler
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import kotlinx.coroutines.Dispatchers
@@ -127,6 +131,7 @@ object WindowsDirectCatalog {
         followRedirects: Boolean = true
     ): Pair<Int, String> {
         val url = URL(urlStr)
+        require(url.protocol.equals("https", ignoreCase = true)) { "HTTPS is required for official Windows catalog requests." }
         val uri = runCatching { url.toURI() }.getOrNull()
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
@@ -392,29 +397,34 @@ object WindowsDirectCatalog {
     ): String? = withTimeoutOrNull(18_000L) {
         suspendCancellableCoroutine { cont ->
             val mainHandler = Handler(Looper.getMainLooper())
+            val finished = AtomicBoolean(false)
+            var wv: WebView? = null
+
+            fun finish(result: String?) {
+                if (!finished.compareAndSet(false, true)) return
+                mainHandler.post {
+                    runCatching {
+                        wv?.stopLoading()
+                        wv?.destroy()
+                    }
+                    wv = null
+                }
+                if (cont.isActive) cont.resume(result)
+            }
+
+            cont.invokeOnCancellation { finish(null) }
+
             mainHandler.post {
+                if (!cont.isActive || finished.get()) return@post
                 val pageSlug = when (osFamily) { "win11" -> "windows11"; "win81" -> "windows8ISO"; else -> "windows10ISO" }
                 val originUrl = "https://www.microsoft.com/en-us/software-download/$pageSlug"
-                val finished = AtomicBoolean(false)
-                var wv: WebView? = null
-
-                fun finish(result: String?) {
-                    if (!finished.compareAndSet(false, true)) return
-                    mainHandler.post {
-                        runCatching {
-                            wv?.stopLoading()
-                            wv?.destroy()
-                        }
-                        wv = null
-                    }
-                    if (cont.isActive) cont.resume(result)
-                }
-
                 try {
                     val webView = WebView(context.applicationContext)
                     wv = webView
                     webView.settings.javaScriptEnabled = true
                     webView.settings.domStorageEnabled = true
+                    webView.settings.allowFileAccess = false
+                    webView.settings.allowContentAccess = false
                     webView.settings.userAgentString = UA
                     WebCookieManager.getInstance().setAcceptCookie(true)
                     WebCookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
@@ -434,7 +444,7 @@ object WindowsDirectCatalog {
                     val triggered = AtomicBoolean(false)
                     webView.webViewClient = object : WebViewClient() {
                         override fun onPageFinished(view: WebView?, url: String?) {
-                            if (view == null || !triggered.compareAndSet(false, true)) return
+                            if (view == null || finished.get() || !triggered.compareAndSet(false, true)) return
                             val safeUrl = apiUrl.replace("\\", "\\\\").replace("'", "\\'")
                             val js = """
                                 (function(){
@@ -448,9 +458,23 @@ object WindowsDirectCatalog {
                             """.trimIndent()
                             view.evaluateJavascript(js, null)
                         }
+
+                        override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                            if (request?.isForMainFrame == true) {
+                                finish(null)
+                            }
+                        }
+
+                        override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
+                            handler?.cancel()
+                            finish(null)
+                        }
                     }
 
-                    cont.invokeOnCancellation { finish(null) }
+                    if (!cont.isActive || finished.get()) {
+                        finish(null)
+                        return@post
+                    }
                     webView.loadUrl(originUrl)
                 } catch (_: Exception) {
                     finish(null)

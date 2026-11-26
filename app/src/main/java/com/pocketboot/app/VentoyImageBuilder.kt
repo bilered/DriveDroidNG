@@ -28,6 +28,7 @@ import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.CloudDownload
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Eject
+import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Layers
 import androidx.compose.material.icons.rounded.Refresh
@@ -140,7 +141,16 @@ data class VentoyDriveContents(
     val win11BypassNro: Boolean,
     val savedExperience: WindowsExperienceConfig = WindowsExperienceConfig(bypassRequirements = win11BypassCheck, bypassMicrosoftAccount = win11BypassNro),
     val savedWinUtil: WinUtilTweaksConfig = WinUtilTweaksConfig(),
-    val hasDriversZip: Boolean = false
+    val hasDriversZip: Boolean = false,
+    val excludedAutoInstallIsos: Set<String> = emptySet()
+)
+
+private data class PocketBootDriveMeta(
+    val exists: Boolean,
+    val experience: WindowsExperienceConfig,
+    val winUtil: WinUtilTweaksConfig,
+    val hasDriversZip: Boolean,
+    val excludedAutoInstallIsos: Set<String> = emptySet()
 )
 
 data class VentoyBuildConfig(
@@ -252,16 +262,22 @@ object VentoyImageBuilder {
         return@withContext runCatching {
             onProgress(WindowsBuildProgress("Checking for updates...", "Querying latest Multi-Boot engine release", 0.08f, true))
 
-            val apiConn = (URL(VENTOY_LATEST_API).openConnection() as HttpURLConnection).apply {
+            val apiUrl = URL(VENTOY_LATEST_API)
+            require(apiUrl.protocol.equals("https", ignoreCase = true)) { "HTTPS is required for Multi-Boot engine updates." }
+            val apiConn = (apiUrl.openConnection() as HttpURLConnection).apply {
                 connectTimeout = 12000
                 readTimeout = 15000
                 setRequestProperty("User-Agent", "PocketBoot-Android")
                 setRequestProperty("Accept", "application/vnd.github+json")
             }
-            if (apiConn.responseCode !in 200..299) {
-                return@withContext ActionResult(false, "GitHub API returned HTTP ${apiConn.responseCode}.", entries = entries)
+            val jsonText = try {
+                if (apiConn.responseCode !in 200..299) {
+                    return@withContext ActionResult(false, "GitHub API returned HTTP ${apiConn.responseCode}.", entries = entries)
+                }
+                apiConn.inputStream.bufferedReader().use { it.readText() }
+            } finally {
+                apiConn.disconnect()
             }
-            val jsonText = apiConn.inputStream.bufferedReader().use { it.readText() }
             val root = JSONObject(jsonText)
             val tag = root.optString("tag_name", "").removePrefix("v").trim()
             val assets = root.optJSONArray("assets") ?: JSONArray()
@@ -279,43 +295,51 @@ object VentoyImageBuilder {
             if (downloadUrl.isBlank() || tag.isBlank()) {
                 return@withContext ActionResult(false, "Could not find Multi-Boot engine archive in latest release.", entries = entries)
             }
+            val parsedDlUrl = URL(downloadUrl)
+            if (!parsedDlUrl.protocol.equals("https", ignoreCase = true)) {
+                return@withContext ActionResult(false, "Refused non-HTTPS Multi-Boot engine download URL.", entries = entries)
+            }
 
             entries.add(LogEntry(ts, "multiboot-upd", "Found Multi-Boot engine v$tag ($assetName)"))
             onProgress(WindowsBuildProgress("Downloading Engine v$tag...", assetName, 0.15f, false))
 
-            val dlConn = (URL(downloadUrl).openConnection() as HttpURLConnection).apply {
+            val dlConn = (parsedDlUrl.openConnection() as HttpURLConnection).apply {
                 connectTimeout = 15000
                 readTimeout = 30000
                 instanceFollowRedirects = true
                 setRequestProperty("User-Agent", "PocketBoot-Android")
             }
-            if (dlConn.responseCode !in 200..299) {
-                return@withContext ActionResult(false, "Download failed (HTTP ${dlConn.responseCode}).", entries = entries)
-            }
-            val totalLen = dlConn.contentLengthLong
-            var downloaded = 0L
-            dlFile.delete()
-            dlConn.inputStream.use { input ->
-                FileOutputStream(dlFile).use { output ->
-                    val buf = ByteArray(65536)
-                    while (true) {
-                        val r = input.read(buf)
-                        if (r <= 0) break
-                        output.write(buf, 0, r)
-                        downloaded += r
-                        if (totalLen > 0L) {
-                            val pct = 0.15f + (downloaded.toFloat() / totalLen.toFloat()) * 0.65f
-                            onProgress(
-                                WindowsBuildProgress(
-                                    "Downloading Engine v$tag...",
-                                    "${UsbGadgetEngine.formatBytes(downloaded)} / ${UsbGadgetEngine.formatBytes(totalLen)}",
-                                    pct,
-                                    false
+            try {
+                if (dlConn.responseCode !in 200..299) {
+                    return@withContext ActionResult(false, "Download failed (HTTP ${dlConn.responseCode}).", entries = entries)
+                }
+                val totalLen = dlConn.contentLengthLong
+                var downloaded = 0L
+                dlFile.delete()
+                dlConn.inputStream.use { input ->
+                    FileOutputStream(dlFile).use { output ->
+                        val buf = ByteArray(65536)
+                        while (true) {
+                            val r = input.read(buf)
+                            if (r <= 0) break
+                            output.write(buf, 0, r)
+                            downloaded += r
+                            if (totalLen > 0L) {
+                                val pct = 0.15f + (downloaded.toFloat() / totalLen.toFloat()) * 0.65f
+                                onProgress(
+                                    WindowsBuildProgress(
+                                        "Downloading Engine v$tag...",
+                                        "${UsbGadgetEngine.formatBytes(downloaded)} / ${UsbGadgetEngine.formatBytes(totalLen)}",
+                                        pct,
+                                        false
+                                    )
                                 )
-                            )
+                            }
                         }
                     }
                 }
+            } finally {
+                dlConn.disconnect()
             }
 
             onProgress(WindowsBuildProgress("Extracting boot engine...", "Preparing offline boot files", 0.86f, true))
@@ -613,8 +637,63 @@ object VentoyImageBuilder {
         )
     }
 
+    /**
+     * Android-universal filesystem capacity probe (works across toybox, busybox, and GNU).
+     * Returns (totalBytes, availableBytes) or (-1L, -1L) if unavailable.
+     * Avoids relying solely on GNU `df -B1` which is unsupported on many Android toybox builds.
+     */
+    private fun queryMountSpaceBytes(mountOrDirPath: String): Pair<Long, Long> {
+        val qPath = shellQuote(mountOrDirPath)
+        val statLine = Shell.cmd("stat -f -c '%b %a %S' $qPath 2>/dev/null").exec().out.firstOrNull().orEmpty().trim()
+        val statParts = statLine.split(Regex("\\s+"))
+        if (statParts.size >= 3) {
+            val blocks = statParts[0].toLongOrNull() ?: -1L
+            val avail = statParts[1].toLongOrNull() ?: -1L
+            val blkSize = statParts[2].toLongOrNull() ?: -1L
+            if (blocks > 0L && avail >= 0L && blkSize > 0L) {
+                return (blocks * blkSize) to (avail * blkSize)
+            }
+        }
+        val dfKLine = Shell.cmd("df -k -P $qPath 2>/dev/null | tail -n 1").exec().out.firstOrNull().orEmpty().trim()
+        val dfKParts = dfKLine.split(Regex("\\s+"))
+        if (dfKParts.size >= 4) {
+            val totK = dfKParts[1].toLongOrNull() ?: -1L
+            val availK = dfKParts[3].toLongOrNull() ?: -1L
+            if (totK > 0L && availK >= 0L) {
+                return (totK * 1024L) to (availK * 1024L)
+            }
+        }
+        val dfBLine = Shell.cmd("df -B1 $qPath 2>/dev/null | tail -n 1").exec().out.firstOrNull().orEmpty().trim()
+        val dfBParts = dfBLine.split(Regex("\\s+"))
+        if (dfBParts.size >= 4) {
+            val totB = dfBParts[1].toLongOrNull() ?: -1L
+            val availB = dfBParts[3].toLongOrNull() ?: -1L
+            if (totB > 0L && availB >= 0L) {
+                return totB to availB
+            }
+        }
+        return -1L to -1L
+    }
+
+    private fun queryHostFreeSpaceBytes(dirPath: String): Long {
+        val statFsFree = UsbGadgetEngine.getFreeSpaceBytes(dirPath)
+        if (statFsFree > 0L) return statFsFree
+        val (_, shellFree) = queryMountSpaceBytes(dirPath)
+        return shellFree
+    }
+
+    fun normalizeVentoyRelPath(relPath: String): String =
+        "/" + relPath.trim().trimStart('/')
+
+    fun isWindowsDesktopAutoInstallEligible(fileName: String): Boolean {
+        if (!fileName.lowercase().endsWith(".iso")) return false
+        if (IsoInspector.quickGuessByName(fileName) != IsoOsType.WINDOWS) return false
+        val kind = WindowsCustomizationEngine.detectWindowsOsKind(fileName)
+        return kind == WindowsOsKind.WIN11 || kind == WindowsOsKind.WIN10 || kind == WindowsOsKind.UNKNOWN
+    }
+
     private fun findWindowsIsoRelPathsOnMounted(): List<String> {
-        val out = Shell.cmd("cd $TEMP_VENTOY_MNT 2>/dev/null && find . -maxdepth 2 -type f -iname '*.iso' ! -path './ventoy/*' 2>/dev/null || true").exec().out
+        val out = Shell.cmd("cd $TEMP_VENTOY_MNT 2>/dev/null && find . -maxdepth 3 -type f -iname '*.iso' ! -path './ventoy/*' 2>/dev/null || true").exec().out
         return out.map { it.trim().removePrefix("./") }
             .filter { rel -> rel.isNotBlank() && IsoInspector.quickGuessByName(rel.substringAfterLast('/')) == IsoOsType.WINDOWS }
             .map { "/$it" }.distinct().sorted()
@@ -625,63 +704,141 @@ object VentoyImageBuilder {
         val srcDir = UsbGadgetEngine.resolveDirectPath(driversDir).trimEnd('/')
         val sevenZip = WindowsImageBuilder.findBundledBinary(context, "lib7zzs.so", listOf("7zz", "7z")) ?: return false
         val stageDir = "/data/local/tmp/pb_vtoy_drv_stage"; val tmpZip = "/data/local/tmp/pb_vtoy_drivers.zip"
+        val dstZip = "$TEMP_VENTOY_MNT/ventoy/drivers_inject.zip"
         val tmpBat = File(context.cacheDir, "VentoyAutoRun.bat").apply {
             writeText("@echo off\r\nif exist \"X:\\Drivers\" (for /r \"X:\\Drivers\" %%F in (*.inf) do drvload \"%%~fF\" >nul 2>&1)\r\nexit /b 0\r\n", Charsets.UTF_8)
         }
         return try {
-            Shell.cmd("""
-                if [ -d ${shellQuote(srcDir)} ]; then
-                    rm -rf $stageDir $tmpZip && mkdir -p $stageDir/Drivers && cp -rf ${shellQuote(srcDir)}/. $stageDir/Drivers/ &&
-                    cp -f ${shellQuote(tmpBat.absolutePath)} $stageDir/VentoyAutoRun.bat &&
-                    cd $stageDir && ${shellQuote(sevenZip)} a -tzip -y $tmpZip . >/dev/null 2>&1 &&
-                    mkdir -p $TEMP_VENTOY_MNT/ventoy && cp -f $tmpZip $TEMP_VENTOY_MNT/ventoy/drivers_inject.zip && rm -rf $stageDir $tmpZip
-                else exit 1; fi
-            """.trimIndent()).exec().isSuccess
-        } finally { tmpBat.delete() }
+            val res = Shell.cmd("""
+                set -e
+                [ -d ${shellQuote(srcDir)} ]
+                rm -rf $stageDir $tmpZip && mkdir -p $stageDir/Drivers
+                cp -rf ${shellQuote(srcDir)}/. $stageDir/Drivers/
+                cp -f ${shellQuote(tmpBat.absolutePath)} $stageDir/VentoyAutoRun.bat
+                cd $stageDir && ${shellQuote(sevenZip)} a -tzip -y $tmpZip . >/dev/null 2>&1
+                SRC_SZ=${'$'}(stat -c '%s' $tmpZip 2>/dev/null || echo 0)
+                [ "${'$'}SRC_SZ" -gt 0 ]
+                mkdir -p $TEMP_VENTOY_MNT/ventoy
+                rm -f $dstZip
+                cp -f $tmpZip $dstZip
+                DST_SZ=${'$'}(stat -c '%s' $dstZip 2>/dev/null || echo 0)
+                if [ "${'$'}DST_SZ" != "${'$'}SRC_SZ" ]; then
+                    rm -f $dstZip
+                    exit 1
+                fi
+            """.trimIndent()).exec()
+            if (!res.isSuccess) {
+                Shell.cmd("rm -f $dstZip 2>/dev/null || true").exec()
+            }
+            res.isSuccess
+        } finally {
+            tmpBat.delete()
+            Shell.cmd("rm -rf $stageDir $tmpZip 2>/dev/null || true").exec()
+        }
     }
 
-    private fun writeVentoyJsonOnMounted(context: Context, bypassCheck: Boolean, bypassNro: Boolean, experience: WindowsExperienceConfig? = null, winUtil: WinUtilTweaksConfig? = null, driversDir: String? = null) {
+    private fun writeVentoyJsonOnMounted(
+        context: Context,
+        bypassCheck: Boolean,
+        bypassNro: Boolean,
+        experience: WindowsExperienceConfig? = null,
+        winUtil: WinUtilTweaksConfig? = null,
+        driversDir: String? = null,
+        excludedAutoInstallIsos: Set<String>? = null
+    ): Boolean {
+        var driversOk = true
         val existingRaw = Shell.cmd("cat $TEMP_VENTOY_MNT/ventoy/ventoy.json 2>/dev/null").exec().out.joinToString("\n")
         val rootObj = runCatching { if (existingRaw.isNotBlank()) JSONObject(existingRaw) else JSONObject() }.getOrDefault(JSONObject())
         rootObj.put("control", JSONArray().apply {
             put(JSONObject().put("VTOY_WIN11_BYPASS_CHECK", if (bypassCheck) "1" else "0"))
             put(JSONObject().put("VTOY_WIN11_BYPASS_NRO", if (bypassNro) "1" else "0"))
         })
-        if (experience != null && winUtil != null) {
-            if (experience.hasAnyActive() || winUtil.hasAnyActive()) {
-                val tmpXml = File(context.cacheDir, "pocketboot_unattend.xml").apply { writeText(WindowsCustomizationEngine.generateVentoySelfContainedXml(experience, winUtil, "amd64"), Charsets.UTF_8) }
-                try { Shell.cmd("mkdir -p $TEMP_VENTOY_MNT/ventoy/scripts && cp -f ${shellQuote(tmpXml.absolutePath)} $TEMP_VENTOY_MNT/ventoy/scripts/pocketboot_unattend.xml").exec() } finally { tmpXml.delete() }
-            } else Shell.cmd("rm -f $TEMP_VENTOY_MNT/ventoy/scripts/pocketboot_unattend.xml 2>/dev/null").exec()
+
+        val existingMeta = readPocketBootMetaOnMounted(bypassCheck, bypassNro)
+        val winIsos = findWindowsIsoRelPathsOnMounted()
+        val winIsoSet = winIsos.toSet()
+        val effExp = experience ?: existingMeta.experience.copy(
+            bypassRequirements = bypassCheck,
+            bypassMicrosoftAccount = bypassNro
+        )
+        val effWu = winUtil ?: existingMeta.winUtil
+        val rawExcluded = excludedAutoInstallIsos ?: existingMeta.excludedAutoInstallIsos
+        // Prune excluded paths that no longer exist on the drive (while keeping any user-set entries when drive has matching ISOs)
+        val effExcluded = rawExcluded.map { normalizeVentoyRelPath(it) }.filter { it in winIsoSet }.toSet()
+        val shouldPersistMeta = (experience != null && winUtil != null) || excludedAutoInstallIsos != null || existingMeta.exists
+
+        val eligibleWinIsos = winIsos.filter { rel ->
+            isWindowsDesktopAutoInstallEligible(rel.substringAfterLast('/')) && rel !in effExcluded
+        }
+
+        if (shouldPersistMeta) {
+            val hasTweaksToInject = effExp.hasAnyActive() || effWu.hasAnyActive()
+            // Remove legacy single-arch file and stale arch XMLs before writing active per-arch templates
+            Shell.cmd("rm -f $TEMP_VENTOY_MNT/ventoy/scripts/pocketboot_unattend*.xml 2>/dev/null").exec()
+            if (hasTweaksToInject) {
+                val neededArches = eligibleWinIsos
+                    .map { WindowsCustomizationEngine.detectProcessorArchitecture(it.substringAfterLast('/')) }
+                    .distinct()
+                    .ifEmpty { listOf("amd64") }
+                neededArches.forEach { arch ->
+                    val fileName = "pocketboot_unattend_$arch.xml"
+                    val tmpXml = File(context.cacheDir, fileName).apply {
+                        writeText(WindowsCustomizationEngine.generateVentoySelfContainedXml(effExp, effWu, arch), Charsets.UTF_8)
+                    }
+                    try {
+                        Shell.cmd("mkdir -p $TEMP_VENTOY_MNT/ventoy/scripts && cp -f ${shellQuote(tmpXml.absolutePath)} $TEMP_VENTOY_MNT/ventoy/scripts/$fileName").exec()
+                    } finally {
+                        tmpXml.delete()
+                    }
+                }
+            }
             val metaObj = JSONObject().apply {
-                put("bypassRequirements", experience.bypassRequirements)
-                put("bypassMicrosoftAccount", experience.bypassMicrosoftAccount)
-                put("disableDataCollection", experience.disableDataCollection)
-                put("disableBitLocker", experience.disableBitLocker)
-                put("qolImprovements", experience.qolImprovements)
-                put("disableSponsoredApps", experience.disableSponsoredApps)
+                put("bypassRequirements", effExp.bypassRequirements)
+                put("bypassMicrosoftAccount", effExp.bypassMicrosoftAccount)
+                put("disableDataCollection", effExp.disableDataCollection)
+                put("disableBitLocker", effExp.disableBitLocker)
+                put("qolImprovements", effExp.qolImprovements)
+                put("disableSponsoredApps", effExp.disableSponsoredApps)
                 put("classicContextMenu", false)
-                put("skipWifiSetup", experience.skipWifiSetup)
-                put("createLocalUser", experience.createLocalUser)
-                put("localUsername", experience.localUsername)
-                put("skipOobe", experience.skipOobe)
-                put("applySkuSiPolicy", experience.applySkuSiPolicy)
-                put("winUtilJson", winUtil.toJsonString())
+                put("skipWifiSetup", effExp.skipWifiSetup)
+                put("createLocalUser", effExp.createLocalUser)
+                put("localUsername", effExp.localUsername)
+                put("skipOobe", effExp.skipOobe)
+                put("applySkuSiPolicy", effExp.applySkuSiPolicy)
+                put("winUtilJson", effWu.toJsonString())
+                put("excludedAutoInstallIsos", JSONArray(effExcluded.sorted()))
             }
             val tmpMeta = File(context.cacheDir, "pb_vtoy_meta.json").apply { writeText(metaObj.toString(), Charsets.UTF_8) }
             try { Shell.cmd("mkdir -p $TEMP_VENTOY_MNT/ventoy && cp -f ${shellQuote(tmpMeta.absolutePath)} $TEMP_VENTOY_MNT/ventoy/pocketboot_meta.json").exec() } finally { tmpMeta.delete() }
         }
         if (driversDir != null) {
-            if (driversDir.isNotBlank()) packDriversInjectionOnMounted(context, driversDir)
-            else Shell.cmd("rm -f $TEMP_VENTOY_MNT/ventoy/drivers_inject.zip 2>/dev/null").exec()
+            if (driversDir.isNotBlank()) {
+                driversOk = packDriversInjectionOnMounted(context, driversDir)
+            } else {
+                Shell.cmd("rm -f $TEMP_VENTOY_MNT/ventoy/drivers_inject.zip 2>/dev/null").exec()
+            }
         }
-        val hasXml = Shell.cmd("[ -f $TEMP_VENTOY_MNT/ventoy/scripts/pocketboot_unattend.xml ] && echo 1 || echo 0").exec().out.lastOrNull()?.trim() == "1"
-        val hasDrvZip = Shell.cmd("[ -f $TEMP_VENTOY_MNT/ventoy/drivers_inject.zip ] && echo 1 || echo 0").exec().out.lastOrNull()?.trim() == "1"
-        val winIsos = findWindowsIsoRelPathsOnMounted()
-        if (hasXml && winIsos.isNotEmpty()) {
-            val autoArr = JSONArray()
-            winIsos.forEach { rel -> autoArr.put(JSONObject().apply { put("image", rel); put("template", JSONArray().put("/ventoy/scripts/pocketboot_unattend.xml")); put("autosel", 1); put("timeout", 3) }) }
-            rootObj.put("auto_install", autoArr)
-        } else rootObj.remove("auto_install")
+        val hasDrvZip = driversOk && Shell.cmd("[ -s $TEMP_VENTOY_MNT/ventoy/drivers_inject.zip ] && echo 1 || echo 0").exec().out.lastOrNull()?.trim() == "1"
+        val autoArr = JSONArray()
+        eligibleWinIsos.forEach { rel ->
+            val arch = WindowsCustomizationEngine.detectProcessorArchitecture(rel.substringAfterLast('/'))
+            val archXml = "/ventoy/scripts/pocketboot_unattend_$arch.xml"
+            val legacyXml = "/ventoy/scripts/pocketboot_unattend.xml"
+            val chosenXml = when {
+                Shell.cmd("[ -f ${shellQuote("$TEMP_VENTOY_MNT$archXml")} ] && echo 1 || echo 0").exec().out.lastOrNull()?.trim() == "1" -> archXml
+                Shell.cmd("[ -f ${shellQuote("$TEMP_VENTOY_MNT$legacyXml")} ] && echo 1 || echo 0").exec().out.lastOrNull()?.trim() == "1" -> legacyXml
+                else -> ""
+            }
+            if (chosenXml.isNotEmpty()) {
+                autoArr.put(JSONObject().apply {
+                    put("image", rel)
+                    put("template", JSONArray().put(chosenXml))
+                    put("autosel", 1)
+                    put("timeout", 3)
+                })
+            }
+        }
+        if (autoArr.length() > 0) rootObj.put("auto_install", autoArr) else rootObj.remove("auto_install")
         if (hasDrvZip && winIsos.isNotEmpty()) {
             val injArr = JSONArray()
             winIsos.forEach { rel -> injArr.put(JSONObject().apply { put("image", rel); put("archive", "/ventoy/drivers_inject.zip") }) }
@@ -689,12 +846,21 @@ object VentoyImageBuilder {
         } else rootObj.remove("injection")
         val tmpJson = File(context.cacheDir, "ventoy.json").apply { writeText(rootObj.toString(2), Charsets.UTF_8) }
         try { Shell.cmd("mkdir -p $TEMP_VENTOY_MNT/ventoy && cp -f ${shellQuote(tmpJson.absolutePath)} $TEMP_VENTOY_MNT/ventoy/ventoy.json").exec() } finally { tmpJson.delete() }
+        return driversOk
     }
 
-    private fun readPocketBootMetaOnMounted(defaultCheck: Boolean, defaultNro: Boolean): Triple<WindowsExperienceConfig, WinUtilTweaksConfig, Boolean> {
+    private fun readPocketBootMetaOnMounted(defaultCheck: Boolean, defaultNro: Boolean): PocketBootDriveMeta {
         val hasDrv = Shell.cmd("[ -f $TEMP_VENTOY_MNT/ventoy/drivers_inject.zip ] && echo 1 || echo 0").exec().out.lastOrNull()?.trim() == "1"
         val raw = Shell.cmd("cat $TEMP_VENTOY_MNT/ventoy/pocketboot_meta.json 2>/dev/null").exec().out.joinToString("\n")
-        if (raw.isBlank()) return Triple(WindowsExperienceConfig(bypassRequirements = defaultCheck, bypassMicrosoftAccount = defaultNro), WinUtilTweaksConfig(), hasDrv)
+        if (raw.isBlank()) {
+            return PocketBootDriveMeta(
+                exists = false,
+                experience = WindowsExperienceConfig.stock().copy(bypassRequirements = defaultCheck, bypassMicrosoftAccount = defaultNro),
+                winUtil = WinUtilTweaksConfig(),
+                hasDriversZip = hasDrv,
+                excludedAutoInstallIsos = emptySet()
+            )
+        }
         return runCatching {
             val o = JSONObject(raw)
             val exp = WindowsExperienceConfig(
@@ -712,8 +878,28 @@ object VentoyImageBuilder {
                 applySkuSiPolicy = o.optBoolean("applySkuSiPolicy", false)
             )
             val legacyClassic = o.optBoolean("classicContextMenu", false)
-            Triple(exp, WinUtilTweaksConfig.fromJsonString(o.optString("winUtilJson", ""), legacyClassicContextMenu = legacyClassic), hasDrv)
-        }.getOrDefault(Triple(WindowsExperienceConfig(bypassRequirements = defaultCheck, bypassMicrosoftAccount = defaultNro), WinUtilTweaksConfig(), hasDrv))
+            val excluded = mutableSetOf<String>()
+            o.optJSONArray("excludedAutoInstallIsos")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    arr.optString(i, "").trim().takeIf { it.isNotEmpty() }?.let { excluded.add(normalizeVentoyRelPath(it)) }
+                }
+            }
+            PocketBootDriveMeta(
+                exists = true,
+                experience = exp,
+                winUtil = WinUtilTweaksConfig.fromJsonString(o.optString("winUtilJson", ""), legacyClassicContextMenu = legacyClassic),
+                hasDriversZip = hasDrv,
+                excludedAutoInstallIsos = excluded
+            )
+        }.getOrDefault(
+            PocketBootDriveMeta(
+                exists = false,
+                experience = WindowsExperienceConfig.stock().copy(bypassRequirements = defaultCheck, bypassMicrosoftAccount = defaultNro),
+                winUtil = WinUtilTweaksConfig(),
+                hasDriversZip = hasDrv,
+                excludedAutoInstallIsos = emptySet()
+            )
+        )
     }
 
     private fun readVentoyJsonOnMounted(): Pair<Boolean, Boolean> {
@@ -779,6 +965,58 @@ object VentoyImageBuilder {
                 String.format(Locale.US, "%.1f GB", config.sizeMb / 1024.0).replace(".0 GB", " GB")
             } else {
                 "${config.sizeMb} MB"
+            }
+            val drvSizeBytes = if (config.driversDir.isNotBlank()) {
+                UsbGadgetEngine.queryDirSizeBytes(config.driversDir)
+            } else 0L
+            config.initialIsoToAdd?.let { initIso ->
+                val resolvedInit = UsbGadgetEngine.resolveDirectPath(initIso.path)
+                val actualIsoSize = Shell.cmd("stat -c '%s' ${shellQuote(resolvedInit)} 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: initIso.sizeBytes
+                if (actualIsoSize <= 0L) {
+                    return@withContext ActionResult(false, "Source ISO not found or empty: ${initIso.name}", entries = entries)
+                }
+                val requiredPart1Bytes = actualIsoSize + drvSizeBytes + (192L * 1024L * 1024L)
+                if (layout.part1SizeBytes < requiredPart1Bytes) {
+                    val minGb = ((requiredPart1Bytes + (1024L * 1024L * 1024L) - 1L) / (1024L * 1024L * 1024L)).coerceAtLeast(1L)
+                    return@withContext ActionResult(
+                        false,
+                        "Drive size ($sizeLabel) is too small for ${initIso.name} (${UsbGadgetEngine.formatBytes(actualIsoSize)}). Increase Drive Capacity to at least $minGb GB and try again.",
+                        entries = entries
+                    )
+                }
+                val rawPhoneFreeB = queryHostFreeSpaceBytes(safeDir)
+                val existingOutAllocB = Shell.cmd("stat -c '%b' $qOut 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull()?.times(512L)?.coerceAtLeast(0L) ?: 0L
+                val effectivePhoneFreeB = if (rawPhoneFreeB >= 0L) rawPhoneFreeB + existingOutAllocB else -1L
+                val phoneNeededB = actualIsoSize + drvSizeBytes + (96L * 1024L * 1024L)
+                if (effectivePhoneFreeB in 0L until phoneNeededB) {
+                    return@withContext ActionResult(
+                        false,
+                        "Not enough free phone storage (${UsbGadgetEngine.formatBytes(effectivePhoneFreeB)} available). Need at least ${UsbGadgetEngine.formatBytes(phoneNeededB)} free to copy ${initIso.name}.",
+                        entries = entries
+                    )
+                }
+            }
+            if (config.initialIsoToAdd == null && drvSizeBytes > 0L) {
+                val requiredDrvPart1Bytes = drvSizeBytes + (192L * 1024L * 1024L)
+                if (layout.part1SizeBytes < requiredDrvPart1Bytes) {
+                    val minGb = ((requiredDrvPart1Bytes + (1024L * 1024L * 1024L) - 1L) / (1024L * 1024L * 1024L)).coerceAtLeast(1L)
+                    return@withContext ActionResult(
+                        false,
+                        "Drive size ($sizeLabel) is too small for the selected Drivers folder (${UsbGadgetEngine.formatBytes(drvSizeBytes)}). Increase Drive Capacity to at least $minGb GB and try again.",
+                        entries = entries
+                    )
+                }
+                val rawPhoneFreeB = queryHostFreeSpaceBytes(safeDir)
+                val existingOutAllocB = Shell.cmd("stat -c '%b' $qOut 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull()?.times(512L)?.coerceAtLeast(0L) ?: 0L
+                val effectivePhoneFreeB = if (rawPhoneFreeB >= 0L) rawPhoneFreeB + existingOutAllocB else -1L
+                val phoneNeededB = drvSizeBytes + (96L * 1024L * 1024L)
+                if (effectivePhoneFreeB in 0L until phoneNeededB) {
+                    return@withContext ActionResult(
+                        false,
+                        "Not enough free phone storage (${UsbGadgetEngine.formatBytes(effectivePhoneFreeB)} available). Need at least ${UsbGadgetEngine.formatBytes(phoneNeededB)} free for the Drivers folder.",
+                        entries = entries
+                    )
+                }
             }
             val procFs = Shell.cmd("cat /proc/filesystems 2>/dev/null").exec().out
                 .map { it.trim().substringAfterLast('\t').substringAfterLast(' ').lowercase() }
@@ -878,62 +1116,94 @@ object VentoyImageBuilder {
             // Step 4: Mount Partition 1, write ventoy.json bypasses, optionally copy/move initial ISO
             onProgress(WindowsBuildProgress("Configuring Multi-Boot...", "Writing boot configuration", 0.70f, false))
             val mntType = mountVentoyPartition1(context, loopDev)
-            if (mntType != null) {
-                config.initialIsoToAdd?.let { iso ->
-                    val srcPath = UsbGadgetEngine.resolveDirectPath(iso.path)
-                    val destName = iso.name
-                    val destPath = "$TEMP_VENTOY_MNT/$destName"
-                    val srcSize = iso.sizeBytes.coerceAtLeast(1L)
-                    onProgress(
-                        WindowsBuildProgress(
-                            stage = if (config.moveInitialIso) "Moving ISO into Multi-Boot..." else "Copying ISO into Multi-Boot...",
-                            detail = "$destName (${UsbGadgetEngine.formatBytes(srcSize)})",
-                            progress = 0.72f,
-                            isIndeterminate = false
-                        )
+            if (mntType == null) {
+                unmountVentoyPartition1(loopDev)
+                loopDev = ""
+                Shell.cmd("rm -f $qOut 2>/dev/null || true").exec()
+                return@withContext ActionResult(false, "Could not mount formatted Partition 1 to configure Multi-Boot drive.", entries = entries)
+            }
+            config.initialIsoToAdd?.let { iso ->
+                val srcPath = UsbGadgetEngine.resolveDirectPath(iso.path)
+                val destName = iso.name
+                val destPath = "$TEMP_VENTOY_MNT/$destName"
+                val srcSize = Shell.cmd("stat -c '%s' ${shellQuote(srcPath)} 2>/dev/null")
+                    .exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: iso.sizeBytes.coerceAtLeast(1L)
+                val (_, partFreeB) = queryMountSpaceBytes(TEMP_VENTOY_MNT)
+                val requiredInsideB = srcSize + drvSizeBytes + (32L * 1024L * 1024L)
+                if (partFreeB <= 0L || partFreeB < requiredInsideB) {
+                    val minGb = ((requiredInsideB + (192L * 1024L * 1024L) + (1024L * 1024L * 1024L) - 1L) / (1024L * 1024L * 1024L)).coerceAtLeast(1L)
+                    unmountVentoyPartition1(loopDev)
+                    loopDev = ""
+                    Shell.cmd("rm -f $qOut 2>/dev/null || true").exec()
+                    return@withContext ActionResult(
+                        false,
+                        "Partition 1 only has ${if (partFreeB > 0L) UsbGadgetEngine.formatBytes(partFreeB) else "insufficient"} usable space for $destName (${UsbGadgetEngine.formatBytes(srcSize)}). Increase Drive Capacity to at least $minGb GB and retry.",
+                        entries = entries
                     )
-                    val copyJob = launch(Dispatchers.IO) {
-                        while (isActive) {
-                            delay(600L)
-                            val cur = Shell.cmd("stat -c '%s' ${shellQuote(destPath)} 2>/dev/null")
-                                .exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
-                            val frac = (cur.toFloat() / srcSize.toFloat()).coerceIn(0f, 1f)
-                            onProgress(
-                                WindowsBuildProgress(
-                                    stage = if (config.moveInitialIso) "Moving ISO into Multi-Boot..." else "Copying ISO into Multi-Boot...",
-                                    detail = "$destName • ${UsbGadgetEngine.formatBytes(cur)} / ${UsbGadgetEngine.formatBytes(srcSize)}",
-                                    progress = 0.72f + frac * 0.24f,
-                                    isIndeterminate = false
-                                )
+                }
+                onProgress(
+                    WindowsBuildProgress(
+                        stage = if (config.moveInitialIso) "Moving ISO into Multi-Boot..." else "Copying ISO into Multi-Boot...",
+                        detail = "$destName (${UsbGadgetEngine.formatBytes(srcSize)})",
+                        progress = 0.72f,
+                        isIndeterminate = false
+                    )
+                )
+                val copyJob = launch(Dispatchers.IO) {
+                    while (isActive) {
+                        delay(600L)
+                        val cur = Shell.cmd("stat -c '%s' ${shellQuote(destPath)} 2>/dev/null")
+                            .exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                        val frac = (cur.toFloat() / srcSize.toFloat()).coerceIn(0f, 1f)
+                        onProgress(
+                            WindowsBuildProgress(
+                                stage = if (config.moveInitialIso) "Moving ISO into Multi-Boot..." else "Copying ISO into Multi-Boot...",
+                                detail = "$destName • ${UsbGadgetEngine.formatBytes(cur)} / ${UsbGadgetEngine.formatBytes(srcSize)}",
+                                progress = 0.72f + frac * 0.24f,
+                                isIndeterminate = false
                             )
-                        }
-                    }
-                    val vProf = BuildThermalHelper.currentDefaultThermalProfile()
-                    val cpRes = BuildThermalHelper.runIsolatedRootScript(
-                        context,
-                        "ventoy_cp",
-                        "set -e\n${BuildThermalHelper.thermalExecPrefix(vProf)}\n\$THERM_PFX cp -f ${shellQuote(srcPath)} ${shellQuote(destPath)} 2>&1",
-                        trackPid = true
-                    )
-                    copyJob.cancel()
-                    if (!isActive || BuildThermalHelper.isBuildCancelled()) {
-                        unmountVentoyPartition1(loopDev)
-                        loopDev = ""
-                        Shell.cmd("rm -f $qOut 2>/dev/null || true").exec()
-                        return@withContext ActionResult(false, "Multi-Boot drive build cancelled.", entries = entries)
-                    }
-                    if (cpRes.isSuccess) {
-                        if (config.moveInitialIso) {
-                            Shell.cmd("rm -f ${shellQuote(srcPath)} 2>/dev/null").exec()
-                        }
-                        entries.add(LogEntry(ts, "multiboot", "${if (config.moveInitialIso) "Moved" else "Copied"} $destName into Multi-Boot drive"))
-                    } else {
-                        entries.add(LogEntry(ts, "multiboot", "Warning: could not add $destName: ${(cpRes.out + cpRes.err).joinToString(" ").take(140)}", true))
+                        )
                     }
                 }
-                writeVentoyJsonOnMounted(context, config.experience.bypassRequirements, config.experience.bypassMicrosoftAccount, config.experience, config.winUtil, config.driversDir)
-                entries.add(LogEntry(ts, "multiboot", "Mounted Partition 1 via $mntType ($volLabel) and synced Windows boot config & drivers"))
+                val vProf = BuildThermalHelper.currentDefaultThermalProfile()
+                val cpRes = BuildThermalHelper.runIsolatedRootScript(
+                    context,
+                    "ventoy_cp",
+                    "set -e\n${BuildThermalHelper.thermalExecPrefix(vProf)}\n\$THERM_PFX cp -f ${shellQuote(srcPath)} ${shellQuote(destPath)} 2>&1",
+                    trackPid = true
+                )
+                copyJob.cancel()
+                if (!isActive || BuildThermalHelper.isBuildCancelled()) {
+                    unmountVentoyPartition1(loopDev)
+                    loopDev = ""
+                    Shell.cmd("rm -f $qOut 2>/dev/null || true").exec()
+                    return@withContext ActionResult(false, "Multi-Boot drive build cancelled.", entries = entries)
+                }
+                val copiedBytes = Shell.cmd("stat -c '%s' ${shellQuote(destPath)} 2>/dev/null")
+                    .exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                if (!cpRes.isSuccess || copiedBytes != srcSize) {
+                    Shell.cmd("rm -f ${shellQuote(destPath)} 2>/dev/null || true").exec()
+                    unmountVentoyPartition1(loopDev)
+                    loopDev = ""
+                    Shell.cmd("rm -f $qOut 2>/dev/null || true").exec()
+                    val rawErr = (cpRes.out + cpRes.err).joinToString(" ").take(120).trim()
+                    entries.add(LogEntry(ts, "multiboot", "Copy failed for $destName ($copiedBytes / $srcSize bytes): $rawErr", true))
+                    return@withContext ActionResult(
+                        false,
+                        "Failed to copy $destName (wrote ${UsbGadgetEngine.formatBytes(copiedBytes)} of ${UsbGadgetEngine.formatBytes(srcSize)}). Increase drive size or check phone storage and try again.",
+                        entries = entries
+                    )
+                }
+                if (config.moveInitialIso) {
+                    Shell.cmd("rm -f ${shellQuote(srcPath)} 2>/dev/null").exec()
+                }
+                entries.add(LogEntry(ts, "multiboot", "${if (config.moveInitialIso) "Moved" else "Copied"} $destName (${UsbGadgetEngine.formatBytes(copiedBytes)} verified) into Multi-Boot drive"))
             }
+            val driversPackedOk = writeVentoyJsonOnMounted(context, config.experience.bypassRequirements, config.experience.bypassMicrosoftAccount, config.experience, config.winUtil, config.driversDir)
+            if (!driversPackedOk && config.driversDir.isNotBlank()) {
+                entries.add(LogEntry(ts, "multiboot", "Warning: Drivers folder could not be packed into drivers_inject.zip.", true))
+            }
+            entries.add(LogEntry(ts, "multiboot", "Mounted Partition 1 via $mntType ($volLabel) and synced Windows boot config & drivers"))
 
             onProgress(WindowsBuildProgress("Finalizing Multi-Boot drive...", "Syncing & fixing storage permissions", 0.96f, false))
             unmountVentoyPartition1(loopDev)
@@ -946,9 +1216,10 @@ object VentoyImageBuilder {
             IsoInspector.invalidate(outPath)
 
             onProgress(WindowsBuildProgress("Done!", safeName, 1f, false))
+            val drvWarn = if (!driversPackedOk && config.driversDir.isNotBlank()) " (warning: Drivers folder failed to pack)" else ""
             ActionResult(
                 success = true,
-                userMessage = "Created Multi-Boot drive: $safeName ($sizeLabel sparse, ${if (useExfat) "exFAT" else "NTFS"}).",
+                userMessage = "Created Multi-Boot drive: $safeName ($sizeLabel sparse, ${if (useExfat) "exFAT" else "NTFS"})$drvWarn.",
                 createdPath = outPath,
                 entries = entries
             )
@@ -967,10 +1238,9 @@ object VentoyImageBuilder {
         if (loopDev.isBlank() || !loopDev.startsWith("/dev/")) return@withContext null
         return@withContext try {
             val fsLabel = mountVentoyPartition1(context, loopDev) ?: return@withContext null
-            val dfLine = Shell.cmd("df -B1 $TEMP_VENTOY_MNT 2>/dev/null | tail -n 1").exec().out.firstOrNull().orEmpty().trim()
-            val dfParts = dfLine.split(Regex("\\s+"))
-            val totalB = dfParts.getOrNull(1)?.toLongOrNull() ?: info.part1SizeBytes
-            val freeB = dfParts.getOrNull(3)?.toLongOrNull() ?: 0L
+            val (queriedTotalB, queriedFreeB) = queryMountSpaceBytes(TEMP_VENTOY_MNT)
+            val totalB = if (queriedTotalB > 0L) queriedTotalB else info.part1SizeBytes
+            val freeB = if (queriedFreeB >= 0L) queriedFreeB else 0L
 
             val fileLines = Shell.cmd(
                 """
@@ -992,7 +1262,7 @@ object VentoyImageBuilder {
             }.sortedBy { it.name.lowercase() }
 
             val (bypassCheck, bypassNro) = readVentoyJsonOnMounted()
-            val (savedExp, savedWu, hasDrvZip) = readPocketBootMetaOnMounted(bypassCheck, bypassNro)
+            val meta = readPocketBootMetaOnMounted(bypassCheck, bypassNro)
             VentoyDriveContents(
                 info = info,
                 fsType = fsLabel,
@@ -1001,13 +1271,20 @@ object VentoyImageBuilder {
                 files = items,
                 win11BypassCheck = bypassCheck,
                 win11BypassNro = bypassNro,
-                savedExperience = savedExp,
-                savedWinUtil = savedWu,
-                hasDriversZip = hasDrvZip
+                savedExperience = meta.experience,
+                savedWinUtil = meta.winUtil,
+                hasDriversZip = meta.hasDriversZip,
+                excludedAutoInstallIsos = meta.excludedAutoInstallIsos
             )
         } finally {
             unmountVentoyPartition1(loopDev)
         }
+    }
+
+    private suspend fun mountedGuardError(resolvedImg: String, actionLabel: String): String? {
+        return if (UsbGadgetEngine.getStatus().mountedLunFor(resolvedImg) != null) {
+            "${resolvedImg.substringAfterLast('/')} is currently mounted to your PC. Unmount it before $actionLabel."
+        } else null
     }
 
     suspend fun addIsoToVentoy(
@@ -1021,6 +1298,10 @@ object VentoyImageBuilder {
         val entries = mutableListOf<LogEntry>()
         val resolvedImg = UsbGadgetEngine.resolveDirectPath(ventoyImgPath)
         val resolvedSrc = UsbGadgetEngine.resolveDirectPath(sourceIsoPath)
+        mountedGuardError(resolvedImg, "adding ISOs")?.let { return@withContext ActionResult(false, it, entries = entries) }
+        if (moveFile) {
+            mountedGuardError(resolvedSrc, "moving it")?.let { return@withContext ActionResult(false, it, entries = entries) }
+        }
         val isoName = resolvedSrc.substringAfterLast('/')
         val info = probeVentoyImage(resolvedImg)
             ?: return@withContext ActionResult(false, "Selected file is not a valid Multi-Boot .img drive.", entries = entries)
@@ -1041,17 +1322,29 @@ object VentoyImageBuilder {
             val fsLabel = mountVentoyPartition1(context, loopDev)
                 ?: return@withContext ActionResult(false, "Could not mount Multi-Boot Partition 1.", entries = entries)
 
-            val dfLine = Shell.cmd("df -B1 $TEMP_VENTOY_MNT 2>/dev/null | tail -n 1").exec().out.firstOrNull().orEmpty().trim()
-            val freeB = dfLine.split(Regex("\\s+")).getOrNull(3)?.toLongOrNull() ?: 0L
-            if (freeB > 0L && freeB < srcSize + (16L * 1024L * 1024L)) {
+            val destPath = "$TEMP_VENTOY_MNT/$isoName"
+            val existingDestSize = Shell.cmd("stat -c '%s' ${shellQuote(destPath)} 2>/dev/null")
+                .exec().out.firstOrNull()?.trim()?.toLongOrNull()?.coerceAtLeast(0L) ?: 0L
+            val (_, rawFreeB) = queryMountSpaceBytes(TEMP_VENTOY_MNT)
+            val effectiveFreeB = if (rawFreeB >= 0L) rawFreeB + existingDestSize else -1L
+            val neededInsideB = srcSize + (32L * 1024L * 1024L)
+            if (effectiveFreeB <= 0L || effectiveFreeB < neededInsideB) {
                 return@withContext ActionResult(
                     false,
-                    "Not enough free space inside Multi-Boot drive. Need ${UsbGadgetEngine.formatBytes(srcSize)}, only ${UsbGadgetEngine.formatBytes(freeB)} free.",
+                    "Not enough free space inside Multi-Boot drive. Need ${UsbGadgetEngine.formatBytes(srcSize)}, only ${if (effectiveFreeB > 0L) UsbGadgetEngine.formatBytes(effectiveFreeB) else "0 B"} available. Use 'Resize Drive' to increase capacity first.",
                     entries = entries
                 )
             }
-
-            val destPath = "$TEMP_VENTOY_MNT/$isoName"
+            val imgParent = resolvedImg.substringBeforeLast('/', "/data/media/0/Download")
+            val rawPhoneFreeB = queryHostFreeSpaceBytes(imgParent)
+            val effectivePhoneFreeB = if (rawPhoneFreeB >= 0L) rawPhoneFreeB + existingDestSize else -1L
+            if (effectivePhoneFreeB in 0L until (srcSize + (64L * 1024L * 1024L))) {
+                return@withContext ActionResult(
+                    false,
+                    "Not enough free phone storage (${UsbGadgetEngine.formatBytes(effectivePhoneFreeB)} available) to copy $isoName (${UsbGadgetEngine.formatBytes(srcSize)}).",
+                    entries = entries
+                )
+            }
             val verb = if (moveFile) "Moving" else "Copying"
             val progressJob = launch(Dispatchers.IO) {
                 while (isActive) {
@@ -1073,10 +1366,16 @@ object VentoyImageBuilder {
             val cpRes = Shell.cmd("cp -f ${shellQuote(resolvedSrc)} ${shellQuote(destPath)} 2>&1").exec()
             progressJob.cancel()
 
-            if (!cpRes.isSuccess) {
+            val copiedBytes = Shell.cmd("stat -c '%s' ${shellQuote(destPath)} 2>/dev/null")
+                .exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+            if (!cpRes.isSuccess || copiedBytes != srcSize) {
                 Shell.cmd("rm -f ${shellQuote(destPath)} 2>/dev/null").exec()
-                val err = (cpRes.out + cpRes.err).joinToString(" ").take(200)
-                return@withContext ActionResult(false, "Copy failed: $err", entries = entries)
+                val err = (cpRes.out + cpRes.err).joinToString(" ").take(160).trim()
+                return@withContext ActionResult(
+                    false,
+                    "Copy incomplete (wrote ${UsbGadgetEngine.formatBytes(copiedBytes)} of ${UsbGadgetEngine.formatBytes(srcSize)}). Partial file removed — resize drive or check free space.${if (err.isNotBlank()) " ($err)" else ""}",
+                    entries = entries
+                )
             }
 
             if (moveFile) {
@@ -1095,6 +1394,7 @@ object VentoyImageBuilder {
 
     suspend fun removeIsoFromVentoy(context: Context, ventoyImgPath: String, relativePath: String): ActionResult = withContext(Dispatchers.IO) {
         val resolvedImg = UsbGadgetEngine.resolveDirectPath(ventoyImgPath)
+        mountedGuardError(resolvedImg, "removing ISOs")?.let { return@withContext ActionResult(false, it) }
         val info = probeVentoyImage(resolvedImg)
             ?: return@withContext ActionResult(false, "Not a valid Multi-Boot image.")
         val loopDev = attachPartition1Loop(resolvedImg, info.part1OffsetBytes, info.part1SizeBytes)
@@ -1118,6 +1418,7 @@ object VentoyImageBuilder {
 
     suspend fun updateVentoyJson(context: Context, ventoyImgPath: String, bypassCheck: Boolean, bypassNro: Boolean): ActionResult = withContext(Dispatchers.IO) {
         val resolvedImg = UsbGadgetEngine.resolveDirectPath(ventoyImgPath)
+        mountedGuardError(resolvedImg, "updating boot settings")?.let { return@withContext ActionResult(false, it) }
         val info = probeVentoyImage(resolvedImg)
             ?: return@withContext ActionResult(false, "Not a valid Multi-Boot image.")
         val loopDev = attachPartition1Loop(resolvedImg, info.part1OffsetBytes, info.part1SizeBytes)
@@ -1136,14 +1437,51 @@ object VentoyImageBuilder {
 
     suspend fun updateVentoyCustomization(context: Context, ventoyImgPath: String, experience: WindowsExperienceConfig, winUtil: WinUtilTweaksConfig, driversDir: String? = null): ActionResult = withContext(Dispatchers.IO) {
         val resolvedImg = UsbGadgetEngine.resolveDirectPath(ventoyImgPath)
+        mountedGuardError(resolvedImg, "updating tweaks or drivers")?.let { return@withContext ActionResult(false, it) }
         val info = probeVentoyImage(resolvedImg) ?: return@withContext ActionResult(false, "Not a valid Multi-Boot image.")
         val loopDev = attachPartition1Loop(resolvedImg, info.part1OffsetBytes, info.part1SizeBytes)
         if (loopDev.isBlank() || !loopDev.startsWith("/dev/")) return@withContext ActionResult(false, "Could not attach Multi-Boot partition.")
         return@withContext try {
             mountVentoyPartition1(context, loopDev) ?: return@withContext ActionResult(false, "Could not mount Multi-Boot partition.")
-            writeVentoyJsonOnMounted(context, experience.bypassRequirements, experience.bypassMicrosoftAccount, experience, winUtil, driversDir)
-            ActionResult(true, "Saved Windows Experience, System Tweaks & drivers to Multi-Boot drive.")
+            val driversPackedOk = writeVentoyJsonOnMounted(context, experience.bypassRequirements, experience.bypassMicrosoftAccount, experience, winUtil, driversDir)
+            if (!driversPackedOk && !driversDir.isNullOrBlank()) {
+                ActionResult(false, "Saved tweaks, but failed to pack the selected Drivers folder (check folder access & free space).")
+            } else {
+                ActionResult(true, "Saved Windows Experience, System Tweaks & drivers to Multi-Boot drive.")
+            }
         } finally { unmountVentoyPartition1(loopDev) }
+    }
+
+    suspend fun setIsoAutoInstallEnabled(
+        context: Context,
+        ventoyImgPath: String,
+        relativePath: String,
+        enabled: Boolean
+    ): ActionResult = withContext(Dispatchers.IO) {
+        val resolvedImg = UsbGadgetEngine.resolveDirectPath(ventoyImgPath)
+        mountedGuardError(resolvedImg, "changing per-ISO tweak settings")?.let { return@withContext ActionResult(false, it) }
+        val info = probeVentoyImage(resolvedImg) ?: return@withContext ActionResult(false, "Not a valid Multi-Boot image.")
+        val loopDev = attachPartition1Loop(resolvedImg, info.part1OffsetBytes, info.part1SizeBytes)
+        if (loopDev.isBlank() || !loopDev.startsWith("/dev/")) return@withContext ActionResult(false, "Could not attach Multi-Boot partition.")
+        return@withContext try {
+            mountVentoyPartition1(context, loopDev) ?: return@withContext ActionResult(false, "Could not mount Multi-Boot partition.")
+            val (curChk, curNro) = readVentoyJsonOnMounted()
+            val meta = readPocketBootMetaOnMounted(curChk, curNro)
+            val normPath = normalizeVentoyRelPath(relativePath)
+            val updatedExcluded = if (enabled) meta.excludedAutoInstallIsos - normPath else meta.excludedAutoInstallIsos + normPath
+            writeVentoyJsonOnMounted(
+                context = context,
+                bypassCheck = curChk,
+                bypassNro = curNro,
+                experience = meta.experience,
+                winUtil = meta.winUtil,
+                excludedAutoInstallIsos = updatedExcluded
+            )
+            val isoName = relativePath.substringAfterLast('/')
+            ActionResult(true, if (enabled) "Enabled Windows tweaks for $isoName." else "Set $isoName to Stock (no tweaks).")
+        } finally {
+            unmountVentoyPartition1(loopDev)
+        }
     }
 
     /**
@@ -1152,6 +1490,7 @@ object VentoyImageBuilder {
      */
     suspend fun upgradeVentoyBootloader(context: Context, ventoyImgPath: String): ActionResult = withContext(Dispatchers.IO) {
         val resolvedImg = UsbGadgetEngine.resolveDirectPath(ventoyImgPath)
+        mountedGuardError(resolvedImg, "upgrading the bootloader")?.let { return@withContext ActionResult(false, it) }
         val info = probeVentoyImage(resolvedImg)
             ?: return@withContext ActionResult(false, "Not a valid Multi-Boot image.")
         val bundle = resolveBootBundle(context)
@@ -1191,6 +1530,7 @@ object VentoyImageBuilder {
         onProgress: (WindowsBuildProgress) -> Unit
     ): ActionResult = withContext(Dispatchers.IO) {
         val resolvedImg = UsbGadgetEngine.resolveDirectPath(ventoyImgPath)
+        mountedGuardError(resolvedImg, "reclaiming sparse space")?.let { return@withContext ActionResult(false, it) }
         val info = probeVentoyImage(resolvedImg)
             ?: return@withContext ActionResult(false, "Not a valid Multi-Boot image.")
         val qImg = shellQuote(resolvedImg)
@@ -1220,18 +1560,32 @@ object VentoyImageBuilder {
             onProgress(WindowsBuildProgress("Reclaiming Android storage...", "Punching sparse holes in .img", 0.78f, true))
             val digOk = Shell.cmd("command -v fallocate >/dev/null 2>&1 && fallocate -d $qImg 2>/dev/null").exec().isSuccess
             if (!digOk) {
-                // Sparse copy fallback inside `<parent>/.pocketboot_tmp`
+                // Sparse copy fallback inside `<parent>/.pocketboot_tmp` with free-space & exact byte verification
                 val parentDir = resolvedImg.substringBeforeLast('/')
+                val hostFreeB = queryHostFreeSpaceBytes(parentDir)
+                val neededB = beforeDisk + (128L * 1024L * 1024L)
+                if (hostFreeB in 0L until neededB) {
+                    return@withContext ActionResult(
+                        false,
+                        "Not enough free phone storage for safe sparse reclaim (${UsbGadgetEngine.formatBytes(hostFreeB)} free, need ${UsbGadgetEngine.formatBytes(neededB)})."
+                    )
+                }
                 val tmpWork = UsbGadgetEngine.createSafeTempWorkDir(context, parentDir, "reclaim_${System.currentTimeMillis() % 10000}")
                 val qTmpImg = shellQuote("$tmpWork/sparse.img")
-                val cpOk = Shell.cmd("cp --sparse=always $qImg $qTmpImg 2>/dev/null && mv -f $qTmpImg $qImg").exec().isSuccess
+                val cpRes = Shell.cmd("cp --sparse=always $qImg $qTmpImg 2>/dev/null").exec()
+                val tmpSize = if (cpRes.isSuccess) {
+                    Shell.cmd("stat -c '%s' $qTmpImg 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                } else 0L
+                val swappedOk = cpRes.isSuccess && tmpSize == info.totalBytes &&
+                    Shell.cmd("mv -f $qTmpImg $qImg 2>/dev/null").exec().isSuccess
                 UsbGadgetEngine.cleanupTempWorkDir(tmpWork)
-                if (!cpOk) {
-                    return@withContext ActionResult(false, "Kernel lacks fallocate -d and sparse cp.")
+                if (!swappedOk) {
+                    return@withContext ActionResult(false, "Sparse reclaim aborted safely (kernel lacks fallocate -d or verified sparse copy).")
                 }
             }
 
             UsbGadgetEngine.fixUserStoragePermissions(context, resolvedImg, isDir = false); Shell.cmd("stat -c '%s' $qImg 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull()?.takeIf { it > 0L }?.let { UsbGadgetEngine.syncMediaStoreFileSize(context, resolvedImg, it) }
+            IsoInspector.invalidate(resolvedImg)
             val afterBlocks = Shell.cmd("stat -c '%b' $qImg 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: beforeBlocks
             val afterDisk = afterBlocks * 512L
             val saved = (beforeDisk - afterDisk).coerceAtLeast(0L)
@@ -1262,7 +1616,9 @@ object VentoyImageBuilder {
         newSizeGb: Int,
         onProgress: (WindowsBuildProgress) -> Unit
     ): ActionResult = withContext(Dispatchers.IO) {
+        BuildThermalHelper.resetCancelFlag()
         val resolvedImg = UsbGadgetEngine.resolveDirectPath(ventoyImgPath)
+        mountedGuardError(resolvedImg, "resizing this drive")?.let { return@withContext ActionResult(false, it) }
         val info = probeVentoyImage(resolvedImg)
             ?: return@withContext ActionResult(false, "Not a valid Multi-Boot image.")
         val bundle = resolveBootBundle(context)
@@ -1287,7 +1643,8 @@ object VentoyImageBuilder {
             return@withContext runCatching {
                 onProgress(WindowsBuildProgress("Expanding sparse image to $newSizeGb GB...", "Extending disk boundaries", 0.20f, false))
                 val truncOk = Shell.cmd("truncate -s ${newLayout.totalBytes} $qImg 2>&1").exec().isSuccess
-                if (!truncOk) return@withContext ActionResult(false, "Failed to expand image file.")
+                val expandedSz = if (truncOk) Shell.cmd("stat -c '%s' $qImg 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L else 0L
+                if (!truncOk || expandedSz != newLayout.totalBytes) return@withContext ActionResult(false, "Failed to expand image file to ${UsbGadgetEngine.formatBytes(newLayout.totalBytes)}.")
 
                 onProgress(WindowsBuildProgress("Updating partition table & EFI...", "Relocating 32 MB VTOYEFI to new end", 0.48f, false))
                 val tblErr = writeVentoyBootStructures(
@@ -1312,6 +1669,7 @@ object VentoyImageBuilder {
                     return@withContext ActionResult(false, "ntfsresize failed: ${(nrRes.out + nrRes.err).takeLast(3).joinToString(" ").take(160)}")
                 }
                 UsbGadgetEngine.fixUserStoragePermissions(context, resolvedImg, isDir = false); Shell.cmd("stat -c '%s' $qImg 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull()?.takeIf { it > 0L }?.let { UsbGadgetEngine.syncMediaStoreFileSize(context, resolvedImg, it) }
+                IsoInspector.invalidate(resolvedImg)
                 onProgress(WindowsBuildProgress("Done!", "Expanded to $newSizeGb GB", 1f, false))
                 ActionResult(true, "Expanded ${resolvedImg.substringAfterLast('/')} to $newSizeGb GB (all ISOs preserved).")
             }.getOrElse { e ->
@@ -1322,6 +1680,16 @@ object VentoyImageBuilder {
 
         // Path B: Universal safe copy-and-swap (works for exFAT and NTFS without ntfsresize)
         val parentDir = resolvedImg.substringBeforeLast('/')
+        val existingAllocBytes = Shell.cmd("stat -c '%b' $qImg 2>/dev/null")
+            .exec().out.firstOrNull()?.trim()?.toLongOrNull()?.times(512L)?.coerceAtLeast(0L) ?: 0L
+        val hostFreeForResize = queryHostFreeSpaceBytes(parentDir)
+        val resizeTempNeeded = existingAllocBytes + (128L * 1024L * 1024L)
+        if (hostFreeForResize in 0L until resizeTempNeeded) {
+            return@withContext ActionResult(
+                false,
+                "Not enough free phone storage for safe exFAT resize (${UsbGadgetEngine.formatBytes(hostFreeForResize)} free). Need at least ${UsbGadgetEngine.formatBytes(resizeTempNeeded)} free to hold the temporary expanded copy."
+            )
+        }
         val workDir = UsbGadgetEngine.createSafeTempWorkDir(context, parentDir, "resize_${System.currentTimeMillis() % 10000}")
         val newImgName = "expanded.img"
         val newImgPath = "$workDir/$newImgName"
@@ -1351,6 +1719,10 @@ object VentoyImageBuilder {
                     sizeMb = newSizeMb,
                     scheme = info.scheme,
                     filesystem = fsChoice,
+                    win11BypassCheck = false,
+                    win11BypassNro = false,
+                    experience = WindowsExperienceConfig.stock(),
+                    winUtil = WinUtilTweaksConfig(),
                     autoMountAfterBuild = false,
                     volumeLabel = existingLabel
                 ),
@@ -1385,10 +1757,28 @@ object VentoyImageBuilder {
             ).exec()
             if (!mntBoth.isSuccess) return@withContext ActionResult(false, "Could not mount partitions for ISO copy.")
 
+            val qOldMnt = shellQuote(oldMnt)
+            val qNewMnt = shellQuote(newMnt)
+            val migrateScript = """
+                set -e
+                OLD_MNT=$qOldMnt
+                NEW_MNT=$qNewMnt
+                rm -rf "${'$'}NEW_MNT/ventoy"
+                cp -rf "${'$'}OLD_MNT/." "${'$'}NEW_MNT/" 2>&1
+                cd "${'$'}OLD_MNT"
+                find . -maxdepth 3 -type f \( -iname '*.iso' -o -iname '*.img' -o -iname '*.wim' -o -iname '*.vhd' -o -iname '*.vhdx' \) ! -path './ventoy/*' 2>/dev/null | while IFS= read -r rel; do
+                    src_sz=${'$'}(stat -c '%s' "${'$'}rel" 2>/dev/null || echo -1)
+                    dst_sz=${'$'}(stat -c '%s' "${'$'}NEW_MNT/${'$'}rel" 2>/dev/null || echo -2)
+                    if [ "${'$'}src_sz" != "${'$'}dst_sz" ] || [ "${'$'}src_sz" -le 0 ]; then
+                        echo "VERIFY_MISMATCH:${'$'}rel:${'$'}dst_sz/${'$'}src_sz"
+                        exit 1
+                    fi
+                done
+            """.trimIndent()
             val cpRes = BuildThermalHelper.runIsolatedRootScript(
                 context,
                 "multiboot_resize_cp",
-                "set -e\ncp -af ${shellQuote(oldMnt)}/. ${shellQuote(newMnt)}/ 2>&1",
+                migrateScript,
                 trackPid = true
             )
             BuildThermalHelper.unmountAndDetachClean(
@@ -1401,13 +1791,17 @@ object VentoyImageBuilder {
             if (!isActive || BuildThermalHelper.isBuildCancelled()) {
                 return@withContext ActionResult(false, "Resize cancelled (original drive untouched).")
             }
-            if (!cpRes.isSuccess) return@withContext ActionResult(false, "ISO migration failed during resize.")
+            if (!cpRes.isSuccess) {
+                val errHint = (cpRes.out + cpRes.err).takeLast(2).joinToString(" ").take(140).trim()
+                return@withContext ActionResult(false, "ISO migration failed during resize (original drive untouched).${if (errHint.isNotBlank()) " $errHint" else ""}")
+            }
 
             onProgress(WindowsBuildProgress("Replacing with $newSizeGb GB drive...", "Finalizing atomic swap", 0.94f, false))
             val swapRes = Shell.cmd("mv -f ${shellQuote(newImgPath)} $qImg 2>&1").exec()
             if (!swapRes.isSuccess) return@withContext ActionResult(false, "Failed to finalize resized drive.")
 
             UsbGadgetEngine.fixUserStoragePermissions(context, resolvedImg, isDir = false); Shell.cmd("stat -c '%s' $qImg 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull()?.takeIf { it > 0L }?.let { UsbGadgetEngine.syncMediaStoreFileSize(context, resolvedImg, it) }
+            IsoInspector.invalidate(resolvedImg)
             onProgress(WindowsBuildProgress("Done!", "Expanded to $newSizeGb GB", 1f, false))
             ActionResult(true, "Expanded ${resolvedImg.substringAfterLast('/')} to $newSizeGb GB (all ISOs preserved).")
         }.getOrElse { e ->
@@ -1464,10 +1858,17 @@ fun VentoyBuilderSheet(
     var experience by remember { mutableStateOf(WindowsExperienceConfig()) }
     var winUtil by remember { mutableStateOf(WinUtilTweaksConfig()) }
     var driversDir by remember { mutableStateOf("") }
+    var driversBytes by remember { mutableStateOf(0L) }
     var showDriversPicker by remember { mutableStateOf(false) }
     var includeInitial by remember(initialIso?.path) { mutableStateOf(initialIso != null) }
     var moveInitial by remember { mutableStateOf(false) }
     var autoMount by remember { mutableStateOf(true) }
+
+    LaunchedEffect(driversDir) {
+        driversBytes = if (driversDir.isBlank()) 0L else withContext(Dispatchers.IO) {
+            UsbGadgetEngine.queryDirSizeBytes(driversDir)
+        }
+    }
 
     val effectiveSizeMb = if (isCustomSize) {
         val rawNum = customSizeText.toDoubleOrNull() ?: 0.0
@@ -1477,10 +1878,21 @@ fun VentoyBuilderSheet(
         selectedPresetMb
     }
     val customValid = !isCustomSize || ((customSizeText.toDoubleOrNull() ?: 0.0) > 0.0)
+    val includeIsoBytes = if (includeInitial && initialIso != null) initialIso.sizeBytes.coerceAtLeast(0L) else 0L
+    val hasPayloadToFit = (includeInitial && initialIso != null) || driversBytes > 0L
+    val requiredBytesForInitial = if (hasPayloadToFit) {
+        includeIsoBytes + driversBytes + (256L * 1024L * 1024L)
+    } else 0L
+    val part1CapacityBytes = effectiveSizeMb.toLong() * 1024L * 1024L
+    val capacityInsufficient = hasPayloadToFit && part1CapacityBytes < requiredBytesForInitial
+    val minRequiredGb = if (requiredBytesForInitial > 0L) {
+        ((requiredBytesForInitial + (1024L * 1024L * 1024L) - 1L) / (1024L * 1024L * 1024L)).toInt().coerceAtLeast(1)
+    } else 1
+    val suggestedPresetGb = listOf(8, 16, 32, 64, 128).firstOrNull { it >= minRequiredGb }
     val displaySize = if (effectiveSizeMb >= 1024) {
         String.format(Locale.US, "%.2f GB", effectiveSizeMb / 1024.0)
+            .replace(Regex("(\\.\\d*?[1-9])0+ GB$"), "$1 GB")
             .replace(".00 GB", " GB")
-            .replace("0 GB", " GB")
     } else {
         "$effectiveSizeMb MB"
     }
@@ -1708,7 +2120,7 @@ fun VentoyBuilderSheet(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text("Drive Capacity (Sparse)", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
-                        Text(displaySize, style = MaterialTheme.typography.labelLarge, color = PocketColors.accentSoft)
+                        Text(displaySize, style = MaterialTheme.typography.labelLarge, color = if (capacityInsufficient) PocketColors.danger else PocketColors.accentSoft)
                     }
                     val presets = listOf(
                         "8 GB" to 8192,
@@ -1804,7 +2216,7 @@ fun VentoyBuilderSheet(
                                                     if (cur != null && cur > 0.0) {
                                                         customSizeText = if (unit == MultiBootSizeUnit.GB) {
                                                             String.format(Locale.US, "%.1f", (cur / 1024.0).coerceAtLeast(1.0))
-                                                                .replace(".0", "")
+                                                                .removeSuffix(".0")
                                                         } else {
                                                             (cur * 1024.0).roundToInt().toString()
                                                         }
@@ -1822,6 +2234,34 @@ fun VentoyBuilderSheet(
                                         }
                                     }
                                 }
+                            }
+                        }
+                    }
+
+                    if (capacityInsufficient) {
+                        val presetHint = if (suggestedPresetGb != null && suggestedPresetGb != minRequiredGb) " (or tap $suggestedPresetGb GB)" else ""
+                        val payloadDesc = if (includeInitial && initialIso != null) {
+                            "${initialIso.name} (${UsbGadgetEngine.formatBytes(initialIso.sizeBytes)})" +
+                                if (driversBytes > 0L) " + ${UsbGadgetEngine.formatBytes(driversBytes)} drivers" else ""
+                        } else {
+                            "selected Drivers folder (${UsbGadgetEngine.formatBytes(driversBytes)})"
+                        }
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = PocketColors.dangerBg,
+                            border = BorderStroke(0.75.dp, PocketColors.danger)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Rounded.ErrorOutline, null, tint = PocketColors.danger, modifier = Modifier.size(16.dp))
+                                Text(
+                                    text = "Too small for $payloadDesc. Note: Increase size to at least $minRequiredGb GB$presetHint.",
+                                    fontSize = 11.sp,
+                                    color = PocketColors.textPrimary
+                                )
                             }
                         }
                     }
@@ -2020,6 +2460,38 @@ fun VentoyBuilderSheet(
                     }
                 }
 
+                if (capacityInsufficient) {
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = PocketColors.dangerBg,
+                        border = BorderStroke(1.dp, PocketColors.danger)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(12.dp),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            verticalAlignment = Alignment.Top
+                        ) {
+                            Icon(Icons.Rounded.ErrorOutline, null, tint = PocketColors.danger, modifier = Modifier.size(18.dp))
+                            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                                val errTitle = if (includeInitial && initialIso != null) "Drive size is too small for this ISO" else "Drive size is too small for selected Drivers"
+                                Text(errTitle, style = MaterialTheme.typography.labelLarge, color = PocketColors.danger)
+                                val presetHint = if (suggestedPresetGb != null && suggestedPresetGb != minRequiredGb) " (or pick the $suggestedPresetGb GB preset)" else ""
+                                val errDetail = if (includeInitial && initialIso != null) {
+                                    val drvNote = if (driversBytes > 0L) " + ${UsbGadgetEngine.formatBytes(driversBytes)} drivers" else ""
+                                    "${initialIso.name} is ${UsbGadgetEngine.formatBytes(initialIso.sizeBytes)}$drvNote, which will not fit inside a $displaySize drive. Note: Please increase Drive Capacity (Sparse) above to at least $minRequiredGb GB$presetHint to match your ISO size."
+                                } else {
+                                    "Your selected Drivers folder is ${UsbGadgetEngine.formatBytes(driversBytes)}, which will not fit inside a $displaySize drive. Note: Please increase Drive Capacity (Sparse) above to at least $minRequiredGb GB$presetHint."
+                                }
+                                Text(
+                                    text = errDetail,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = PocketColors.textPrimary
+                                )
+                            }
+                        }
+                    }
+                }
+
                 if (targetExists) {
                     Surface(shape = RoundedCornerShape(10.dp), color = PocketColors.warningBg, border = BorderStroke(0.5.dp, PocketColors.warning)) {
                         Row(modifier = Modifier.fillMaxWidth().padding(10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -2050,12 +2522,15 @@ fun VentoyBuilderSheet(
                             )
                         )
                     },
-                    enabled = assetInfo.ready && trimmedName.isNotBlank() && customValid && !updatingAssets,
+                    enabled = assetInfo.ready && trimmedName.isNotBlank() && customValid && !updatingAssets && !capacityInsufficient,
                     modifier = Modifier.fillMaxWidth().height(PocketTokens.PrimaryButtonHeight),
                     shape = RoundedCornerShape(12.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)
                 ) {
-                    Text("Create $displaySize Multi-Boot Drive", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        text = if (capacityInsufficient) "Increase Drive Size (Need $minRequiredGb GB+)" else "Create $displaySize Multi-Boot Drive",
+                        fontWeight = FontWeight.SemiBold
+                    )
                 }
             }
 
@@ -2085,7 +2560,8 @@ fun VentoyManagerSheet(
     onDismiss: () -> Unit,
     onUnmountFirst: () -> Unit,
     onLibraryChanged: () -> Unit,
-    onMessage: (String, Boolean) -> Unit
+    onMessage: (String, Boolean) -> Unit,
+    onBusyChanged: (Boolean) -> Unit = {}
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -2118,6 +2594,10 @@ fun VentoyManagerSheet(
             }
             loading = false
         }
+    }
+
+    LaunchedEffect(opBusy) {
+        onBusyChanged(opBusy)
     }
 
     LaunchedEffect(ventoyFile.path, isMountedToPc) {
@@ -2234,21 +2714,22 @@ fun VentoyManagerSheet(
                         Text("Inspecting Multi-Boot partition...", style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary)
                     }
                 }
-            } else if (contents == null) {
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    color = PocketColors.dangerBg,
-                    border = BorderStroke(1.dp, PocketColors.danger)
-                ) {
-                    Text(
-                        "Could not mount Multi-Boot Partition 1. Check Root & Filesystems in Pre-Flight Diagnostics.",
-                        modifier = Modifier.padding(14.dp),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = PocketColors.textPrimary
-                    )
-                }
             } else {
-                val c = contents!!
+                val c = contents
+                if (c == null) {
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = PocketColors.dangerBg,
+                        border = BorderStroke(1.dp, PocketColors.danger)
+                    ) {
+                        Text(
+                            "Could not mount Multi-Boot Partition 1. Check Root & Filesystems in Pre-Flight Diagnostics.",
+                            modifier = Modifier.padding(14.dp),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = PocketColors.textPrimary
+                        )
+                    }
+                } else {
                 val usedBytes = (c.totalBytes - c.freeBytes).coerceAtLeast(0L)
                 val usedRatio = if (c.totalBytes > 0L) (usedBytes.toFloat() / c.totalBytes.toFloat()).coerceIn(0f, 1f) else 0f
 
@@ -2369,7 +2850,27 @@ fun VentoyManagerSheet(
                     }
                 } else {
                     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        val hasDriveTweaks = c.savedExperience.hasAnyActive() || c.savedWinUtil.hasAnyActive()
                         c.files.forEach { item ->
+                            val isWinIso = IsoInspector.quickGuessByName(item.name) == IsoOsType.WINDOWS
+                            val winKind = if (isWinIso) WindowsCustomizationEngine.detectWindowsOsKind(item.name) else WindowsOsKind.UNKNOWN
+                            val eligible = VentoyImageBuilder.isWindowsDesktopAutoInstallEligible(item.name)
+                            val isoArch = if (isWinIso) WindowsCustomizationEngine.detectProcessorArchitecture(item.name) else ""
+                            val normRel = VentoyImageBuilder.normalizeVentoyRelPath(item.relativePath)
+                            val tweaksOnForIso = eligible && normRel !in c.excludedAutoInstallIsos
+                            val metaSubtitle = buildString {
+                                append(UsbGadgetEngine.formatBytes(item.sizeBytes))
+                                if (eligible) {
+                                    append(" · ")
+                                    append(winKind.label)
+                                    append(" · ")
+                                    append(isoArch)
+                                } else if (isWinIso) {
+                                    append(" · ")
+                                    append(winKind.label)
+                                    append(" (Stock only)")
+                                }
+                            }
                             Surface(
                                 shape = RoundedCornerShape(12.dp),
                                 color = PocketColors.surfaceInput,
@@ -2378,12 +2879,49 @@ fun VentoyManagerSheet(
                                 Row(
                                     modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
                                     verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                                 ) {
                                     Icon(Icons.Rounded.Album, null, tint = PocketColors.accentSoft, modifier = Modifier.size(20.dp))
                                     Column(modifier = Modifier.weight(1f)) {
                                         Text(item.name, style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                        Text(UsbGadgetEngine.formatBytes(item.sizeBytes), style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary)
+                                        Text(metaSubtitle, style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    }
+                                    if (eligible) {
+                                        val activePill = tweaksOnForIso && hasDriveTweaks
+                                        Surface(
+                                            modifier = Modifier.bounceClick {
+                                                scope.launch {
+                                                    opBusy = true
+                                                    opProgress = WindowsBuildProgress("Updating ISO mode...", item.name, 0.5f, true)
+                                                    val res = VentoyImageBuilder.setIsoAutoInstallEnabled(context, ventoyFile.path, item.relativePath, !tweaksOnForIso)
+                                                    opBusy = false
+                                                    onMessage(res.userMessage, !res.success)
+                                                    reloadContents()
+                                                }
+                                            },
+                                            shape = RoundedCornerShape(8.dp),
+                                            color = when {
+                                                activePill -> PocketColors.accentBg
+                                                tweaksOnForIso -> PocketColors.surfaceSubtle
+                                                else -> PocketColors.surfaceCard
+                                            },
+                                            border = BorderStroke(
+                                                0.75.dp,
+                                                if (activePill) PocketColors.accent else PocketColors.border
+                                            )
+                                        ) {
+                                            Text(
+                                                text = if (tweaksOnForIso) "Tweaks" else "Stock",
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = when {
+                                                    activePill -> PocketColors.accentSoft
+                                                    tweaksOnForIso -> PocketColors.textPrimary
+                                                    else -> PocketColors.textMuted
+                                                }
+                                            )
+                                        }
                                     }
                                     IconButton(
                                         onClick = {
@@ -2472,7 +3010,7 @@ fun VentoyManagerSheet(
                     Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 11.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text("Windows Experience, System Tweaks & Drivers Injection", style = MaterialTheme.typography.labelLarge, color = PocketColors.accentSoft)
-                            Text("Applies to all Windows ISOs on this drive (Linux ISOs untouched)", fontSize = 11.sp, color = PocketColors.textSecondary)
+                            Text("Applies per architecture to Windows 10/11 ISOs marked Tweaks (Win 7/Server & Linux untouched)", fontSize = 11.sp, color = PocketColors.textSecondary)
                         }
                         Text(if (showMgrTweaksPanel) "Hide" else "Configure", style = MaterialTheme.typography.labelSmall, color = PocketColors.accentSoft)
                     }
@@ -2516,6 +3054,7 @@ fun VentoyManagerSheet(
                         colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)
                     ) { Text("Apply Tweaks & Drivers to Multi-Boot", fontWeight = FontWeight.SemiBold) }
                 }
+                }
             }
 
             Spacer(modifier = Modifier.height(22.dp))
@@ -2557,6 +3096,14 @@ fun VentoyManagerSheet(
                         }
                     }
 
+                    contents?.let { cNow ->
+                        Text(
+                            text = "Available inside drive: ${UsbGadgetEngine.formatBytes(cNow.freeBytes)}",
+                            fontSize = 11.sp,
+                            color = PocketColors.textSecondary
+                        )
+                    }
+
                     if (isoCandidates.isEmpty()) {
                         Text(
                             "No .iso files found in Your Drive Files. Tap Browse on Home to add an ISO first.",
@@ -2564,11 +3111,16 @@ fun VentoyManagerSheet(
                             color = PocketColors.textSecondary
                         )
                     } else {
+                        val currentDriveFree = contents?.freeBytes ?: -1L
+                        val existingByName = contents?.files?.filter { !it.relativePath.trimStart('/').contains('/') }?.associateBy { it.name.lowercase() }.orEmpty()
                         isoCandidates.forEach { iso ->
+                            val existingMatch = existingByName[iso.name.lowercase()]
+                            val availForThisIso = if (currentDriveFree >= 0L) currentDriveFree + (existingMatch?.sizeBytes ?: 0L) else -1L
+                            val isoTooLarge = availForThisIso >= 0L && (iso.sizeBytes + (32L * 1024L * 1024L)) > availForThisIso
                             Surface(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .clickable {
+                                    .clickable(enabled = !isoTooLarge) {
                                         showAddIsoPicker = false
                                         scope.launch {
                                             opBusy = true
@@ -2587,18 +3139,39 @@ fun VentoyManagerSheet(
                                         }
                                     },
                                 shape = RoundedCornerShape(10.dp),
-                                color = PocketColors.surfaceInput,
-                                border = BorderStroke(0.5.dp, PocketColors.border)
+                                color = if (isoTooLarge) PocketColors.dangerBg else PocketColors.surfaceInput,
+                                border = BorderStroke(0.5.dp, if (isoTooLarge) PocketColors.danger else PocketColors.border)
                             ) {
                                 Row(
                                     modifier = Modifier.fillMaxWidth().padding(12.dp),
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                                 ) {
-                                    Icon(Icons.Rounded.Album, null, tint = PocketColors.accentSoft, modifier = Modifier.size(18.dp))
+                                    Icon(
+                                        if (isoTooLarge) Icons.Rounded.ErrorOutline else Icons.Rounded.Album,
+                                        null,
+                                        tint = if (isoTooLarge) PocketColors.danger else PocketColors.accentSoft,
+                                        modifier = Modifier.size(18.dp)
+                                    )
                                     Column(modifier = Modifier.weight(1f)) {
-                                        Text(iso.name, style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                        Text(UsbGadgetEngine.formatBytes(iso.sizeBytes), fontSize = 11.sp, color = PocketColors.textSecondary)
+                                        Text(
+                                            iso.name,
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = if (isoTooLarge) PocketColors.textSecondary else PocketColors.textPrimary,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            text = if (isoTooLarge) {
+                                                "${UsbGadgetEngine.formatBytes(iso.sizeBytes)} · Too large (use Resize Drive first)"
+                                            } else if (existingMatch != null) {
+                                                "${UsbGadgetEngine.formatBytes(iso.sizeBytes)} · Replaces existing ISO"
+                                            } else {
+                                                UsbGadgetEngine.formatBytes(iso.sizeBytes)
+                                            },
+                                            fontSize = 11.sp,
+                                            color = if (isoTooLarge) PocketColors.danger else PocketColors.textSecondary
+                                        )
                                     }
                                 }
                             }
@@ -2615,7 +3188,8 @@ fun VentoyManagerSheet(
     }
 
     if (showResizeDialog) {
-        val currentGb = ((ventoyFile.sizeBytes / (1024L * 1024L * 1024L)).toInt()).coerceAtLeast(1)
+        val liveBytes = contents?.info?.totalBytes?.takeIf { it > 0L } ?: ventoyFile.sizeBytes
+        val currentGb = ((liveBytes / (1024L * 1024L * 1024L)).toInt()).coerceAtLeast(1)
         val optionsGb = listOf(16, 32, 64, 128).filter { it > currentGb }
         var targetGb by remember(currentGb) { mutableIntStateOf(optionsGb.firstOrNull() ?: (currentGb + 16).coerceAtMost(128)) }
 

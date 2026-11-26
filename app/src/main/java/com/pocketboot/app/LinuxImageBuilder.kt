@@ -99,8 +99,12 @@ object LinuxImageBuilder {
 
     suspend fun inspectMaxFileBytesInIso(context: Context, isoPath: String): Long = withContext(Dispatchers.IO) {
         val bundled7z = WindowsImageBuilder.findBundledBinary(context, "lib7zzs.so", listOf("7zz", "7z")) ?: return@withContext 0L
-        Shell.cmd("${shellQuote(bundled7z)} l -slt ${shellQuote(UsbGadgetEngine.resolveDirectPath(isoPath))} 2>/dev/null | awk -F' = ' '/^Size = /{if (\$2+0 > m) m=\$2+0} END{print m+0}'")
-            .exec().out.lastOrNull()?.trim()?.toLongOrNull() ?: 0L
+        Shell.cmd("${shellQuote(bundled7z)} l -slt ${shellQuote(UsbGadgetEngine.resolveDirectPath(isoPath))} 2>/dev/null").exec().out
+            .asSequence()
+            .map { it.trim() }
+            .filter { it.startsWith("Size = ") }
+            .mapNotNull { it.removePrefix("Size = ").trim().toLongOrNull() }
+            .maxOrNull() ?: 0L
     }
 
     fun cancelActiveBuild() {
@@ -143,7 +147,8 @@ object LinuxImageBuilder {
             val alignBytes = 1024L * 1024L
             val persistOffsetBytes = ((isoSize + alignBytes - 1L) / alignBytes) * alignBytes
             val totalBytes = if (withPersistence) persistOffsetBytes + persistBytes else isoSize
-            val freeSpace = UsbGadgetEngine.getFreeSpaceBytes(safeDir)
+            val rawFreeSpace = UsbGadgetEngine.getFreeSpaceBytes(safeDir)
+            val freeSpace = if (rawFreeSpace > 0L) rawFreeSpace + UsbGadgetEngine.queryExistingFileAllocatedBytes(outPath) else 0L
             if (freeSpace > 0L && freeSpace < totalBytes + (64L * 1024L * 1024L)) return@withContext ActionResult(false, "Not enough free space. Need ${UsbGadgetEngine.formatBytes(totalBytes)}, have ${UsbGadgetEngine.formatBytes(freeSpace)}.", entries = entries)
             onProgress(WindowsBuildProgress("Copying ISO image...", if (withPersistence) "${UsbGadgetEngine.formatBytes(isoSize)} + ${config.persistenceGb} GB ${config.style.volumeLabel}" else UsbGadgetEngine.formatBytes(isoSize), 0.28f, true))
             val linuxProf = BuildThermalHelper.currentDefaultThermalProfile()
@@ -158,7 +163,16 @@ object LinuxImageBuilder {
                 trackPid = true
             )
             if (!isActive || BuildThermalHelper.isBuildCancelled()) { cleanup(true); return@withContext ActionResult(false, "Build cancelled.", entries = entries) }
-            if (!cpRes.isSuccess) { cleanup(true); return@withContext ActionResult(false, "Failed to copy ISO: ${(cpRes.out + cpRes.err).joinToString(" ").take(200)}", entries = entries) }
+            val copiedIsoBytes = Shell.cmd("stat -c '%s' $qOut 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+            if (!cpRes.isSuccess || copiedIsoBytes != isoSize) {
+                cleanup(true)
+                val errTxt = (cpRes.out + cpRes.err).joinToString(" ").take(160).trim()
+                return@withContext ActionResult(
+                    false,
+                    "Failed to copy ISO (wrote ${UsbGadgetEngine.formatBytes(copiedIsoBytes)} of ${UsbGadgetEngine.formatBytes(isoSize)}).${if (errTxt.isNotBlank()) " $errTxt" else ""}",
+                    entries = entries
+                )
+            }
 
             if (withPersistence) {
                 if (!Shell.cmd("truncate -s $totalBytes $qOut 2>&1 || dd if=/dev/zero of=$qOut bs=1M count=0 seek=${totalBytes / (1024L * 1024L)} 2>&1").exec().isSuccess) { cleanup(true); return@withContext ActionResult(false, "Failed to expand image for persistence.", entries = entries) }
@@ -182,6 +196,7 @@ object LinuxImageBuilder {
             UsbGadgetEngine.fixUserStoragePermissions(context, outPath, isDir = false)
             val lOutBytes = Shell.cmd("stat -c '%s' $qOut 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
             if (lOutBytes > 0L) UsbGadgetEngine.syncMediaStoreFileSize(context, outPath, lOutBytes)
+            IsoInspector.invalidate(outPath)
             onProgress(WindowsBuildProgress("Done!", safeName, 1f, false))
             val msg = if (withPersistence) "Built $safeName with ${config.persistenceGb} GB ${config.style.volumeLabel}." else "Built standard live USB image $safeName."
             entries.add(LogEntry(ts, "linux-build", msg))
@@ -221,10 +236,11 @@ object LinuxImageBuilder {
             val part1OffsetBytes = 1024L * 1024L
             val part2OffsetBytes = part1OffsetBytes + fatBytes
             val totalBytes = part2OffsetBytes + persistBytes + (2L * 1024L * 1024L)
-            val freeSpace = UsbGadgetEngine.getFreeSpaceBytes(safeDir)
+            val rawFreeSpace = UsbGadgetEngine.getFreeSpaceBytes(safeDir)
+            val freeSpace = if (rawFreeSpace > 0L) rawFreeSpace + UsbGadgetEngine.queryExistingFileAllocatedBytes(outPath) else 0L
             if (freeSpace > 0L && freeSpace < totalBytes + (64L * 1024L * 1024L)) return@withContext ActionResult(false, "Not enough free space. Need ${UsbGadgetEngine.formatBytes(totalBytes)}, have ${UsbGadgetEngine.formatBytes(freeSpace)}.", entries = entries)
             onProgress(WindowsBuildProgress("Allocating FAT32 USB image...", UsbGadgetEngine.formatBytes(totalBytes), 0.14f, false))
-            if (!Shell.cmd("mkdir -p $qDir && rm -f $qOut && truncate -s $totalBytes $qOut 2>&1").exec().isSuccess) return@withContext ActionResult(false, "Failed to allocate image file.", entries = entries)
+            if (!Shell.cmd("mkdir -p $qDir && rm -f $qOut && (truncate -s $totalBytes $qOut 2>/dev/null || dd if=/dev/zero of=$qOut bs=1M count=0 seek=${totalBytes / (1024L * 1024L)} 2>&1)").exec().isSuccess) return@withContext ActionResult(false, "Failed to allocate image file.", entries = entries)
             val mbrBytes = DiskPartitioner.buildLinuxFat32MbrSector(
                 part1StartLba = part1OffsetBytes / 512L,
                 part1Sectors = fatBytes / 512L,
@@ -277,7 +293,11 @@ object LinuxImageBuilder {
             Shell.cmd(
                 """
                 find $TEMP_FAT_MNT -maxdepth 4 -type f \( -iname 'grub.cfg' -o -iname 'isolinux.cfg' -o -iname 'syslinux.cfg' -o -iname 'loopback.cfg' -o -iname 'txt.cfg' \) 2>/dev/null | while IFS= read -r cfg; do
-                    sed -i -E "s#(CDLABEL=)[^[:space:]\"']+#\1$safeSedLbl#g; s#(root=live:LABEL=)[^[:space:]\"']+#\1$safeSedLbl#g; s#(archisolabel=)[^[:space:]\"']+#\1$safeSedLbl#g; s#(misolabel=)[^[:space:]\"']+#\1$safeSedLbl#g; s#(search[[:space:]][^;#]*[[:space:]](-l|--label)[[:space:]]+['\"]?)[^[:space:]'\"]+(['\"]?)#\1$safeSedLbl\3#g" "${'$'}cfg" 2>/dev/null || true
+                    if sed -E "s#(CDLABEL=)[^[:space:]\"']+#\1$safeSedLbl#g; s#(root=live:LABEL=)[^[:space:]\"']+#\1$safeSedLbl#g; s#(archisolabel=)[^[:space:]\"']+#\1$safeSedLbl#g; s#(misolabel=)[^[:space:]\"']+#\1$safeSedLbl#g; s#(search[[:space:]][^;#]*[[:space:]](-l|--label)[[:space:]]+['\"]?)[^[:space:]'\"]+(['\"]?)#\1$safeSedLbl\3#g" "${'$'}cfg" > "${'$'}{cfg}.pb_tmp" 2>/dev/null && [ -s "${'$'}{cfg}.pb_tmp" ]; then
+                        mv -f "${'$'}{cfg}.pb_tmp" "${'$'}cfg" 2>/dev/null || rm -f "${'$'}{cfg}.pb_tmp" 2>/dev/null
+                    else
+                        rm -f "${'$'}{cfg}.pb_tmp" 2>/dev/null || true
+                    fi
                 done
                 """.trimIndent()
             ).exec()
@@ -288,7 +308,11 @@ object LinuxImageBuilder {
                 Shell.cmd(
                     """
                     find $TEMP_FAT_MNT -maxdepth 4 -type f \( -iname 'grub.cfg' -o -iname 'isolinux.cfg' -o -iname 'syslinux.cfg' -o -iname 'loopback.cfg' -o -iname 'txt.cfg' \) 2>/dev/null | while IFS= read -r cfg; do
-                        sed -i "/$bootParam/!{s/boot=casper/boot=casper $bootParam/g; s/boot=live/boot=live $bootParam/g;}" "${'$'}cfg" 2>/dev/null || true
+                        if sed "/$bootParam/!{s/boot=casper/boot=casper $bootParam/g; s/boot=live/boot=live $bootParam/g;}" "${'$'}cfg" > "${'$'}{cfg}.pb_tmp" 2>/dev/null && [ -s "${'$'}{cfg}.pb_tmp" ]; then
+                            mv -f "${'$'}{cfg}.pb_tmp" "${'$'}cfg" 2>/dev/null || rm -f "${'$'}{cfg}.pb_tmp" 2>/dev/null
+                        else
+                            rm -f "${'$'}{cfg}.pb_tmp" 2>/dev/null || true
+                        fi
                     done
                     """.trimIndent()
                 ).exec()
@@ -305,6 +329,7 @@ object LinuxImageBuilder {
             UsbGadgetEngine.fixUserStoragePermissions(context, outPath, isDir = false)
             val lOutBytes = Shell.cmd("stat -c '%s' $qOut 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
             if (lOutBytes > 0L) UsbGadgetEngine.syncMediaStoreFileSize(context, outPath, lOutBytes)
+            IsoInspector.invalidate(outPath)
             val msg = if (withPersistence) "Built FAT32 USB $safeName + ${config.persistenceGb} GB ${config.style.volumeLabel}." else "Built Extracted FAT32 USB $safeName."
             entries.add(LogEntry(ts, "linux-build", msg))
             onProgress(WindowsBuildProgress("Done!", safeName, 1f, false))
@@ -380,15 +405,22 @@ fun LinuxBuilderSheet(
     }
     var outputName by remember(defaultOutName) { mutableStateOf(defaultOutName) }
     val fat32Blocked = maxIsoFileBytes > 4_294_967_295L
-    val estNeeded = isoFile.sizeBytes + (if (usbMode == LinuxUsbMode.WITH_PERSISTENCE) persistGb.toLong() * 1024L * 1024L * 1024L else 0L) + (if (writeMethod == LinuxWriteMethod.EXTRACTED_FAT32) 256L * 1024L * 1024L else 16L * 1024L * 1024L)
-    val freeSpace = remember(defaultDir) { UsbGadgetEngine.getFreeSpaceBytes(defaultDir) }
-    val lowSpace = freeSpace in 1 until estNeeded
-
     var targetExists by remember(isoFile.path) { mutableStateOf(false) }
+    var existingTargetAllocBytes by remember(isoFile.path) { mutableStateOf(0L) }
     val resolvedOutName = remember(outputName, defaultOutName) { UsbGadgetEngine.sanitizeOutputFileName(outputName.ifBlank { defaultOutName }, ".img", "linux-usb") }
     LaunchedEffect(defaultDir, resolvedOutName) {
         targetExists = UsbGadgetEngine.fileExistsInDir(defaultDir, resolvedOutName)
+        existingTargetAllocBytes = if (targetExists) {
+            withContext(Dispatchers.IO) { UsbGadgetEngine.queryExistingFileAllocatedBytes("${defaultDir.trimEnd('/')}/$resolvedOutName") }
+        } else 0L
     }
+    var rawFreeSpace by remember(defaultDir) { mutableStateOf(0L) }
+    LaunchedEffect(defaultDir) {
+        rawFreeSpace = withContext(Dispatchers.IO) { UsbGadgetEngine.getFreeSpaceBytes(defaultDir) }
+    }
+    val estNeeded = isoFile.sizeBytes + (if (usbMode == LinuxUsbMode.WITH_PERSISTENCE) persistGb.toLong() * 1024L * 1024L * 1024L else 0L) + (if (writeMethod == LinuxWriteMethod.EXTRACTED_FAT32) 256L * 1024L * 1024L else 16L * 1024L * 1024L)
+    val freeSpace = if (rawFreeSpace > 0L) rawFreeSpace + existingTargetAllocBytes else 0L
+    val lowSpace = freeSpace in 1 until estNeeded
 
     ModalBottomSheet(onDismissRequest = { if (!building) onDismiss() }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), containerColor = PocketColors.surfaceCard) {
         Column(modifier = Modifier.fillMaxWidth().navigationBarsPadding().imePadding().padding(horizontal = 20.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(13.dp)) {

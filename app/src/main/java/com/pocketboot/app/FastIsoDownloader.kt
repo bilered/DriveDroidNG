@@ -24,9 +24,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -38,11 +35,6 @@ import java.util.Date
 import java.util.zip.ZipInputStream
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlinx.coroutines.sync.Semaphore
-import java.security.MessageDigest
-import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicLong
 
 enum class ChecksumVerifyStatus {
@@ -111,8 +103,9 @@ class TurboDownloadService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val isPausedAction = intent?.action == ACTION_PAUSE_LOCKS
         val notif = NotificationHelper.buildDownloadNotification(this, FastIsoDownloader.state.value)
-        runCatching {
+        val promoted = runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 startForeground(
                     NotificationHelper.DL_NOTIF_ID,
@@ -122,8 +115,17 @@ class TurboDownloadService : Service() {
             } else {
                 startForeground(NotificationHelper.DL_NOTIF_ID, notif)
             }
+        }.isSuccess
+        if (!promoted) {
+            releaseLocks()
+            stopSelf(startId)
+            return START_NOT_STICKY
         }
-        acquireLocks()
+        if (isPausedAction) {
+            releaseLocks()
+        } else {
+            acquireLocks()
+        }
         return START_NOT_STICKY
     }
 
@@ -171,9 +173,18 @@ class TurboDownloadService : Service() {
     }
 
     companion object {
+        private const val ACTION_PAUSE_LOCKS = "com.pocketboot.app.ACTION_TURBO_PAUSE_LOCKS"
+
         fun start(context: Context) {
             runCatching {
                 ContextCompat.startForegroundService(context, Intent(context, TurboDownloadService::class.java))
+            }
+        }
+
+        fun pauseLocks(context: Context) {
+            runCatching {
+                val intent = Intent(context, TurboDownloadService::class.java).setAction(ACTION_PAUSE_LOCKS)
+                ContextCompat.startForegroundService(context, intent)
             }
         }
 
@@ -214,14 +225,21 @@ object FastIsoDownloader {
     private var cachedOnError: ((String) -> Unit)? = null
     private var cachedOnLog: ((LogEntry) -> Unit)? = null
     @Volatile private var cachedUserAgent: String = BROWSER_UA
-    private const val BROWSER_UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.6.8"
+    private const val BROWSER_UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.6.9"
     private const val WGET_UA = "Wget/1.21.4"
     private const val CURL_UA = "curl/8.5.0"
     private fun logDl(msg: String, isError: Boolean = false) { cachedOnLog?.invoke(LogEntry(SimpleDateFormat("HH:mm:ss", Locale.US).format(Date()), "download", msg, isError)) }
     private var cachedContext: Context? = null
 
-    fun publishExternalCompletion(event: DownloadCompletionEvent) {
-        _lastCompletion.value = event
+    private fun sanitizeDownloadFileName(raw: String, fallback: String = "downloaded-image.iso"): String {
+        val cleaned = raw
+            .replace('\\', '/')
+            .substringAfterLast('/')
+            .replace("..", "")
+            .replace(Regex("[^A-Za-z0-9._ -]"), "_")
+            .trim()
+            .trim('.')
+        return cleaned.ifBlank { fallback }
     }
 
     fun dismissLastCompletion() {
@@ -364,7 +382,7 @@ object FastIsoDownloader {
         while (redirects < 12) {
             val conn = (URL(current).openConnection() as HttpURLConnection).apply {
                 requestMethod = method; instanceFollowRedirects = false; connectTimeout = 15_000; readTimeout = 25_000
-                setRequestProperty("User-Agent", userAgent); setRequestProperty("Accept", "*/*"); setRequestProperty("Accept-Encoding", "identity"); setRequestProperty("Connection", "keep-alive"); setRequestProperty("Connection", "keep-alive")
+                setRequestProperty("User-Agent", userAgent); setRequestProperty("Accept", "*/*"); setRequestProperty("Accept-Encoding", "identity"); setRequestProperty("Connection", "keep-alive")
                 if (cookies.isNotEmpty()) setRequestProperty("Cookie", cookies.entries.joinToString("; ") { "${it.key}=${it.value}" })
                 if (rangeHeader != null) setRequestProperty("Range", rangeHeader)
             }
@@ -439,12 +457,17 @@ object FastIsoDownloader {
         onError: (String) -> Unit,
         onLog: (LogEntry) -> Unit = {}
     ) {
-        cancel(deleteTemp = true)
+        val wasPaused = _state.value?.isPaused == true
+        if (wasPaused) {
+            saveSidecarMeta()
+            cancel(deleteTemp = false)
+        } else {
+            cancel(deleteTemp = true)
+        }
         pausedFlag.set(false)
         cancelledFlag.set(false)
 
-        val cleanName = fileName.trim().ifBlank { "downloaded-image.iso" }
-            .replace(Regex("[^A-Za-z0-9._ -]"), "_")
+        val cleanName = sanitizeDownloadFileName(fileName, "downloaded-image.iso")
         val clampedThreads = connections.coerceIn(1, 16)
 
         cachedContext = context.applicationContext
@@ -476,7 +499,10 @@ object FastIsoDownloader {
                 logDl("Starting download: $title ($normalized)")
                 val (resolvedUrl, dynamicSha, dynamicName) = resolveDynamicApiUrl(normalized)
                 if (!dynamicSha.isNullOrBlank() && cachedExpectedSha256.isBlank()) cachedExpectedSha256 = dynamicSha.lowercase()
-                if (!dynamicName.isNullOrBlank() && (cleanName.startsWith("pop-os_latest", true) || cleanName.startsWith("tails-amd64-latest", true))) { _state.value = _state.value?.copy(fileName = dynamicName) }
+                if (!dynamicName.isNullOrBlank() && (cleanName.startsWith("pop-os_latest", true) || cleanName.startsWith("tails-amd64-latest", true))) {
+                    val safeDynamic = sanitizeDownloadFileName(dynamicName, cleanName)
+                    _state.value = _state.value?.copy(fileName = safeDynamic)
+                }
                 val probe = probeServer(resolvedUrl)
                 if (probe.isHtmlPage) {
                     val isMsLink = resolvedUrl.contains("microsoft.com", true) || resolvedUrl.contains("software-static", true)
@@ -497,6 +523,13 @@ object FastIsoDownloader {
                 val metaFile = File(dlDir, "$cleanName.part.pbmeta")
                 if (tmpFile.exists()) tmpFile.delete()
                 if (metaFile.exists()) metaFile.delete()
+                if (total > 0L) {
+                    val freeStage = UsbGadgetEngine.getFreeSpaceBytes(dlDir.absolutePath)
+                    val neededStage = total + (128L * 1024L * 1024L)
+                    if (freeStage in 1L until neededStage) {
+                        throw IllegalStateException("Not enough free phone storage (${UsbGadgetEngine.formatBytes(freeStage)} free). Need at least ${UsbGadgetEngine.formatBytes(neededStage)} for $cleanName.")
+                    }
+                }
                 stagingFile = tmpFile
                 sidecarFile = metaFile
 
@@ -633,7 +666,10 @@ object FastIsoDownloader {
         saveSidecarMeta()
         val pausedState = cur.copy(isPaused = true, speedBytesPerSec = 0L, etaSeconds = -1L, statusText = "Paused")
         _state.value = pausedState
-        cachedContext?.let { NotificationHelper.updateDownloadProgress(it, pausedState) }
+        cachedContext?.let {
+            TurboDownloadService.pauseLocks(it)
+            NotificationHelper.updateDownloadProgress(it, pausedState)
+        }
     }
 
     fun resume() {
@@ -746,35 +782,63 @@ object FastIsoDownloader {
         )
 
         val targetDir = UsbGadgetEngine.resolveDirectPath(finalState.targetDir).trimEnd('/')
-        val finalDest = "$targetDir/${finalState.fileName}"
+        val expectedBytes = tmpFile.length()
+        if (expectedBytes <= 0L) {
+            throw IllegalStateException("Downloaded staging file is missing or empty.")
+        }
+        var destName = finalState.fileName
+        var finalDest = "$targetDir/$destName"
+        if (UsbGadgetEngine.getStatus().mountedLunFor(finalDest) != null) {
+            val stem = destName.substringBeforeLast('.')
+            val ext = if (destName.contains('.')) ".${destName.substringAfterLast('.')}" else ""
+            destName = "${stem}_new_${System.currentTimeMillis() % 10000}$ext"
+            finalDest = "$targetDir/$destName"
+            logDl("Target file is currently mounted to PC; saving download safely as $destName")
+        }
         val qSrc = "'${tmpFile.absolutePath.replace("'", "'\\''")}'"
         val qDir = "'${targetDir.replace("'", "'\\''")}'"
         val qDst = "'${finalDest.replace("'", "'\\''")}'"
 
         val movedViaRoot = runCatching {
-            Shell.cmd("mkdir -p $qDir && mv -f $qSrc $qDst").exec().isSuccess
+            val mvRes = Shell.cmd("mkdir -p $qDir && mv -f $qSrc $qDst").exec()
+            if (!mvRes.isSuccess) return@runCatching false
+            val dlSz = Shell.cmd("stat -c '%s' $qDst 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+            if (dlSz != expectedBytes) {
+                Shell.cmd("rm -f $qDst 2>/dev/null || true").exec()
+                return@runCatching false
+            }
+            true
         }.getOrDefault(false)
 
         val savedPath = if (movedViaRoot) {
             UsbGadgetEngine.fixUserStoragePermissions(ctx, targetDir, isDir = true)
             UsbGadgetEngine.fixUserStoragePermissions(ctx, finalDest, isDir = false)
-            val dlSz = Shell.cmd("stat -c '%s' $qDst 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
-            if (dlSz > 0L) UsbGadgetEngine.syncMediaStoreFileSize(ctx, finalDest, dlSz)
+            UsbGadgetEngine.syncMediaStoreFileSize(ctx, finalDest, expectedBytes)
             finalDest
         } else {
-            val fallback = File(targetDir.replaceFirst("/data/media/0", "/storage/emulated/0"), finalState.fileName)
-            runCatching {
+            val fallback = File(targetDir.replaceFirst("/data/media/0", "/storage/emulated/0"), destName)
+            val fallbackOk = runCatching {
                 fallback.parentFile?.mkdirs()
                 tmpFile.copyTo(fallback, overwrite = true)
+                if (fallback.length() != expectedBytes) {
+                    fallback.delete()
+                    return@runCatching false
+                }
                 tmpFile.delete()
                 UsbGadgetEngine.fixUserStoragePermissions(ctx, finalDest, isDir = false)
-                finalDest
-            }.getOrElse { tmpFile.absolutePath }
+                UsbGadgetEngine.syncMediaStoreFileSize(ctx, finalDest, expectedBytes)
+                true
+            }.getOrDefault(false)
+            if (!fallbackOk) {
+                throw IllegalStateException("Could not save $destName to ${UsbGadgetEngine.friendlyFolderName(finalState.targetDir)} (check free space & folder permissions).")
+            }
+            finalDest
         }
 
+        IsoInspector.invalidate(savedPath)
         runCatching { sidecarFile?.delete() }
         stagingFile = null; sidecarFile = null
-        var effectiveSavedPath = savedPath; var effectiveFileName = finalState.fileName
+        var effectiveSavedPath = savedPath; var effectiveFileName = destName
         if (effectiveFileName.endsWith(".iso.zip", true) || effectiveFileName.endsWith(".img.zip", true)) {
             _state.value = finalState.copy(statusText = "Extracting ISO from zip archive...")
             extractImageFromZipArchive(ctx, effectiveSavedPath, targetDir)?.let { effectiveSavedPath = it; effectiveFileName = it.substringAfterLast('/'); logDl("Auto-extracted archive -> $effectiveFileName") }
@@ -866,22 +930,53 @@ object FastIsoDownloader {
         if (!srcFile.exists()) return null
         var extractedName: String? = null
         val outTmp = File(context.cacheDir, "pb_extract_out.bin")
-        ZipInputStream(srcFile.inputStream().buffered()).use { zis ->
-            while (true) {
-                val entry = zis.nextEntry ?: break
-                if (!entry.isDirectory) {
-                    val ename = entry.name.substringAfterLast('/')
-                    if (ename.endsWith(".iso", true) || ename.endsWith(".img", true)) { extractedName = ename; outTmp.outputStream().buffered().use { zis.copyTo(it) }; break }
+        if (outTmp.exists()) outTmp.delete()
+        try {
+            ZipInputStream(srcFile.inputStream().buffered()).use { zis ->
+                while (true) {
+                    val entry = zis.nextEntry ?: break
+                    if (!entry.isDirectory) {
+                        val rawLeaf = entry.name.replace('\\', '/').substringAfterLast('/')
+                        if (rawLeaf.endsWith(".iso", true) || rawLeaf.endsWith(".img", true)) {
+                            val reqExt = if (rawLeaf.endsWith(".img", true)) ".img" else ".iso"
+                            val safeLeaf = UsbGadgetEngine.sanitizeOutputFileName(rawLeaf, reqExt, "extracted")
+                            val entrySize = entry.size
+                            if (entrySize > 0L) {
+                                val freeCache = UsbGadgetEngine.getFreeSpaceBytes(context.cacheDir.absolutePath)
+                                if (freeCache in 1L until (entrySize + (64L * 1024L * 1024L))) {
+                                    logDl("Not enough free space (${UsbGadgetEngine.formatBytes(freeCache)}) to extract $safeLeaf (${UsbGadgetEngine.formatBytes(entrySize)})", isError = true)
+                                    return null
+                                }
+                            }
+                            extractedName = safeLeaf
+                            outTmp.outputStream().buffered().use { zis.copyTo(it) }
+                            break
+                        }
+                    }
                 }
             }
+        } finally {
+            stagedZip.delete()
         }
-        stagedZip.delete()
-        val finalName = extractedName ?: return null
+        val finalName = extractedName ?: run { outTmp.delete(); return null }
+        if (!outTmp.exists() || outTmp.length() <= 0L) {
+            outTmp.delete()
+            return null
+        }
         val finalOutPath = "${targetDir.trimEnd('/')}/$finalName"
-        if (Shell.cmd("mv -f '${outTmp.absolutePath.replace("'", "'\\''")}' '${finalOutPath.replace("'", "'\\''")}' && rm -f $qZip").exec().isSuccess) { UsbGadgetEngine.fixUserStoragePermissions(context, finalOutPath, false); val zSz = Shell.cmd("stat -c '%s' '${finalOutPath.replace("'", "'\\''")}' 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L; if (zSz > 0L) UsbGadgetEngine.syncMediaStoreFileSize(context, finalOutPath, zSz); finalOutPath } else { outTmp.delete(); null }
+        if (Shell.cmd("mv -f '${outTmp.absolutePath.replace("'", "'\\''")}' '${finalOutPath.replace("'", "'\\''")}' && rm -f $qZip").exec().isSuccess) {
+            UsbGadgetEngine.fixUserStoragePermissions(context, finalOutPath, false)
+            val zSz = Shell.cmd("stat -c '%s' '${finalOutPath.replace("'", "'\\''")}' 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+            if (zSz > 0L) UsbGadgetEngine.syncMediaStoreFileSize(context, finalOutPath, zSz)
+            IsoInspector.invalidate(finalOutPath)
+            finalOutPath
+        } else {
+            outTmp.delete()
+            null
+        }
     }.getOrNull()
 
-    private fun downloadChunkWithRetries(file: File, idx: Int, totalCounter: AtomicLong) {
+    private suspend fun downloadChunkWithRetries(file: File, idx: Int, totalCounter: AtomicLong) {
         val end = chunkEnds[idx]
         var attempt = 0
         val buf = ByteArray(262_144)
@@ -916,11 +1011,13 @@ object FastIsoDownloader {
                     conn.disconnect()
                 }
                 attempt = 0
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 if (pausedFlag.get() || cancelledFlag.get()) return
                 attempt++
                 if (attempt > 5) throw e
-                Thread.sleep(700L * attempt)
+                delay(700L * attempt)
             }
         }
     }
@@ -960,707 +1057,4 @@ object FastIsoDownloader {
         }
     }
 
-    suspend fun downloadFileTurbo(
-        url: String,
-        partFile: File,
-        metaFile: File,
-        expectedSize: Long,
-        expectedSha1: String,
-        maxConnections: Int,
-        pausedFlag: AtomicBoolean,
-        cancelledFlag: AtomicBoolean,
-        totalCounter: AtomicLong,
-        activeStreamsOut: AtomicInteger? = null,
-        onThrottle: ((Int) -> Unit)? = null
-    ): Boolean = withContext(Dispatchers.IO) {
-        val cleanSha1 = expectedSha1.trim().lowercase()
-        val bufSize = 262_144
-
-        val wantsMultiChunk = expectedSize >= 16L * 1024L * 1024L && maxConnections > 1
-        if (!wantsMultiChunk) {
-            var attempt = 0
-            val buf = ByteArray(bufSize)
-            while (!cancelledFlag.get() && !pausedFlag.get()) {
-                var attemptWritten = 0L
-                try {
-                    val md = if (cleanSha1.length == 40) MessageDigest.getInstance("SHA-1") else null
-                    val conn = openFollowingRedirects(url, "GET")
-                    try {
-                        val code = conn.responseCode
-                        if (code !in 200..299) throw IllegalStateException("HTTP $code")
-                        partFile.parentFile?.mkdirs()
-                        RandomAccessFile(partFile, "rw").use { raf ->
-                            raf.setLength(0L)
-                            conn.inputStream.use { input ->
-                                while (!cancelledFlag.get() && !pausedFlag.get()) {
-                                    val r = input.read(buf)
-                                    if (r <= 0) break
-                                    raf.write(buf, 0, r)
-                                    md?.update(buf, 0, r)
-                                    attemptWritten += r.toLong()
-                                    totalCounter.addAndGet(r.toLong())
-                                }
-                            }
-                        }
-                    } finally {
-                        conn.disconnect()
-                    }
-                    if (cancelledFlag.get() || pausedFlag.get()) {
-                        partFile.delete()
-                        totalCounter.addAndGet(-attemptWritten)
-                        return@withContext false
-                    }
-                    if (md != null) {
-                        val hex = md.digest().joinToString("") { "%02x".format(it) }
-                        if (!hex.equals(cleanSha1, ignoreCase = true)) {
-                            throw IllegalStateException("SHA-1 mismatch")
-                        }
-                    }
-                    metaFile.delete()
-                    return@withContext true
-                } catch (e: CancellationException) {
-                    partFile.delete()
-                    if (attemptWritten > 0L) totalCounter.addAndGet(-attemptWritten)
-                    throw e
-                } catch (e: Exception) {
-                    partFile.delete()
-                    if (attemptWritten > 0L) totalCounter.addAndGet(-attemptWritten)
-                    if (cancelledFlag.get() || pausedFlag.get()) return@withContext false
-                    attempt++
-                    if (attempt > 5) throw e
-                    val isThrottle = e.message?.contains("429") == true || e.message?.contains("503") == true
-                    delay(if (isThrottle) 1500L * attempt else 800L * attempt)
-                }
-            }
-            return@withContext false
-        }
-
-        val probe = runCatching { probeServer(url) }.getOrNull()
-        val finalUrl = probe?.finalUrl?.ifBlank { url } ?: url
-        val totalLen = when {
-            probe != null && probe.totalBytes > 0L -> probe.totalBytes
-            expectedSize > 0L -> expectedSize
-            else -> -1L
-        }
-        val canRange = (probe?.acceptsRanges == true) && totalLen >= 16L * 1024L * 1024L
-        if (!canRange) {
-            return@withContext downloadFileTurbo(
-                url = finalUrl,
-                partFile = partFile,
-                metaFile = metaFile,
-                expectedSize = 0L,
-                expectedSha1 = cleanSha1,
-                maxConnections = 1,
-                pausedFlag = pausedFlag,
-                cancelledFlag = cancelledFlag,
-                totalCounter = totalCounter,
-                activeStreamsOut = activeStreamsOut,
-                onThrottle = onThrottle
-            )
-        }
-
-        val numChunks = maxConnections.coerceIn(2, 16)
-        var starts = LongArray(0)
-        var ends = LongArray(0)
-        var cursors = LongArray(0)
-
-        var restored = false
-        if (partFile.exists() && metaFile.exists() && partFile.length() == totalLen) {
-            runCatching {
-                val obj = JSONObject(metaFile.readText(Charsets.UTF_8))
-                if (obj.optLong("totalBytes") == totalLen) {
-                    val sArr = obj.optJSONArray("chunkStarts")
-                    val eArr = obj.optJSONArray("chunkEnds")
-                    val cArr = obj.optJSONArray("chunkCursors")
-                    if (sArr != null && eArr != null && cArr != null && sArr.length() > 0) {
-                        val n = sArr.length()
-                        starts = LongArray(n) { sArr.optLong(it) }
-                        ends = LongArray(n) { eArr.optLong(it) }
-                        cursors = LongArray(n) { cArr.optLong(it) }
-                        val alreadyDone = (0 until n).sumOf { i -> (cursors[i] - starts[i]).coerceAtLeast(0L) }
-                        totalCounter.addAndGet(alreadyDone)
-                        restored = true
-                    }
-                }
-            }
-        }
-
-        if (!restored) {
-            partFile.parentFile?.mkdirs()
-            RandomAccessFile(partFile, "rw").use { it.setLength(totalLen) }
-            starts = LongArray(numChunks)
-            ends = LongArray(numChunks)
-            cursors = LongArray(numChunks)
-            val slice = totalLen / numChunks
-            for (i in 0 until numChunks) {
-                val s = i * slice
-                val e = if (i == numChunks - 1) totalLen - 1L else (s + slice - 1L)
-                starts[i] = s
-                ends[i] = e
-                cursors[i] = s
-            }
-        }
-
-        fun persistMeta() {
-            runCatching {
-                val obj = JSONObject().apply {
-                    put("totalBytes", totalLen)
-                    put("chunkStarts", JSONArray().apply { starts.forEach { put(it) } })
-                    put("chunkEnds", JSONArray().apply { ends.forEach { put(it) } })
-                    put("chunkCursors", JSONArray().apply { cursors.forEach { put(it) } })
-                }
-                metaFile.writeText(obj.toString(), Charsets.UTF_8)
-            }
-        }
-        persistMeta()
-
-        val activeCap = AtomicInteger(starts.size)
-        val permitsToDrop = AtomicInteger(0)
-        val throttledCount = AtomicInteger(0)
-        val permitPool = Semaphore(starts.size)
-
-        fun consumeOneDropToken(): Boolean {
-            while (true) {
-                val cur = permitsToDrop.get()
-                if (cur <= 0) return false
-                if (permitsToDrop.compareAndSet(cur, cur - 1)) return true
-            }
-        }
-
-        val checkpointJob = launch {
-            while (isActive && !pausedFlag.get() && !cancelledFlag.get()) {
-                delay(1500L)
-                persistMeta()
-            }
-        }
-
-        try {
-            coroutineScope {
-                starts.indices.map { idx ->
-                    async(Dispatchers.IO) {
-                        val buf = ByteArray(bufSize)
-                        val end = ends[idx]
-                        var attempt = 0
-                        while (cursors[idx] <= end && !pausedFlag.get() && !cancelledFlag.get()) {
-                            var acquired = false
-                            try {
-                                permitPool.acquire()
-                                acquired = true
-                                activeStreamsOut?.incrementAndGet()
-                                val startPos = cursors[idx]
-                                val conn = openFollowingRedirects(finalUrl, "GET", rangeHeader = "bytes=$startPos-$end")
-                                try {
-                                    val code = conn.responseCode
-                                    if (code == 429 || code == 503) throw IllegalStateException("THROTTLE_HTTP_$code")
-                                    val needsPartial = startPos > 0L || end < totalLen - 1L
-                                    if (needsPartial && code != 206) {
-                                        throw IllegalStateException("Expected HTTP 206 for byte range on chunk $idx (got HTTP $code)")
-                                    }
-                                    if (code != 206 && code != 200) throw IllegalStateException("HTTP $code on chunk $idx")
-                                    RandomAccessFile(partFile, "rw").use { raf ->
-                                        raf.seek(startPos)
-                                        conn.inputStream.use { input ->
-                                            while (!pausedFlag.get() && !cancelledFlag.get()) {
-                                                val r = input.read(buf)
-                                                if (r <= 0) break
-                                                val rem = (end - cursors[idx] + 1L).coerceAtLeast(0L)
-                                                val toWrite = minOf(r.toLong(), rem).toInt()
-                                                if (toWrite <= 0) break
-                                                raf.write(buf, 0, toWrite)
-                                                cursors[idx] += toWrite.toLong()
-                                                totalCounter.addAndGet(toWrite.toLong())
-                                            }
-                                        }
-                                    }
-                                } finally {
-                                    conn.disconnect()
-                                }
-                                attempt = 0
-                            } catch (e: CancellationException) {
-                                throw e
-                            } catch (e: Exception) {
-                                if (pausedFlag.get() || cancelledFlag.get()) return@async
-                                attempt++
-                                val isThrottle = e.message?.startsWith("THROTTLE_HTTP_") == true
-                                if (isThrottle) {
-                                    val hits = throttledCount.incrementAndGet()
-                                    val prev = activeCap.get()
-                                    if (hits % 2 == 1 && prev > 2) {
-                                        val nextCap = (prev / 2).coerceAtLeast(2)
-                                        if (activeCap.compareAndSet(prev, nextCap)) {
-                                            permitsToDrop.addAndGet(prev - nextCap)
-                                            onThrottle?.invoke(nextCap)
-                                        }
-                                    }
-                                    if (attempt > 6) throw e
-                                    delay(1600L * attempt)
-                                } else {
-                                    if (attempt > 5) throw e
-                                    delay(750L * attempt)
-                                }
-                            } finally {
-                                if (acquired) {
-                                    activeStreamsOut?.decrementAndGet()
-                                    if (!consumeOneDropToken()) {
-                                        permitPool.release()
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }.awaitAll()
-            }
-        } finally {
-            checkpointJob.cancel()
-            persistMeta()
-        }
-
-        if (pausedFlag.get() || cancelledFlag.get()) return@withContext false
-
-        if (cleanSha1.length == 40) {
-            val md = MessageDigest.getInstance("SHA-1")
-            val vBuf = ByteArray(bufSize)
-            partFile.inputStream().use { input ->
-                while (true) {
-                    val r = input.read(vBuf)
-                    if (r <= 0) break
-                    md.update(vBuf, 0, r)
-                }
-            }
-            val hex = md.digest().joinToString("") { "%02x".format(it) }
-            if (!hex.equals(cleanSha1, ignoreCase = true)) {
-                partFile.delete()
-                metaFile.delete()
-                throw IllegalStateException("SHA-1 verification failed after multi-chunk download")
-            }
-        }
-
-        metaFile.delete()
-        true
-    }
-
-    data class TurboBatchItem(
-        val id: String,
-        val url: String,
-        val partFile: File,
-        val metaFile: File,
-        val expectedSize: Long,
-        val expectedSha1: String,
-        val urlExpiryEpoch: Long = 0L
-    )
-
-    /**
-     * Global work-stealing multi-file Turbo engine with Mutex-locked URL auto-refresh.
-     * Splits files >= 4 MB into dynamic 4–8 MB byte-range slices and keeps all `connections`
-     * workers saturated across files. When Microsoft CDN links expire (HTTP 403/410 or near P1= expiry),
-     * a single Mutex-guarded refresh updates URLs for all concurrent workers seamlessly.
-     */
-    suspend fun downloadBatchTurbo(
-        items: List<TurboBatchItem>,
-        connections: Int,
-        pausedFlag: AtomicBoolean,
-        cancelledFlag: AtomicBoolean,
-        totalCounter: AtomicLong,
-        activeStreamsOut: AtomicInteger,
-        onRefreshUrls: (suspend () -> Map<String, Pair<String, Long>>)? = null,
-        onFileVerified: suspend (TurboBatchItem) -> Unit
-    ) = withContext(Dispatchers.IO) {
-        if (items.isEmpty()) return@withContext
-        val workerCount = connections.coerceIn(1, 16)
-        val bufSize = 262_144
-
-        val liveUrls = ConcurrentHashMap<String, String>()
-        val liveExpiries = ConcurrentHashMap<String, Long>()
-        items.forEach {
-            liveUrls[it.id] = it.url
-            if (it.urlExpiryEpoch > 0L) liveExpiries[it.id] = it.urlExpiryEpoch
-        }
-        val refreshMutex = Mutex()
-        val lastRefreshMs = AtomicLong(0L)
-
-        suspend fun resolveFreshUrl(item: TurboBatchItem, forceRefresh: Boolean): String {
-            val nowSec = System.currentTimeMillis() / 1000L
-            val expSec = liveExpiries[item.id] ?: item.urlExpiryEpoch
-            val nearExpiry = expSec > 0L && nowSec >= (expSec - 45L)
-            if (onRefreshUrls != null && (forceRefresh || nearExpiry)) {
-                refreshMutex.withLock {
-                    val nowMs = System.currentTimeMillis()
-                    val latestExp = liveExpiries[item.id] ?: item.urlExpiryEpoch
-                    val stillNeeds = forceRefresh || (latestExp > 0L && (nowMs / 1000L) >= (latestExp - 45L))
-                    if (stillNeeds && (nowMs - lastRefreshMs.get() >= 15_000L)) {
-                        runCatching {
-                            val refreshed = onRefreshUrls.invoke()
-                            if (refreshed.isNotEmpty()) {
-                                refreshed.forEach { (id, pair) ->
-                                    if (pair.first.startsWith("http")) {
-                                        liveUrls[id] = pair.first
-                                        if (pair.second > 0L) liveExpiries[id] = pair.second
-                                    }
-                                }
-                                lastRefreshMs.set(System.currentTimeMillis())
-                                logDl("Auto-refreshed ${refreshed.size} Microsoft CDN download URLs mid-batch")
-                            }
-                        }
-                    }
-                }
-            }
-            return liveUrls[item.id] ?: item.url
-        }
-
-        class FileTracker(val item: TurboBatchItem, val sliceCount: Int) {
-            val completedSlices = ConcurrentHashMap.newKeySet<Int>()
-            val remainingSlices = AtomicInteger(sliceCount)
-            val fallbackSingleStream = AtomicBoolean(false)
-            val finalized = AtomicBoolean(false)
-            val verifyRetries = AtomicInteger(0)
-            val lock = Any()
-
-            fun persistMeta() {
-                if (sliceCount <= 1) return
-                synchronized(lock) {
-                    runCatching {
-                        val obj = JSONObject().apply {
-                            put("totalBytes", item.expectedSize)
-                            put("sliceCount", sliceCount)
-                            put("doneSlices", JSONArray().apply { completedSlices.sorted().forEach { put(it) } })
-                        }
-                        item.metaFile.writeText(obj.toString(), Charsets.UTF_8)
-                    }
-                }
-            }
-        }
-
-        data class WorkSlice(
-            val tracker: FileTracker,
-            val sliceIndex: Int,
-            val start: Long,
-            val end: Long,
-            val isRanged: Boolean
-        )
-
-        val queue = ConcurrentLinkedQueue<WorkSlice>()
-        val trackers = mutableListOf<FileTracker>()
-
-        val ordered = items.sortedByDescending { it.expectedSize }
-        for (item in ordered) {
-            val sz = item.expectedSize
-            if (sz >= 4L * 1024L * 1024L && workerCount > 1) {
-                val sliceSize = if (sz >= 64L * 1024L * 1024L) 8L * 1024L * 1024L else 4L * 1024L * 1024L
-                val count = ((sz + sliceSize - 1L) / sliceSize).toInt().coerceAtLeast(1)
-                val tracker = FileTracker(item, count)
-
-                val doneSet = mutableSetOf<Int>()
-                if (item.partFile.exists() && item.metaFile.exists() && item.partFile.length() == sz) {
-                    runCatching {
-                        val obj = JSONObject(item.metaFile.readText(Charsets.UTF_8))
-                        if (obj.optLong("totalBytes") == sz && obj.optInt("sliceCount") == count) {
-                            val arr = obj.optJSONArray("doneSlices")
-                            if (arr != null) {
-                                for (k in 0 until arr.length()) {
-                                    val idx = arr.optInt(k, -1)
-                                    if (idx in 0 until count) doneSet.add(idx)
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if (doneSet.isEmpty()) {
-                    item.partFile.parentFile?.mkdirs()
-                    RandomAccessFile(item.partFile, "rw").use { it.setLength(sz) }
-                } else {
-                    tracker.completedSlices.addAll(doneSet)
-                    tracker.remainingSlices.set((count - doneSet.size).coerceAtLeast(0))
-                    val restoredBytes = doneSet.sumOf { idx ->
-                        val s = idx.toLong() * sliceSize
-                        val e = minOf(sz - 1L, s + sliceSize - 1L)
-                        (e - s + 1L)
-                    }
-                    totalCounter.addAndGet(restoredBytes)
-                }
-
-                if (tracker.remainingSlices.get() == 0) {
-                    val resumeErr = runCatching { verifyAndFinalize(tracker.item, bufSize) }.exceptionOrNull()
-                    if (resumeErr == null) {
-                        onFileVerified(tracker.item)
-                    } else {
-                        logDl("Cached partial ${item.id} failed verification (${resumeErr.message}) — re-downloading cleanly")
-                        totalCounter.addAndGet(-sz)
-                        item.partFile.delete()
-                        item.metaFile.delete()
-                        tracker.completedSlices.clear()
-                        tracker.remainingSlices.set(count)
-                        trackers.add(tracker)
-                        item.partFile.parentFile?.mkdirs()
-                        RandomAccessFile(item.partFile, "rw").use { it.setLength(sz) }
-                        for (idx in 0 until count) {
-                            val s = idx.toLong() * sliceSize
-                            val e = minOf(sz - 1L, s + sliceSize - 1L)
-                            queue.add(WorkSlice(tracker, idx, s, e, isRanged = true))
-                        }
-                    }
-                } else {
-                    trackers.add(tracker)
-                    for (idx in 0 until count) {
-                        if (idx in doneSet) continue
-                        val s = idx.toLong() * sliceSize
-                        val e = minOf(sz - 1L, s + sliceSize - 1L)
-                        queue.add(WorkSlice(tracker, idx, s, e, isRanged = true))
-                    }
-                }
-            } else {
-                val tracker = FileTracker(item, 1)
-                trackers.add(tracker)
-                queue.add(WorkSlice(tracker, 0, 0L, (sz - 1L).coerceAtLeast(0L), isRanged = false))
-            }
-        }
-
-        if (queue.isEmpty()) return@withContext
-
-        coroutineScope {
-            (0 until workerCount).map {
-                async(Dispatchers.IO) {
-                    val buf = ByteArray(bufSize)
-                    while (!pausedFlag.get() && !cancelledFlag.get()) {
-                        val task = queue.poll() ?: break
-                        val tracker = task.tracker
-                        val item = tracker.item
-
-                        if (task.isRanged && tracker.fallbackSingleStream.get()) continue
-
-                        activeStreamsOut.incrementAndGet()
-                        try {
-                            if (task.isRanged) {
-                                var attempt = 0
-                                var sliceDone = false
-                                while (!sliceDone && !pausedFlag.get() && !cancelledFlag.get()) {
-                                    var writtenThisAttempt = 0L
-                                    try {
-                                        val activeUrl = resolveFreshUrl(item, forceRefresh = false)
-                                        val conn = openFollowingRedirects(activeUrl, "GET", rangeHeader = "bytes=${task.start}-${task.end}")
-                                        var keepAliveReusable = false
-                                        try {
-                                            val code = conn.responseCode
-                                            if (code == 403 || code == 410) throw IllegalStateException("EXPIRED_$code")
-                                            if (code == 429 || code == 503) throw IllegalStateException("THROTTLE_$code")
-                                            if (code == 200 && task.start > 0L) {
-                                                if (tracker.fallbackSingleStream.compareAndSet(false, true)) {
-                                                    val isolatedPart = File(item.partFile.parentFile, "${item.partFile.name}.single")
-                                                    val isolatedItem = item.copy(partFile = isolatedPart)
-                                                    val okSingle = downloadSingleKeepAlive(isolatedItem, buf, pausedFlag, cancelledFlag, totalCounter, ::resolveFreshUrl)
-                                                    if (okSingle && tracker.finalized.compareAndSet(false, true)) {
-                                                        item.partFile.delete()
-                                                        if (!isolatedPart.renameTo(item.partFile)) {
-                                                            isolatedPart.copyTo(item.partFile, overwrite = true)
-                                                            isolatedPart.delete()
-                                                        }
-                                                        item.metaFile.delete()
-                                                        onFileVerified(item)
-                                                    } else {
-                                                        isolatedPart.delete()
-                                                    }
-                                                }
-                                                sliceDone = true
-                                                break
-                                            }
-                                            if (code != 206 && code != 200) throw IllegalStateException("HTTP $code")
-                                            RandomAccessFile(item.partFile, "rw").use { raf ->
-                                                raf.seek(task.start)
-                                                val expectedLen = task.end - task.start + 1L
-                                                conn.inputStream.use { input ->
-                                                    while (writtenThisAttempt < expectedLen && !pausedFlag.get() && !cancelledFlag.get()) {
-                                                        val toRead = minOf(buf.size.toLong(), expectedLen - writtenThisAttempt).toInt()
-                                                        val r = input.read(buf, 0, toRead)
-                                                        if (r <= 0) break
-                                                        raf.write(buf, 0, r)
-                                                        writtenThisAttempt += r.toLong()
-                                                        totalCounter.addAndGet(r.toLong())
-                                                    }
-                                                }
-                                                if (!pausedFlag.get() && !cancelledFlag.get() && writtenThisAttempt < expectedLen) {
-                                                    throw IllegalStateException("Truncated range slice ($writtenThisAttempt/$expectedLen)")
-                                                }
-                                                if (!pausedFlag.get() && !cancelledFlag.get()) keepAliveReusable = true
-                                            }
-                                        } finally {
-                                            if (!keepAliveReusable) conn.disconnect()
-                                        }
-                                        if (pausedFlag.get() || cancelledFlag.get()) {
-                                            totalCounter.addAndGet(-writtenThisAttempt)
-                                            break
-                                        }
-                                        sliceDone = true
-                                    } catch (e: CancellationException) {
-                                        if (writtenThisAttempt > 0L) totalCounter.addAndGet(-writtenThisAttempt)
-                                        throw e
-                                    } catch (e: Exception) {
-                                        if (writtenThisAttempt > 0L) totalCounter.addAndGet(-writtenThisAttempt)
-                                        if (pausedFlag.get() || cancelledFlag.get()) break
-                                        attempt++
-                                        if (attempt > 6) throw IllegalStateException("${item.partFile.name}: ${e.message}")
-                                        val isExpired = e.message?.startsWith("EXPIRED_") == true
-                                        if (isExpired && onRefreshUrls != null) {
-                                            resolveFreshUrl(item, forceRefresh = true)
-                                            delay(400L)
-                                        } else {
-                                            val isThrottle = e.message?.startsWith("THROTTLE_") == true
-                                            val jitter = (System.nanoTime() and 0xFFL)
-                                            delay((if (isThrottle) 700L * attempt else 500L * attempt) + jitter)
-                                        }
-                                    }
-                                }
-                                if (sliceDone && !tracker.fallbackSingleStream.get() && !pausedFlag.get() && !cancelledFlag.get()) {
-                                    tracker.completedSlices.add(task.sliceIndex)
-                                    val left = tracker.remainingSlices.decrementAndGet()
-                                    if (left > 0) {
-                                        if (tracker.completedSlices.size % 2 == 0) tracker.persistMeta()
-                                    } else if (tracker.finalized.compareAndSet(false, true)) {
-                                        val verifyErr = runCatching { verifyAndFinalize(item, bufSize) }.exceptionOrNull()
-                                        if (verifyErr == null) {
-                                            onFileVerified(item)
-                                        } else {
-                                            val retryNum = tracker.verifyRetries.incrementAndGet()
-                                            if (retryNum > 2) {
-                                                throw IllegalStateException("${item.id}: ${verifyErr.message ?: "Integrity check failed"} (after $retryNum retries)")
-                                            }
-                                            logDl("Integrity mismatch on ${item.id} (${verifyErr.message}) — retrying clean single-stream download ($retryNum/2)")
-                                            totalCounter.addAndGet(-item.expectedSize.coerceAtLeast(0L))
-                                            item.partFile.delete()
-                                            item.metaFile.delete()
-                                            tracker.completedSlices.clear()
-                                            tracker.remainingSlices.set(1)
-                                            tracker.finalized.set(false)
-                                            tracker.fallbackSingleStream.set(true)
-                                            queue.add(WorkSlice(tracker, 0, 0L, (item.expectedSize - 1L).coerceAtLeast(0L), isRanged = false))
-                                        }
-                                    }
-                                }
-                            } else {
-                                val ok = downloadSingleKeepAlive(item, buf, pausedFlag, cancelledFlag, totalCounter, ::resolveFreshUrl)
-                                if (ok && tracker.finalized.compareAndSet(false, true)) {
-                                    item.metaFile.delete()
-                                    onFileVerified(item)
-                                }
-                            }
-                        } finally {
-                            activeStreamsOut.decrementAndGet()
-                        }
-                    }
-                }
-            }.awaitAll()
-        }
-
-        if (pausedFlag.get()) {
-            trackers.forEach { if (!it.finalized.get()) it.persistMeta() }
-        }
-    }
-
-    private suspend fun downloadSingleKeepAlive(
-        item: TurboBatchItem,
-        buf: ByteArray,
-        pausedFlag: AtomicBoolean,
-        cancelledFlag: AtomicBoolean,
-        totalCounter: AtomicLong,
-        urlResolver: suspend (TurboBatchItem, Boolean) -> String
-    ): Boolean {
-        val cleanSha1 = item.expectedSha1.trim().lowercase()
-        var attempt = 0
-        while (!pausedFlag.get() && !cancelledFlag.get()) {
-            var written = 0L
-            try {
-                val md = if (cleanSha1.length == 40) MessageDigest.getInstance("SHA-1") else null
-                val activeUrl = urlResolver(item, false)
-                val conn = openFollowingRedirects(activeUrl, "GET")
-                var keepAliveReusable = false
-                try {
-                    val code = conn.responseCode
-                    if (code == 403 || code == 410) throw IllegalStateException("EXPIRED_$code")
-                    if (code == 429 || code == 503) throw IllegalStateException("THROTTLE_$code")
-                    if (code !in 200..299) throw IllegalStateException("HTTP $code")
-                    item.partFile.parentFile?.mkdirs()
-                    RandomAccessFile(item.partFile, "rw").use { raf ->
-                        raf.setLength(0L)
-                        conn.inputStream.use { input ->
-                            while (!pausedFlag.get() && !cancelledFlag.get()) {
-                                val r = input.read(buf)
-                                if (r <= 0) break
-                                raf.write(buf, 0, r)
-                                md?.update(buf, 0, r)
-                                written += r.toLong()
-                                totalCounter.addAndGet(r.toLong())
-                            }
-                        }
-                    }
-                    if (!pausedFlag.get() && !cancelledFlag.get()) keepAliveReusable = true
-                } finally {
-                    if (!keepAliveReusable) conn.disconnect()
-                }
-                if (pausedFlag.get() || cancelledFlag.get()) {
-                    item.partFile.delete()
-                    totalCounter.addAndGet(-written)
-                    return false
-                }
-                if (written <= 0L) {
-                    throw IllegalStateException("Empty download (0 bytes)")
-                }
-                if (item.expectedSize > 0L && written != item.expectedSize) {
-                    throw IllegalStateException("Size mismatch ($written/${item.expectedSize})")
-                }
-                if (md != null) {
-                    val hex = md.digest().joinToString("") { "%02x".format(it) }
-                    if (!hex.equals(cleanSha1, ignoreCase = true)) {
-                        throw IllegalStateException("SHA-1 mismatch")
-                    }
-                }
-                return true
-            } catch (e: CancellationException) {
-                item.partFile.delete()
-                if (written > 0L) totalCounter.addAndGet(-written)
-                throw e
-            } catch (e: Exception) {
-                item.partFile.delete()
-                if (written > 0L) totalCounter.addAndGet(-written)
-                if (pausedFlag.get() || cancelledFlag.get()) return false
-                attempt++
-                if (attempt > 6) throw IllegalStateException("${item.partFile.name}: ${e.message}")
-                val isExpired = e.message?.startsWith("EXPIRED_") == true
-                if (isExpired) {
-                    urlResolver(item, true)
-                    delay(400L)
-                } else {
-                    val isThrottle = e.message?.startsWith("THROTTLE_") == true
-                    delay(if (isThrottle) 800L * attempt else 500L * attempt)
-                }
-            }
-        }
-        return false
-    }
-
-    private fun verifyAndFinalize(item: TurboBatchItem, bufSize: Int) {
-        val actualLen = if (item.partFile.exists()) item.partFile.length() else -1L
-        if (actualLen <= 0L || (item.expectedSize > 0L && actualLen != item.expectedSize)) {
-            item.partFile.delete()
-            item.metaFile.delete()
-            throw IllegalStateException("Size mismatch on ${item.partFile.name} ($actualLen/${item.expectedSize})")
-        }
-        val cleanSha1 = item.expectedSha1.trim().lowercase()
-        if (cleanSha1.length == 40) {
-            val md = MessageDigest.getInstance("SHA-1")
-            val vBuf = ByteArray(bufSize)
-            item.partFile.inputStream().use { input ->
-                while (true) {
-                    val r = input.read(vBuf)
-                    if (r <= 0) break
-                    md.update(vBuf, 0, r)
-                }
-            }
-            val hex = md.digest().joinToString("") { "%02x".format(it) }
-            if (!hex.equals(cleanSha1, ignoreCase = true)) {
-                item.partFile.delete()
-                item.metaFile.delete()
-                throw IllegalStateException("SHA-1 mismatch on ${item.partFile.name}")
-            }
-        }
-        item.metaFile.delete()
-    }
 }

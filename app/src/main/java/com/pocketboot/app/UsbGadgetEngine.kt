@@ -296,10 +296,44 @@ object UsbGadgetEngine {
     fun getFreeSpaceBytes(dirPath: String): Long {
         val publicPath = dirPath.replaceFirst("/data/media/0", "/storage/emulated/0")
         return runCatching {
-            val f = File(publicPath)
-            val target = if (f.exists()) f.absolutePath else "/storage/emulated/0"
+            var probe: File? = File(publicPath)
+            while (probe != null && !probe.exists()) {
+                probe = probe.parentFile
+            }
+            val target = probe?.absolutePath ?: "/storage/emulated/0"
             StatFs(target).availableBytes
         }.getOrElse { 0L }
+    }
+
+    /**
+     * Android-universal directory size helper (works on Toybox, BusyBox, and GNU without relying on `awk` or GNU `du -b`).
+     * Tries `du -sb`, falls back to POSIX `du -sk` (* 1024), and returns 0L if missing/empty.
+     */
+    fun queryDirSizeBytes(dirPath: String): Long {
+        val resolved = resolveDirectPath(dirPath).trimEnd('/')
+        if (resolved.isBlank()) return 0L
+        val qPath = shellQuote(resolved)
+        val bLine = Shell.cmd("if [ -e $qPath ]; then du -sb $qPath 2>/dev/null; fi")
+            .exec().out.firstOrNull().orEmpty().trim()
+        val exactB = bLine.split(Regex("\\s+")).firstOrNull()?.toLongOrNull()
+        if (exactB != null && exactB >= 0L) return exactB
+        val kLine = Shell.cmd("if [ -e $qPath ]; then du -sk $qPath 2>/dev/null; fi")
+            .exec().out.firstOrNull().orEmpty().trim()
+        val kb = kLine.split(Regex("\\s+")).firstOrNull()?.toLongOrNull()
+        return if (kb != null && kb >= 0L) kb * 1024L else 0L
+    }
+
+    /**
+     * Returns actual allocated on-disk bytes for an existing file (512-byte blocks via `stat -c '%b'`),
+     * useful for overwrite-aware free-space checks on sparse or full images.
+     */
+    fun queryExistingFileAllocatedBytes(filePath: String): Long {
+        val resolved = resolveDirectPath(filePath).trimEnd('/')
+        if (resolved.isBlank()) return 0L
+        val qPath = shellQuote(resolved)
+        val blocks = Shell.cmd("stat -c '%b' $qPath 2>/dev/null")
+            .exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+        return if (blocks > 0L) blocks * 512L else 0L
     }
 
     private fun shellQuote(value: String): String {
@@ -732,15 +766,17 @@ object UsbGadgetEngine {
         runCatching {
             if (!Shell.getShell().isRoot) return@withContext null
             val qPath = shellQuote(resolveDirectPath(path))
-            val out = Shell.cmd("sha256sum $qPath 2>/dev/null | awk '{print \$1}'").exec().out.firstOrNull()?.trim()
-            out?.takeIf { it.length == 64 }
+            val out = Shell.cmd("sha256sum $qPath 2>/dev/null").exec().out.firstOrNull().orEmpty().trim()
+            val hash = out.split(Regex("\\s+")).firstOrNull()?.trim()
+            hash?.takeIf { it.length == 64 && it.all { c -> c in '0'..'9' || c in 'a'..'f' || c in 'A'..'F' } }
         }.getOrNull()
     }
 
     suspend fun renameImageFile(
         oldPath: String,
         newNameInput: String,
-        isCurrentlyMounted: Boolean
+        isCurrentlyMounted: Boolean,
+        context: Context? = null
     ): ActionResult = withContext(Dispatchers.IO) {
         val ts = nowTs()
         val entries = mutableListOf<LogEntry>()
@@ -748,8 +784,8 @@ object UsbGadgetEngine {
             return@withContext ActionResult(false, "Unmount this drive before renaming it.")
         }
         val cleanInput = newNameInput.trim()
-        if (cleanInput.isEmpty() || cleanInput.contains('/') || cleanInput.contains('\\')) {
-            return@withContext ActionResult(false, "Enter a valid filename without slashes.")
+        if (cleanInput.isEmpty() || cleanInput.contains('/') || cleanInput.contains('\\') || cleanInput.contains("..")) {
+            return@withContext ActionResult(false, "Enter a valid filename without slashes or '..'.")
         }
         return@withContext runCatching {
             val resolvedOld = resolveDirectPath(oldPath)
@@ -760,10 +796,13 @@ object UsbGadgetEngine {
                 oldName.endsWith(".img", ignoreCase = true) -> ".img"
                 else -> ""
             }
-            val finalName = if (oldExt.isNotEmpty() && !cleanInput.endsWith(oldExt, ignoreCase = true)) {
-                "$cleanInput$oldExt"
+            val finalName = if (oldExt.isNotEmpty()) {
+                sanitizeOutputFileName(cleanInput, oldExt, oldName.substringBeforeLast('.').ifBlank { "pocketboot" })
             } else {
-                cleanInput
+                cleanInput.replace(Regex("[\\x00-\\x1F:*?\"<>|]"), "").trim().trim('.')
+            }
+            if (finalName.isBlank()) {
+                return@withContext ActionResult(false, "Enter a valid filename.")
             }
             val newPath = "$parentDir/$finalName"
             if (newPath == resolvedOld) {
@@ -777,6 +816,15 @@ object UsbGadgetEngine {
             }
             val res = Shell.cmd("mv $qOld $qNew 2>&1").exec()
             if (res.isSuccess) {
+                IsoInspector.invalidate(resolvedOld)
+                IsoInspector.invalidate(newPath)
+                if (context != null) {
+                    val oldPub = resolvedOld.replaceFirst("/data/media/0", "/storage/emulated/0")
+                    val newPub = newPath.replaceFirst("/data/media/0", "/storage/emulated/0")
+                    runCatching {
+                        MediaScannerConnection.scanFile(context.applicationContext, arrayOf(oldPub, newPub), null, null)
+                    }
+                }
                 entries.add(LogEntry(ts, "rename", "Renamed $oldName -> $finalName", false))
                 ActionResult(true, "Renamed to $finalName.", createdPath = newPath, entries = entries)
             } else {
@@ -811,7 +859,7 @@ object UsbGadgetEngine {
             Shell.cmd("[ -e ${shellQuote(full)} ]").exec().isSuccess
     }
 
-    suspend fun deleteImageFile(path: String, mountedLun: Int? = null): ActionResult = withContext(Dispatchers.IO) {
+    suspend fun deleteImageFile(path: String, mountedLun: Int? = null, context: Context? = null): ActionResult = withContext(Dispatchers.IO) {
         val ts = nowTs()
         val entries = mutableListOf<LogEntry>()
         runCatching {
@@ -824,6 +872,13 @@ object UsbGadgetEngine {
             val res = Shell.cmd("rm -f $qPath 2>&1").exec()
             val fileName = resolved.substringAfterLast('/')
             if (res.isSuccess) {
+                IsoInspector.invalidate(resolved)
+                if (context != null) {
+                    val pub = resolved.replaceFirst("/data/media/0", "/storage/emulated/0")
+                    runCatching {
+                        MediaScannerConnection.scanFile(context.applicationContext, arrayOf(pub), null, null)
+                    }
+                }
                 entries.add(LogEntry(ts, "delete", "Deleted $resolved", false))
                 ActionResult(true, "Deleted $fileName from phone.", entries = entries)
             } else {
@@ -835,18 +890,6 @@ object UsbGadgetEngine {
             entries.add(LogEntry(ts, "delete", "Exception: ${e.message}", true))
             ActionResult(false, "Delete failed: ${e.message}", entries = entries)
         }
-    }
-
-    suspend fun moveFileToDir(sourcePath: String, targetDir: String): String? = withContext(Dispatchers.IO) {
-        runCatching {
-            val src = resolveDirectPath(sourcePath)
-            val dstDir = resolveDirectPath(targetDir).trimEnd('/')
-            val fileName = src.substringAfterLast('/')
-            val dst = "$dstDir/$fileName"
-            if (src == dst) return@withContext dst
-            val res = Shell.cmd("mkdir -p ${shellQuote(dstDir)} && mv ${shellQuote(src)} ${shellQuote(dst)}").exec()
-            if (res.isSuccess) dst else src
-        }.getOrNull()
     }
 
     fun setUsbPowerControl(alwaysOn: Boolean) {
@@ -971,9 +1014,23 @@ object UsbGadgetEngine {
                 PIDS=${'$'}(pidof file-storage 2>/dev/null || pgrep -f 'file-storage|f_mass_storage' 2>/dev/null || true)
                 for pid in ${'$'}PIDS; do
                     [ -r "/proc/${'$'}pid/status" ] || continue
-                    PSTATE=${'$'}(awk '/^State:/ {print ${'$'}2; exit}' "/proc/${'$'}pid/status" 2>/dev/null)
+                    PSTATE=""
+                    while IFS= read -r st_line; do
+                        case "${'$'}st_line" in
+                            State:*) set -- ${'$'}st_line; PSTATE="${'$'}2"; break ;;
+                        esac
+                    done < "/proc/${'$'}pid/status" 2>/dev/null
                     if [ "${'$'}PSTATE" = "R" ] || [ "${'$'}PSTATE" = "D" ]; then ACTIVE=1; fi
-                    if [ -r "/proc/${'$'}pid/io" ]; then RB=${'$'}(awk '/^(rchar|read_bytes|wchar|write_bytes):/ {s+=${'$'}2} END {print s+0}' "/proc/${'$'}pid/io" 2>/dev/null); IO_BYTES=${'$'}((IO_BYTES + RB)); fi
+                    if [ -r "/proc/${'$'}pid/io" ]; then
+                        while IFS= read -r io_line; do
+                            case "${'$'}io_line" in
+                                rchar:*|read_bytes:*|wchar:*|write_bytes:*)
+                                    set -- ${'$'}io_line
+                                    case "${'$'}2" in ''|*[!0-9]*) ;; *) IO_BYTES=${'$'}((IO_BYTES + ${'$'}2)) ;; esac
+                                    ;;
+                            esac
+                        done < "/proc/${'$'}pid/io" 2>/dev/null
+                    fi
                 done
                 echo "${'$'}ST|${'$'}SPD|${'$'}IO_BYTES|${'$'}ACTIVE"
             """.trimIndent()
@@ -1311,16 +1368,24 @@ object UsbGadgetEngine {
             if (getStatus().mountedLunFor(outPath) != null) {
                 return@withContext ActionResult(false, "$safeName is currently mounted to your PC. Unmount it before overwriting.", entries = entries)
             }
+            val expectedBytes = sizeMb.toLong().coerceAtLeast(1L) * 1024L * 1024L
+            val existingAllocB = queryExistingFileAllocatedBytes(outPath)
+            val freeB = getFreeSpaceBytes(safeDir)
+            if (freeB > 0L && (freeB + existingAllocB) < (16L * 1024L * 1024L)) {
+                return@withContext ActionResult(false, "Phone storage is critically low (${formatBytes(freeB)} free). Free up space before creating a blank drive.", entries = entries)
+            }
             val qDir = shellQuote(safeDir)
             val qOut = shellQuote(outPath)
 
             val script = """
+                set -e
                 mkdir -p $qDir
+                rm -f $qOut
                 if command -v truncate >/dev/null 2>&1; then
-                    truncate -s ${sizeMb}M $qOut 2>&1
+                    truncate -s $expectedBytes $qOut 2>&1
                     echo "LOG|create|Created ${sizeMb} MB sparse drive at $outPath"
                 else
-                    dd if=/dev/zero of=$qOut bs=1M count=0 seek=$sizeMb 2>/dev/null || dd if=/dev/zero of=$qOut bs=1M count=$sizeMb 2>/dev/null
+                    dd if=/dev/zero of=$qOut bs=1M count=0 seek=$sizeMb 2>/dev/null || dd if=/dev/zero of=$qOut bs=1M count=$sizeMb 2>&1
                     echo "LOG|create|Created ${sizeMb} MB drive at $outPath"
                 fi
             """.trimIndent()
@@ -1343,17 +1408,25 @@ object UsbGadgetEngine {
                 entries.add(LogEntry(ts, "error", it, true))
             }
 
-            if (res.isSuccess) {
+            val createdBytes = if (res.isSuccess) {
+                Shell.cmd("stat -c '%s' $qOut 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+            } else 0L
+            val verifiedOk = res.isSuccess && createdBytes == expectedBytes
+
+            if (verifiedOk) {
                 fixUserStoragePermissions(context, safeDir, isDir = true)
                 fixUserStoragePermissions(context, outPath, isDir = false)
-                val createdBytes = Shell.cmd("stat -c '%s' $qOut 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
-                if (createdBytes > 0L) syncMediaStoreFileSize(context, outPath, createdBytes)
+                syncMediaStoreFileSize(context, outPath, createdBytes)
+                IsoInspector.invalidate(outPath)
+            } else {
+                Shell.cmd("rm -f $qOut 2>/dev/null || true").exec()
+                entries.add(LogEntry(ts, "create", "Verification failed ($createdBytes / $expectedBytes bytes)", true))
             }
 
             ActionResult(
-                success = res.isSuccess,
-                userMessage = if (res.isSuccess) "Created $safeName (${sizeMb} MB)." else "Could not create $safeName.",
-                createdPath = if (res.isSuccess) outPath else null,
+                success = verifiedOk,
+                userMessage = if (verifiedOk) "Created $safeName (${sizeMb} MB)." else "Could not create $safeName (${formatBytes(createdBytes)} / ${formatBytes(expectedBytes)}).",
+                createdPath = if (verifiedOk) outPath else null,
                 entries = entries
             )
         }.getOrElse { e ->
@@ -1373,8 +1446,8 @@ object UsbGadgetEngine {
             """
             mkdir -p $qCand 2>/dev/null &&
             touch $qParent/.nomedia 2>/dev/null &&
-            ln -sf . "$candidate/.pb_symtest" 2>/dev/null &&
-            rm -f "$candidate/.pb_symtest" 2>/dev/null
+            ln -sf . $qCand/.pb_symtest 2>/dev/null &&
+            rm -f $qCand/.pb_symtest 2>/dev/null
             """.trimIndent()
         ).exec().isSuccess
 
@@ -1407,18 +1480,13 @@ object UsbGadgetEngine {
             runCatching {
                 var workBytes = 0L
                 scanDirs.map { resolveDirectPath(it).trimEnd('/') }.distinct().forEach { dir ->
-                    val qTmp = shellQuote("$dir/.pocketboot_tmp")
-                    val b = Shell.cmd(
-                        "if [ -d $qTmp ]; then du -sb $qTmp 2>/dev/null | awk '{print \$1}'; else echo 0; fi"
-                    ).exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
-                    workBytes += b
+                    workBytes += queryDirSizeBytes("$dir/.pocketboot_tmp")
                 }
                 val baseDir = context.applicationContext.getExternalFilesDir(null) ?: context.applicationContext.cacheDir
                 val dlDir = File(baseDir, "turbo_dl")
                 val resumableBytes = dlDir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
-                val rootTmpBytes = Shell.cmd(
-                    "du -sbc /data/local/tmp/pb_* 2>/dev/null | tail -n 1 | awk '{print \$1}'"
-                ).exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                val rootTmpPaths = Shell.cmd("for p in /data/local/tmp/pb_*; do [ -e \"${'$'}p\" ] && echo \"${'$'}p\"; done 2>/dev/null").exec().out
+                val rootTmpBytes = rootTmpPaths.map { it.trim() }.filter { it.isNotEmpty() }.sumOf { queryDirSizeBytes(it) }
                 TempStorageStats(workTempBytes = workBytes, resumableBytes = resumableBytes, rootTmpBytes = rootTmpBytes)
             }.getOrDefault(TempStorageStats())
         }

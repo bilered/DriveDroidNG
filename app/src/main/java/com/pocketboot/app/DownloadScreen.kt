@@ -657,7 +657,18 @@ fun DownloadScreen(
     var autoMount by remember { mutableStateOf(true) }
 
     val anyDownloadActive = turboState != null
-    val freeBytes = remember(defaultDir, turboState) { UsbGadgetEngine.getFreeSpaceBytes(defaultDir) }
+    var freeBytes by remember(defaultDir) { mutableStateOf(0L) }
+    var dirFreeMap by remember { mutableStateOf<Map<String, Long>>(emptyMap()) }
+    LaunchedEffect(defaultDir, turboState == null) {
+        freeBytes = withContext(Dispatchers.IO) { UsbGadgetEngine.getFreeSpaceBytes(defaultDir) }
+    }
+    LaunchedEffect(folderMenuExpanded, settings.scanDirs) {
+        if (folderMenuExpanded) {
+            dirFreeMap = withContext(Dispatchers.IO) {
+                settings.scanDirs.associateWith { d -> UsbGadgetEngine.getFreeSpaceBytes(d) }
+            }
+        }
+    }
 
     val activeRepoUrls = remember(settings.useDefaultDistroRepo, settings.customRepoUrls) {
         buildList {
@@ -904,7 +915,7 @@ fun DownloadScreen(
                         ) {
                             settings.scanDirs.forEach { dir ->
                                 val isSelected = activeMultiBootTarget == null && dir == defaultDir
-                                val dirFree = remember(dir, folderMenuExpanded) { UsbGadgetEngine.getFreeSpaceBytes(dir) }
+                                val dirFree = dirFreeMap[dir] ?: 0L
                                 DropdownMenuItem(
                                     text = {
                                         Column {

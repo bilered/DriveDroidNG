@@ -293,6 +293,7 @@ class AppPrefs(context: Context) {
             settings.fileModes.forEach { (k, v) -> modesObj.put(k, v) }
             return JSONObject().apply {
                 put("pocketbootBackupVersion", 3); put("defaultDir", settings.defaultDir)
+                put("downloadTargetMultiBootPath", settings.downloadTargetMultiBootPath)
                 put("favoriteQuickMountPath", settings.favoriteQuickMountPath)
                 put("keepAdbActive", settings.keepAdbActive); put("autoPatchSelinux", settings.autoPatchSelinux)
                 put("surfaceMode", settings.surfaceMode.name); put("useMonet", settings.useMonet)
@@ -350,6 +351,7 @@ class AppPrefs(context: Context) {
             current.copy(
                 hasCompletedSetup = true,
                 defaultDir = defDir,
+                downloadTargetMultiBootPath = obj.optString("downloadTargetMultiBootPath", current.downloadTargetMultiBootPath),
                 favoriteQuickMountPath = obj.optString("favoriteQuickMountPath", current.favoriteQuickMountPath),
                 keepAdbActive = obj.optBoolean("keepAdbActive", current.keepAdbActive),
                 autoPatchSelinux = obj.optBoolean("autoPatchSelinux", current.autoPatchSelinux),

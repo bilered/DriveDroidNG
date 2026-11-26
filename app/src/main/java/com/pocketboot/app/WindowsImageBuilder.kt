@@ -114,7 +114,7 @@ object WindowsImageBuilder {
         val qIso = shellQuote(resolved)
         val hdrTmp = File(context.cacheDir, "pb_wim_hdr_${System.nanoTime()}.bin")
         val xmlTmp = File(context.cacheDir, "pb_wim_xml_${System.nanoTime()}.bin")
-        try {
+        val fastFound: List<WindowsEditionItem> = try {
             val mounted = Shell.cmd(
                 """
                 mkdir -p $TEMP_EDITION_MNT && umount $TEMP_EDITION_MNT 2>/dev/null || true
@@ -124,64 +124,74 @@ object WindowsImageBuilder {
                 """.trimIndent()
             ).exec().isSuccess
             if (!mounted) {
-                // Fallback for kernels restricting UDF loop-mounts: peek install.wim/esd via bundled 7zzs + wimlib-imagex
-                return@withContext inspectEditionsViaBundledTools(context, resolved)
-            }
-
-            val wimPath = Shell.cmd(
-                "find $TEMP_EDITION_MNT -maxdepth 2 -type f \\( -iname 'install.wim' -o -iname 'install.esd' -o -iname 'install.swm' \\) 2>/dev/null | head -n 1"
-            ).exec().out.firstOrNull().orEmpty().trim()
-            if (wimPath.isBlank()) return@withContext emptyList()
-
-            val qWim = shellQuote(wimPath)
-            val qHdr = shellQuote(hdrTmp.absolutePath)
-            val gotHdr = Shell.cmd("dd if=$qWim of=$qHdr bs=1 count=208 2>/dev/null && chmod 0644 $qHdr").exec().isSuccess
-            if (!gotHdr || !hdrTmp.exists() || hdrTmp.length() < 104L) return@withContext emptyList()
-
-            val hdr = hdrTmp.readBytes()
-            val magic = String(hdr, 0, 5, Charsets.US_ASCII)
-            if (magic != "MSWIM" && magic != "WLPWM") return@withContext emptyList()
-
-            // WIMHEADER_V1_PACKED: rhXmlData (RESHDR_DISK_SHORT, 24 bytes) starts at offset 72
-            // bytes 72..78: 7-byte LE size, byte 79: flags, bytes 80..87: 8-byte LE file offset
-            var xmlSize = 0L
-            for (i in 0 until 7) {
-                xmlSize = xmlSize or ((hdr[72 + i].toLong() and 0xFFL) shl (8 * i))
-            }
-            val xmlOffset = ByteBuffer.wrap(hdr, 80, 8).order(ByteOrder.LITTLE_ENDIAN).long
-            if (xmlOffset <= 0L || xmlSize <= 16L || xmlSize > 2L * 1024L * 1024L) return@withContext emptyList()
-
-            val qXml = shellQuote(xmlTmp.absolutePath)
-            val skipBlocks = xmlOffset / 512L
-            val leadBytes = (xmlOffset % 512L).toInt()
-            val totalReadBytes = leadBytes + xmlSize
-            val blockCount = (totalReadBytes + 511L) / 512L
-            val gotXml = Shell.cmd(
-                "dd if=$qWim of=$qXml bs=512 skip=$skipBlocks count=$blockCount 2>/dev/null && chmod 0644 $qXml"
-            ).exec().isSuccess
-            if (!gotXml || !xmlTmp.exists()) return@withContext emptyList()
-
-            val rawAll = xmlTmp.readBytes()
-            if (rawAll.size < leadBytes + 4) return@withContext emptyList()
-            val sliceLen = minOf(xmlSize.toInt(), rawAll.size - leadBytes)
-            val xmlText = String(rawAll, leadBytes, sliceLen, Charsets.UTF_16LE)
-
-            val imageRegex = Regex("""<IMAGE\s+INDEX="(\d+)"[^>]*>(.*?)</IMAGE>""", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
-            val displayRegex = Regex("""<DISPLAYNAME>(.*?)</DISPLAYNAME>""", RegexOption.IGNORE_CASE)
-            val nameRegex = Regex("""<NAME>(.*?)</NAME>""", RegexOption.IGNORE_CASE)
-
-            val found = mutableListOf<WindowsEditionItem>()
-            imageRegex.findAll(xmlText).forEach { m ->
-                val idx = m.groupValues[1].toIntOrNull() ?: return@forEach
-                val body = m.groupValues[2]
-                val label = (displayRegex.find(body)?.groupValues?.get(1)
-                    ?: nameRegex.find(body)?.groupValues?.get(1)
-                    ?: "Edition #$idx").trim()
-                if (label.isNotEmpty()) {
-                    found.add(WindowsEditionItem(index = idx, name = label))
+                emptyList()
+            } else {
+                val wimPath = Shell.cmd(
+                    "find $TEMP_EDITION_MNT -maxdepth 2 -type f \\( -iname 'install.wim' -o -iname 'install.esd' -o -iname 'install.swm' \\) 2>/dev/null | head -n 1"
+                ).exec().out.firstOrNull().orEmpty().trim()
+                if (wimPath.isBlank()) {
+                    emptyList()
+                } else {
+                    val qWim = shellQuote(wimPath)
+                    val qHdr = shellQuote(hdrTmp.absolutePath)
+                    val gotHdr = Shell.cmd("dd if=$qWim of=$qHdr bs=1 count=208 2>/dev/null && chmod 0644 $qHdr").exec().isSuccess
+                    if (!gotHdr || !hdrTmp.exists() || hdrTmp.length() < 104L) {
+                        emptyList()
+                    } else {
+                        val hdr = hdrTmp.readBytes()
+                        val magic = String(hdr, 0, 5, Charsets.US_ASCII)
+                        if (magic != "MSWIM" && magic != "WLPWM") {
+                            emptyList()
+                        } else {
+                            // WIMHEADER_V1_PACKED: rhXmlData (RESHDR_DISK_SHORT, 24 bytes) starts at offset 72
+                            // bytes 72..78: 7-byte LE size, byte 79: flags, bytes 80..87: 8-byte LE file offset
+                            var xmlSize = 0L
+                            for (i in 0 until 7) {
+                                xmlSize = xmlSize or ((hdr[72 + i].toLong() and 0xFFL) shl (8 * i))
+                            }
+                            val xmlOffset = ByteBuffer.wrap(hdr, 80, 8).order(ByteOrder.LITTLE_ENDIAN).long
+                            if (xmlOffset <= 0L || xmlSize <= 16L || xmlSize > 2L * 1024L * 1024L) {
+                                emptyList()
+                            } else {
+                                val qXml = shellQuote(xmlTmp.absolutePath)
+                                val skipBlocks = xmlOffset / 512L
+                                val leadBytes = (xmlOffset % 512L).toInt()
+                                val totalReadBytes = leadBytes + xmlSize
+                                val blockCount = (totalReadBytes + 511L) / 512L
+                                val gotXml = Shell.cmd(
+                                    "dd if=$qWim of=$qXml bs=512 skip=$skipBlocks count=$blockCount 2>/dev/null && chmod 0644 $qXml"
+                                ).exec().isSuccess
+                                if (!gotXml || !xmlTmp.exists()) {
+                                    emptyList()
+                                } else {
+                                    val rawAll = xmlTmp.readBytes()
+                                    if (rawAll.size < leadBytes + 4) {
+                                        emptyList()
+                                    } else {
+                                        val sliceLen = minOf(xmlSize.toInt(), rawAll.size - leadBytes)
+                                        val xmlText = String(rawAll, leadBytes, sliceLen, Charsets.UTF_16LE)
+                                        val imageRegex = Regex("""<IMAGE\s+INDEX="(\d+)"[^>]*>(.*?)</IMAGE>""", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
+                                        val displayRegex = Regex("""<DISPLAYNAME>(.*?)</DISPLAYNAME>""", RegexOption.IGNORE_CASE)
+                                        val nameRegex = Regex("""<NAME>(.*?)</NAME>""", RegexOption.IGNORE_CASE)
+                                        val found = mutableListOf<WindowsEditionItem>()
+                                        imageRegex.findAll(xmlText).forEach { m ->
+                                            val idx = m.groupValues[1].toIntOrNull() ?: return@forEach
+                                            val body = m.groupValues[2]
+                                            val label = (displayRegex.find(body)?.groupValues?.get(1)
+                                                ?: nameRegex.find(body)?.groupValues?.get(1)
+                                                ?: "Edition #$idx").trim()
+                                            if (label.isNotEmpty()) {
+                                                found.add(WindowsEditionItem(index = idx, name = label))
+                                            }
+                                        }
+                                        found.sortedBy { it.index }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
-            found.sortedBy { it.index }
         } catch (_: Exception) {
             emptyList()
         } finally {
@@ -189,6 +199,7 @@ object WindowsImageBuilder {
             xmlTmp.delete()
             Shell.cmd("umount $TEMP_EDITION_MNT 2>/dev/null || umount -l $TEMP_EDITION_MNT 2>/dev/null; rm -rf $TEMP_EDITION_MNT 2>/dev/null").exec()
         }
+        if (fastFound.isNotEmpty()) fastFound else inspectEditionsViaBundledTools(context, resolved)
     }
 
     private fun inspectEditionsViaBundledTools(context: Context, resolvedIso: String): List<WindowsEditionItem> {
@@ -200,10 +211,15 @@ object WindowsImageBuilder {
             val q7z = shellQuote(sevenZip)
             val qWim = shellQuote(wimlib)
             val qTmp = shellQuote(tmpDir.absolutePath)
-            // Extract only install.wim/esd if small or use 7zzs listing to locate exact path
-            val wimRel = Shell.cmd(
-                "$q7z l -ba $qIso 2>/dev/null | awk '{print \$NF}' | grep -iE '(^|/)sources/install\\.(wim|esd|swm)$' | head -n 1"
-            ).exec().out.firstOrNull().orEmpty().trim()
+            // Locate exact sources/install.(wim|esd|swm) path without relying on `awk` (handles spaces safely)
+            val wimRegex = Regex("""(^|/)sources/install\.(wim|esd|swm)$""", RegexOption.IGNORE_CASE)
+            val wimRel = Shell.cmd("$q7z l -slt $qIso 2>/dev/null").exec().out
+                .asSequence()
+                .map { it.trim() }
+                .filter { it.startsWith("Path = ") }
+                .map { it.removePrefix("Path = ").trim() }
+                .firstOrNull { p -> wimRegex.containsMatchIn(p.replace('\\', '/')) }
+                .orEmpty()
             if (wimRel.isBlank()) return emptyList()
             val extOk = Shell.cmd("export TMPDIR=$qTmp && $q7z e -y -o$qTmp $qIso ${shellQuote(wimRel)} >/dev/null 2>&1").exec().isSuccess
             val extracted = tmpDir.listFiles()?.firstOrNull { it.isFile && it.length() > 1024L } ?: return emptyList()
@@ -287,19 +303,25 @@ object WindowsImageBuilder {
             return runCatching { cached.readBytes() }.getOrNull()
         }
         return runCatching {
-            val conn = (URL(UEFI_NTFS_URL).openConnection() as HttpURLConnection).apply {
+            val url = URL(UEFI_NTFS_URL)
+            require(url.protocol.equals("https", ignoreCase = true)) { "HTTPS required for UEFI:NTFS download." }
+            val conn = (url.openConnection() as HttpURLConnection).apply {
                 connectTimeout = 10000
                 readTimeout = 15000
                 instanceFollowRedirects = true
             }
-            if (conn.responseCode in 200..299) {
-                val bytes = conn.inputStream.use { it.readBytes() }
-                if (bytes.size >= 65536) {
-                    cached.writeBytes(bytes)
-                    return bytes
+            try {
+                if (conn.responseCode in 200..299) {
+                    val bytes = conn.inputStream.use { it.readBytes() }
+                    if (bytes.size >= 65536) {
+                        cached.writeBytes(bytes)
+                        return bytes
+                    }
                 }
+                null
+            } finally {
+                conn.disconnect()
             }
-            null
         }.getOrNull()
     }
 
@@ -363,14 +385,15 @@ object WindowsImageBuilder {
                 return@withContext ActionResult(false, "Source ISO not found or empty.", entries = entries)
             }
             val extraDriversBytes = if (config.extraDriversDir.isNotBlank()) {
-                val drvResolved = UsbGadgetEngine.resolveDirectPath(config.extraDriversDir)
-                Shell.cmd("du -sb ${shellQuote(drvResolved)} 2>/dev/null | awk '{print \$1}'").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                UsbGadgetEngine.queryDirSizeBytes(config.extraDriversDir)
             } else 0L
 
             val uefiNtfsBytes = loadUefiNtfsImage(context)
             val layout = DiskPartitioner.calculateLayout(isoSize + extraDriversBytes, uefiNtfsBytes?.size?.toLong() ?: (1024L * 1024L))
 
-            val freeSpace = UsbGadgetEngine.getFreeSpaceBytes(safeDir)
+            val rawFreeSpace = UsbGadgetEngine.getFreeSpaceBytes(safeDir)
+            val existingOutAllocB = UsbGadgetEngine.queryExistingFileAllocatedBytes(outPath)
+            val freeSpace = if (rawFreeSpace > 0L) rawFreeSpace + existingOutAllocB else 0L
             if (freeSpace > 0L && freeSpace < layout.totalBytes + (128L * 1024L * 1024L)) {
                 val needed = UsbGadgetEngine.formatBytes(layout.totalBytes)
                 val avail = UsbGadgetEngine.formatBytes(freeSpace)
@@ -387,9 +410,12 @@ object WindowsImageBuilder {
             var hasOver4GbFile = isoSize > FAT32_MAX_FILE
             if (sevenZip != null) {
                 entries.add(LogEntry(ts, "win-build", "Extractor: $sevenZip"))
-                val maxEntrySize = Shell.cmd(
-                    "${shellQuote(sevenZip)} l -slt $qIso 2>/dev/null | awk -F' = ' '/^Size = /{if(\$2+0>m)m=\$2+0} END{print m+0}'"
-                ).exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                val maxEntrySize = Shell.cmd("${shellQuote(sevenZip)} l -slt $qIso 2>/dev/null").exec().out
+                    .asSequence()
+                    .map { it.trim() }
+                    .filter { it.startsWith("Size = ") }
+                    .mapNotNull { it.removePrefix("Size = ").trim().toLongOrNull() }
+                    .maxOrNull() ?: 0L
                 if (maxEntrySize > 0L) {
                     hasOver4GbFile = maxEntrySize > FAT32_MAX_FILE
                     entries.add(LogEntry(ts, "win-build", "Largest file in ISO: ${UsbGadgetEngine.formatBytes(maxEntrySize)}"))
@@ -644,6 +670,11 @@ object WindowsImageBuilder {
             val qSourcesDir = shellQuote(sourcesDir)
             val installWimCandidate = Shell.cmd("find $qSourcesDir -maxdepth 1 -type f \\( -iname 'install.wim' -o -iname 'install.esd' -o -iname 'install.swm' \\) 2>/dev/null | head -n 1").exec().out.firstOrNull().orEmpty().trim()
             val bootWimCandidate = Shell.cmd("find $qSourcesDir -maxdepth 1 -type f -iname 'boot.wim' 2>/dev/null | head -n 1").exec().out.firstOrNull().orEmpty().trim()
+            if (installWimCandidate.isBlank() && bootWimCandidate.isBlank()) {
+                entries.add(LogEntry(ts, "win-build", "Extracted partition is missing sources/install.* and sources/boot.wim (UDF/ISO9660 bridge or invalid Windows ISO)", true))
+                cleanup(deletePartial = true)
+                return@withContext ActionResult(false, "Extracted ISO is missing Windows installation files (sources/install.* or boot.wim).", entries = entries)
+            }
 
             if (wimBin != null && installWimCandidate.isNotBlank()) {
                 val w7Res = BuildThermalHelper.runIsolatedRootScript(
@@ -878,7 +909,10 @@ object WindowsImageBuilder {
                 if (drvRes.isSuccess) {
                     entries.add(LogEntry(ts, "win-build", "Injected Drivers/Apps folder from $drvSrc into /Drivers"))
                 } else {
-                    entries.add(LogEntry(ts, "win-build", "Driver folder copy warning: ${(drvRes.out + drvRes.err).joinToString(" ").take(120)}", true))
+                    val drvErr = (drvRes.out + drvRes.err).joinToString(" ").take(140).trim()
+                    entries.add(LogEntry(ts, "win-build", "Driver folder copy failed: $drvErr", true))
+                    cleanup(deletePartial = true)
+                    return@withContext ActionResult(false, "Failed to copy Drivers/Apps folder into Windows USB: ${drvErr.ifBlank { "check folder access & free space" }}", entries = entries)
                 }
             }
 
@@ -897,6 +931,7 @@ object WindowsImageBuilder {
             UsbGadgetEngine.fixUserStoragePermissions(context, outPath, isDir = false)
             val builtOutBytes = Shell.cmd("stat -c '%s' $qOut 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
             if (builtOutBytes > 0L) UsbGadgetEngine.syncMediaStoreFileSize(context, outPath, builtOutBytes)
+            IsoInspector.invalidate(outPath)
 
             onProgress(WindowsBuildProgress("Done!", safeName, 1f, false))
             entries.add(LogEntry(ts, "win-build", "Built Windows USB image: $outPath"))
@@ -1009,6 +1044,7 @@ fun WindowsBuilderSheet(
 
     var driversBytes by remember(isoFile.path) { mutableStateOf(0L) }
     var targetExists by remember(isoFile.path) { mutableStateOf(false) }
+    var existingTargetAllocBytes by remember(isoFile.path) { mutableStateOf(0L) }
     val resolvedOutName = remember(outputName, baseName) { UsbGadgetEngine.sanitizeOutputFileName(outputName.ifBlank { baseName }, ".img", "windows-usb") }
     LaunchedEffect(isoFile.path) {
         inspectingEditions = true
@@ -1027,16 +1063,21 @@ fun WindowsBuilderSheet(
     }
     LaunchedEffect(extraDriversDir) {
         driversBytes = if (extraDriversDir.isBlank()) 0L else withContext(Dispatchers.IO) {
-            val drv = UsbGadgetEngine.resolveDirectPath(extraDriversDir)
-            val qDrv = "'${drv.replace("'", "'\\''")}'"
-            Shell.cmd("du -sb $qDrv 2>/dev/null | awk '{print \$1}'").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+            UsbGadgetEngine.queryDirSizeBytes(extraDriversDir)
         }
     }
     LaunchedEffect(defaultDir, resolvedOutName) {
         targetExists = UsbGadgetEngine.fileExistsInDir(defaultDir, resolvedOutName)
+        existingTargetAllocBytes = if (targetExists) {
+            withContext(Dispatchers.IO) { UsbGadgetEngine.queryExistingFileAllocatedBytes("${defaultDir.trimEnd('/')}/$resolvedOutName") }
+        } else 0L
+    }
+    var rawFreeSpace by remember(defaultDir) { mutableStateOf(0L) }
+    LaunchedEffect(defaultDir) {
+        rawFreeSpace = withContext(Dispatchers.IO) { UsbGadgetEngine.getFreeSpaceBytes(defaultDir) }
     }
     val estNeeded = isoFile.sizeBytes + driversBytes + (512L * 1024L * 1024L)
-    val freeSpace = remember(defaultDir) { UsbGadgetEngine.getFreeSpaceBytes(defaultDir) }
+    val freeSpace = if (rawFreeSpace > 0L) rawFreeSpace + existingTargetAllocBytes else 0L
     val lowSpace = freeSpace in 1 until estNeeded
 
     ModalBottomSheet(onDismissRequest = { if (!building) onDismiss() }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), containerColor = PocketColors.surfaceCard) {

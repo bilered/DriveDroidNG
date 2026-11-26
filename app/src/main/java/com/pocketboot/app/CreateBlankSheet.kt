@@ -78,8 +78,8 @@ fun CreateBlankSheetContent(
 
     val displaySize = if (effectiveSizeMb >= 1024) {
         String.format(Locale.US, "%.2f GB", effectiveSizeMb / 1024.0)
+            .replace(Regex("(\\.\\d*?[1-9])0+ GB$"), "$1 GB")
             .replace(".00 GB", " GB")
-            .replace("0 GB", " GB")
     } else {
         "$effectiveSizeMb MB"
     }
@@ -221,7 +221,7 @@ fun CreateBlankSheetContent(
                                             if (currentVal != null && currentVal > 0.0) {
                                                 customSizeText = if (unit == SizeUnit.GB) {
                                                     String.format(Locale.US, "%.1f", (currentVal / 1024.0).coerceAtLeast(0.5))
-                                                        .replace(".0", "")
+                                                        .removeSuffix(".0")
                                                 } else {
                                                     (currentVal * 1024.0).roundToInt().toString()
                                                 }
