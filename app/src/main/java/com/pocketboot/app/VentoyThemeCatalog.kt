@@ -184,8 +184,10 @@ object VentoyThemeCatalog {
                 else -> ""
             }
             if (backend.isEmpty()) continue
+            val leafLow = backend.substringAfterLast('/').lowercase()
             val styleHint = when {
-                backend.contains("persistence", ignoreCase = true) && !backend.contains("casper", ignoreCase = true) -> "Debian/Kali"
+                leafLow.contains("persistence") && !leafLow.contains("casper") && !leafLow.contains("writable") -> "Debian/Kali"
+                leafLow.contains("casper") -> "Pop!/Legacy"
                 else -> "Ubuntu/Mint"
             }
             out.add(

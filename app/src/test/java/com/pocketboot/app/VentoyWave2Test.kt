@@ -70,14 +70,21 @@ class VentoyWave2Test {
 
     @Test
     fun ventoyPersistenceHelper_sanitizesBackendPathsAndEligibility() {
-        val ubPath = VentoyPersistenceHelper.buildPersistenceBackendPath("/ISO/Ubuntu 26.04 (LTS).iso", LinuxPersistenceStyle.UBUNTU_MINT)
+        val ubPath = VentoyPersistenceHelper.buildPersistenceBackendPath("/ISO/Ubuntu 26.04 (LTS).iso", LinuxPersistenceStyle.UBUNTU_WRITABLE)
         assertTrue(ubPath.startsWith("/ventoy/persistence/"))
-        assertTrue(ubPath.endsWith("_casper-rw.dat"))
+        assertTrue(ubPath.endsWith("_writable.dat"))
         assertFalse(ubPath.contains(" "))
+
+        val popPath = VentoyPersistenceHelper.buildPersistenceBackendPath("pop-os_24.04.iso", LinuxPersistenceStyle.CASPER_RW)
+        assertTrue(popPath.endsWith("_casper-rw.dat"))
 
         val kaliPath = VentoyPersistenceHelper.buildPersistenceBackendPath("../evil/kali-linux-2026.iso", LinuxPersistenceStyle.DEBIAN_KALI)
         assertTrue(kaliPath.endsWith("_persistence.dat"))
         assertFalse(kaliPath.contains(".."))
+
+        assertEquals(LinuxPersistenceStyle.DEBIAN_KALI, VentoyPersistenceHelper.guessStyleForIso("kali-linux-2026.1-live-amd64.iso"))
+        assertEquals(LinuxPersistenceStyle.CASPER_RW, VentoyPersistenceHelper.guessStyleForIso("pop-os_24.04_amd64.iso"))
+        assertEquals(LinuxPersistenceStyle.UBUNTU_WRITABLE, VentoyPersistenceHelper.guessStyleForIso("ubuntu-26.04.1-desktop-amd64.iso"))
 
         assertTrue(VentoyPersistenceHelper.isLinuxPersistenceEligible("ubuntu-26.04.iso"))
         assertFalse(VentoyPersistenceHelper.isLinuxPersistenceEligible("Win11_26H2_x64.iso"))
@@ -92,6 +99,7 @@ class VentoyWave2Test {
 
         assertEquals(driveDefault, VentoyImageBuilder.resolveProfileWinUtil(VentoyImageBuilder.PROFILE_ID_DEFAULT, driveDefault, customMap))
         assertTrue(VentoyImageBuilder.resolveProfileWinUtil(VentoyImageBuilder.PROFILE_ID_MINIMAL, driveDefault, customMap).hasAnyActive())
+        assertTrue(VentoyImageBuilder.resolveProfileWinUtil(VentoyImageBuilder.PROFILE_ID_LAPTOP, driveDefault, customMap).hasAnyActive())
         assertTrue(VentoyImageBuilder.resolveProfileWinUtil("custom:CleanGaming", driveDefault, customMap).removeEdge)
         assertEquals("custom_cleangaming", VentoyImageBuilder.profileSlug("custom:CleanGaming"))
 

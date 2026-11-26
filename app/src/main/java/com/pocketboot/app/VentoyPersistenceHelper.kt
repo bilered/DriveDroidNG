@@ -25,6 +25,19 @@ object VentoyPersistenceHelper {
     /**
      * Generates a clean, deterministic, traversal-safe persistence backend path inside Partition 1.
      */
+    fun guessStyleForIso(isoName: String): LinuxPersistenceStyle {
+        val low = isoName.lowercase()
+        return when {
+            low.contains("kali") || low.contains("debian") || low.contains("tails") ||
+                low.contains("gparted") || low.contains("clonezilla") || low.contains("parrot") ->
+                LinuxPersistenceStyle.DEBIAN_KALI
+            low.contains("pop-os") || low.contains("pop_os") ->
+                LinuxPersistenceStyle.CASPER_RW
+            else ->
+                LinuxPersistenceStyle.UBUNTU_WRITABLE
+        }
+    }
+
     fun buildPersistenceBackendPath(isoRelPath: String, style: LinuxPersistenceStyle): String {
         val leaf = isoRelPath.replace('\\', '/').substringAfterLast('/').substringBeforeLast('.')
         val safeStem = leaf
@@ -33,8 +46,7 @@ object VentoyPersistenceHelper {
             .trim('_', '.')
             .take(32)
             .ifBlank { "linux" }
-        val suffix = if (style == LinuxPersistenceStyle.DEBIAN_KALI) "persistence" else "casper-rw"
-        return "/ventoy/persistence/${safeStem}_${suffix}.dat"
+        return "/ventoy/persistence/${safeStem}_${style.volumeLabel}.dat"
     }
 
     suspend fun createPersistenceForIso(

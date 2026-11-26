@@ -785,7 +785,7 @@ object VentoyImageBuilder {
         PROFILE_ID_MINIMAL -> WinUtilTweaksConfig.minimalPreset()
         PROFILE_ID_ADVANCED -> WinUtilTweaksConfig.advancedPreset()
         PROFILE_ID_DESKTOP -> WinUtilTweaksConfig.desktopPreset()
-        PROFILE_ID_LAPTOP -> WinUtilTweaksConfig.laptopPreset()
+        PROFILE_ID_LAPTOP -> WinUtilTweaksConfig.laptopSafePreset()
         else -> customProfiles[profileId]?.let { WinUtilTweaksConfig.fromJsonString(it) } ?: driveWinUtil
     }
 
@@ -3914,7 +3914,7 @@ fun VentoyManagerSheet(
         val cNow = contents
         val normRel = VentoyImageBuilder.normalizeVentoyRelPath(item.relativePath)
         val existingPers = cNow?.persistenceEntries?.firstOrNull { it.imagePath.equals(normRel, ignoreCase = true) }
-        val defaultStyle = remember(item.name) { LinuxPersistenceStyle.guessForIso(item.name) }
+        val defaultStyle = remember(item.name) { VentoyPersistenceHelper.guessStyleForIso(item.name) }
         var persStyle by remember(item.relativePath) { mutableStateOf(defaultStyle) }
         var persSizeGb by remember(item.relativePath) { mutableIntStateOf(4) }
 
@@ -3942,7 +3942,8 @@ fun VentoyManagerSheet(
                     Text("Distro Format", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         listOf(
-                            LinuxPersistenceStyle.UBUNTU_MINT to "Ubuntu / Mint",
+                            LinuxPersistenceStyle.UBUNTU_WRITABLE to "Ubuntu 20+",
+                            LinuxPersistenceStyle.CASPER_RW to "Pop! / Legacy",
                             LinuxPersistenceStyle.DEBIAN_KALI to "Debian / Kali"
                         ).forEach { (st, lbl) ->
                             val sel = persStyle == st
