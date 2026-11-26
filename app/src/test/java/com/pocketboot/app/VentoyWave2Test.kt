@@ -89,6 +89,9 @@ class VentoyWave2Test {
         assertTrue(VentoyPersistenceHelper.isLinuxPersistenceEligible("ubuntu-26.04.iso"))
         assertFalse(VentoyPersistenceHelper.isLinuxPersistenceEligible("Win11_26H2_x64.iso"))
         assertFalse(VentoyPersistenceHelper.isLinuxPersistenceEligible("disk.img"))
+
+        assertTrue(VentoyPersistenceHelper.hasValidExt4SuperblockMagic(byteArrayOf(0x53.toByte(), 0xEF.toByte())))
+        assertFalse(VentoyPersistenceHelper.hasValidExt4SuperblockMagic(byteArrayOf(0x00, 0x00)))
     }
 
     @Test

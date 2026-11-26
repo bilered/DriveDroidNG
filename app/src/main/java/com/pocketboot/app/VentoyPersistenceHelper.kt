@@ -14,6 +14,8 @@ import java.io.File
 object VentoyPersistenceHelper {
 
     private const val TEMP_PERS_EXT4_MNT = "/data/local/tmp/pb_vtoy_pers_mnt"
+    private const val TEMP_PERS_SEED_DIR = "/data/local/tmp/pb_vtoy_pers_seed"
+    private const val TEMP_PERS_STAGE_FILE = "/data/local/tmp/pb_vtoy_pers_stage.dat"
 
     private fun shellQuote(value: String): String = "'${value.replace("'", "'\\''")}'"
 
@@ -49,6 +51,38 @@ object VentoyPersistenceHelper {
         return "/ventoy/persistence/${safeStem}_${style.volumeLabel}.dat"
     }
 
+    internal fun hasValidExt4SuperblockMagic(headerAt1080: ByteArray): Boolean =
+        headerAt1080.size >= 2 &&
+            headerAt1080[0] == 0x53.toByte() &&
+            headerAt1080[1] == 0xEF.toByte()
+
+    private fun verifyExt4FileSuperblock(context: Context, datFullPath: String): Boolean {
+        val tmpMagic = File(context.cacheDir, "pb_ext4_magic_${System.nanoTime()}.bin")
+        val qDat = shellQuote(datFullPath)
+        val qTmp = shellQuote(tmpMagic.absolutePath)
+        return try {
+            Shell.cmd("dd if=$qDat of=$qTmp bs=1 skip=1080 count=2 2>/dev/null && chmod 0644 $qTmp").exec()
+            val bytes = if (tmpMagic.exists()) tmpMagic.readBytes() else ByteArray(0)
+            hasValidExt4SuperblockMagic(bytes)
+        } catch (_: Exception) {
+            false
+        } finally {
+            tmpMagic.delete()
+        }
+    }
+
+    private fun findMke2fsBinary(): String? {
+        val out = Shell.cmd(
+            """
+            if command -v mke2fs >/dev/null 2>&1; then command -v mke2fs
+            elif command -v mkfs.ext4 >/dev/null 2>&1; then command -v mkfs.ext4
+            elif [ -x /system/bin/mke2fs ]; then echo /system/bin/mke2fs
+            fi
+            """.trimIndent()
+        ).exec().out.firstOrNull().orEmpty().trim()
+        return out.ifBlank { null }
+    }
+
     suspend fun createPersistenceForIso(
         context: Context,
         ventoyImgPath: String,
@@ -64,6 +98,9 @@ object VentoyPersistenceHelper {
         val info = VentoyImageBuilder.probeVentoyImage(resolvedImg)
             ?: return@withContext ActionResult(false, "Selected file is not a valid Multi-Boot image.")
 
+        val mke2fsBin = findMke2fsBinary()
+            ?: return@withContext ActionResult(false, "No mke2fs/mkfs.ext4 binary found on device to format ext4 persistence.")
+
         val clampedGb = sizeGb.coerceIn(1, 16)
         val sizeBytes = clampedGb.toLong() * 1024L * 1024L * 1024L
         val normIso = VentoyThemeCatalog.normalizeRelPath(isoRelativePath)
@@ -73,20 +110,21 @@ object VentoyPersistenceHelper {
         if (partLoop.isBlank() || !partLoop.startsWith("/dev/")) {
             return@withContext ActionResult(false, "Could not attach Multi-Boot partition.")
         }
-        var datLoop = ""
+        var stageLoop = ""
         val datFullPath = "${VentoyImageBuilder.TEMP_VENTOY_MNT}$backendRel"
         val qDat = shellQuote(datFullPath)
         var datAllocated = false
 
         fun cleanupAll(deleteDat: Boolean) {
-            if (datLoop.isNotBlank()) {
+            if (stageLoop.isNotBlank()) {
                 BuildThermalHelper.unmountAndDetachClean(
                     mountPoints = listOf(TEMP_PERS_EXT4_MNT),
-                    loopDevices = listOf(datLoop),
+                    loopDevices = listOf(stageLoop),
                     removeDirs = true
                 )
-                datLoop = ""
+                stageLoop = ""
             }
+            Shell.cmd("rm -rf $TEMP_PERS_SEED_DIR $TEMP_PERS_STAGE_FILE 2>/dev/null || true").exec()
             if (deleteDat && datAllocated) {
                 Shell.cmd("rm -f $qDat 2>/dev/null || true").exec()
             }
@@ -137,7 +175,7 @@ object VentoyPersistenceHelper {
                 Shell.cmd("rm -f ${shellQuote("${VentoyImageBuilder.TEMP_VENTOY_MNT}$oldBackend")} 2>/dev/null || true").exec()
             }
 
-            onProgress(WindowsBuildProgress("Allocating ${clampedGb} GB persistence...", "${style.volumeLabel} ($fsLabel)", 0.32f, false))
+            onProgress(WindowsBuildProgress("Allocating ${clampedGb} GB persistence...", "${style.volumeLabel} ($fsLabel)", 0.30f, false))
             val persDir = "${VentoyImageBuilder.TEMP_VENTOY_MNT}/ventoy/persistence"
             val allocOk = Shell.cmd(
                 "mkdir -p ${shellQuote(persDir)} && rm -f $qDat && " +
@@ -152,57 +190,79 @@ object VentoyPersistenceHelper {
                 return@withContext ActionResult(false, "Failed to allocate ${clampedGb} GB persistence file inside Multi-Boot drive.")
             }
 
-            onProgress(WindowsBuildProgress("Formatting ext4 persistence...", "Label: ${style.volumeLabel}", 0.58f, true))
-            datLoop = Shell.cmd(
-                """
-                L=${'$'}(losetup -f -s $qDat 2>/dev/null)
-                if [ -z "${'$'}L" ]; then L=${'$'}(losetup -f --show $qDat 2>/dev/null); fi
-                if [ -z "${'$'}L" ]; then
-                    CAND=${'$'}(losetup -f 2>/dev/null)
-                    if [ -n "${'$'}CAND" ] && losetup "${'$'}CAND" $qDat 2>/dev/null; then L="${'$'}CAND"; fi
-                fi
-                echo "${'$'}L"
-                """.trimIndent()
-            ).exec().out.lastOrNull().orEmpty().trim()
-            if (datLoop.isBlank() || !datLoop.startsWith("/dev/")) {
-                cleanupAll(deleteDat = true)
-                return@withContext ActionResult(false, "Could not attach loop device for persistence file.")
-            }
-
-            val qDatLoop = shellQuote(datLoop)
-            val label = style.volumeLabel
-            val fmtRes = Shell.cmd(
-                """
-                if command -v mke2fs >/dev/null 2>&1; then mke2fs -t ext4 -F -L $label $qDatLoop 2>&1
-                elif command -v mkfs.ext4 >/dev/null 2>&1; then mkfs.ext4 -F -L $label $qDatLoop 2>&1
-                elif [ -x /system/bin/mke2fs ]; then /system/bin/mke2fs -t ext4 -F -L $label $qDatLoop 2>&1
-                else echo "No mke2fs/mkfs.ext4 binary found on device"; exit 1; fi
-                """.trimIndent()
-            ).exec()
-            if (!fmtRes.isSuccess) {
-                val errHint = (fmtRes.out + fmtRes.err).takeLast(2).joinToString(" ").take(160)
-                cleanupAll(deleteDat = true)
-                return@withContext ActionResult(false, "ext4 persistence format failed: $errHint")
-            }
+            // Format `.dat` DIRECTLY as a regular file with mke2fs — avoids nested loop devices over exFAT/FUSE!
+            onProgress(WindowsBuildProgress("Formatting ext4 persistence...", "Label: ${style.volumeLabel} (direct format)", 0.58f, true))
+            val qMke2fs = shellQuote(mke2fsBin)
+            val qLabel = shellQuote(style.volumeLabel)
+            var formatSucceeded = false
+            var lastFmtErr = ""
 
             if (style == LinuxPersistenceStyle.DEBIAN_KALI) {
-                onProgress(WindowsBuildProgress("Initializing persistence.conf...", "/ union", 0.78f, false))
-                val confOk = Shell.cmd(
-                    "mkdir -p $TEMP_PERS_EXT4_MNT && mount -t ext4 -o rw $qDatLoop $TEMP_PERS_EXT4_MNT 2>&1 && " +
-                        "printf '/ union\\n' > $TEMP_PERS_EXT4_MNT/persistence.conf"
+                // Seed `/persistence.conf` directly during mke2fs via `-d` (no losetup or mount needed!)
+                val seedReady = Shell.cmd(
+                    "rm -rf $TEMP_PERS_SEED_DIR && mkdir -p $TEMP_PERS_SEED_DIR && printf '/ union\\n' > $TEMP_PERS_SEED_DIR/persistence.conf"
                 ).exec().isSuccess
-                if (!confOk) {
-                    cleanupAll(deleteDat = true)
-                    return@withContext ActionResult(false, "Could not write /persistence.conf inside ext4 persistence image.")
+                if (seedReady) {
+                    val fmtRes = Shell.cmd("$qMke2fs -t ext4 -F -m 0 -L $qLabel -d $TEMP_PERS_SEED_DIR $qDat 2>&1").exec()
+                    if (fmtRes.isSuccess && verifyExt4FileSuperblock(context, datFullPath)) {
+                        formatSucceeded = true
+                    } else {
+                        lastFmtErr = (fmtRes.out + fmtRes.err).takeLast(2).joinToString(" ").take(160)
+                    }
+                }
+                // Fallback if device mke2fs lacks `-d`: stage sparse file on native /data/local/tmp (never nested in exFAT/FUSE)
+                if (!formatSucceeded) {
+                    onProgress(WindowsBuildProgress("Formatting Debian/Kali persistence...", "Staging on native /data", 0.68f, true))
+                    val qStage = shellQuote(TEMP_PERS_STAGE_FILE)
+                    val stageAlloc = Shell.cmd(
+                        "rm -f $qStage && (truncate -s $sizeBytes $qStage 2>/dev/null || dd if=/dev/zero of=$qStage bs=1M count=0 seek=${clampedGb * 1024} 2>&1)"
+                    ).exec().isSuccess
+                    val stageFmt = stageAlloc && Shell.cmd("$qMke2fs -t ext4 -F -m 0 -L $qLabel $qStage 2>&1").exec().isSuccess
+                    if (stageFmt) {
+                        stageLoop = Shell.cmd(
+                            """
+                            L=${'$'}(losetup -f -s $qStage 2>/dev/null)
+                            if [ -z "${'$'}L" ]; then L=${'$'}(losetup -f --show $qStage 2>/dev/null); fi
+                            if [ -z "${'$'}L" ]; then
+                                CAND=${'$'}(losetup -f 2>/dev/null)
+                                if [ -n "${'$'}CAND" ] && losetup "${'$'}CAND" $qStage 2>/dev/null; then L="${'$'}CAND"; fi
+                            fi
+                            echo "${'$'}L"
+                            """.trimIndent()
+                        ).exec().out.lastOrNull().orEmpty().trim()
+                        val wroteConf = stageLoop.startsWith("/dev/") && Shell.cmd(
+                            "mkdir -p $TEMP_PERS_EXT4_MNT && mount -t ext4 -o rw ${shellQuote(stageLoop)} $TEMP_PERS_EXT4_MNT 2>&1 && " +
+                                "printf '/ union\\n' > $TEMP_PERS_EXT4_MNT/persistence.conf"
+                        ).exec().isSuccess
+                        if (stageLoop.isNotBlank()) {
+                            BuildThermalHelper.unmountAndDetachClean(listOf(TEMP_PERS_EXT4_MNT), listOf(stageLoop), removeDirs = true)
+                            stageLoop = ""
+                        }
+                        if (wroteConf) {
+                            onProgress(WindowsBuildProgress("Copying persistence to Multi-Boot...", "${clampedGb} GB", 0.80f, true))
+                            val cpOk = Shell.cmd("cp -f $qStage $qDat 2>&1").exec().isSuccess
+                            val cpSz = Shell.cmd("stat -c '%s' $qDat 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                            if (cpOk && cpSz == sizeBytes && verifyExt4FileSuperblock(context, datFullPath)) {
+                                formatSucceeded = true
+                            }
+                        }
+                    }
+                    Shell.cmd("rm -f $qStage 2>/dev/null || true").exec()
+                }
+            } else {
+                val fmtRes = Shell.cmd("$qMke2fs -t ext4 -F -m 0 -L $qLabel $qDat 2>&1").exec()
+                if (fmtRes.isSuccess && verifyExt4FileSuperblock(context, datFullPath)) {
+                    formatSucceeded = true
+                } else {
+                    lastFmtErr = (fmtRes.out + fmtRes.err).takeLast(2).joinToString(" ").take(160)
                 }
             }
 
-            BuildThermalHelper.unmountAndDetachClean(
-                mountPoints = listOf(TEMP_PERS_EXT4_MNT),
-                loopDevices = listOf(datLoop),
-                removeDirs = true
-            )
-            datLoop = ""
+            if (!formatSucceeded) {
+                cleanupAll(deleteDat = true)
+                val detail = if (lastFmtErr.isNotBlank()) ": $lastFmtErr" else ""
+                return@withContext ActionResult(false, "ext4 persistence format failed$detail")
+            }
 
             onProgress(WindowsBuildProgress("Updating Multi-Boot config...", backendRel, 0.90f, false))
             VentoyThemeCatalog.upsertPersistenceEntry(rootObj, normIso, backendRel)
@@ -273,7 +333,7 @@ object VentoyPersistenceHelper {
                 tmpJson.delete()
             }
             IsoInspector.invalidate(resolvedImg)
-            ActionResult(true, "Removed Linux persistence for ${isoRelativePath.substringAfterLast('/')}.")
+            ActionResult(true, "Removed Linux persistence for ${isoRelativePath.substringAfterLast('/')}. Tap Reclaim Space to free phone storage.")
         } finally {
             VentoyImageBuilder.unmountVentoyPartition1(loopDev)
         }
