@@ -16,7 +16,7 @@ class FilenameAndVersionTest {
 
     @Test
     fun isoInspector_sanitizesLabelsAndDetectsOsHints() {
-        assertEquals("POCKETBOOT", IsoInspector.sanitizeFatLabel("!!!", fallback = "POCKETBOOT"))
+        assertEquals("POCKETBOOT", IsoInspector.sanitizeFatLabel("///:::***", fallback = "POCKETBOOT"))
         assertEquals("UBUNTU_2604", IsoInspector.sanitizeFatLabel("Ubuntu_2604_Long_Label"))
         assertEquals(IsoOsType.WINDOWS, IsoInspector.quickGuessByName("Win11_26H2_English_x64.iso"))
         assertEquals(IsoOsType.VENTOY_IMAGE, IsoInspector.quickGuessByName("POCKETBOOT Multi ISO.img"))

@@ -56,9 +56,8 @@ class DiskPartitionerTest {
         val primarySig = String(gpt.primarySectors, 512, 8, Charsets.US_ASCII)
         assertEquals("EFI PART", primarySig)
 
-        val primBuf = ByteBuffer.wrap(gpt.primarySectors, 512, 92).order(ByteOrder.LITTLE_ENDIAN)
-        val storedCrc = primBuf.getInt(16)
         val headerCopy = gpt.primarySectors.copyOfRange(512, 512 + 92)
+        val storedCrc = ByteBuffer.wrap(headerCopy).order(ByteOrder.LITTLE_ENDIAN).getInt(16)
         headerCopy[16] = 0; headerCopy[17] = 0; headerCopy[18] = 0; headerCopy[19] = 0
         val crc = CRC32().apply { update(headerCopy) }.value.toInt()
         assertEquals(storedCrc, crc)

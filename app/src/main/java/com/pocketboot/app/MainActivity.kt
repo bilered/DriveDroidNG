@@ -349,38 +349,6 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
 
     LaunchedEffect(Unit) { refreshAll() }
 
-    LaunchedEffect(usbBuildCompletion?.id) {
-        val evt = usbBuildCompletion ?: return@LaunchedEffect
-        UsbBuildManager.consumeCompletion(evt.id)
-        val res = evt.result
-        logs.addAll(res.entries)
-        if (evt.cancelled) {
-            showFeedback(res.userMessage, false)
-        } else if (res.success && res.createdPath != null) {
-            when (evt.kind) {
-                UsbBuildKind.WINDOWS -> windowsBuilderTarget = null
-                UsbBuildKind.LINUX -> linuxBuilderTarget = null
-                UsbBuildKind.MULTIBOOT -> {
-                    showVentoyBuilder = false
-                    ventoyBuilderInitialIso = null
-                    isoTypes[res.createdPath] = IsoOsType.VENTOY_IMAGE
-                }
-            }
-            val updated = settings.copy(
-                pinnedFiles = (settings.pinnedFiles + res.createdPath).distinct(),
-                hiddenFiles = settings.hiddenFiles - res.createdPath
-            )
-            updateSettings(updated, rescan = true)
-            if (evt.autoMountAfterBuild) {
-                mountPath(res.createdPath, evt.autoMountMode, lunIndex = 0)
-            } else {
-                showFeedback(res.userMessage, false)
-            }
-        } else {
-            showFeedback(res.userMessage, true)
-        }
-    }
-
     fun showFeedback(message: String, isError: Boolean = false) {
         statusBannerError = if (isError) message else null
         scope.launch {
@@ -545,6 +513,38 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
             } else {
                 mountPath(shortcutPath, MountMode.AUTO, lunIndex = 0, rememberMode = false)
             }
+        }
+    }
+
+    LaunchedEffect(usbBuildCompletion?.id) {
+        val evt = usbBuildCompletion ?: return@LaunchedEffect
+        UsbBuildManager.consumeCompletion(evt.id)
+        val res = evt.result
+        logs.addAll(res.entries)
+        if (evt.cancelled) {
+            showFeedback(res.userMessage, false)
+        } else if (res.success && res.createdPath != null) {
+            when (evt.kind) {
+                UsbBuildKind.WINDOWS -> windowsBuilderTarget = null
+                UsbBuildKind.LINUX -> linuxBuilderTarget = null
+                UsbBuildKind.MULTIBOOT -> {
+                    showVentoyBuilder = false
+                    ventoyBuilderInitialIso = null
+                    isoTypes[res.createdPath] = IsoOsType.VENTOY_IMAGE
+                }
+            }
+            val updated = settings.copy(
+                pinnedFiles = (settings.pinnedFiles + res.createdPath).distinct(),
+                hiddenFiles = settings.hiddenFiles - res.createdPath
+            )
+            updateSettings(updated, rescan = true)
+            if (evt.autoMountAfterBuild) {
+                mountPath(res.createdPath, evt.autoMountMode, lunIndex = 0)
+            } else {
+                showFeedback(res.userMessage, false)
+            }
+        } else {
+            showFeedback(res.userMessage, true)
         }
     }
 
