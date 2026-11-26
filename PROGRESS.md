@@ -1,21 +1,15 @@
 # PocketBoot Development Progress
 
-## Current Milestone: v4.6.7 (Writable Auto-Mount, Hidden UEFI:NTFS, Editable 1-Line Labels, Clean Flush, Linux FAT32 Boot Fixes & Brand Scrub)
-- **Fixed Windows Setup "Install driver to show hardware" & Missing Explorer Drive (`MainActivity.kt`, `WindowsImageBuilder.kt`, `VentoyImageBuilder.kt`):**
-  - Switched post-build auto-mount for Windows USB and Multi-Boot drives (and Multi-Boot recommended mount mode) from Read-Only USB (`USB_RO`) to **Writable USB (`USB_RW`)** so Windows/WinPE `ntfs.sys` can mount fresh Linux-created NTFS volumes cleanly.
-  - Added shared `BuildThermalHelper.unmountAndDetachClean()` (up to 10 × 1 s `sync` + real `umount` retry before lazy fallback + `losetup -d` + final `sync`) across Windows, Linux, and Multi-Boot builders to prevent dirty/unflushed NTFS handoffs.
-- **Hidden `UEFI:NTFS` Helper Partition (`DiskPartitioner.kt`):**
-  - Updated GPT Partition 2 (`UEFI:NTFS`) attributes from `0x9000000000000000` to **`0xD000000000000001`** (`PLATFORM_REQUIRED | READ_ONLY | HIDDEN | NO_DRIVE_LETTER`) so the 1 MB boot partition no longer appears as an extra drive letter in Windows Explorer while UEFI still boots it and Windows Setup still ignores it.
-- **Hybrid Editable 1-Line Volume Labels (`IsoInspector.kt`, `WindowsImageBuilder.kt`, `LinuxImageBuilder.kt`, `VentoyImageBuilder.kt`):**
-  - **Windows USB:** Defaults to 1-line Explorer-safe `POCKETBOOT-WIN 11` (`WIN 10`, `WIN 8.1`, `WIN 7`, `WIN SRV`) on NTFS (`PB-WIN11` on FAT32), with an editable Volume Label box and live >20-char Explorer wrap warning.
-  - **Multi-Boot:** Defaults to **`POCKETBOOT Multi ISO`** (NTFS, 20 chars) / **`PB MultiISO`** (exFAT, 11 chars) and filename **`POCKETBOOT Multi ISO.img`**, editable, with `-c 4096` NTFS clusters, label preservation on Resize Path B, and instant spaced-name recognition in `IsoInspector.quickGuessByName()`.
-  - **Linux & Tool (Extracted FAT32):** Defaults to the **original ISO-9660 disc label trimmed to 11 chars** (editable), patches `CDLABEL=` / `archisolabel=` / `misolabel=` case-insensitively across boot configs, deduplicates persistence boot flags, and writes standard LBA CHS (`FE FF FF`) MBR entries via `DiskPartitioner.buildLinuxFat32MbrSector()`.
-- **Clean Edition Choice with Full Unattended OOBE (`WindowsImageBuilder.kt`, `WindowsCustomization.kt`):**
-  - Kept `Full Unattended OOBE Skip` + `"Ask during Setup"` on `Panther\unattend.xml` (preserving *"Previous version of Setup"*, Edition picker & EULA while skipping OOBE); only pre-selecting an edition chip injects `/Autounattend.xml` into `boot.wim`.
-- **App-Wide Third-Party Brand Scrub:**
-  - Removed all user-facing `IDM`, `Ventoy`, and `Rufus` references from UI strings, badges, progress states, dialogs, and Activity Logs across the app while keeping proper attribution solely inside **Settings → Open-Source Credits**.
-- **Post-Audit `v4.6.7` Hardening (`BuildThermalHelper.kt`, `VentoyImageBuilder.kt`, `LinuxImageBuilder.kt`, `WindowsImageBuilder.kt`):**
-  - Escaped spaces to `\040` before matching `/proc/mounts` in `unmountAndDetachClean()` so clean-flush retries work inside folders with spaces.
-  - Replaced `blkid -s LABEL -o value` with Toybox-compatible `blkid` regex parsing in Multi-Boot Resize Path B, passed empty `volumeLabel` when untouched in `Auto Select` so exFAT properly gets `PB MultiISO`, deleted partial `.img` on `buildVentoyImage()` exception, and added PID-tracked cancel + clean unmount in Resize Path B.
-  - Extended Linux Extracted FAT32 boot-config syncing to cover `root=live:LABEL=` and GRUB `search ... -l/--label`.
-  - Auto-upgraded unedited `POCKETBOOT-WINDOWS` labels once `install.wim` editions load for generically named Windows ISOs, and tidied `wimBin` lookup.
+## Current Milestone: v4.6.8 (Dedicated Full-Screen System Tweaks, 1:1 Catalog Parity, Search History, Custom Presets, Store-Safe Windows Update Pause & Optional Undo Script)
+- **Dedicated Full-Screen `SystemTweaksScreen.kt`:**
+  - Full-screen edge-to-edge UI titled **"System Tweaks"** with collapsible sections (`Essential (21)`, `Customize Preferences (21)`, `Advanced — Caution (29)`, `Performance Plans (1)`), live active counts, **"Active Only"** filter, unsaved-changes Back guard, and inline `.cmd` preview (`Specialize.cmd`, `SetupComplete.cmd`, `Undo.cmd`).
+  - Live **Search Bar with Persistent Search History** (up to 8 recent searches in `AppPrefs.kt`, starter suggestion chips, per-chip delete, and Clear).
+  - Per-tweak **`ⓘ` Info Dialog** on every single tweak and MPO/Undo option detailing exact registry keys, services, tasks, impact tags, and side effects.
+  - Built-in **`Standard`**, **`Minimal`**, **`Advanced`**, **`Desktop`**, and **`Laptop`** presets + **`+ Save Preset`** custom System Tweaks presets backed up in Settings JSON v3 + live preset match / `(Modified)` indicator.
+  - Optional **"Add Undo Script"** badge toggle (OFF by default, excluded from active count & preset match): drops auto-elevated `Undo_PocketBoot_Tweaks.cmd` to `%PUBLIC%\Desktop\` only when checked and tweaks are active.
+- **1:1 Tweaks Parity & All 9 Pre-Build Audit Fixes:**
+  - Moved **Classic Right-Click Menu** out of Pane 1 into **System Tweaks → Advanced** with automatic legacy preset & Multi-Boot metadata migration.
+  - Added Store-Safe **Disable Windows Update** (2099 UX pause + `AUOptions=2`/`NoAutoUpdate=1` policy guard; preserves Store, Game Pass, Optional Features & Windows Update drivers), **Security-Only Updates**, **Disable Windows Security (Defender)**, 3-state **MPO** selector, and expandable **AppX Debloat Sub-Picker** (`excludedAppxPackages`).
+  - Upgraded Multi-Boot self-contained XML to GZip-chunked (~1,200-char) stagers supporting `PocketBoot_Specialize.cmd`, `SetupComplete.cmd`, and `Undo_PocketBoot_Tweaks.cmd`.
+  - Replaced interactive `cleanmgr` with headless DISM/cache cleanup and added VSS-ready Restore Point creation in `SetupComplete.cmd`.
+  - Scrubbed all remaining user-facing `WinUtil` strings and credited **Chris Titus Tech WinUtil (MIT)** exclusively in **Settings → Open-Source Credits**.

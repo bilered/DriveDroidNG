@@ -1,3 +1,23 @@
+## v4.6.8 (2026-11-26)
+- **Dedicated Full-Screen System Tweaks Screen (`SystemTweaksScreen.kt`, `WindowsCustomization.kt`, `AppPrefs.kt`):**
+  - Replaced the nested bottom sheet with an edge-to-edge full-screen **System Tweaks** screen featuring collapsible sections with live active counts, an **"Active Only"** filter chip, unsaved-changes Back guard, inline `.cmd` preview (`Specialize.cmd`, `SetupComplete.cmd`, `Undo.cmd`), and a subtle first-time hint banner.
+  - Added a live **Search Bar with Persistent Search History** (up to 8 recent queries stored in `AppPrefs.kt`, quick starter suggestion chips when empty, per-chip `×` removal, and Clear History).
+  - Added a small **`ⓘ` Info Dialog** on every tweak explaining exact registry paths, services, scheduled tasks, impact level (`Safe` / `Caution` / `Removes Component`), and side effects.
+  - Added **Custom System Tweaks Presets** (`+ Save Preset`, tap-to-apply, `×` delete, backed up in Settings Export/Import JSON v3) plus a live preset match / `(Modified)` badge.
+  - Added an optional **"Add Undo Script"** badge toggle (OFF by default; excluded from active count and preset-modified status): when checked with active tweaks, drops an auto-elevated `Undo_PocketBoot_Tweaks.cmd` onto `%PUBLIC%\Desktop\`; when unchecked, drops nothing.
+- **1:1 System Tweaks Parity, Official Presets & Pane 1 Cleanup (`WindowsCustomization.kt`, `SystemTweaksScreen.kt`):**
+  - Expanded offline script catalog to 72 tweaks (DNS section, Aggressive WU Disable, and Block WU Driver Installs omitted): **Essential (21)** including an expandable **AppX Debloat Sub-Picker** (keep individual apps while removing the rest), **Customize Preferences (21)** including a 3-state **Multiplane Overlay (MPO)** selector (`Default`, `Disable MPO`, `Force Enable`), **Advanced — Caution (29)**, and **Performance Plans (1)**.
+  - Added exact upstream **`Standard`**, **`Minimal`**, and **`Advanced`** presets alongside updated **`Desktop`** and **`Laptop`** presets built on the `Standard` baseline.
+  - Moved **Classic Windows 10 Right-Click Menu** out of Pane 1 into **System Tweaks → Advanced** and auto-migrated legacy saved presets and Multi-Boot metadata cleanly (zero ghost counts).
+- **Store-Safe Windows Update Pause, Security-Only Deferral & Windows Security (`WindowsCustomization.kt`, `SystemTweaksScreen.kt`):**
+  - Added **Disable Windows Update (Store-Safe)**: sets dynamic install-UTC StartTime + `2099-12-31T23:59:59Z` EndTime/ExpiryTime + `FlightSettingsMaxPauseDays=30000` in `WindowsUpdate\UX\Settings` (Home & Pro) + `Policies\WindowsUpdate\AU` (`NoAutoUpdate=1`, `AUOptions=2`, `NoAutoRebootWithLoggedOnUsers=1`) while preserving Microsoft Store, Xbox Game Pass, Optional Features, and Windows Update driver installs.
+  - Added **Security-Only Windows Updates** (365-day Feature / 4-day Quality deferral, mutually exclusive with Disable Windows Update) and **Disable Windows Security (Defender)** policies with clear `ⓘ` Tamper Protection guidance.
+- **Reliability & Multi-Boot Parity Hardening (`WindowsCustomization.kt`, `WindowsImageBuilder.kt`):**
+  - Upgraded Multi-Boot self-contained unattend XML to GZip-compress and chunk `PocketBoot_Specialize.cmd`, `SetupComplete.cmd`, and optional `Undo_PocketBoot_Tweaks.cmd` into short (~1,200-char) stagers, preventing 8 KB command-line overflows and giving Multi-Boot full parity for Restore Point, Cleanup, and Undo Script.
+  - Wired `winUtil` into `buildSetupCompleteScript()` with headless DISM cleanup (no Session-0 `cleanmgr` hang) and VSS-ready Restore Point creation (`SystemRestorePointCreationFrequency` throttle bypass).
+- **Clean Attribution (`SettingsScreen.kt`, `WindowsCustomization.kt`, `WindowsImageBuilder.kt`):**
+  - Scrubbed all remaining user-facing `WinUtil` strings from UI and logs; credited **Chris Titus Tech WinUtil (MIT)** exclusively inside **Settings → Open-Source Credits**.
+
 ## v4.6.7 (2026-11-26)
 - **Fixed Windows Setup "Install driver to show hardware" & Missing Drive on Auto-Mount (`MainActivity.kt`, `WindowsImageBuilder.kt`, `VentoyImageBuilder.kt`, `BuildThermalHelper.kt`):**
   - Switched post-build auto-mount for Windows USB and Multi-Boot drives (and Multi-Boot recommended mount mode) from Read-Only USB (`USB_RO`) to **Writable USB (`USB_RW`)** so Windows/WinPE `ntfs.sys` can cleanly mount fresh Linux-created NTFS volumes.

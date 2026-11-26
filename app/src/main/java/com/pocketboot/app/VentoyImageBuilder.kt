@@ -659,7 +659,7 @@ object VentoyImageBuilder {
                 put("disableBitLocker", experience.disableBitLocker)
                 put("qolImprovements", experience.qolImprovements)
                 put("disableSponsoredApps", experience.disableSponsoredApps)
-                put("classicContextMenu", experience.classicContextMenu)
+                put("classicContextMenu", false)
                 put("skipWifiSetup", experience.skipWifiSetup)
                 put("createLocalUser", experience.createLocalUser)
                 put("localUsername", experience.localUsername)
@@ -704,14 +704,15 @@ object VentoyImageBuilder {
                 disableBitLocker = o.optBoolean("disableBitLocker", true),
                 qolImprovements = o.optBoolean("qolImprovements", true),
                 disableSponsoredApps = o.optBoolean("disableSponsoredApps", false),
-                classicContextMenu = o.optBoolean("classicContextMenu", false),
+                classicContextMenu = false,
                 skipWifiSetup = o.optBoolean("skipWifiSetup", true),
                 createLocalUser = o.optBoolean("createLocalUser", false),
                 localUsername = o.optString("localUsername", ""),
                 skipOobe = o.optBoolean("skipOobe", false),
                 applySkuSiPolicy = o.optBoolean("applySkuSiPolicy", false)
             )
-            Triple(exp, WinUtilTweaksConfig.fromJsonString(o.optString("winUtilJson", "")), hasDrv)
+            val legacyClassic = o.optBoolean("classicContextMenu", false)
+            Triple(exp, WinUtilTweaksConfig.fromJsonString(o.optString("winUtilJson", ""), legacyClassicContextMenu = legacyClassic), hasDrv)
         }.getOrDefault(Triple(WindowsExperienceConfig(bypassRequirements = defaultCheck, bypassMicrosoftAccount = defaultNro), WinUtilTweaksConfig(), hasDrv))
     }
 
@@ -1141,7 +1142,7 @@ object VentoyImageBuilder {
         return@withContext try {
             mountVentoyPartition1(context, loopDev) ?: return@withContext ActionResult(false, "Could not mount Multi-Boot partition.")
             writeVentoyJsonOnMounted(context, experience.bypassRequirements, experience.bypassMicrosoftAccount, experience, winUtil, driversDir)
-            ActionResult(true, "Saved Windows Experience, WinUtil tweaks & drivers to Multi-Boot drive.")
+            ActionResult(true, "Saved Windows Experience, System Tweaks & drivers to Multi-Boot drive.")
         } finally { unmountVentoyPartition1(loopDev) }
     }
 
@@ -1431,12 +1432,17 @@ fun VentoyBuilderSheet(
     defaultDir: String,
     initialIso: ImageFile?,
     presets: List<AutounattendPreset> = emptyList(),
+    systemTweaksPresets: List<SystemTweaksPreset> = emptyList(),
+    systemTweaksSearchHistory: List<String> = emptyList(),
     building: Boolean,
     progress: WindowsBuildProgress,
     onDismiss: () -> Unit,
     onCancelBuild: () -> Unit,
     onSavePreset: (AutounattendPreset) -> Unit = {},
     onDeletePreset: (String) -> Unit = {},
+    onSaveSystemTweaksPreset: (SystemTweaksPreset) -> Unit = {},
+    onDeleteSystemTweaksPreset: (String) -> Unit = {},
+    onUpdateSearchHistory: (List<String>) -> Unit = {},
     onStartBuild: (VentoyBuildConfig) -> Unit,
     onMessage: (String, Boolean) -> Unit
 ) {
@@ -1924,14 +1930,19 @@ fun VentoyBuilderSheet(
 
                 WindowsTwoPaneCustomizer(
                     osKind = WindowsOsKind.WIN11, arch = "amd64", experience = experience, winUtil = winUtil, presets = presets,
+                    systemTweaksPresets = systemTweaksPresets,
+                    systemTweaksSearchHistory = systemTweaksSearchHistory,
                     showCa2023Option = false, showCustomScriptOption = false, defaultBrowseDir = defaultDir,
                     onExperienceChange = { experience = it }, onWinUtilChange = { winUtil = it },
                     onApplyPreset = { p ->
-                        experience = WindowsExperienceConfig(p.bypassRequirements, p.bypassMicrosoftAccount, p.disableDataCollection, p.disableBitLocker, p.qolImprovements, p.disableSponsoredApps, p.classicContextMenu, p.skipWifiSetup, p.createLocalUser, p.localUsername, "", p.skipOobe, p.useCa2023Bootloaders, p.applySkuSiPolicy)
-                        winUtil = WinUtilTweaksConfig.fromJsonString(p.winUtilJson)
+                        experience = WindowsExperienceConfig(p.bypassRequirements, p.bypassMicrosoftAccount, p.disableDataCollection, p.disableBitLocker, p.qolImprovements, p.disableSponsoredApps, false, p.skipWifiSetup, p.createLocalUser, p.localUsername, "", p.skipOobe, p.useCa2023Bootloaders, p.applySkuSiPolicy)
+                        winUtil = WinUtilTweaksConfig.fromJsonString(p.winUtilJson, legacyClassicContextMenu = p.classicContextMenu)
                     },
-                    onSavePreset = { n -> onSavePreset(AutounattendPreset(n, scheme.name, experience.bypassRequirements, experience.bypassMicrosoftAccount, experience.disableDataCollection, experience.disableBitLocker, experience.disableSponsoredApps, experience.classicContextMenu, experience.skipWifiSetup, experience.createLocalUser, experience.localUsername, experience.skipOobe, experience.qolImprovements, experience.useCa2023Bootloaders, experience.applySkuSiPolicy, winUtil.toJsonString())) },
-                    onDeletePreset = onDeletePreset
+                    onSavePreset = { n -> onSavePreset(AutounattendPreset(n, scheme.name, experience.bypassRequirements, experience.bypassMicrosoftAccount, experience.disableDataCollection, experience.disableBitLocker, experience.disableSponsoredApps, false, experience.skipWifiSetup, experience.createLocalUser, experience.localUsername, experience.skipOobe, experience.qolImprovements, experience.useCa2023Bootloaders, experience.applySkuSiPolicy, winUtil.toJsonString())) },
+                    onDeletePreset = onDeletePreset,
+                    onSaveSystemTweaksPreset = onSaveSystemTweaksPreset,
+                    onDeleteSystemTweaksPreset = onDeleteSystemTweaksPreset,
+                    onUpdateSearchHistory = onUpdateSearchHistory
                 )
                 Surface(modifier = Modifier.fillMaxWidth().bounceClick { showDriversPicker = true }, shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.75.dp, if (driversDir.isNotBlank()) PocketColors.accent else PocketColors.border)) {
                     Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 11.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -2063,9 +2074,14 @@ fun VentoyManagerSheet(
     isMountedToPc: Boolean,
     availableIsos: List<ImageFile>,
     presets: List<AutounattendPreset> = emptyList(),
+    systemTweaksPresets: List<SystemTweaksPreset> = emptyList(),
+    systemTweaksSearchHistory: List<String> = emptyList(),
     defaultDir: String = "/data/media/0/Download",
     onSavePreset: (AutounattendPreset) -> Unit = {},
     onDeletePreset: (String) -> Unit = {},
+    onSaveSystemTweaksPreset: (SystemTweaksPreset) -> Unit = {},
+    onDeleteSystemTweaksPreset: (String) -> Unit = {},
+    onUpdateSearchHistory: (List<String>) -> Unit = {},
     onDismiss: () -> Unit,
     onUnmountFirst: () -> Unit,
     onLibraryChanged: () -> Unit,
@@ -2455,7 +2471,7 @@ fun VentoyManagerSheet(
                 Surface(modifier = Modifier.fillMaxWidth().bounceClick { showMgrTweaksPanel = !showMgrTweaksPanel }, shape = RoundedCornerShape(12.dp), color = PocketColors.accentBg, border = BorderStroke(0.75.dp, PocketColors.accent)) {
                     Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 11.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("Windows Experience, WinUtil & Drivers Injection", style = MaterialTheme.typography.labelLarge, color = PocketColors.accentSoft)
+                            Text("Windows Experience, System Tweaks & Drivers Injection", style = MaterialTheme.typography.labelLarge, color = PocketColors.accentSoft)
                             Text("Applies to all Windows ISOs on this drive (Linux ISOs untouched)", fontSize = 11.sp, color = PocketColors.textSecondary)
                         }
                         Text(if (showMgrTweaksPanel) "Hide" else "Configure", style = MaterialTheme.typography.labelSmall, color = PocketColors.accentSoft)
@@ -2464,14 +2480,19 @@ fun VentoyManagerSheet(
                 if (showMgrTweaksPanel) {
                     WindowsTwoPaneCustomizer(
                         osKind = WindowsOsKind.WIN11, arch = "amd64", experience = mgrExp, winUtil = mgrWinUtil, presets = presets,
+                        systemTweaksPresets = systemTweaksPresets,
+                        systemTweaksSearchHistory = systemTweaksSearchHistory,
                         showCa2023Option = false, showCustomScriptOption = false, defaultBrowseDir = defaultDir,
                         onExperienceChange = { mgrExp = it }, onWinUtilChange = { mgrWinUtil = it },
                         onApplyPreset = { p ->
-                            mgrExp = WindowsExperienceConfig(p.bypassRequirements, p.bypassMicrosoftAccount, p.disableDataCollection, p.disableBitLocker, p.qolImprovements, p.disableSponsoredApps, p.classicContextMenu, p.skipWifiSetup, p.createLocalUser, p.localUsername, "", p.skipOobe, p.useCa2023Bootloaders, p.applySkuSiPolicy)
-                            mgrWinUtil = WinUtilTweaksConfig.fromJsonString(p.winUtilJson)
+                            mgrExp = WindowsExperienceConfig(p.bypassRequirements, p.bypassMicrosoftAccount, p.disableDataCollection, p.disableBitLocker, p.qolImprovements, p.disableSponsoredApps, false, p.skipWifiSetup, p.createLocalUser, p.localUsername, "", p.skipOobe, p.useCa2023Bootloaders, p.applySkuSiPolicy)
+                            mgrWinUtil = WinUtilTweaksConfig.fromJsonString(p.winUtilJson, legacyClassicContextMenu = p.classicContextMenu)
                         },
-                        onSavePreset = { n -> onSavePreset(AutounattendPreset(n, PartitionScheme.GPT.name, mgrExp.bypassRequirements, mgrExp.bypassMicrosoftAccount, mgrExp.disableDataCollection, mgrExp.disableBitLocker, mgrExp.disableSponsoredApps, mgrExp.classicContextMenu, mgrExp.skipWifiSetup, mgrExp.createLocalUser, mgrExp.localUsername, mgrExp.skipOobe, mgrExp.qolImprovements, mgrExp.useCa2023Bootloaders, mgrExp.applySkuSiPolicy, mgrWinUtil.toJsonString())) },
-                        onDeletePreset = onDeletePreset
+                        onSavePreset = { n -> onSavePreset(AutounattendPreset(n, PartitionScheme.GPT.name, mgrExp.bypassRequirements, mgrExp.bypassMicrosoftAccount, mgrExp.disableDataCollection, mgrExp.disableBitLocker, mgrExp.disableSponsoredApps, false, mgrExp.skipWifiSetup, mgrExp.createLocalUser, mgrExp.localUsername, mgrExp.skipOobe, mgrExp.qolImprovements, mgrExp.useCa2023Bootloaders, mgrExp.applySkuSiPolicy, mgrWinUtil.toJsonString())) },
+                        onDeletePreset = onDeletePreset,
+                        onSaveSystemTweaksPreset = onSaveSystemTweaksPreset,
+                        onDeleteSystemTweaksPreset = onDeleteSystemTweaksPreset,
+                        onUpdateSearchHistory = onUpdateSearchHistory
                     )
                     Surface(modifier = Modifier.fillMaxWidth().bounceClick { showMgrDriversPicker = true }, shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.75.dp, if (mgrDriversDir.isNotBlank()) PocketColors.accent else PocketColors.border)) {
                         Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {

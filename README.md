@@ -1,4 +1,4 @@
-# PocketBoot v4.6.7
+# PocketBoot v4.6.8
 
 Rooted Android USB Gadget ISO/IMG boot utility, multi-boot Ventoy drive manager, official OS downloader, and Rufus-style Windows & Linux bootable USB builder.
 

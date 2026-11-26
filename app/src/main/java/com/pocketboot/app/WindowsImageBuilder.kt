@@ -821,9 +821,15 @@ object WindowsImageBuilder {
                         writeText(WindowsCustomizationEngine.buildSpecializeScript(config.experience, config.winUtil), Charsets.UTF_8)
                     }.also { tempFiles.add(it) }
                     val tmpComp = File(context.cacheDir, "SetupComplete.cmd").apply {
-                        writeText(WindowsCustomizationEngine.buildSetupCompleteScript(false, customFileName.isNotBlank(), customFileName), Charsets.UTF_8)
+                        writeText(WindowsCustomizationEngine.buildSetupCompleteScript(false, customFileName.isNotBlank(), customFileName, config.winUtil), Charsets.UTF_8)
                     }.also { tempFiles.add(it) }
                     cmds.add("mkdir -p ${shellQuote(oemScripts)} && cp -f ${shellQuote(tmpSpec.absolutePath)} ${shellQuote("$oemScripts/PocketBoot_Specialize.cmd")} && cp -f ${shellQuote(tmpComp.absolutePath)} ${shellQuote("$oemScripts/SetupComplete.cmd")}")
+                    if (config.winUtil.addUndoScript && config.winUtil.hasAnyActive()) {
+                        val tmpUndo = File(context.cacheDir, "Undo_PocketBoot_Tweaks.cmd").apply {
+                            writeText(WindowsCustomizationEngine.buildUndoScript(config.experience, config.winUtil), Charsets.UTF_8)
+                        }.also { tempFiles.add(it) }
+                        cmds.add("cp -f ${shellQuote(tmpUndo.absolutePath)} ${shellQuote("$oemScripts/Undo_PocketBoot_Tweaks.cmd")}")
+                    }
                     if (customPath.isNotBlank()) {
                         cmds.add("mkdir -p ${shellQuote(oemCustom)} && cp -f ${shellQuote(UsbGadgetEngine.resolveDirectPath(customPath))} ${shellQuote(oemCustom)}/ 2>/dev/null || true")
                     }
@@ -838,7 +844,7 @@ object WindowsImageBuilder {
                         needPantherXml -> "Panther/unattend.xml only (Native Mode: Previous Setup & EULA preserved)"
                         else -> "boot.wim LabConfig only (Native Mode)"
                     }
-                    entries.add(LogEntry(ts, "win-build", "Applied $modeDesc (${config.arch}, scripts=${if (needScripts) "yes" else "none"}, Exp=${config.experience.activeCount()}, WinUtil=${config.winUtil.activeCount()})"))
+                    entries.add(LogEntry(ts, "win-build", "Applied $modeDesc (${config.arch}, scripts=${if (needScripts) "yes" else "none"}, Exp=${config.experience.activeCount()}, Tweaks=${config.winUtil.activeCount()})"))
                 }
             } finally {
                 tempFiles.forEach { it.delete() }
@@ -969,8 +975,16 @@ object WindowsImageBuilder {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun WindowsBuilderSheet(
-    isoFile: ImageFile, defaultDir: String, presets: List<AutounattendPreset>, building: Boolean, progress: WindowsBuildProgress,
-    onDismiss: () -> Unit, onCancelBuild: () -> Unit, onSavePreset: (AutounattendPreset) -> Unit, onDeletePreset: (String) -> Unit, onStartBuild: (WindowsBuildConfig) -> Unit
+    isoFile: ImageFile, defaultDir: String, presets: List<AutounattendPreset>,
+    systemTweaksPresets: List<SystemTweaksPreset> = emptyList(),
+    systemTweaksSearchHistory: List<String> = emptyList(),
+    building: Boolean, progress: WindowsBuildProgress,
+    onDismiss: () -> Unit, onCancelBuild: () -> Unit,
+    onSavePreset: (AutounattendPreset) -> Unit, onDeletePreset: (String) -> Unit,
+    onSaveSystemTweaksPreset: (SystemTweaksPreset) -> Unit = {},
+    onDeleteSystemTweaksPreset: (String) -> Unit = {},
+    onUpdateSearchHistory: (List<String>) -> Unit = {},
+    onStartBuild: (WindowsBuildConfig) -> Unit
 ) {
     val context = LocalContext.current
     val detectedOs = remember(isoFile.name) { WindowsCustomizationEngine.detectWindowsOsKind(isoFile.name) }
@@ -1108,16 +1122,21 @@ fun WindowsBuilderSheet(
                     }
                 }
                 WindowsTwoPaneCustomizer(
-                    osKind = detectedOs, arch = detectedArch, experience = experience, winUtil = winUtil, presets = presets,
+                    osKind = effectiveOs, arch = detectedArch, experience = experience, winUtil = winUtil, presets = presets,
+                    systemTweaksPresets = systemTweaksPresets,
+                    systemTweaksSearchHistory = systemTweaksSearchHistory,
                     showCa2023Option = true, showCustomScriptOption = true, defaultBrowseDir = defaultDir, selectedEditionIndex = selectedEditionIndex,
                     onExperienceChange = { experience = it }, onWinUtilChange = { winUtil = it },
                     onApplyPreset = { p ->
                         scheme = runCatching { PartitionScheme.valueOf(p.schemeName) }.getOrDefault(scheme)
-                        experience = WindowsExperienceConfig(p.bypassRequirements, p.bypassMicrosoftAccount, p.disableDataCollection, p.disableBitLocker, p.qolImprovements, p.disableSponsoredApps, p.classicContextMenu, p.skipWifiSetup, p.createLocalUser, p.localUsername, "", p.skipOobe, p.useCa2023Bootloaders, p.applySkuSiPolicy)
-                        winUtil = WinUtilTweaksConfig.fromJsonString(p.winUtilJson)
+                        experience = WindowsExperienceConfig(p.bypassRequirements, p.bypassMicrosoftAccount, p.disableDataCollection, p.disableBitLocker, p.qolImprovements, p.disableSponsoredApps, false, p.skipWifiSetup, p.createLocalUser, p.localUsername, "", p.skipOobe, p.useCa2023Bootloaders, p.applySkuSiPolicy)
+                        winUtil = WinUtilTweaksConfig.fromJsonString(p.winUtilJson, legacyClassicContextMenu = p.classicContextMenu)
                     },
-                    onSavePreset = { n -> onSavePreset(AutounattendPreset(n, scheme.name, experience.bypassRequirements, experience.bypassMicrosoftAccount, experience.disableDataCollection, experience.disableBitLocker, experience.disableSponsoredApps, experience.classicContextMenu, experience.skipWifiSetup, experience.createLocalUser, experience.localUsername, experience.skipOobe, experience.qolImprovements, experience.useCa2023Bootloaders, experience.applySkuSiPolicy, winUtil.toJsonString())) },
-                    onDeletePreset = onDeletePreset
+                    onSavePreset = { n -> onSavePreset(AutounattendPreset(n, scheme.name, experience.bypassRequirements, experience.bypassMicrosoftAccount, experience.disableDataCollection, experience.disableBitLocker, experience.disableSponsoredApps, false, experience.skipWifiSetup, experience.createLocalUser, experience.localUsername, experience.skipOobe, experience.qolImprovements, experience.useCa2023Bootloaders, experience.applySkuSiPolicy, winUtil.toJsonString())) },
+                    onDeletePreset = onDeletePreset,
+                    onSaveSystemTweaksPreset = onSaveSystemTweaksPreset,
+                    onDeleteSystemTweaksPreset = onDeleteSystemTweaksPreset,
+                    onUpdateSearchHistory = onUpdateSearchHistory
                 )
                 Surface(shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, if (eiCfgUnlock) PocketColors.accent.copy(alpha = 0.55f) else PocketColors.border)) {
                     Row(modifier = Modifier.fillMaxWidth().clickable { eiCfgUnlock = !eiCfgUnlock }.padding(horizontal = 13.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {

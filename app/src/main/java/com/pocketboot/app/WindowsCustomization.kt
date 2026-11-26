@@ -1,5 +1,6 @@
 package com.pocketboot.app
 
+import android.util.Base64
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -14,7 +15,6 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -33,21 +33,17 @@ import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.Preview
 import androidx.compose.material.icons.rounded.Security
 import androidx.compose.material.icons.rounded.Tune
-import androidx.compose.material.icons.rounded.WarningAmber
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -57,14 +53,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import org.json.JSONArray
 import org.json.JSONObject
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBarsPadding
+import java.io.ByteArrayOutputStream
+import java.util.zip.GZIPOutputStream
 
 enum class WindowsOsKind(val label: String, val isModernWin11: Boolean, val supportsEsd: Boolean) {
     WIN11("Windows 11", true, true), WIN10("Windows 10", false, true),
@@ -85,15 +81,15 @@ data class WindowsExperienceConfig(
         get() = if (createLocalUser) WindowsCustomizationEngine.sanitizeWindowsUsername(localUsername) else ""
     /** Post-WinPE tweaks applied via Panther\unattend.xml (specialize/oobeSystem). */
     fun hasPostSetupTweaks(): Boolean = bypassMicrosoftAccount || disableDataCollection || disableBitLocker ||
-        qolImprovements || disableSponsoredApps || classicContextMenu || skipWifiSetup || skipOobe ||
+        qolImprovements || disableSponsoredApps || skipWifiSetup || skipOobe ||
         sanitizedLocalUsername.isNotEmpty() || applySkuSiPolicy || customPostInstallScriptPath.isNotBlank()
     /** Tweaks that require staging PocketBoot_Specialize.cmd / SetupComplete.cmd beyond pure XML. */
-    fun needsSpecializeScript(): Boolean = qolImprovements || disableSponsoredApps || classicContextMenu ||
+    fun needsSpecializeScript(): Boolean = qolImprovements || disableSponsoredApps ||
         applySkuSiPolicy || customPostInstallScriptPath.isNotBlank()
     fun hasUnattendTweaks(): Boolean = bypassRequirements || hasPostSetupTweaks()
     fun hasAnyActive(): Boolean = hasUnattendTweaks() || useCa2023Bootloaders
     fun activeCount(): Int = listOf(bypassRequirements, bypassMicrosoftAccount, disableDataCollection, disableBitLocker,
-        qolImprovements, disableSponsoredApps, classicContextMenu, skipWifiSetup, skipOobe,
+        qolImprovements, disableSponsoredApps, skipWifiSetup, skipOobe,
         sanitizedLocalUsername.isNotEmpty(), useCa2023Bootloaders, applySkuSiPolicy, customPostInstallScriptPath.isNotBlank()).count { it }
     companion object {
         fun stock(): WindowsExperienceConfig = WindowsExperienceConfig(
@@ -110,72 +106,412 @@ data class WindowsExperienceConfig(
 }
 
 data class WinUtilTweaksConfig(
-    val disableActivityHistory: Boolean = false, val disableDeliveryOptimization: Boolean = false,
-    val endTaskWithRightClick: Boolean = false, val disableAutoFolderDiscovery: Boolean = false,
-    val disableHibernation: Boolean = false, val disableLocationTracking: Boolean = false,
-    val preventDeviceCompanionApps: Boolean = false, val disableWpbt: Boolean = false,
-    val servicesToManual: Boolean = false, val revertStartMenuLayout: Boolean = false,
-    val darkThemeDefault: Boolean = false, val enableLongPaths: Boolean = false,
-    val showHiddenFiles: Boolean = false, val disableMouseAcceleration: Boolean = false,
-    val numLockOnStartup: Boolean = false, val disableStickyKeys: Boolean = false,
-    val taskbarAlignLeft: Boolean = false, val hideTaskbarSearch: Boolean = false,
-    val hideTaskView: Boolean = false, val showBatteryPercentage: Boolean = false,
-    val disableLockScreen: Boolean = false, val disableLogonAcrylicBlur: Boolean = false,
-    val verboseBsodAndLogon: Boolean = false, val alwaysShowScrollbars: Boolean = false,
-    val hideSettingsHome: Boolean = false, val disableGameMode: Boolean = false,
-    val disableWindowSnapping: Boolean = false, val disableS0Network: Boolean = false,
-    val disableMpo: Boolean = false, val disableAndRemoveWindowsAi: Boolean = false,
-    val removeOneDrive: Boolean = false, val debloatEdge: Boolean = false,
-    val removeEdge: Boolean = false, val removeExplorerHomeGallery: Boolean = false,
-    val setHardwareClockUtc: Boolean = false, val disableReservedStorage: Boolean = false,
-    val disableBackgroundApps: Boolean = false, val disableStorageSense: Boolean = false,
-    val disableSearchIndexing: Boolean = false, val blockRazerLogitechAutoInstall: Boolean = false,
-    val preferIpv4OverIpv6: Boolean = false, val disableIpv6: Boolean = false,
-    val disableTeredo: Boolean = false, val disableSvchostSplitting: Boolean = false,
-    val visualEffectsBestPerformance: Boolean = false, val disableNotificationCenter: Boolean = false,
-    val forceS3Sleep: Boolean = false, val ultimatePerformancePlan: Boolean = false
+    // Essential Tweaks (21)
+    val createRestorePoint: Boolean = false,
+    val deleteTempFiles: Boolean = false,
+    val disableConsumerFeatures: Boolean = false,
+    val disableTelemetry: Boolean = false,
+    val disableActivityHistory: Boolean = false,
+    val disableGameDvr: Boolean = false,
+    val disableHibernation: Boolean = false,
+    val disableHomegroup: Boolean = false,
+    val disableLocationTracking: Boolean = false,
+    val disableStorageSense: Boolean = false,
+    val disableWifiSense: Boolean = false,
+    val disableAutoFolderDiscovery: Boolean = false,
+    val disableWpbt: Boolean = false,
+    val endTaskWithRightClick: Boolean = false,
+    val preventDeviceCompanionApps: Boolean = false,
+    val disableBitLockerAuto: Boolean = false,
+    val runDiskCleanup: Boolean = false,
+    val servicesToManual: Boolean = false,
+    val disablePowershell7Telemetry: Boolean = false,
+    val revertStartMenuLayout: Boolean = false,
+    val debloatDefaultAppx: Boolean = false,
+    val excludedAppxPackages: Set<String> = emptySet(),
+    // Customize Preferences (21)
+    val darkThemeDefault: Boolean = false,
+    val disableBingSearch: Boolean = false,
+    val disableStartMenuRecommendations: Boolean = false,
+    val numLockOnStartup: Boolean = false,
+    val verboseBsodAndLogon: Boolean = false,
+    val showHiddenFiles: Boolean = false,
+    val showFileExtensions: Boolean = false,
+    val disableMouseAcceleration: Boolean = false,
+    val disableStickyKeys: Boolean = false,
+    val taskbarAlignLeft: Boolean = false,
+    val hideTaskbarSearch: Boolean = false,
+    val hideTaskView: Boolean = false,
+    val showBatteryPercentage: Boolean = false,
+    val disableLockScreen: Boolean = false,
+    val disableLogonAcrylicBlur: Boolean = false,
+    val alwaysShowScrollbars: Boolean = false,
+    val disableGameMode: Boolean = false,
+    val disableWindowSnapping: Boolean = false,
+    val disableS0Network: Boolean = false,
+    val hideSettingsHome: Boolean = false,
+    val mpoMode: String = MPO_DEFAULT, // DEFAULT, DISABLE, ENABLE
+    // Advanced Tweaks - Caution (29)
+    val classicContextMenu: Boolean = false,
+    val disableWindowsUpdates: Boolean = false, // Store-Safe 2099 Pause + Policy Guard
+    val securityOnlyUpdates: Boolean = false, // 365-day Feature / 4-day Quality deferral
+    val disableWindowsSecurity: Boolean = false,
+    val adobeNetworkBlock: Boolean = false,
+    val disableIpv6: Boolean = false,
+    val preferIpv4OverIpv6: Boolean = false,
+    val disableTeredo: Boolean = false,
+    val disableBackgroundApps: Boolean = false,
+    val disableFullscreenOptimizations: Boolean = false,
+    val disableStoreSearch: Boolean = false,
+    val disableNotificationCenter: Boolean = false,
+    val disableReservedStorage: Boolean = false,
+    val disableSearchIndexing: Boolean = false,
+    val disableSvchostSplitting: Boolean = false,
+    val blockRazerLogitechAutoInstall: Boolean = false,
+    val disableUnsignedRdpWarnings: Boolean = false,
+    val disableDeliveryOptimization: Boolean = false,
+    val enableLongPaths: Boolean = false,
+    val visualEffectsBestPerformance: Boolean = false,
+    val setHardwareClockUtc: Boolean = false,
+    val enableLegacyF8Boot: Boolean = false,
+    val removeExplorerHomeGallery: Boolean = false,
+    val debloatEdge: Boolean = false,
+    val debloatBrave: Boolean = false,
+    val removeEdge: Boolean = false,
+    val removeOneDrive: Boolean = false,
+    val disableAndRemoveWindowsAi: Boolean = false,
+    val forceS3Sleep: Boolean = false,
+    // Performance Plans (1)
+    val ultimatePerformancePlan: Boolean = false,
+    // Script Output Option (excluded from activeCount / preset-modified check)
+    val addUndoScript: Boolean = false
 ) {
-    fun activeCount(): Int = listOf(disableActivityHistory, disableDeliveryOptimization, endTaskWithRightClick, disableAutoFolderDiscovery, disableHibernation, disableLocationTracking, preventDeviceCompanionApps, disableWpbt, servicesToManual, revertStartMenuLayout, darkThemeDefault, enableLongPaths, showHiddenFiles, disableMouseAcceleration, numLockOnStartup, disableStickyKeys, taskbarAlignLeft, hideTaskbarSearch, hideTaskView, showBatteryPercentage, disableLockScreen, disableLogonAcrylicBlur, verboseBsodAndLogon, alwaysShowScrollbars, hideSettingsHome, disableGameMode, disableWindowSnapping, disableS0Network, disableMpo, disableAndRemoveWindowsAi, removeOneDrive, debloatEdge, removeEdge, removeExplorerHomeGallery, setHardwareClockUtc, disableReservedStorage, disableBackgroundApps, disableStorageSense, disableSearchIndexing, blockRazerLogitechAutoInstall, preferIpv4OverIpv6, disableIpv6, disableTeredo, disableSvchostSplitting, visualEffectsBestPerformance, disableNotificationCenter, forceS3Sleep, ultimatePerformancePlan).count { it }
+    fun activeAppxPackages(): List<Pair<String, String>> =
+        if (!debloatDefaultAppx) emptyList()
+        else DEFAULT_DEBLOAT_APPX.filterNot { it.first in excludedAppxPackages }
+
+    fun essentialActiveCount(): Int = listOf(
+        createRestorePoint, deleteTempFiles, disableConsumerFeatures, disableTelemetry,
+        disableActivityHistory, disableGameDvr, disableHibernation, disableHomegroup,
+        disableLocationTracking, disableStorageSense, disableWifiSense, disableAutoFolderDiscovery,
+        disableWpbt, endTaskWithRightClick, preventDeviceCompanionApps, disableBitLockerAuto,
+        runDiskCleanup, servicesToManual, disablePowershell7Telemetry, revertStartMenuLayout,
+        debloatDefaultAppx && activeAppxPackages().isNotEmpty()
+    ).count { it }
+
+    fun preferencesActiveCount(): Int = listOf(
+        darkThemeDefault, disableBingSearch, disableStartMenuRecommendations, numLockOnStartup,
+        verboseBsodAndLogon, showHiddenFiles, showFileExtensions, disableMouseAcceleration,
+        disableStickyKeys, taskbarAlignLeft, hideTaskbarSearch, hideTaskView,
+        showBatteryPercentage, disableLockScreen, disableLogonAcrylicBlur, alwaysShowScrollbars,
+        disableGameMode, disableWindowSnapping, disableS0Network, hideSettingsHome,
+        mpoMode != MPO_DEFAULT
+    ).count { it }
+
+    fun advancedActiveCount(): Int = listOf(
+        classicContextMenu, disableWindowsUpdates, securityOnlyUpdates, disableWindowsSecurity,
+        adobeNetworkBlock, disableIpv6, preferIpv4OverIpv6, disableTeredo,
+        disableBackgroundApps, disableFullscreenOptimizations, disableStoreSearch, disableNotificationCenter,
+        disableReservedStorage, disableSearchIndexing, disableSvchostSplitting, blockRazerLogitechAutoInstall,
+        disableUnsignedRdpWarnings, disableDeliveryOptimization, enableLongPaths, visualEffectsBestPerformance,
+        setHardwareClockUtc, enableLegacyF8Boot, removeExplorerHomeGallery, debloatEdge,
+        debloatBrave, removeEdge, removeOneDrive, disableAndRemoveWindowsAi, forceS3Sleep
+    ).count { it }
+
+    fun performanceActiveCount(): Int = if (ultimatePerformancePlan) 1 else 0
+
+    fun activeCount(): Int = essentialActiveCount() + preferencesActiveCount() + advancedActiveCount() + performanceActiveCount()
+
     fun hasAnyActive(): Boolean = activeCount() > 0
+
+    fun hasPostOobeTasks(): Boolean = createRestorePoint || deleteTempFiles || runDiskCleanup
+
+    fun normalizedForComparison(): WinUtilTweaksConfig = copy(
+        addUndoScript = false,
+        excludedAppxPackages = if (debloatDefaultAppx) excludedAppxPackages else emptySet()
+    )
+
     fun toJsonString(): String {
-        if (!hasAnyActive()) return ""
+        if (!hasAnyActive() && !addUndoScript) return ""
         return JSONObject().apply {
-            if (disableActivityHistory) put("disableActivityHistory", true); if (disableDeliveryOptimization) put("disableDeliveryOptimization", true)
-            if (endTaskWithRightClick) put("endTaskWithRightClick", true); if (disableAutoFolderDiscovery) put("disableAutoFolderDiscovery", true)
-            if (disableHibernation) put("disableHibernation", true); if (disableLocationTracking) put("disableLocationTracking", true)
-            if (preventDeviceCompanionApps) put("preventDeviceCompanionApps", true); if (disableWpbt) put("disableWpbt", true)
-            if (servicesToManual) put("servicesToManual", true); if (revertStartMenuLayout) put("revertStartMenuLayout", true)
-            if (darkThemeDefault) put("darkThemeDefault", true); if (enableLongPaths) put("enableLongPaths", true)
-            if (showHiddenFiles) put("showHiddenFiles", true); if (disableMouseAcceleration) put("disableMouseAcceleration", true)
-            if (numLockOnStartup) put("numLockOnStartup", true); if (disableStickyKeys) put("disableStickyKeys", true)
-            if (taskbarAlignLeft) put("taskbarAlignLeft", true); if (hideTaskbarSearch) put("hideTaskbarSearch", true)
-            if (hideTaskView) put("hideTaskView", true); if (showBatteryPercentage) put("showBatteryPercentage", true)
-            if (disableLockScreen) put("disableLockScreen", true); if (disableLogonAcrylicBlur) put("disableLogonAcrylicBlur", true)
-            if (verboseBsodAndLogon) put("verboseBsodAndLogon", true); if (alwaysShowScrollbars) put("alwaysShowScrollbars", true)
-            if (hideSettingsHome) put("hideSettingsHome", true); if (disableGameMode) put("disableGameMode", true)
-            if (disableWindowSnapping) put("disableWindowSnapping", true); if (disableS0Network) put("disableS0Network", true)
-            if (disableMpo) put("disableMpo", true); if (disableAndRemoveWindowsAi) put("disableAndRemoveWindowsAi", true)
-            if (removeOneDrive) put("removeOneDrive", true); if (debloatEdge) put("debloatEdge", true)
-            if (removeEdge) put("removeEdge", true); if (removeExplorerHomeGallery) put("removeExplorerHomeGallery", true)
-            if (setHardwareClockUtc) put("setHardwareClockUtc", true); if (disableReservedStorage) put("disableReservedStorage", true)
-            if (disableBackgroundApps) put("disableBackgroundApps", true); if (disableStorageSense) put("disableStorageSense", true)
-            if (disableSearchIndexing) put("disableSearchIndexing", true); if (blockRazerLogitechAutoInstall) put("blockRazerLogitechAutoInstall", true)
-            if (preferIpv4OverIpv6) put("preferIpv4OverIpv6", true); if (disableIpv6) put("disableIpv6", true)
-            if (disableTeredo) put("disableTeredo", true); if (disableSvchostSplitting) put("disableSvchostSplitting", true)
-            if (visualEffectsBestPerformance) put("visualEffectsBestPerformance", true); if (disableNotificationCenter) put("disableNotificationCenter", true)
-            if (forceS3Sleep) put("forceS3Sleep", true); if (ultimatePerformancePlan) put("ultimatePerformancePlan", true)
+            if (createRestorePoint) put("createRestorePoint", true)
+            if (deleteTempFiles) put("deleteTempFiles", true)
+            if (disableConsumerFeatures) put("disableConsumerFeatures", true)
+            if (disableTelemetry) put("disableTelemetry", true)
+            if (disableActivityHistory) put("disableActivityHistory", true)
+            if (disableGameDvr) put("disableGameDvr", true)
+            if (disableHibernation) put("disableHibernation", true)
+            if (disableHomegroup) put("disableHomegroup", true)
+            if (disableLocationTracking) put("disableLocationTracking", true)
+            if (disableStorageSense) put("disableStorageSense", true)
+            if (disableWifiSense) put("disableWifiSense", true)
+            if (disableAutoFolderDiscovery) put("disableAutoFolderDiscovery", true)
+            if (disableWpbt) put("disableWpbt", true)
+            if (endTaskWithRightClick) put("endTaskWithRightClick", true)
+            if (preventDeviceCompanionApps) put("preventDeviceCompanionApps", true)
+            if (disableBitLockerAuto) put("disableBitLockerAuto", true)
+            if (runDiskCleanup) put("runDiskCleanup", true)
+            if (servicesToManual) put("servicesToManual", true)
+            if (disablePowershell7Telemetry) put("disablePowershell7Telemetry", true)
+            if (revertStartMenuLayout) put("revertStartMenuLayout", true)
+            if (debloatDefaultAppx && activeAppxPackages().isNotEmpty()) {
+                put("debloatDefaultAppx", true)
+                if (excludedAppxPackages.isNotEmpty()) put("excludedAppxPackages", JSONArray(excludedAppxPackages.sorted()))
+            }
+            if (darkThemeDefault) put("darkThemeDefault", true)
+            if (disableBingSearch) put("disableBingSearch", true)
+            if (disableStartMenuRecommendations) put("disableStartMenuRecommendations", true)
+            if (numLockOnStartup) put("numLockOnStartup", true)
+            if (verboseBsodAndLogon) put("verboseBsodAndLogon", true)
+            if (showHiddenFiles) put("showHiddenFiles", true)
+            if (showFileExtensions) put("showFileExtensions", true)
+            if (disableMouseAcceleration) put("disableMouseAcceleration", true)
+            if (disableStickyKeys) put("disableStickyKeys", true)
+            if (taskbarAlignLeft) put("taskbarAlignLeft", true)
+            if (hideTaskbarSearch) put("hideTaskbarSearch", true)
+            if (hideTaskView) put("hideTaskView", true)
+            if (showBatteryPercentage) put("showBatteryPercentage", true)
+            if (disableLockScreen) put("disableLockScreen", true)
+            if (disableLogonAcrylicBlur) put("disableLogonAcrylicBlur", true)
+            if (alwaysShowScrollbars) put("alwaysShowScrollbars", true)
+            if (disableGameMode) put("disableGameMode", true)
+            if (disableWindowSnapping) put("disableWindowSnapping", true)
+            if (disableS0Network) put("disableS0Network", true)
+            if (hideSettingsHome) put("hideSettingsHome", true)
+            if (mpoMode != MPO_DEFAULT) put("mpoMode", mpoMode)
+            if (classicContextMenu) put("classicContextMenu", true)
+            if (disableWindowsUpdates) put("disableWindowsUpdates", true)
+            if (securityOnlyUpdates) put("securityOnlyUpdates", true)
+            if (disableWindowsSecurity) put("disableWindowsSecurity", true)
+            if (adobeNetworkBlock) put("adobeNetworkBlock", true)
+            if (disableIpv6) put("disableIpv6", true)
+            if (preferIpv4OverIpv6) put("preferIpv4OverIpv6", true)
+            if (disableTeredo) put("disableTeredo", true)
+            if (disableBackgroundApps) put("disableBackgroundApps", true)
+            if (disableFullscreenOptimizations) put("disableFullscreenOptimizations", true)
+            if (disableStoreSearch) put("disableStoreSearch", true)
+            if (disableNotificationCenter) put("disableNotificationCenter", true)
+            if (disableReservedStorage) put("disableReservedStorage", true)
+            if (disableSearchIndexing) put("disableSearchIndexing", true)
+            if (disableSvchostSplitting) put("disableSvchostSplitting", true)
+            if (blockRazerLogitechAutoInstall) put("blockRazerLogitechAutoInstall", true)
+            if (disableUnsignedRdpWarnings) put("disableUnsignedRdpWarnings", true)
+            if (disableDeliveryOptimization) put("disableDeliveryOptimization", true)
+            if (enableLongPaths) put("enableLongPaths", true)
+            if (visualEffectsBestPerformance) put("visualEffectsBestPerformance", true)
+            if (setHardwareClockUtc) put("setHardwareClockUtc", true)
+            if (enableLegacyF8Boot) put("enableLegacyF8Boot", true)
+            if (removeExplorerHomeGallery) put("removeExplorerHomeGallery", true)
+            if (debloatEdge) put("debloatEdge", true)
+            if (debloatBrave) put("debloatBrave", true)
+            if (removeEdge) put("removeEdge", true)
+            if (removeOneDrive) put("removeOneDrive", true)
+            if (disableAndRemoveWindowsAi) put("disableAndRemoveWindowsAi", true)
+            if (forceS3Sleep) put("forceS3Sleep", true)
+            if (ultimatePerformancePlan) put("ultimatePerformancePlan", true)
+            if (addUndoScript) put("addUndoScript", true)
         }.toString()
     }
+
     companion object {
-        fun fromJsonString(raw: String): WinUtilTweaksConfig {
-            if (raw.isBlank()) return WinUtilTweaksConfig()
+        const val MPO_DEFAULT = "DEFAULT"
+        const val MPO_DISABLE = "DISABLE"
+        const val MPO_ENABLE = "ENABLE"
+
+        val DEFAULT_DEBLOAT_APPX: List<Pair<String, String>> = listOf(
+            "Microsoft.BingNews" to "Bing News",
+            "Microsoft.BingWeather" to "Bing Weather",
+            "Microsoft.Clipchamp" to "Clipchamp",
+            "Microsoft.GamingApp" to "Xbox App",
+            "Microsoft.GetHelp" to "Get Help",
+            "Microsoft.Getstarted" to "Microsoft Tips",
+            "Microsoft.MicrosoftOfficeHub" to "Microsoft 365 Hub",
+            "Microsoft.MicrosoftSolitaireCollection" to "Solitaire Collection",
+            "Microsoft.MicrosoftStickyNotes" to "Sticky Notes",
+            "Microsoft.People" to "Microsoft People",
+            "Microsoft.PowerAutomateDesktop" to "Power Automate",
+            "Microsoft.Todos" to "Microsoft To Do",
+            "Microsoft.WindowsFeedbackHub" to "Feedback Hub",
+            "Microsoft.YourPhone" to "Phone Link"
+        )
+
+        fun fromJsonString(raw: String, legacyClassicContextMenu: Boolean = false): WinUtilTweaksConfig {
+            if (raw.isBlank()) {
+                return if (legacyClassicContextMenu) WinUtilTweaksConfig(classicContextMenu = true) else WinUtilTweaksConfig()
+            }
             return runCatching {
-                val o = JSONObject(raw); val disIpv6 = o.optBoolean("disableIpv6", false); val fS3 = o.optBoolean("forceS3Sleep", false); val remEdge = o.optBoolean("removeEdge", false)
-                WinUtilTweaksConfig(o.optBoolean("disableActivityHistory", false), o.optBoolean("disableDeliveryOptimization", false), o.optBoolean("endTaskWithRightClick", false), o.optBoolean("disableAutoFolderDiscovery", false), o.optBoolean("disableHibernation", false), o.optBoolean("disableLocationTracking", false), o.optBoolean("preventDeviceCompanionApps", false), o.optBoolean("disableWpbt", false), o.optBoolean("servicesToManual", false), o.optBoolean("revertStartMenuLayout", false), o.optBoolean("darkThemeDefault", false), o.optBoolean("enableLongPaths", false), o.optBoolean("showHiddenFiles", false), o.optBoolean("disableMouseAcceleration", false), o.optBoolean("numLockOnStartup", false), o.optBoolean("disableStickyKeys", false), o.optBoolean("taskbarAlignLeft", false), o.optBoolean("hideTaskbarSearch", false), o.optBoolean("hideTaskView", false), o.optBoolean("showBatteryPercentage", false), o.optBoolean("disableLockScreen", false), o.optBoolean("disableLogonAcrylicBlur", false), o.optBoolean("verboseBsodAndLogon", false), o.optBoolean("alwaysShowScrollbars", false), o.optBoolean("hideSettingsHome", false), o.optBoolean("disableGameMode", false), o.optBoolean("disableWindowSnapping", false), !fS3 && o.optBoolean("disableS0Network", false), o.optBoolean("disableMpo", false), o.optBoolean("disableAndRemoveWindowsAi", false), o.optBoolean("removeOneDrive", false), !remEdge && o.optBoolean("debloatEdge", false), remEdge, o.optBoolean("removeExplorerHomeGallery", false), o.optBoolean("setHardwareClockUtc", false), o.optBoolean("disableReservedStorage", false), o.optBoolean("disableBackgroundApps", false), o.optBoolean("disableStorageSense", false), o.optBoolean("disableSearchIndexing", false), o.optBoolean("blockRazerLogitechAutoInstall", false), !disIpv6 && o.optBoolean("preferIpv4OverIpv6", false), disIpv6, o.optBoolean("disableTeredo", false), o.optBoolean("disableSvchostSplitting", false), o.optBoolean("visualEffectsBestPerformance", false), o.optBoolean("disableNotificationCenter", false), fS3, o.optBoolean("ultimatePerformancePlan", false))
-            }.getOrDefault(WinUtilTweaksConfig())
+                val o = JSONObject(raw)
+                val disIpv6 = o.optBoolean("disableIpv6", false)
+                val fS3 = o.optBoolean("forceS3Sleep", false)
+                val remEdge = o.optBoolean("removeEdge", false)
+                val disWu = o.optBoolean("disableWindowsUpdates", false)
+                val legacyMpo = o.optBoolean("disableMpo", false)
+                val parsedMpo = o.optString("mpoMode", if (legacyMpo) MPO_DISABLE else MPO_DEFAULT)
+                    .uppercase()
+                    .takeIf { it in setOf(MPO_DEFAULT, MPO_DISABLE, MPO_ENABLE) }
+                    ?: MPO_DEFAULT
+                val excluded = mutableSetOf<String>()
+                o.optJSONArray("excludedAppxPackages")?.let { arr ->
+                    for (i in 0 until arr.length()) {
+                        arr.optString(i, "").trim().takeIf { it.isNotEmpty() }?.let { excluded.add(it) }
+                    }
+                }
+                val rawDebloat = o.optBoolean("debloatDefaultAppx", false)
+                val effectiveDebloat = rawDebloat && DEFAULT_DEBLOAT_APPX.any { it.first !in excluded }
+                WinUtilTweaksConfig(
+                    createRestorePoint = o.optBoolean("createRestorePoint", false),
+                    deleteTempFiles = o.optBoolean("deleteTempFiles", false),
+                    disableConsumerFeatures = o.optBoolean("disableConsumerFeatures", false),
+                    disableTelemetry = o.optBoolean("disableTelemetry", false),
+                    disableActivityHistory = o.optBoolean("disableActivityHistory", false),
+                    disableGameDvr = o.optBoolean("disableGameDvr", false),
+                    disableHibernation = o.optBoolean("disableHibernation", false),
+                    disableHomegroup = o.optBoolean("disableHomegroup", false),
+                    disableLocationTracking = o.optBoolean("disableLocationTracking", false),
+                    disableStorageSense = o.optBoolean("disableStorageSense", false),
+                    disableWifiSense = o.optBoolean("disableWifiSense", false),
+                    disableAutoFolderDiscovery = o.optBoolean("disableAutoFolderDiscovery", false),
+                    disableWpbt = o.optBoolean("disableWpbt", false),
+                    endTaskWithRightClick = o.optBoolean("endTaskWithRightClick", false),
+                    preventDeviceCompanionApps = o.optBoolean("preventDeviceCompanionApps", false),
+                    disableBitLockerAuto = o.optBoolean("disableBitLockerAuto", false),
+                    runDiskCleanup = o.optBoolean("runDiskCleanup", false),
+                    servicesToManual = o.optBoolean("servicesToManual", false),
+                    disablePowershell7Telemetry = o.optBoolean("disablePowershell7Telemetry", false),
+                    revertStartMenuLayout = o.optBoolean("revertStartMenuLayout", false),
+                    debloatDefaultAppx = effectiveDebloat,
+                    excludedAppxPackages = if (effectiveDebloat) excluded else emptySet(),
+                    darkThemeDefault = o.optBoolean("darkThemeDefault", false),
+                    disableBingSearch = o.optBoolean("disableBingSearch", false),
+                    disableStartMenuRecommendations = o.optBoolean("disableStartMenuRecommendations", false),
+                    numLockOnStartup = o.optBoolean("numLockOnStartup", false),
+                    verboseBsodAndLogon = o.optBoolean("verboseBsodAndLogon", false),
+                    showHiddenFiles = o.optBoolean("showHiddenFiles", false),
+                    showFileExtensions = o.optBoolean("showFileExtensions", false),
+                    disableMouseAcceleration = o.optBoolean("disableMouseAcceleration", false),
+                    disableStickyKeys = o.optBoolean("disableStickyKeys", false),
+                    taskbarAlignLeft = o.optBoolean("taskbarAlignLeft", false),
+                    hideTaskbarSearch = o.optBoolean("hideTaskbarSearch", false),
+                    hideTaskView = o.optBoolean("hideTaskView", false),
+                    showBatteryPercentage = o.optBoolean("showBatteryPercentage", false),
+                    disableLockScreen = o.optBoolean("disableLockScreen", false),
+                    disableLogonAcrylicBlur = o.optBoolean("disableLogonAcrylicBlur", false),
+                    alwaysShowScrollbars = o.optBoolean("alwaysShowScrollbars", false),
+                    disableGameMode = o.optBoolean("disableGameMode", false),
+                    disableWindowSnapping = o.optBoolean("disableWindowSnapping", false),
+                    disableS0Network = !fS3 && o.optBoolean("disableS0Network", false),
+                    hideSettingsHome = o.optBoolean("hideSettingsHome", false),
+                    mpoMode = parsedMpo,
+                    classicContextMenu = o.optBoolean("classicContextMenu", false) || legacyClassicContextMenu,
+                    disableWindowsUpdates = disWu,
+                    securityOnlyUpdates = !disWu && o.optBoolean("securityOnlyUpdates", false),
+                    disableWindowsSecurity = o.optBoolean("disableWindowsSecurity", false),
+                    adobeNetworkBlock = o.optBoolean("adobeNetworkBlock", false),
+                    disableIpv6 = disIpv6,
+                    preferIpv4OverIpv6 = !disIpv6 && o.optBoolean("preferIpv4OverIpv6", false),
+                    disableTeredo = o.optBoolean("disableTeredo", false),
+                    disableBackgroundApps = o.optBoolean("disableBackgroundApps", false),
+                    disableFullscreenOptimizations = o.optBoolean("disableFullscreenOptimizations", false),
+                    disableStoreSearch = o.optBoolean("disableStoreSearch", false),
+                    disableNotificationCenter = o.optBoolean("disableNotificationCenter", false),
+                    disableReservedStorage = o.optBoolean("disableReservedStorage", false),
+                    disableSearchIndexing = o.optBoolean("disableSearchIndexing", false),
+                    disableSvchostSplitting = o.optBoolean("disableSvchostSplitting", false),
+                    blockRazerLogitechAutoInstall = o.optBoolean("blockRazerLogitechAutoInstall", false),
+                    disableUnsignedRdpWarnings = o.optBoolean("disableUnsignedRdpWarnings", false),
+                    disableDeliveryOptimization = o.optBoolean("disableDeliveryOptimization", false),
+                    enableLongPaths = o.optBoolean("enableLongPaths", false),
+                    visualEffectsBestPerformance = o.optBoolean("visualEffectsBestPerformance", false),
+                    setHardwareClockUtc = o.optBoolean("setHardwareClockUtc", false),
+                    enableLegacyF8Boot = o.optBoolean("enableLegacyF8Boot", false),
+                    removeExplorerHomeGallery = o.optBoolean("removeExplorerHomeGallery", false),
+                    debloatEdge = !remEdge && o.optBoolean("debloatEdge", false),
+                    debloatBrave = o.optBoolean("debloatBrave", false),
+                    removeEdge = remEdge,
+                    removeOneDrive = o.optBoolean("removeOneDrive", false),
+                    disableAndRemoveWindowsAi = o.optBoolean("disableAndRemoveWindowsAi", false),
+                    forceS3Sleep = fS3,
+                    ultimatePerformancePlan = o.optBoolean("ultimatePerformancePlan", false),
+                    addUndoScript = o.optBoolean("addUndoScript", false)
+                )
+            }.getOrDefault(if (legacyClassicContextMenu) WinUtilTweaksConfig(classicContextMenu = true) else WinUtilTweaksConfig())
         }
-        fun desktopPreset() = WinUtilTweaksConfig(disableActivityHistory = true, disableDeliveryOptimization = true, endTaskWithRightClick = true, disableAutoFolderDiscovery = true, disableHibernation = true, disableLocationTracking = true, preventDeviceCompanionApps = true, disableWpbt = true, servicesToManual = true, darkThemeDefault = true, enableLongPaths = true, disableMouseAcceleration = true, numLockOnStartup = true, disableStickyKeys = true, hideSettingsHome = true, ultimatePerformancePlan = true)
-        fun laptopSafePreset() = WinUtilTweaksConfig(disableActivityHistory = true, disableDeliveryOptimization = true, endTaskWithRightClick = true, disableAutoFolderDiscovery = true, disableLocationTracking = true, preventDeviceCompanionApps = true, disableWpbt = true, servicesToManual = true, darkThemeDefault = true, enableLongPaths = true, disableStickyKeys = true, showBatteryPercentage = true, hideSettingsHome = true, disableS0Network = true)
+
+        // Exact upstream config/preset.json -> Standard (Recommended)
+        fun standardPreset() = WinUtilTweaksConfig(
+            createRestorePoint = true,
+            disableConsumerFeatures = true,
+            disableTelemetry = true,
+            disableActivityHistory = true,
+            disableGameDvr = true,
+            disableLocationTracking = true,
+            disableWifiSense = true,
+            disableAutoFolderDiscovery = true,
+            disableWpbt = true,
+            endTaskWithRightClick = true,
+            preventDeviceCompanionApps = true,
+            servicesToManual = true,
+            debloatDefaultAppx = true,
+            disableDeliveryOptimization = true
+        )
+
+        // Exact upstream config/preset.json -> Minimal
+        fun minimalPreset() = WinUtilTweaksConfig(
+            disableConsumerFeatures = true,
+            disableTelemetry = true,
+            disableWpbt = true,
+            servicesToManual = true
+        )
+
+        // Exact upstream config/preset.json -> Advanced
+        fun advancedPreset() = standardPreset().copy(
+            createRestorePoint = false,
+            classicContextMenu = true,
+            disableAndRemoveWindowsAi = true,
+            debloatEdge = true,
+            disableBackgroundApps = true,
+            removeExplorerHomeGallery = true
+        )
+
+        // Desktop-optimal preset built on Standard baseline
+        fun desktopPreset() = standardPreset().copy(
+            disableHibernation = true,
+            disableMouseAcceleration = true,
+            numLockOnStartup = true,
+            darkThemeDefault = true,
+            showFileExtensions = true,
+            disableStickyKeys = true,
+            hideSettingsHome = true,
+            enableLongPaths = true,
+            ultimatePerformancePlan = true
+        )
+
+        // Laptop-safe preset built on Standard baseline (keeps Hibernation, trackpad accel, Balanced plan)
+        fun laptopSafePreset() = standardPreset().copy(
+            disableHibernation = false,
+            disableMouseAcceleration = false,
+            numLockOnStartup = false,
+            disableS0Network = true,
+            showBatteryPercentage = true,
+            darkThemeDefault = true,
+            showFileExtensions = true,
+            disableStickyKeys = true,
+            hideSettingsHome = true,
+            enableLongPaths = true,
+            ultimatePerformancePlan = false
+        )
+
+        fun matchedBuiltInPresetName(config: WinUtilTweaksConfig): String? {
+            val norm = config.normalizedForComparison()
+            return when (norm) {
+                standardPreset() -> "Standard"
+                minimalPreset() -> "Minimal"
+                advancedPreset() -> "Advanced"
+                desktopPreset() -> "Desktop"
+                laptopSafePreset() -> "Laptop"
+                else -> null
+            }
+        }
     }
 }
 
@@ -189,12 +525,23 @@ object WindowsCustomizationEngine {
         "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"
     )
 
-    /**
-     * Sanitizes a Windows local account username (matches official Rufus #2991 rules):
-     * strips illegal characters including '&', trims leading/trailing dots & spaces, clamps to 20 chars,
-     * and rejects reserved Windows built-in / DOS device names so oobeSystem never fails.
-     */
     private const val ILLEGAL_USERNAME_CHARS = "/\\[]:;|=,+*?<>\"&@"
+
+    private val CURATED_MANUAL_SERVICES = listOf(
+        "DiagTrack", "dmwappushservice", "MapsBroker", "WerSvc", "Fax",
+        "RemoteRegistry", "RetailDemo", "TrkWks", "WMPNetworkSvc",
+        "SharedAccess", "WalletService", "WpcMonSvc", "icssvc", "wisvc"
+    )
+
+    private val ADOBE_BLOCK_HOSTS = listOf(
+        "activate.adobe.com", "practivate.adobe.com", "ereg.adobe.com",
+        "activate.wip3.adobe.com", "wip3.adobe.com", "3dns-3.adobe.com",
+        "3dns-2.adobe.com", "adobe-dns.adobe.com", "adobe-dns-2.adobe.com",
+        "adobe-dns-3.adobe.com", "ereg.wip3.adobe.com", "activate-sea.adobe.com",
+        "wwis-dubc1-vip60.adobe.com", "activate-sjc0.adobe.com", "lmlicenses.wip4.adobe.com",
+        "lm.licenses.adobe.com", "na1r.services.adobe.com", "hlrcv.stage.adobe.com",
+        "genuine.adobe.com", "prod.adobegenuine.com", "cc-api-data.adobe.io"
+    )
 
     fun filterUsernameInput(raw: String): String = raw
         .filter { ch -> ch.code >= 0x20 && ch !in ILLEGAL_USERNAME_CHARS }
@@ -243,16 +590,34 @@ object WindowsCustomizationEngine {
         sb.appendLine("if exist \"%PB_FLAG%\" exit /b 0")
         sb.appendLine("mkdir \"C:\\Windows\\Setup\\Scripts\" >nul 2>&1")
         sb.appendLine("echo [PocketBoot] Specialize configuration started...")
-        sb.appendLine("echo [PocketBoot v4.6.7] Specialize started %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.6.8] Specialize started %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("set \"PB_BUILD=0\"")
         sb.appendLine("for /f \"tokens=3\" %%B in ('reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\" /v CurrentBuildNumber 2^>nul ^| findstr /i CurrentBuildNumber') do set \"PB_BUILD=%%B\"")
+
+        // Deduplicated Pane 1 + Essential HKLM policies
+        val effTelemetry = experience.disableDataCollection || winUtil.disableTelemetry
+        val effBitLocker = experience.disableBitLocker || winUtil.disableBitLockerAuto
+        val effConsumer = experience.disableSponsoredApps || experience.qolImprovements || winUtil.disableConsumerFeatures
+        val effClassicMenu = winUtil.classicContextMenu || experience.classicContextMenu
+        val effShowExt = experience.qolImprovements || winUtil.showFileExtensions
+        val effBingSearch = experience.qolImprovements || winUtil.disableBingSearch
+        val effRemoveOneDrive = winUtil.removeOneDrive
+
         if (experience.bypassMicrosoftAccount) sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\OOBE\" /v BypassNRO /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
-        if (experience.disableBitLocker) sb.appendLine("reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\BitLocker\" /v PreventDeviceEncryption /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
-        if (experience.disableDataCollection) {
+        if (effBitLocker) sb.appendLine("reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\BitLocker\" /v PreventDeviceEncryption /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+        if (effTelemetry) {
             sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\DataCollection\" /v AllowTelemetry /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
             sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\DataCollection\" /v AllowTelemetry /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
+            if (winUtil.disableTelemetry) {
+                sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\DataCollection\" /v DoNotShowFeedbackNotifications /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+                sb.appendLine("schtasks /Change /TN \"\\Microsoft\\Windows\\Application Experience\\Microsoft Compatibility Appraiser\" /DISABLE >> \"%PB_LOG%\" 2>&1")
+                sb.appendLine("schtasks /Change /TN \"\\Microsoft\\Windows\\Customer Experience Improvement Program\\Consolidator\" /DISABLE >> \"%PB_LOG%\" 2>&1")
+                sb.appendLine("schtasks /Change /TN \"\\Microsoft\\Windows\\Customer Experience Improvement Program\\UsbCeip\" /DISABLE >> \"%PB_LOG%\" 2>&1")
+                sb.appendLine("sc config DiagTrack start= disabled >> \"%PB_LOG%\" 2>&1")
+                sb.appendLine("sc config dmwappushservice start= disabled >> \"%PB_LOG%\" 2>&1")
+            }
         }
-        if (experience.disableSponsoredApps || experience.qolImprovements) {
+        if (effConsumer) {
             sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\CloudContent\" /v DisableWindowsConsumerFeatures /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
             sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\CloudContent\" /v DisableSoftLanding /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
         }
@@ -267,21 +632,49 @@ object WindowsCustomizationEngine {
             sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU\" /v NoAutoRebootWithLoggedOnUsers /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
         }
         if (experience.applySkuSiPolicy) sb.appendLine("if exist \"C:\\Windows\\System32\\SecureBootUpdates\\SkuSiPolicy.p7b\" (mountvol S: /S >> \"%PB_LOG%\" 2>&1 & if exist \"S:\\EFI\\Microsoft\\Boot\" copy /y \"C:\\Windows\\System32\\SecureBootUpdates\\SkuSiPolicy.p7b\" \"S:\\EFI\\Microsoft\\Boot\\SkuSiPolicy.p7b\" >> \"%PB_LOG%\" 2>&1 & mountvol S: /D >> \"%PB_LOG%\" 2>&1)")
+
+        // Essential Tweaks (HKLM / Services / System)
         if (winUtil.disableActivityHistory) {
             sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\System\" /v EnableActivityFeed /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
             sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\System\" /v PublishUserActivities /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
             sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\System\" /v UploadUserActivities /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
         }
-        if (winUtil.disableDeliveryOptimization) sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\DeliveryOptimization\" /v DODownloadMode /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
+        if (winUtil.disableGameDvr) {
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\GameDVR\" /v AllowGameDVR /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\PolicyManager\\default\\ApplicationManagement\\AllowGameDVR\" /v value /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
+        }
         if (winUtil.disableHibernation) sb.appendLine("powercfg /h off >> \"%PB_LOG%\" 2>&1")
+        if (winUtil.disableHomegroup) {
+            sb.appendLine("sc config HomeGroupListener start= demand >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("sc config HomeGroupProvider start= demand >> \"%PB_LOG%\" 2>&1")
+        }
         if (winUtil.disableLocationTracking) {
             sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\location\" /v Value /t REG_SZ /d Deny /f >> \"%PB_LOG%\" 2>&1")
             sb.appendLine("sc config lfsvc start= disabled >> \"%PB_LOG%\" 2>&1")
         }
-        if (winUtil.preventDeviceCompanionApps) sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Device Metadata\" /v PreventDeviceMetadataFromNetwork /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+        if (winUtil.disableStorageSense) sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\StorageSense\" /v AllowStorageSenseGlobal /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
+        if (winUtil.disableWifiSense) {
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\PolicyManager\\default\\WiFi\\AllowWiFiHotSpotReporting\" /v Value /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\PolicyManager\\default\\WiFi\\AllowAutoConnectToWiFiSenseHotspots\" /v Value /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
+        }
         if (winUtil.disableWpbt) sb.appendLine("reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\" /v DisableWpbtExecution /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
-        if (winUtil.servicesToManual) sb.appendLine("for %%S in (DiagTrack dmwappushservice MapsBroker WerSvc Fax RemoteRegistry RetailDemo TrkWks WMPNetworkSvc) do sc config %%S start= demand >> \"%PB_LOG%\" 2>&1")
-        if (winUtil.enableLongPaths) sb.appendLine("reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\FileSystem\" /v LongPathsEnabled /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+        if (winUtil.preventDeviceCompanionApps) sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Device Metadata\" /v PreventDeviceMetadataFromNetwork /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+        if (winUtil.servicesToManual) {
+            val svcList = CURATED_MANUAL_SERVICES.filterNot { winUtil.disableTelemetry && it in setOf("DiagTrack", "dmwappushservice") }.joinToString(" ")
+            sb.appendLine("for %%S in ($svcList) do sc config %%S start= demand >> \"%PB_LOG%\" 2>&1")
+        }
+        if (winUtil.disablePowershell7Telemetry) {
+            sb.appendLine("reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment\" /v POWERSHELL_TELEMETRY_OPTOUT /t REG_SZ /d 1 /f >> \"%PB_LOG%\" 2>&1")
+        }
+        if (winUtil.debloatDefaultAppx) {
+            val targets = winUtil.activeAppxPackages().map { it.first }
+            if (targets.isNotEmpty()) {
+                val regex = targets.joinToString("|") { it.replace(".", "\\.") }
+                sb.appendLine("powershell -NoProfile -ExecutionPolicy Bypass -Command \"Get-AppxProvisionedPackage -Online | Where-Object { \$_.DisplayName -match '^($regex)' } | ForEach-Object { Remove-AppxProvisionedPackage -Online -PackageName \$_.PackageName -ErrorAction SilentlyContinue }\" >> \"%PB_LOG%\" 2>&1")
+            }
+        }
+
+        // Customize Preferences (HKLM)
         if (winUtil.disableLockScreen) sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Personalization\" /v NoLockScreen /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
         if (winUtil.disableLogonAcrylicBlur) sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\System\" /v DisableAcrylicBackgroundOnLogon /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
         if (winUtil.verboseBsodAndLogon) {
@@ -293,17 +686,66 @@ object WindowsCustomizationEngine {
             sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Power\\PowerSettings\\f15576e8-98b7-4186-b944-eafa664402d9\" /v ACSettingIndex /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
             sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Power\\PowerSettings\\f15576e8-98b7-4186-b944-eafa664402d9\" /v DCSettingIndex /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
         }
-        if (winUtil.forceS3Sleep) sb.appendLine("reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Power\" /v PlatformAoAcOverride /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
-        if (winUtil.disableMpo) sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\Dwm\" /v OverlayTestMode /t REG_DWORD /d 5 /f >> \"%PB_LOG%\" 2>&1")
-        if (winUtil.disableAndRemoveWindowsAi) {
-            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsAI\" /v DisableAIDataAnalysis /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
-            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsAI\" /v TurnOffSavingSnapshots /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
-            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsCopilot\" /v TurnOffWindowsCopilot /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
-            sb.appendLine("if !PB_BUILD! GEQ 22000 (")
-            sb.appendLine("  dism /Online /Disable-Feature /FeatureName:Recall /NoRestart >> \"%PB_LOG%\" 2>&1")
-            sb.appendLine("  powershell -NoProfile -ExecutionPolicy Bypass -Command \"Get-AppxProvisionedPackage -Online | Where-Object { \$_.DisplayName -match 'Copilot|Recall' } | ForEach-Object { Remove-AppxProvisionedPackage -Online -PackageName \$_.PackageName -ErrorAction SilentlyContinue }\" >> \"%PB_LOG%\" 2>&1")
+        when (winUtil.mpoMode) {
+            WinUtilTweaksConfig.MPO_DISABLE -> sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\Dwm\" /v OverlayTestMode /t REG_DWORD /d 5 /f >> \"%PB_LOG%\" 2>&1")
+            WinUtilTweaksConfig.MPO_ENABLE -> {
+                sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Microsoft\\Windows\\Dwm\" /v OverlayTestMode /f >> \"%PB_LOG%\" 2>&1")
+                sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\Dwm\" /v OverlayMinFPS /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
+            }
+        }
+
+        // Advanced Tweaks (HKLM / System)
+        if (winUtil.disableWindowsUpdates) {
+            // Store-Safe Windows Update Pause (2099 UX Settings + Policy Guard; preserves Store, Game Pass, Optional Features & Drivers)
+            sb.appendLine("powershell -NoProfile -ExecutionPolicy Bypass -Command \"\$p='HKLM:\\SOFTWARE\\Microsoft\\WindowsUpdate\\UX\\Settings'; New-Item -Path \$p -Force | Out-Null; \$now=[DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'); \$end='2099-12-31T23:59:59Z'; Set-ItemProperty -Path \$p -Name FlightSettingsMaxPauseDays -Type DWord -Value 30000; Set-ItemProperty -Path \$p -Name PauseFeatureUpdatesStartTime -Type String -Value \$now; Set-ItemProperty -Path \$p -Name PauseQualityUpdatesStartTime -Type String -Value \$now; Set-ItemProperty -Path \$p -Name PauseUpdatesStartTime -Type String -Value \$now; Set-ItemProperty -Path \$p -Name PauseFeatureUpdatesEndTime -Type String -Value \$end; Set-ItemProperty -Path \$p -Name PauseQualityUpdatesEndTime -Type String -Value \$end; Set-ItemProperty -Path \$p -Name PauseUpdatesExpiryTime -Type String -Value \$end\" >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU\" /v NoAutoUpdate /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU\" /v AUOptions /t REG_DWORD /d 2 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU\" /v NoAutoRebootWithLoggedOnUsers /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+        } else if (winUtil.securityOnlyUpdates) {
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\" /v DeferFeatureUpdates /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\" /v DeferFeatureUpdatesPeriodInDays /t REG_DWORD /d 365 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\" /v DeferQualityUpdates /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\" /v DeferQualityUpdatesPeriodInDays /t REG_DWORD /d 4 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\" /v BranchReadinessLevel /t REG_DWORD /d 20 /f >> \"%PB_LOG%\" 2>&1")
+        }
+        if (winUtil.disableWindowsSecurity) {
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\" /v DisableAntiSpyware /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection\" /v DisableRealtimeMonitoring /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection\" /v DisableBehaviorMonitoring /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection\" /v DisableOnAccessProtection /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection\" /v DisableScanOnRealtimeEnable /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Spynet\" /v SpynetReporting /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Spynet\" /v SubmitSamplesConsent /t REG_DWORD /d 2 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender Security Center\\Systray\" /v HideSystray /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+        }
+        if (winUtil.adobeNetworkBlock) {
+            sb.appendLine("findstr /c:\"# PocketBoot Adobe Block\" \"C:\\Windows\\System32\\drivers\\etc\\hosts\" >nul 2>&1 || (")
+            sb.appendLine("  echo.>> \"C:\\Windows\\System32\\drivers\\etc\\hosts\"")
+            sb.appendLine("  echo # PocketBoot Adobe Block START>> \"C:\\Windows\\System32\\drivers\\etc\\hosts\"")
+            ADOBE_BLOCK_HOSTS.forEach { host ->
+                sb.appendLine("  echo 0.0.0.0 $host>> \"C:\\Windows\\System32\\drivers\\etc\\hosts\"")
+            }
+            sb.appendLine("  echo # PocketBoot Adobe Block END>> \"C:\\Windows\\System32\\drivers\\etc\\hosts\"")
             sb.appendLine(")")
         }
+        if (winUtil.disableIpv6) sb.appendLine("reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters\" /v DisabledComponents /t REG_DWORD /d 255 /f >> \"%PB_LOG%\" 2>&1")
+        else if (winUtil.preferIpv4OverIpv6) sb.appendLine("reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters\" /v DisabledComponents /t REG_DWORD /d 32 /f >> \"%PB_LOG%\" 2>&1")
+        if (winUtil.disableTeredo) sb.appendLine("netsh interface teredo set state disabled >> \"%PB_LOG%\" 2>&1")
+        if (winUtil.disableBackgroundApps) sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\AppPrivacy\" /v LetAppsRunInBackground /t REG_DWORD /d 2 /f >> \"%PB_LOG%\" 2>&1")
+        if (winUtil.disableStoreSearch) sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Explorer\" /v NoUseStoreOpenWith /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+        if (winUtil.disableReservedStorage) sb.appendLine("dism /Online /Set-ReservedStorageState /State:Disabled >> \"%PB_LOG%\" 2>&1")
+        if (winUtil.disableSearchIndexing) sb.appendLine("sc config WSearch start= disabled >> \"%PB_LOG%\" 2>&1")
+        if (winUtil.disableSvchostSplitting) sb.appendLine("reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Control\" /v SvcHostSplitThresholdInKB /t REG_DWORD /d 67108864 /f >> \"%PB_LOG%\" 2>&1")
+        if (winUtil.blockRazerLogitechAutoInstall) {
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\DriverSearching\" /v SearchOrderConfig /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Device Metadata\" /v PreventDeviceMetadataFromNetwork /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+        }
+        if (winUtil.disableUnsignedRdpWarnings) sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\Terminal Services\\Client\" /v AuthenticationLevelOverride /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
+        if (winUtil.disableDeliveryOptimization) sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\DeliveryOptimization\" /v DODownloadMode /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
+        if (winUtil.enableLongPaths) sb.appendLine("reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\FileSystem\" /v LongPathsEnabled /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+        if (winUtil.setHardwareClockUtc) sb.appendLine("reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation\" /v RealTimeIsUniversal /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+        if (winUtil.enableLegacyF8Boot) sb.appendLine("bcdedit /set {default} bootmenupolicy legacy >> \"%PB_LOG%\" 2>&1")
+        if (winUtil.removeExplorerHomeGallery) sb.appendLine("if !PB_BUILD! GEQ 22000 (reg delete \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Desktop\\NameSpace\\{e88865ea-0e1c-4e20-9aa6-edcd0212c87c}\" /f >> \"%PB_LOG%\" 2>&1 & reg delete \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Desktop\\NameSpace\\{f874310e-b6b7-47dc-bc84-b9e6b38f5903}\" /f >> \"%PB_LOG%\" 2>&1)")
         if (winUtil.debloatEdge && !winUtil.removeEdge) {
             sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Edge\" /v HubsSidebarEnabled /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
             sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Edge\" /v EdgeShoppingAssistantEnabled /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
@@ -311,59 +753,75 @@ object WindowsCustomizationEngine {
             sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Edge\" /v BackgroundModeEnabled /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
             sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Edge\" /v ShowMicrosoftRewards /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
         }
+        if (winUtil.debloatBrave) {
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\BraveSoftware\\Brave\" /v BraveRewardsDisabled /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\BraveSoftware\\Brave\" /v BraveWalletDisabled /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\BraveSoftware\\Brave\" /v BraveVPNDisabled /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\BraveSoftware\\Brave\" /v BraveAIChatEnabled /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\BraveSoftware\\Brave\" /v TorDisabled /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+        }
         if (winUtil.removeEdge) {
             sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\EdgeUpdate\" /v DoNotUpdateToEdgeWithChromium /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
             sb.appendLine("for /d %%D in (\"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\*\") do if exist \"%%D\\Installer\\setup.exe\" \"%%D\\Installer\\setup.exe\" --uninstall --system-level --verbose-logging --force-uninstall >> \"%PB_LOG%\" 2>&1")
         }
-        if (winUtil.removeExplorerHomeGallery) sb.appendLine("if !PB_BUILD! GEQ 22000 (reg delete \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Desktop\\NameSpace\\{e88865ea-0e1c-4e20-9aa6-edcd0212c87c}\" /f >> \"%PB_LOG%\" 2>&1 & reg delete \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Desktop\\NameSpace\\{f874310e-b6b7-47dc-bc84-b9e6b38f5903}\" /f >> \"%PB_LOG%\" 2>&1)")
-        if (winUtil.setHardwareClockUtc) sb.appendLine("reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation\" /v RealTimeIsUniversal /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
-        if (winUtil.disableReservedStorage) sb.appendLine("dism /Online /Set-ReservedStorageState /State:Disabled >> \"%PB_LOG%\" 2>&1")
-        if (winUtil.disableBackgroundApps) sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\AppPrivacy\" /v LetAppsRunInBackground /t REG_DWORD /d 2 /f >> \"%PB_LOG%\" 2>&1")
-        if (winUtil.disableStorageSense) sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\StorageSense\" /v AllowStorageSenseGlobal /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
-        if (winUtil.disableSearchIndexing) sb.appendLine("sc config WSearch start= disabled >> \"%PB_LOG%\" 2>&1")
-        if (winUtil.blockRazerLogitechAutoInstall) {
-            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\DriverSearching\" /v SearchOrderConfig /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
-            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Device Metadata\" /v PreventDeviceMetadataFromNetwork /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+        if (effRemoveOneDrive) {
+            sb.appendLine("if exist \"C:\\Windows\\SysWOW64\\OneDriveSetup.exe\" \"C:\\Windows\\SysWOW64\\OneDriveSetup.exe\" /uninstall >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("if exist \"C:\\Windows\\System32\\OneDriveSetup.exe\" \"C:\\Windows\\System32\\OneDriveSetup.exe\" /uninstall >> \"%PB_LOG%\" 2>&1")
         }
-        if (winUtil.disableIpv6) sb.appendLine("reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters\" /v DisabledComponents /t REG_DWORD /d 255 /f >> \"%PB_LOG%\" 2>&1")
-        else if (winUtil.preferIpv4OverIpv6) sb.appendLine("reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters\" /v DisabledComponents /t REG_DWORD /d 32 /f >> \"%PB_LOG%\" 2>&1")
-        if (winUtil.disableTeredo) sb.appendLine("netsh interface teredo set state disabled >> \"%PB_LOG%\" 2>&1")
-        if (winUtil.disableSvchostSplitting) sb.appendLine("reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Control\" /v SvcHostSplitThresholdInKB /t REG_DWORD /d 67108864 /f >> \"%PB_LOG%\" 2>&1")
+        if (winUtil.disableAndRemoveWindowsAi) {
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsAI\" /v DisableAIDataAnalysis /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsAI\" /v TurnOffSavingSnapshots /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsCopilot\" /v TurnOffWindowsCopilot /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Policies\\WindowsNotepad\" /v DisableAIFeatures /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Paint\" /v DisableCocreator /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("sc query WSAIFabricSvc >nul 2>&1 && sc config WSAIFabricSvc start= disabled >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("if !PB_BUILD! GEQ 22000 (")
+            sb.appendLine("  dism /Online /Disable-Feature /FeatureName:Recall /NoRestart >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("  powershell -NoProfile -ExecutionPolicy Bypass -Command \"Get-AppxProvisionedPackage -Online | Where-Object { \$_.DisplayName -match 'Copilot|Recall' } | ForEach-Object { Remove-AppxProvisionedPackage -Online -PackageName \$_.PackageName -ErrorAction SilentlyContinue }\" >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine(")")
+        }
+        if (winUtil.forceS3Sleep) sb.appendLine("reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Power\" /v PlatformAoAcOverride /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
         if (winUtil.ultimatePerformancePlan) {
             sb.appendLine("powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 >> \"%PB_LOG%\" 2>&1")
             sb.appendLine("for /f \"tokens=4\" %%G in ('powercfg /list ^| findstr /i \"Ultimate Performance\"') do powercfg /setactive %%G >> \"%PB_LOG%\" 2>&1")
         }
-        if (winUtil.removeOneDrive) {
-            sb.appendLine("if exist \"C:\\Windows\\SysWOW64\\OneDriveSetup.exe\" \"C:\\Windows\\SysWOW64\\OneDriveSetup.exe\" /uninstall >> \"%PB_LOG%\" 2>&1")
-            sb.appendLine("if exist \"C:\\Windows\\System32\\OneDriveSetup.exe\" \"C:\\Windows\\System32\\OneDriveSetup.exe\" /uninstall >> \"%PB_LOG%\" 2>&1")
-        }
 
-        val hasDefaultUserTweaks = experience.qolImprovements || experience.disableSponsoredApps || experience.classicContextMenu ||
-            winUtil.endTaskWithRightClick || winUtil.disableAutoFolderDiscovery || winUtil.revertStartMenuLayout || winUtil.darkThemeDefault ||
-            winUtil.showHiddenFiles || winUtil.disableMouseAcceleration || winUtil.numLockOnStartup || winUtil.disableStickyKeys ||
+        // Default User hive tweaks (C:\Users\Default\NTUSER.DAT)
+        val hasDefaultUserTweaks = experience.qolImprovements || effConsumer || effClassicMenu || effShowExt || effBingSearch ||
+            winUtil.endTaskWithRightClick || winUtil.disableAutoFolderDiscovery || winUtil.revertStartMenuLayout ||
+            winUtil.darkThemeDefault || winUtil.disableStartMenuRecommendations || winUtil.showHiddenFiles ||
+            winUtil.disableMouseAcceleration || winUtil.numLockOnStartup || winUtil.disableStickyKeys ||
             winUtil.taskbarAlignLeft || winUtil.hideTaskbarSearch || winUtil.hideTaskView || winUtil.showBatteryPercentage ||
             winUtil.alwaysShowScrollbars || winUtil.disableGameMode || winUtil.disableWindowSnapping ||
-            winUtil.visualEffectsBestPerformance || winUtil.disableNotificationCenter || winUtil.removeOneDrive
+            winUtil.visualEffectsBestPerformance || winUtil.disableNotificationCenter || winUtil.disableFullscreenOptimizations ||
+            winUtil.disableGameDvr || effRemoveOneDrive
         if (hasDefaultUserTweaks) {
             sb.appendLine("reg load \"HKU\\PB_DEF\" \"C:\\Users\\Default\\NTUSER.DAT\" >> \"%PB_LOG%\" 2>&1")
             sb.appendLine("if !ERRORLEVEL! EQU 0 (")
-            if (experience.qolImprovements || winUtil.removeOneDrive) sb.appendLine("  reg delete \"HKU\\PB_DEF\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\" /v OneDriveSetup /f >> \"%PB_LOG%\" 2>&1")
-            if (experience.qolImprovements || experience.disableSponsoredApps) {
+            if (experience.qolImprovements || effRemoveOneDrive) sb.appendLine("  reg delete \"HKU\\PB_DEF\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\" /v OneDriveSetup /f >> \"%PB_LOG%\" 2>&1")
+            if (effConsumer) {
                 sb.appendLine("  reg add \"HKU\\PB_DEF\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager\" /v SilentInstalledAppsEnabled /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
                 sb.appendLine("  reg add \"HKU\\PB_DEF\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager\" /v SubscribedContent-338388Enabled /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
                 sb.appendLine("  reg add \"HKU\\PB_DEF\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager\" /v SubscribedContent-338389Enabled /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
                 sb.appendLine("  reg add \"HKU\\PB_DEF\\Software\\Microsoft\\Windows\\CurrentVersion\\UserProfileEngagement\" /v ScoobeSystemSettingEnabled /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
             }
+            if (effShowExt) sb.appendLine("  reg add \"HKU\\PB_DEF\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\" /v HideFileExt /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
+            if (effBingSearch) {
+                sb.appendLine("  reg add \"HKU\\PB_DEF\\Software\\Policies\\Microsoft\\Windows\\Explorer\" /v DisableSearchBoxSuggestions /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+                sb.appendLine("  reg add \"HKU\\PB_DEF\\Software\\Microsoft\\Windows\\CurrentVersion\\Search\" /v BingSearchEnabled /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
+            }
             if (experience.qolImprovements) {
-                sb.appendLine("  reg add \"HKU\\PB_DEF\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\" /v HideFileExt /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
                 sb.appendLine("  reg add \"HKU\\PB_DEF\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\" /v LaunchTo /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
                 sb.appendLine("  reg add \"HKU\\PB_DEF\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\" /v ShowCopilotButton /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
                 sb.appendLine("  reg add \"HKU\\PB_DEF\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\" /v TaskbarMn /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
                 sb.appendLine("  reg add \"HKU\\PB_DEF\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\" /v TaskbarDa /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
                 sb.appendLine("  reg add \"HKU\\PB_DEF\\Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings\" /v IsDynamicSearchBoxEnabled /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
-                sb.appendLine("  reg add \"HKU\\PB_DEF\\Software\\Policies\\Microsoft\\Windows\\Explorer\" /v DisableSearchBoxSuggestions /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
             }
-            if (experience.classicContextMenu) sb.appendLine("  if !PB_BUILD! GEQ 22000 reg add \"HKU\\PB_DEF\\Software\\Classes\\CLSID\\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\\InprocServer32\" /f /ve >> \"%PB_LOG%\" 2>&1")
+            if (winUtil.disableStartMenuRecommendations) {
+                sb.appendLine("  reg add \"HKU\\PB_DEF\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\" /v Start_IrisRecommendations /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
+                sb.appendLine("  reg add \"HKU\\PB_DEF\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\" /v Start_TrackDocs /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
+            }
+            if (effClassicMenu) sb.appendLine("  if !PB_BUILD! GEQ 22000 reg add \"HKU\\PB_DEF\\Software\\Classes\\CLSID\\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\\InprocServer32\" /f /ve /d \"\" >> \"%PB_LOG%\" 2>&1")
             if (winUtil.endTaskWithRightClick) sb.appendLine("  if !PB_BUILD! GEQ 22000 reg add \"HKU\\PB_DEF\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\\TaskbarDeveloperSettings\" /v TaskbarEndTask /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
             if (winUtil.disableAutoFolderDiscovery) sb.appendLine("  reg add \"HKU\\PB_DEF\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\Bags\\AllFolders\\Shell\" /v FolderType /t REG_SZ /d NotSpecified /f >> \"%PB_LOG%\" 2>&1")
             if (winUtil.revertStartMenuLayout) sb.appendLine("  if !PB_BUILD! GEQ 22000 reg add \"HKU\\PB_DEF\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\" /v Start_Layout /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
@@ -388,17 +846,31 @@ object WindowsCustomizationEngine {
             if (winUtil.showBatteryPercentage) sb.appendLine("  if !PB_BUILD! GEQ 22000 reg add \"HKU\\PB_DEF\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\" /v ShowBatteryPercentage /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
             if (winUtil.alwaysShowScrollbars) sb.appendLine("  reg add \"HKU\\PB_DEF\\Control Panel\\Accessibility\" /v DynamicScrollbars /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
             if (winUtil.disableGameMode) sb.appendLine("  reg add \"HKU\\PB_DEF\\Software\\Microsoft\\GameBar\" /v AutoGameModeEnabled /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
+            if (winUtil.disableGameDvr) sb.appendLine("  reg add \"HKU\\PB_DEF\\System\\GameConfigStore\" /v GameDVR_Enabled /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
+            if (winUtil.disableFullscreenOptimizations) {
+                sb.appendLine("  reg add \"HKU\\PB_DEF\\System\\GameConfigStore\" /v GameDVR_FSEBehaviorMode /t REG_DWORD /d 2 /f >> \"%PB_LOG%\" 2>&1")
+                sb.appendLine("  reg add \"HKU\\PB_DEF\\System\\GameConfigStore\" /v GameDVR_HonorUserFSEBehaviorMode /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+                sb.appendLine("  reg add \"HKU\\PB_DEF\\System\\GameConfigStore\" /v GameDVR_DXGIHonorFSEWindowsCompatible /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
+            }
             if (winUtil.disableWindowSnapping) sb.appendLine("  reg add \"HKU\\PB_DEF\\Control Panel\\Desktop\" /v WindowArrangementActive /t REG_SZ /d 0 /f >> \"%PB_LOG%\" 2>&1")
             if (winUtil.visualEffectsBestPerformance) sb.appendLine("  reg add \"HKU\\PB_DEF\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VisualEffects\" /v VisualFXSetting /t REG_DWORD /d 2 /f >> \"%PB_LOG%\" 2>&1")
             if (winUtil.disableNotificationCenter) sb.appendLine("  reg add \"HKU\\PB_DEF\\Software\\Policies\\Microsoft\\Windows\\Explorer\" /v DisableNotificationCenter /t REG_DWORD /d 1 /f >> \"%PB_LOG%\" 2>&1")
             sb.appendLine("  reg unload \"HKU\\PB_DEF\" >> \"%PB_LOG%\" 2>&1")
             sb.appendLine(")")
         }
-        // OEM BIOS-keyed laptop safeguard: Windows skips SetupComplete.cmd when an OEM product key is detected in ACPI MSDM.
-        // Register SetupComplete.cmd under FirstBoot\PostOobe so it executes right after OOBE on every machine (guarded by .pb_setupcomplete_done so it runs strictly once).
+
+        // Drop optional Undo script to Public Desktop only when explicitly enabled AND tweaks are active
+        if (winUtil.addUndoScript && winUtil.hasAnyActive()) {
+            sb.appendLine("if exist \"C:\\Windows\\Setup\\Scripts\\Undo_PocketBoot_Tweaks.cmd\" (")
+            sb.appendLine("  mkdir \"C:\\Users\\Public\\Desktop\" >nul 2>&1")
+            sb.appendLine("  copy /y \"C:\\Windows\\Setup\\Scripts\\Undo_PocketBoot_Tweaks.cmd\" \"C:\\Users\\Public\\Desktop\\Undo_PocketBoot_Tweaks.cmd\" >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine(")")
+        }
+
+        // OEM BIOS-keyed laptop safeguard: register SetupComplete.cmd under FirstBoot\PostOobe
         sb.appendLine("if exist \"C:\\Windows\\Setup\\Scripts\\SetupComplete.cmd\" reg add \"HKLM\\SYSTEM\\Setup\\FirstBoot\\PostOobe\" /v \"00\" /t REG_SZ /d \"cmd.exe /c C:\\Windows\\Setup\\Scripts\\SetupComplete.cmd & exit /b 0\" /f >> \"%PB_LOG%\" 2>&1")
         sb.appendLine("echo done > \"%PB_FLAG%\"")
-        sb.appendLine("echo [PocketBoot v4.6.7] Specialize finished %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.6.8] Specialize finished %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("exit /b 0")
         return sb.toString().replace("\r\n", "\n").replace("\n", "\r\n")
     }
@@ -406,7 +878,8 @@ object WindowsCustomizationEngine {
     fun buildSetupCompleteScript(
         runComponentCleanup: Boolean = false,
         hasCustomScript: Boolean = false,
-        customScriptFileName: String = ""
+        customScriptFileName: String = "",
+        winUtil: WinUtilTweaksConfig = WinUtilTweaksConfig()
     ): String {
         val sb = StringBuilder()
         sb.appendLine("@echo off")
@@ -420,6 +893,27 @@ object WindowsCustomizationEngine {
         sb.appendLine("echo done > \"%PB_SC_FLAG%\"")
         sb.appendLine("reg delete \"HKLM\\SYSTEM\\Setup\\FirstBoot\\PostOobe\" /v \"00\" /f >nul 2>&1")
         sb.appendLine("if not exist \"C:\\Windows\\Setup\\Scripts\\.pb_spec_done\" if exist \"C:\\Windows\\Setup\\Scripts\\PocketBoot_Specialize.cmd\" call \"C:\\Windows\\Setup\\Scripts\\PocketBoot_Specialize.cmd\"")
+        if (winUtil.addUndoScript && winUtil.hasAnyActive()) {
+            sb.appendLine("if not exist \"C:\\Users\\Public\\Desktop\\Undo_PocketBoot_Tweaks.cmd\" if exist \"C:\\Windows\\Setup\\Scripts\\Undo_PocketBoot_Tweaks.cmd\" copy /y \"C:\\Windows\\Setup\\Scripts\\Undo_PocketBoot_Tweaks.cmd\" \"C:\\Users\\Public\\Desktop\\Undo_PocketBoot_Tweaks.cmd\" >> \"%PB_LOG%\" 2>&1")
+        }
+        if (winUtil.createRestorePoint) {
+            sb.appendLine("echo [PocketBoot] Creating initial System Restore Point... >> \"%PB_LOG%\"")
+            sb.appendLine("sc config VSS start= demand >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("net start VSS >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\SystemRestore\" /v SystemRestorePointCreationFrequency /t REG_DWORD /d 0 /f >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("powershell -NoProfile -ExecutionPolicy Bypass -Command \"Enable-ComputerRestore -Drive 'C:\\' -ErrorAction SilentlyContinue; Checkpoint-Computer -Description 'PocketBoot Fresh Install' -RestorePointType 'MODIFY_SETTINGS' -ErrorAction SilentlyContinue\" >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\SystemRestore\" /v SystemRestorePointCreationFrequency /f >> \"%PB_LOG%\" 2>&1")
+        }
+        if (winUtil.deleteTempFiles) {
+            sb.appendLine("del /f /s /q \"%TEMP%\\*\" >nul 2>&1")
+            sb.appendLine("del /f /s /q \"C:\\Windows\\Temp\\*\" >nul 2>&1")
+        }
+        if (winUtil.runDiskCleanup || runComponentCleanup) {
+            // Headless cleanup (never invokes interactive cleanmgr GUI in Session 0)
+            sb.appendLine("dism /Online /Cleanup-Image /StartComponentCleanup >> \"%PB_LOG%\" 2>&1")
+            sb.appendLine("del /f /s /q \"C:\\Windows\\Prefetch\\*\" >nul 2>&1")
+            sb.appendLine("del /f /s /q \"C:\\Windows\\SoftwareDistribution\\Download\\*\" >nul 2>&1")
+        }
         if (hasCustomScript && customScriptFileName.isNotBlank()) {
             if (customScriptFileName.lowercase().endsWith(".ps1")) {
                 sb.appendLine("if exist \"C:\\Windows\\Setup\\Custom\\$customScriptFileName\" powershell -NoProfile -ExecutionPolicy Bypass -File \"C:\\Windows\\Setup\\Custom\\$customScriptFileName\" >> \"%PB_LOG%\" 2>&1")
@@ -427,17 +921,225 @@ object WindowsCustomizationEngine {
                 sb.appendLine("if exist \"C:\\Windows\\Setup\\Custom\\$customScriptFileName\" call \"C:\\Windows\\Setup\\Custom\\$customScriptFileName\" >> \"%PB_LOG%\" 2>&1")
             }
         }
-        if (runComponentCleanup) {
-            sb.appendLine("dism /Online /Cleanup-Image /StartComponentCleanup /ResetBase >> \"%PB_LOG%\" 2>&1")
-        }
         sb.appendLine("if exist \"C:\\Windows\\Setup\\Custom\" rmdir /s /q \"C:\\Windows\\Setup\\Custom\" >nul 2>&1")
-        sb.appendLine("echo [PocketBoot v4.6.7] SetupComplete finished %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.6.8] SetupComplete finished %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("start \"\" /b cmd /c \"ping -n 4 127.0.0.1 >nul & rmdir /s /q C:\\Windows\\Setup\\Scripts >nul 2>&1\"")
         sb.appendLine("exit /b 0")
         return sb.toString().replace("\r\n", "\n").replace("\n", "\r\n")
     }
 
-    fun generateAutounattendXml(experience: WindowsExperienceConfig, winUtil: WinUtilTweaksConfig, arch: String = "amd64", selectedEditionIndex: Int? = null, hasSpecializeScript: Boolean = false, hasOemUpdates: Boolean = false, includeWindowsPePass: Boolean = true, uiLang: String = "", autoLogonCount: Int = 1, includeLabConfigInPe: Boolean = true): String {
+    fun buildUndoScript(experience: WindowsExperienceConfig, winUtil: WinUtilTweaksConfig): String {
+        val sb = StringBuilder()
+        sb.appendLine("@echo off")
+        sb.appendLine("setlocal EnableExtensions")
+        sb.appendLine("net session >nul 2>&1 || (")
+        sb.appendLine("  echo Requesting Administrator privileges...")
+        sb.appendLine("  powershell -NoProfile -ExecutionPolicy Bypass -Command \"Start-Process -FilePath '%~f0' -Verb RunAs\"")
+        sb.appendLine("  exit /b 0")
+        sb.appendLine(")")
+        sb.appendLine("echo =======================================================")
+        sb.appendLine("echo   PocketBoot v4.6.8 - Revert Applied System Tweaks")
+        sb.appendLine("echo =======================================================")
+        sb.appendLine("echo.")
+        if (winUtil.disableConsumerFeatures || experience.disableSponsoredApps) {
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\CloudContent\" /v DisableWindowsConsumerFeatures /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\CloudContent\" /v DisableSoftLanding /f >nul 2>&1")
+            sb.appendLine("reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager\" /v SilentInstalledAppsEnabled /t REG_DWORD /d 1 /f >nul 2>&1")
+        }
+        if (winUtil.disableTelemetry || experience.disableDataCollection) {
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\DataCollection\" /v AllowTelemetry /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\DataCollection\" /v AllowTelemetry /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\DataCollection\" /v DoNotShowFeedbackNotifications /f >nul 2>&1")
+            sb.appendLine("schtasks /Change /TN \"\\Microsoft\\Windows\\Application Experience\\Microsoft Compatibility Appraiser\" /ENABLE >nul 2>&1")
+            sb.appendLine("schtasks /Change /TN \"\\Microsoft\\Windows\\Customer Experience Improvement Program\\Consolidator\" /ENABLE >nul 2>&1")
+            sb.appendLine("schtasks /Change /TN \"\\Microsoft\\Windows\\Customer Experience Improvement Program\\UsbCeip\" /ENABLE >nul 2>&1")
+            sb.appendLine("sc config DiagTrack start= auto >nul 2>&1")
+            sb.appendLine("sc config dmwappushservice start= demand >nul 2>&1")
+        }
+        if (winUtil.disableBitLockerAuto || experience.disableBitLocker) {
+            sb.appendLine("reg delete \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\BitLocker\" /v PreventDeviceEncryption /f >nul 2>&1")
+        }
+        if (winUtil.disableActivityHistory) {
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\System\" /v EnableActivityFeed /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\System\" /v PublishUserActivities /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\System\" /v UploadUserActivities /f >nul 2>&1")
+        }
+        if (winUtil.disableGameDvr) {
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\GameDVR\" /v AllowGameDVR /f >nul 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\PolicyManager\\default\\ApplicationManagement\\AllowGameDVR\" /v value /t REG_DWORD /d 1 /f >nul 2>&1")
+            sb.appendLine("reg add \"HKCU\\System\\GameConfigStore\" /v GameDVR_Enabled /t REG_DWORD /d 1 /f >nul 2>&1")
+        }
+        if (winUtil.disableHibernation) sb.appendLine("powercfg /h on >nul 2>&1")
+        if (winUtil.disableHomegroup) {
+            sb.appendLine("sc config HomeGroupListener start= demand >nul 2>&1")
+            sb.appendLine("sc config HomeGroupProvider start= demand >nul 2>&1")
+        }
+        if (winUtil.disableLocationTracking) {
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\location\" /v Value /t REG_SZ /d Allow /f >nul 2>&1")
+            sb.appendLine("sc config lfsvc start= demand >nul 2>&1")
+        }
+        if (winUtil.disableStorageSense) sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\StorageSense\" /v AllowStorageSenseGlobal /f >nul 2>&1")
+        if (winUtil.disableWifiSense) {
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\PolicyManager\\default\\WiFi\\AllowWiFiHotSpotReporting\" /v Value /t REG_DWORD /d 1 /f >nul 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\PolicyManager\\default\\WiFi\\AllowAutoConnectToWiFiSenseHotspots\" /v Value /t REG_DWORD /d 1 /f >nul 2>&1")
+        }
+        if (winUtil.disableAutoFolderDiscovery) sb.appendLine("reg delete \"HKCU\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\Bags\\AllFolders\\Shell\" /v FolderType /f >nul 2>&1")
+        if (winUtil.disableWpbt) sb.appendLine("reg delete \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\" /v DisableWpbtExecution /f >nul 2>&1")
+        if (winUtil.endTaskWithRightClick) sb.appendLine("reg delete \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\\TaskbarDeveloperSettings\" /v TaskbarEndTask /f >nul 2>&1")
+        if (winUtil.preventDeviceCompanionApps || winUtil.blockRazerLogitechAutoInstall) {
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Device Metadata\" /v PreventDeviceMetadataFromNetwork /f >nul 2>&1")
+        }
+        if (winUtil.blockRazerLogitechAutoInstall) sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\DriverSearching\" /v SearchOrderConfig /f >nul 2>&1")
+        if (winUtil.servicesToManual) {
+            if (!winUtil.disableTelemetry && !experience.disableDataCollection) {
+                sb.appendLine("sc config DiagTrack start= auto >nul 2>&1")
+            }
+            sb.appendLine("sc config MapsBroker start= delayed-auto >nul 2>&1")
+            sb.appendLine("sc config TrkWks start= auto >nul 2>&1")
+        }
+        if (winUtil.disablePowershell7Telemetry) sb.appendLine("reg delete \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment\" /v POWERSHELL_TELEMETRY_OPTOUT /f >nul 2>&1")
+        if (winUtil.revertStartMenuLayout) sb.appendLine("reg delete \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\" /v Start_Layout /f >nul 2>&1")
+        if (winUtil.darkThemeDefault) {
+            sb.appendLine("reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\" /v AppsUseLightTheme /t REG_DWORD /d 1 /f >nul 2>&1")
+            sb.appendLine("reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\" /v SystemUsesLightTheme /t REG_DWORD /d 1 /f >nul 2>&1")
+        }
+        if (winUtil.disableBingSearch) {
+            sb.appendLine("reg delete \"HKCU\\Software\\Policies\\Microsoft\\Windows\\Explorer\" /v DisableSearchBoxSuggestions /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Search\" /v BingSearchEnabled /f >nul 2>&1")
+        }
+        if (winUtil.disableStartMenuRecommendations) {
+            sb.appendLine("reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\" /v Start_IrisRecommendations /t REG_DWORD /d 1 /f >nul 2>&1")
+            sb.appendLine("reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\" /v Start_TrackDocs /t REG_DWORD /d 1 /f >nul 2>&1")
+        }
+        if (winUtil.numLockOnStartup) {
+            sb.appendLine("reg add \"HKCU\\Control Panel\\Keyboard\" /v InitialKeyboardIndicators /t REG_SZ /d 0 /f >nul 2>&1")
+            sb.appendLine("reg add \"HKU\\.DEFAULT\\Control Panel\\Keyboard\" /v InitialKeyboardIndicators /t REG_SZ /d 2147483648 /f >nul 2>&1")
+        }
+        if (winUtil.verboseBsodAndLogon) {
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\" /v VerboseStatus /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\CrashControl\" /v DisplayParameters /f >nul 2>&1")
+        }
+        if (winUtil.showHiddenFiles) sb.appendLine("reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\" /v Hidden /t REG_DWORD /d 2 /f >nul 2>&1")
+        if (winUtil.showFileExtensions) sb.appendLine("reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\" /v HideFileExt /t REG_DWORD /d 1 /f >nul 2>&1")
+        if (winUtil.disableMouseAcceleration) {
+            sb.appendLine("reg add \"HKCU\\Control Panel\\Mouse\" /v MouseSpeed /t REG_SZ /d 1 /f >nul 2>&1")
+            sb.appendLine("reg add \"HKCU\\Control Panel\\Mouse\" /v MouseThreshold1 /t REG_SZ /d 6 /f >nul 2>&1")
+            sb.appendLine("reg add \"HKCU\\Control Panel\\Mouse\" /v MouseThreshold2 /t REG_SZ /d 10 /f >nul 2>&1")
+        }
+        if (winUtil.disableStickyKeys) sb.appendLine("reg add \"HKCU\\Control Panel\\Accessibility\\StickyKeys\" /v Flags /t REG_SZ /d 510 /f >nul 2>&1")
+        if (winUtil.taskbarAlignLeft) sb.appendLine("reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\" /v TaskbarAl /t REG_DWORD /d 1 /f >nul 2>&1")
+        if (winUtil.hideTaskbarSearch) sb.appendLine("reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Search\" /v SearchboxTaskbarMode /t REG_DWORD /d 1 /f >nul 2>&1")
+        if (winUtil.hideTaskView) sb.appendLine("reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\" /v ShowTaskViewButton /t REG_DWORD /d 1 /f >nul 2>&1")
+        if (winUtil.showBatteryPercentage) sb.appendLine("reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\" /v ShowBatteryPercentage /t REG_DWORD /d 0 /f >nul 2>&1")
+        if (winUtil.disableLockScreen) sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Personalization\" /v NoLockScreen /f >nul 2>&1")
+        if (winUtil.disableLogonAcrylicBlur) sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\System\" /v DisableAcrylicBackgroundOnLogon /f >nul 2>&1")
+        if (winUtil.alwaysShowScrollbars) sb.appendLine("reg add \"HKCU\\Control Panel\\Accessibility\" /v DynamicScrollbars /t REG_DWORD /d 1 /f >nul 2>&1")
+        if (winUtil.disableGameMode) sb.appendLine("reg add \"HKCU\\Software\\Microsoft\\GameBar\" /v AutoGameModeEnabled /t REG_DWORD /d 1 /f >nul 2>&1")
+        if (winUtil.disableWindowSnapping) sb.appendLine("reg add \"HKCU\\Control Panel\\Desktop\" /v WindowArrangementActive /t REG_SZ /d 1 /f >nul 2>&1")
+        if (winUtil.disableS0Network) {
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Power\\PowerSettings\\f15576e8-98b7-4186-b944-eafa664402d9\" /v ACSettingIndex /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Power\\PowerSettings\\f15576e8-98b7-4186-b944-eafa664402d9\" /v DCSettingIndex /f >nul 2>&1")
+        }
+        if (winUtil.hideSettingsHome) sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\" /v SettingsPageVisibility /f >nul 2>&1")
+        if (winUtil.mpoMode != WinUtilTweaksConfig.MPO_DEFAULT) {
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Microsoft\\Windows\\Dwm\" /v OverlayTestMode /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Microsoft\\Windows\\Dwm\" /v OverlayMinFPS /f >nul 2>&1")
+        }
+        if (winUtil.classicContextMenu) sb.appendLine("reg delete \"HKCU\\Software\\Classes\\CLSID\\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\" /f >nul 2>&1")
+        if (winUtil.disableWindowsUpdates) {
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Microsoft\\WindowsUpdate\\UX\\Settings\" /v FlightSettingsMaxPauseDays /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Microsoft\\WindowsUpdate\\UX\\Settings\" /v PauseFeatureUpdatesStartTime /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Microsoft\\WindowsUpdate\\UX\\Settings\" /v PauseQualityUpdatesStartTime /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Microsoft\\WindowsUpdate\\UX\\Settings\" /v PauseUpdatesStartTime /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Microsoft\\WindowsUpdate\\UX\\Settings\" /v PauseFeatureUpdatesEndTime /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Microsoft\\WindowsUpdate\\UX\\Settings\" /v PauseQualityUpdatesEndTime /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Microsoft\\WindowsUpdate\\UX\\Settings\" /v PauseUpdatesExpiryTime /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU\" /v NoAutoUpdate /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU\" /v AUOptions /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU\" /v NoAutoRebootWithLoggedOnUsers /f >nul 2>&1")
+        }
+        if (winUtil.securityOnlyUpdates) {
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\" /v DeferFeatureUpdates /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\" /v DeferFeatureUpdatesPeriodInDays /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\" /v DeferQualityUpdates /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\" /v DeferQualityUpdatesPeriodInDays /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\" /v BranchReadinessLevel /f >nul 2>&1")
+        }
+        if (winUtil.disableWindowsSecurity) {
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\" /v DisableAntiSpyware /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection\" /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Spynet\" /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender Security Center\\Systray\" /v HideSystray /f >nul 2>&1")
+        }
+        if (winUtil.adobeNetworkBlock) {
+            sb.appendLine("powershell -NoProfile -ExecutionPolicy Bypass -Command \"\$h='C:\\Windows\\System32\\drivers\\etc\\hosts'; \$c=Get-Content \$h -Raw -ErrorAction SilentlyContinue; if (\$c) { \$c=[regex]::Replace(\$c,'(?s)# PocketBoot Adobe Block START.*?# PocketBoot Adobe Block END\\r?\\n?',''); Set-Content -Path \$h -Value \$c -NoNewline }\" >nul 2>&1")
+        }
+        if (winUtil.disableIpv6 || winUtil.preferIpv4OverIpv6) sb.appendLine("reg delete \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters\" /v DisabledComponents /f >nul 2>&1")
+        if (winUtil.disableTeredo) sb.appendLine("netsh interface teredo set state default >nul 2>&1")
+        if (winUtil.disableBackgroundApps) sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\AppPrivacy\" /v LetAppsRunInBackground /f >nul 2>&1")
+        if (winUtil.disableFullscreenOptimizations) {
+            sb.appendLine("reg delete \"HKCU\\System\\GameConfigStore\" /v GameDVR_FSEBehaviorMode /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKCU\\System\\GameConfigStore\" /v GameDVR_HonorUserFSEBehaviorMode /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKCU\\System\\GameConfigStore\" /v GameDVR_DXGIHonorFSEWindowsCompatible /f >nul 2>&1")
+        }
+        if (winUtil.disableStoreSearch) sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Explorer\" /v NoUseStoreOpenWith /f >nul 2>&1")
+        if (winUtil.disableNotificationCenter) sb.appendLine("reg delete \"HKCU\\Software\\Policies\\Microsoft\\Windows\\Explorer\" /v DisableNotificationCenter /f >nul 2>&1")
+        if (winUtil.disableReservedStorage) sb.appendLine("dism /Online /Set-ReservedStorageState /State:Enabled >nul 2>&1")
+        if (winUtil.disableSearchIndexing) {
+            sb.appendLine("sc config WSearch start= delayed-auto >nul 2>&1")
+            sb.appendLine("net start WSearch >nul 2>&1")
+        }
+        if (winUtil.disableSvchostSplitting) sb.appendLine("reg delete \"HKLM\\SYSTEM\\CurrentControlSet\\Control\" /v SvcHostSplitThresholdInKB /f >nul 2>&1")
+        if (winUtil.disableUnsignedRdpWarnings) sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\Terminal Services\\Client\" /v AuthenticationLevelOverride /f >nul 2>&1")
+        if (winUtil.disableDeliveryOptimization) sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\DeliveryOptimization\" /v DODownloadMode /f >nul 2>&1")
+        if (winUtil.enableLongPaths) sb.appendLine("reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\FileSystem\" /v LongPathsEnabled /t REG_DWORD /d 0 /f >nul 2>&1")
+        if (winUtil.visualEffectsBestPerformance) sb.appendLine("reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VisualEffects\" /v VisualFXSetting /t REG_DWORD /d 0 /f >nul 2>&1")
+        if (winUtil.setHardwareClockUtc) sb.appendLine("reg delete \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation\" /v RealTimeIsUniversal /f >nul 2>&1")
+        if (winUtil.enableLegacyF8Boot) sb.appendLine("bcdedit /set {default} bootmenupolicy standard >nul 2>&1")
+        if (winUtil.removeExplorerHomeGallery) {
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Desktop\\NameSpace\\{e88865ea-0e1c-4e20-9aa6-edcd0212c87c}\" /ve /t REG_SZ /d \"{e88865ea-0e1c-4e20-9aa6-edcd0212c87c}\" /f >nul 2>&1")
+            sb.appendLine("reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Desktop\\NameSpace\\{f874310e-b6b7-47dc-bc84-b9e6b38f5903}\" /ve /t REG_SZ /d \"CLSID_MSGraphHomeFolder\" /f >nul 2>&1")
+        }
+        if (winUtil.debloatEdge) sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Edge\" /f >nul 2>&1")
+        if (winUtil.debloatBrave) sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\BraveSoftware\\Brave\" /f >nul 2>&1")
+        if (winUtil.disableAndRemoveWindowsAi) {
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsAI\" /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsCopilot\" /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Policies\\WindowsNotepad\" /v DisableAIFeatures /f >nul 2>&1")
+            sb.appendLine("reg delete \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Paint\" /v DisableCocreator /f >nul 2>&1")
+            sb.appendLine("sc query WSAIFabricSvc >nul 2>&1 && sc config WSAIFabricSvc start= demand >nul 2>&1")
+        }
+        if (winUtil.forceS3Sleep) sb.appendLine("reg delete \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Power\" /v PlatformAoAcOverride /f >nul 2>&1")
+        if (winUtil.ultimatePerformancePlan) sb.appendLine("powercfg /setactive 381b4222-f694-41f0-9685-ff5bb260df2e >nul 2>&1")
+        sb.appendLine("echo.")
+        sb.appendLine("echo All reversible PocketBoot tweaks have been reverted. Reboot your PC to finish applying changes.")
+        if (winUtil.removeEdge || winUtil.removeOneDrive || (winUtil.debloatDefaultAppx && winUtil.activeAppxPackages().isNotEmpty())) {
+            sb.appendLine("echo Note: Uninstalled apps or browsers ^(Edge, OneDrive, or AppX packages^) can be reinstalled anytime from Microsoft Store or microsoft.com.")
+        }
+        sb.appendLine("pause")
+        sb.appendLine("exit /b 0")
+        return sb.toString().replace("\r\n", "\n").replace("\n", "\r\n")
+    }
+
+    private fun gzipToBase64(text: String): String {
+        val baos = ByteArrayOutputStream()
+        GZIPOutputStream(baos).use { it.write(text.toByteArray(Charsets.UTF_8)) }
+        return Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+    }
+
+    fun generateAutounattendXml(
+        experience: WindowsExperienceConfig,
+        winUtil: WinUtilTweaksConfig,
+        arch: String = "amd64",
+        selectedEditionIndex: Int? = null,
+        hasSpecializeScript: Boolean = false,
+        hasOemUpdates: Boolean = false,
+        includeWindowsPePass: Boolean = true,
+        uiLang: String = "",
+        autoLogonCount: Int = 1,
+        includeLabConfigInPe: Boolean = true,
+        extraSpecializeCommands: List<Pair<String, String>> = emptyList()
+    ): String {
         val safeArch = if (arch.lowercase() in setOf("x86", "arm64", "amd64")) arch.lowercase() else "amd64"
         val peCommands = mutableListOf<Pair<String, String>>()
         if (includeLabConfigInPe && experience.bypassRequirements) {
@@ -448,7 +1150,9 @@ object WindowsCustomizationEngine {
             peCommands.add("Bypass Storage Check" to """reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassStorageCheck /t REG_DWORD /d 1 /f""")
         }
         val specCommands = mutableListOf<Triple<String, String, Boolean>>()
-        if (hasSpecializeScript) {
+        if (extraSpecializeCommands.isNotEmpty()) {
+            extraSpecializeCommands.forEach { (desc, cmd) -> specCommands.add(Triple(desc, cmd, false)) }
+        } else if (hasSpecializeScript) {
             specCommands.add(Triple("PocketBoot Specialize Tweaks & Updates", """cmd /c "C:\Windows\Setup\Scripts\PocketBoot_Specialize.cmd"""", hasOemUpdates))
         } else {
             if (experience.bypassMicrosoftAccount) specCommands.add(Triple("Bypass Microsoft Account", """reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE" /v BypassNRO /t REG_DWORD /d 1 /f""", false))
@@ -526,22 +1230,49 @@ object WindowsCustomizationEngine {
         return sb.toString()
     }
 
+    /**
+     * Multi-Boot self-contained unattend XML generator.
+     * GZip-compresses and chunks PocketBoot_Specialize.cmd, SetupComplete.cmd, and optional Undo_PocketBoot_Tweaks.cmd
+     * into short (~1200 char) RunSynchronousCommand stagers so Windows Setup's 8 KB command limit is never exceeded
+     * and post-OOBE tasks (Restore Point, Cleanup, Undo Script) achieve 100% parity with Windows USB Builder.
+     */
     fun generateVentoySelfContainedXml(experience: WindowsExperienceConfig, winUtil: WinUtilTweaksConfig, arch: String = "amd64"): String {
         val safeArch = if (arch.lowercase() in setOf("amd64", "x86", "arm64")) arch.lowercase() else "amd64"
         val needScript = experience.needsSpecializeScript() || winUtil.hasAnyActive()
-        val baseXml = generateAutounattendXml(experience, winUtil, safeArch, null, hasSpecializeScript = needScript, hasOemUpdates = false)
-        if (!needScript) return baseXml
-        val scriptText = buildSpecializeScript(experience, winUtil)
-        val b64 = android.util.Base64.encodeToString(scriptText.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
-        val inlineCmd = """powershell -NoProfile -ExecutionPolicy Bypass -Command "New-Item -ItemType Directory -Force 'C:\Windows\Setup\Scripts' | Out-Null; [IO.File]::WriteAllBytes('C:\Windows\Setup\Scripts\PocketBoot_Specialize.cmd',[Convert]::FromBase64String('$b64')); & cmd.exe /c 'C:\Windows\Setup\Scripts\PocketBoot_Specialize.cmd'" """.trim()
-        return baseXml.replace(xmlEscape("""cmd /c "C:\Windows\Setup\Scripts\PocketBoot_Specialize.cmd""""), xmlEscape(inlineCmd))
+        if (!needScript) {
+            return generateAutounattendXml(experience, winUtil, safeArch, null, hasSpecializeScript = false, hasOemUpdates = false)
+        }
+        val stagers = mutableListOf<Pair<String, String>>()
+        stagers.add("Prepare Scripts Directory" to """cmd /c mkdir "C:\Windows\Setup\Scripts" >nul 2>&1 & del /f /q "C:\Windows\Setup\Scripts\*.gzb64" >nul 2>&1 & exit /b 0""")
+
+        fun appendChunkedFile(baseName: String, content: String) {
+            val gzB64 = gzipToBase64(content)
+            val chunks = gzB64.chunked(1200)
+            chunks.forEachIndexed { idx, chunk ->
+                stagers.add("Stage $baseName (${idx + 1}/${chunks.size})" to "cmd /c >>\"C:\\Windows\\Setup\\Scripts\\$baseName.gzb64\" echo($chunk")
+            }
+            val unpackPs = "${'$'}b=[Convert]::FromBase64String(((Get-Content -Raw 'C:\\Windows\\Setup\\Scripts\\$baseName.gzb64') -replace '\\s','')); ${'$'}ms=New-Object IO.MemoryStream(,${'$'}b); ${'$'}gz=New-Object IO.Compression.GZipStream(${'$'}ms,[IO.Compression.CompressionMode]::Decompress); ${'$'}out=[IO.File]::Create('C:\\Windows\\Setup\\Scripts\\$baseName'); ${'$'}gz.CopyTo(${'$'}out); ${'$'}out.Close(); ${'$'}gz.Close(); Remove-Item 'C:\\Windows\\Setup\\Scripts\\$baseName.gzb64' -Force -ErrorAction SilentlyContinue"
+            stagers.add("Unpack $baseName" to "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$unpackPs\"")
+        }
+
+        appendChunkedFile("PocketBoot_Specialize.cmd", buildSpecializeScript(experience, winUtil))
+        appendChunkedFile("SetupComplete.cmd", buildSetupCompleteScript(false, false, "", winUtil))
+        if (winUtil.addUndoScript && winUtil.hasAnyActive()) {
+            appendChunkedFile("Undo_PocketBoot_Tweaks.cmd", buildUndoScript(experience, winUtil))
+        }
+        stagers.add("Run PocketBoot Specialize" to "cmd /c \"C:\\Windows\\Setup\\Scripts\\PocketBoot_Specialize.cmd\"")
+
+        return generateAutounattendXml(
+            experience = experience,
+            winUtil = winUtil,
+            arch = safeArch,
+            selectedEditionIndex = null,
+            hasSpecializeScript = true,
+            hasOemUpdates = false,
+            extraSpecializeCommands = stagers
+        )
     }
 
-    /**
-     * Official Rufus-parity LabConfig patching: writes BypassTPMCheck, BypassSecureBootCheck, BypassRAMCheck,
-     * BypassCPUCheck, and BypassStorageCheck directly into sources/boot.wim Index 2 offline SYSTEM hive so
-     * no USB-root autounattend.xml is needed (preserving "Previous version of Setup", Product Key, Edition & EULA).
-     */
     fun buildLabConfigRegContent(): String =
         "REGEDIT4\r\n\r\n" +
             "[HKEY_LOCAL_MACHINE\\SYSTEM\\Setup\\LabConfig]\r\n" +
@@ -551,11 +1282,6 @@ object WindowsCustomizationEngine {
             "\"BypassCPUCheck\"=dword:00000001\r\n" +
             "\"BypassStorageCheck\"=dword:00000001\r\n\r\n"
 
-    /**
-     * Unified single-pass boot.wim Index 2 updater (exact official Rufus parity):
-     * patches LabConfig into /Windows/System32/config/SYSTEM (when regFile + chntpw provided)
-     * and/or injects /Autounattend.xml (when xmlFile provided) in ONE wimlib-imagex update call.
-     */
     fun patchBootWimSnippet(
         qWimBin: String,
         qSourcesDir: String,
@@ -603,153 +1329,81 @@ object WindowsCustomizationEngine {
         BOOT_WIM=${'$'}(find $qSourcesDir -maxdepth 1 -type f -iname 'boot.wim' 2>/dev/null | head -n 1)
         if [ -z "${'$'}BOOT_WIM" ] || [ ! -s "${'$'}BOOT_WIM" ]; then
             rm -rf "${'$'}BOOT_TMP"
-            echo "LOG|labconfig|boot.wim not found in sources/"
-            exit 1
+            exit 0
         fi
-        IDX_CNT=${'$'}($qWimBin info "${'$'}BOOT_WIM" 2>/dev/null | grep -c '^Index:' || echo 0)
-        BOOT_IDX=2
-        if [ "${'$'}{IDX_CNT:-0}" -lt 2 ]; then BOOT_IDX=1; fi
-        UPD_CMD="${'$'}BOOT_TMP/update_cmds.txt"
+        BOOT_CNT=${'$'}($qWimBin info "${'$'}BOOT_WIM" 2>/dev/null | grep -i "^Image Count:" | awk '{print ${'$'}3}' | head -n 1)
+        if [ "${'$'}{BOOT_CNT:-1}" -ge 2 ]; then BOOT_IDX=2; else BOOT_IDX=1; fi
+        UPD_CMD="${'$'}BOOT_TMP/upd.txt"
         : > "${'$'}UPD_CMD"
         LAB_READY=0
         AU_READY=0
         $labBlock
         $auBlock
-        if [ ! -s "${'$'}UPD_CMD" ]; then
-            rm -rf "${'$'}BOOT_TMP"
-            exit 1
+        if [ -s "${'$'}UPD_CMD" ]; then
+            if $qWimBin update "${'$'}BOOT_WIM" "${'$'}BOOT_IDX" --command-file="${'$'}UPD_CMD" >/dev/null 2>&1; then
+                if [ "${'$'}LAB_READY" = "1" ]; then
+                    echo "PATCHED_LAB_OK"
+                    echo "LOG|labconfig|Patched LabConfig hardware bypasses directly into boot.wim Index ${'$'}BOOT_IDX (Native Mode)"
+                fi
+                if [ "${'$'}AU_READY" = "1" ]; then
+                    echo "PATCHED_AU_OK"
+                    echo "LOG|win-build|Injected /Autounattend.xml into boot.wim Index ${'$'}BOOT_IDX (Unattended Mode)"
+                fi
+            else
+                echo "LOG|win-build|boot.wim Index ${'$'}BOOT_IDX update failed"
+            fi
         fi
-        $qWimBin update "${'$'}BOOT_WIM" "${'$'}BOOT_IDX" < "${'$'}UPD_CMD" >/dev/null 2>&1
         rm -rf "${'$'}BOOT_TMP"
-        if [ "${'$'}LAB_READY" = "1" ]; then
-            echo "LOG|labconfig|Patched LabConfig hardware bypasses directly into boot.wim Index ${'$'}BOOT_IDX (Native Mode)"
-            echo "PATCHED_LAB_OK"
-        fi
-        if [ "${'$'}AU_READY" = "1" ]; then
-            echo "LOG|win-build|Injected /Autounattend.xml into boot.wim Index ${'$'}BOOT_IDX (Unattended Mode)"
-            echo "PATCHED_AU_OK"
-        fi
         """.trimIndent()
     }
 
-    fun applyCa2023BootloadersSnippet(qWimBin: String, qInstallFile: String, qIsoRoot: String, qBootWim: String = ""): String = """
+    fun applyCa2023BootloadersSnippet(qWimBin: String, qMnt: String, qSourcesDir: String): String = """
+        set -e
         CA_TMP="/data/local/tmp/pb_ca2023"
         rm -rf "${'$'}CA_TMP" && mkdir -p "${'$'}CA_TMP"
-        export TMPDIR="${'$'}CA_TMP" HOME="${'$'}CA_TMP" WIMLIB_IMAGEX_IGNORE_CASE=1
-        CA_APPLIED=""
-        INST_SRC=$qInstallFile
-        BOOT_WIM_SRC=${qBootWim.ifBlank { "''" }}
-        ISO_ROOT=$qIsoRoot
-        extract_wim_file() {
-            local rel_path="${'$'}1"
-            local out_name=${'$'}(basename "${'$'}rel_path")
-            rm -f "${'$'}CA_TMP/${'$'}out_name"
-            case "${'$'}INST_SRC" in
-                *.swm|*.SWM)
-                    local wdir=${'$'}(dirname "${'$'}INST_SRC")
-                    local wbase=${'$'}(basename "${'$'}INST_SRC")
-                    local wpre="${'$'}{wbase%.*}"
-                    local wext="${'$'}{wbase##*.}"
-                    $qWimBin extract "${'$'}INST_SRC" 1 "${'$'}rel_path" --ref="${'$'}{wdir}/${'$'}{wpre}*.${'$'}{wext}" --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null || true
-                    ;;
-                *)
-                    if [ -n "${'$'}INST_SRC" ] && [ -s "${'$'}INST_SRC" ]; then
-                        $qWimBin extract "${'$'}INST_SRC" 1 "${'$'}rel_path" --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null || true
-                    fi
-                    ;;
-            esac
-            if [ ! -s "${'$'}CA_TMP/${'$'}out_name" ] && [ -n "${'$'}BOOT_WIM_SRC" ] && [ -s "${'$'}BOOT_WIM_SRC" ]; then
-                $qWimBin extract "${'$'}BOOT_WIM_SRC" 2 "${'$'}rel_path" --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null || \
-                    $qWimBin extract "${'$'}BOOT_WIM_SRC" 1 "${'$'}rel_path" --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes 2>/dev/null || true
-            fi
-            [ -s "${'$'}CA_TMP/${'$'}out_name" ]
-        }
-        resolve_ci_dir() {
-            local base="${'$'}1"; local child="${'$'}2"
-            local hit=${'$'}(find "${'$'}base" -maxdepth 1 -mindepth 1 -type d -iname "${'$'}child" 2>/dev/null | head -n 1)
-            if [ -n "${'$'}hit" ]; then printf '%s' "${'$'}hit"; else mkdir -p "${'$'}base/${'$'}child"; printf '%s' "${'$'}base/${'$'}child"; fi
-        }
-        copy_ci_file() {
-            local src="${'$'}1"; local dir="${'$'}2"; local name="${'$'}3"
-            local existing=${'$'}(find "${'$'}dir" -maxdepth 1 -mindepth 1 -type f -iname "${'$'}name" 2>/dev/null | head -n 1)
-            if [ -n "${'$'}existing" ]; then cp -f "${'$'}src" "${'$'}existing"; else cp -f "${'$'}src" "${'$'}dir/${'$'}name"; fi
-        }
-        EFI_DIR=${'$'}(resolve_ci_dir "${'$'}ISO_ROOT" "efi")
-        EFI_BOOT_DIR=${'$'}(resolve_ci_dir "${'$'}EFI_DIR" "boot")
-        EFI_MS_DIR=${'$'}(resolve_ci_dir "${'$'}EFI_DIR" "microsoft")
-        EFI_MS_BOOT_DIR=${'$'}(resolve_ci_dir "${'$'}EFI_MS_DIR" "boot")
-        if extract_wim_file /Windows/Boot/EFI_EX/bootmgfw_EX.efi && [ -s "${'$'}CA_TMP/bootmgfw_EX.efi" ]; then
-            if find "${'$'}EFI_BOOT_DIR" -maxdepth 1 -type f -iname 'bootaa64.efi' 2>/dev/null | grep -q . && ! find "${'$'}EFI_BOOT_DIR" -maxdepth 1 -type f -iname 'bootx64.efi' 2>/dev/null | grep -q .; then
-                copy_ci_file "${'$'}CA_TMP/bootmgfw_EX.efi" "${'$'}EFI_BOOT_DIR" "bootaa64.efi"
+        export TMPDIR="${'$'}CA_TMP" HOME="${'$'}CA_TMP"
+        IMG_SRC=${'$'}(find $qSourcesDir -maxdepth 1 -type f \( -iname 'install.wim' -o -iname 'install.esd' \) 2>/dev/null | head -n 1)
+        if [ -z "${'$'}IMG_SRC" ]; then
+            echo "LOG|ca2023|No install.wim/esd found for CA 2023 extraction"
+            rm -rf "${'$'}CA_TMP"
+            exit 0
+        fi
+        for FP in "/Windows/Boot/EFI_EX/bootmgfw_EX.efi" "/Windows/Boot/EFI_EX/bootx64_EX.efi" "/Windows/Boot/EFI_EX/bootaa64_EX.efi" "/Windows/Boot/PCAT_EX/bootmgr_EX"; do
+            $qWimBin extract "${'$'}IMG_SRC" 1 "${'$'}FP" --dest-dir="${'$'}CA_TMP" --no-acls --no-attributes >/dev/null 2>&1 || true
+        done
+        if [ -s "${'$'}CA_TMP/bootmgfw_EX.efi" ]; then
+            mkdir -p $qMnt/efi/boot
+            if [ -f $qMnt/efi/boot/bootaa64.efi ] && [ -s "${'$'}CA_TMP/bootaa64_EX.efi" ]; then
+                cp -f "${'$'}CA_TMP/bootaa64_EX.efi" $qMnt/efi/boot/bootaa64.efi
             else
-                copy_ci_file "${'$'}CA_TMP/bootmgfw_EX.efi" "${'$'}EFI_BOOT_DIR" "bootx64.efi"
+                cp -f "${'$'}CA_TMP/bootmgfw_EX.efi" $qMnt/efi/boot/bootx64.efi
             fi
-            if find "${'$'}EFI_MS_BOOT_DIR" -maxdepth 1 -type f -iname 'bootmgfw.efi' 2>/dev/null | grep -q .; then
-                copy_ci_file "${'$'}CA_TMP/bootmgfw_EX.efi" "${'$'}EFI_MS_BOOT_DIR" "bootmgfw.efi"
-            fi
-            CA_APPLIED="bootmgfw_EX.efi"
-        fi
-        if extract_wim_file /Windows/Boot/EFI_EX/bootmgr_EX.efi && [ -s "${'$'}CA_TMP/bootmgr_EX.efi" ]; then
-            copy_ci_file "${'$'}CA_TMP/bootmgr_EX.efi" "${'$'}ISO_ROOT" "bootmgr.efi"
-            CA_APPLIED="${'$'}{CA_APPLIED:+${'$'}CA_APPLIED + }bootmgr_EX.efi"
-        fi
-        if extract_wim_file /Windows/Boot/DVD/EFI/efisys_ex.bin && [ -s "${'$'}CA_TMP/efisys_ex.bin" ]; then
-            copy_ci_file "${'$'}CA_TMP/efisys_ex.bin" "${'$'}EFI_MS_BOOT_DIR" "efisys.bin"
-            CA_APPLIED="${'$'}{CA_APPLIED:+${'$'}CA_APPLIED + }efisys_ex.bin"
-        fi
-        if extract_wim_file /Windows/Boot/DVD/EFI/efisys_noprompt_ex.bin && [ -s "${'$'}CA_TMP/efisys_noprompt_ex.bin" ]; then
-            copy_ci_file "${'$'}CA_TMP/efisys_noprompt_ex.bin" "${'$'}EFI_MS_BOOT_DIR" "efisys_noprompt.bin"
-            CA_APPLIED="${'$'}{CA_APPLIED:+${'$'}CA_APPLIED + }efisys_noprompt_ex.bin"
-        fi
-        if [ -n "${'$'}CA_APPLIED" ]; then
-            echo "LOG|ca2023|Applied Windows CA 2023 bootloaders (${'$'}CA_APPLIED)"
+            [ -f $qMnt/efi/microsoft/boot/bootmgfw.efi ] && cp -f "${'$'}CA_TMP/bootmgfw_EX.efi" $qMnt/efi/microsoft/boot/bootmgfw.efi || true
+            [ -s "${'$'}CA_TMP/bootmgr_EX" ] && [ -f $qMnt/bootmgr ] && cp -f "${'$'}CA_TMP/bootmgr_EX" $qMnt/bootmgr || true
+            echo "LOG|ca2023|Installed Windows UEFI CA 2023 signed bootloaders from install image"
         else
-            echo "LOG|ca2023|Source image lacks EFI_EX CA 2023 bootloaders; kept standard bootloaders"
+            echo "LOG|ca2023|ISO does not contain EFI_EX CA 2023 bootloaders (kept original bootx64.efi)"
         fi
         rm -rf "${'$'}CA_TMP"
-    """.trimIndent()
-
-    fun applyWin7UefiFixSnippet(qWimBin: String, qInstallFile: String, qIsoRoot: String): String = """
-        ISO_ROOT=$qIsoRoot
-        INST_SRC=$qInstallFile
-        if ! find "${'$'}ISO_ROOT" -maxdepth 3 -type f \( -iname 'bootx64.efi' -o -iname 'bootaa64.efi' \) 2>/dev/null | grep -q .; then
-            W7_TMP="/data/local/tmp/pb_win7_efi"
-            rm -rf "${'$'}W7_TMP" && mkdir -p "${'$'}W7_TMP"
-            export TMPDIR="${'$'}W7_TMP" HOME="${'$'}W7_TMP" WIMLIB_IMAGEX_IGNORE_CASE=1
-            W7_OK=0
-            case "${'$'}INST_SRC" in
-                *.swm|*.SWM)
-                    WDIR=${'$'}(dirname "${'$'}INST_SRC"); WBASE=${'$'}(basename "${'$'}INST_SRC"); WPRE="${'$'}{WBASE%.*}"; WEXT="${'$'}{WBASE##*.}"
-                    if $qWimBin extract "${'$'}INST_SRC" 1 /Windows/Boot/EFI/bootmgfw.efi --ref="${'$'}{WDIR}/${'$'}{WPRE}*.${'$'}{WEXT}" --dest-dir="${'$'}W7_TMP" --no-acls --no-attributes 2>/dev/null; then W7_OK=1; fi
-                    ;;
-                *)
-                    if $qWimBin extract "${'$'}INST_SRC" 1 /Windows/Boot/EFI/bootmgfw.efi --dest-dir="${'$'}W7_TMP" --no-acls --no-attributes 2>/dev/null; then W7_OK=1; fi
-                    ;;
-            esac
-            if [ "${'$'}W7_OK" = "1" ] && [ -s "${'$'}W7_TMP/bootmgfw.efi" ]; then
-                EFI_DIR=${'$'}(find "${'$'}ISO_ROOT" -maxdepth 1 -mindepth 1 -type d -iname 'efi' 2>/dev/null | head -n 1)
-                [ -z "${'$'}EFI_DIR" ] && EFI_DIR="${'$'}ISO_ROOT/efi"
-                EFI_BOOT_DIR=${'$'}(find "${'$'}EFI_DIR" -maxdepth 1 -mindepth 1 -type d -iname 'boot' 2>/dev/null | head -n 1)
-                [ -z "${'$'}EFI_BOOT_DIR" ] && EFI_BOOT_DIR="${'$'}EFI_DIR/boot"
-                mkdir -p "${'$'}EFI_BOOT_DIR"
-                cp -f "${'$'}W7_TMP/bootmgfw.efi" "${'$'}EFI_BOOT_DIR/bootx64.efi"
-                echo "LOG|win7|Extracted Windows 7 UEFI bootx64.efi from install image"
-            fi
-            rm -rf "${'$'}W7_TMP"
-        fi
     """.trimIndent()
 }
 
 @Composable
 fun WindowsTwoPaneCustomizer(
     osKind: WindowsOsKind, arch: String = "amd64", experience: WindowsExperienceConfig, winUtil: WinUtilTweaksConfig,
-    presets: List<AutounattendPreset>, showCa2023Option: Boolean = true, showCustomScriptOption: Boolean = true,
+    presets: List<AutounattendPreset>,
+    systemTweaksPresets: List<SystemTweaksPreset> = emptyList(),
+    systemTweaksSearchHistory: List<String> = emptyList(),
+    showCa2023Option: Boolean = true, showCustomScriptOption: Boolean = true,
     defaultBrowseDir: String = "/data/media/0/Download", selectedEditionIndex: Int? = null,
     onExperienceChange: (WindowsExperienceConfig) -> Unit, onWinUtilChange: (WinUtilTweaksConfig) -> Unit,
-    onApplyPreset: (AutounattendPreset) -> Unit, onSavePreset: (String) -> Unit, onDeletePreset: (String) -> Unit
+    onApplyPreset: (AutounattendPreset) -> Unit, onSavePreset: (String) -> Unit, onDeletePreset: (String) -> Unit,
+    onSaveSystemTweaksPreset: (SystemTweaksPreset) -> Unit = {},
+    onDeleteSystemTweaksPreset: (String) -> Unit = {},
+    onUpdateSearchHistory: (List<String>) -> Unit = {}
 ) {
     var pane1Expanded by remember { mutableStateOf(false) }
-    var showWinUtilSheet by remember { mutableStateOf(false) }
+    var showSystemTweaksScreen by remember { mutableStateOf(false) }
     var showSavePresetDialog by remember { mutableStateOf(false) }
     var newPresetName by remember { mutableStateOf("") }
     var showPreviewDialog by remember { mutableStateOf(false) }
@@ -792,7 +1446,7 @@ fun WindowsTwoPaneCustomizer(
             }
         }
 
-        // PANE 1: Windows Experience & Bypasses
+        // PANE 1: Windows Experience & Bypasses (Classic Right-Click Menu moved to System Tweaks -> Advanced)
         Surface(shape = RoundedCornerShape(14.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.75.dp, if (expCount > 0) PocketColors.accent.copy(alpha = 0.55f) else PocketColors.border)) {
             Column(modifier = Modifier.fillMaxWidth()) {
                 Row(modifier = Modifier.fillMaxWidth().clickable { pane1Expanded = !pane1Expanded }.padding(horizontal = 13.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -813,7 +1467,6 @@ fun WindowsTwoPaneCustomizer(
                         CustomSwitchRow("Disable Automatic BitLocker Encryption", "PreventDeviceEncryption = 1", experience.disableBitLocker) { onExperienceChange(experience.copy(disableBitLocker = it)) }
                         CustomSwitchRow("QoL Improvements Bundle", "No Fast Startup, Copilot, OneDrive nag, Outlook, Widgets/Bing · show file extensions", experience.qolImprovements) { onExperienceChange(experience.copy(qolImprovements = it)) }
                         CustomSwitchRow("Remove Sponsored Bloat Apps", "Block silent promoted Start Menu installs", experience.disableSponsoredApps) { onExperienceChange(experience.copy(disableSponsoredApps = it)) }
-                        if (osKind == WindowsOsKind.WIN11 || osKind == WindowsOsKind.UNKNOWN) CustomSwitchRow("Classic Windows 10 Right-Click Menu", "Restores full context menu immediately", experience.classicContextMenu) { onExperienceChange(experience.copy(classicContextMenu = it)) }
                         CustomSwitchRow("Skip Wi-Fi / Network Setup Screen", "HideWirelessSetupInOOBE", experience.skipWifiSetup) { onExperienceChange(experience.copy(skipWifiSetup = it)) }
                         CustomSwitchRow("Create Local Admin Account", "Pre-create account & auto-logon once", experience.createLocalUser) { onExperienceChange(experience.copy(createLocalUser = it)) }
                         AnimatedVisibility(visible = experience.createLocalUser) {
@@ -856,27 +1509,56 @@ fun WindowsTwoPaneCustomizer(
             }
         }
 
-        // PANE 2: Dedicated System Tweaks (WinUtil) Pane
-        Surface(modifier = Modifier.fillMaxWidth().bounceClick { showWinUtilSheet = true }, shape = RoundedCornerShape(14.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.75.dp, if (winUtilCount > 0) PocketColors.accent.copy(alpha = 0.65f) else PocketColors.border)) {
+        // PANE 2: Dedicated Full-Screen System Tweaks Entry Card
+        val matchedPreset = remember(winUtil, systemTweaksPresets) {
+            val norm = winUtil.normalizedForComparison()
+            WinUtilTweaksConfig.matchedBuiltInPresetName(norm)
+                ?: systemTweaksPresets.firstOrNull { WinUtilTweaksConfig.fromJsonString(it.tweaksJson).normalizedForComparison() == norm }?.name
+        }
+        Surface(modifier = Modifier.fillMaxWidth().bounceClick { showSystemTweaksScreen = true }, shape = RoundedCornerShape(14.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.75.dp, if (winUtilCount > 0) PocketColors.accent.copy(alpha = 0.65f) else PocketColors.border)) {
             Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Box(modifier = Modifier.size(34.dp).clip(RoundedCornerShape(9.dp)).background(if (winUtilCount > 0) PocketColors.accentBg else PocketColors.violetBg), contentAlignment = Alignment.Center) { Icon(Icons.Rounded.Tune, null, tint = if (winUtilCount > 0) PocketColors.accentSoft else PocketColors.violet, modifier = Modifier.size(18.dp)) }
                 Column(modifier = Modifier.weight(1f)) {
-                    Text("System Tweaks (WinUtil)", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
-                    Text(if (winUtilCount > 0) "$winUtilCount tweak(s) selected · Essential, Preferences & Advanced" else "Optional: Dark mode, WPBT block, Services, AI removal, Power plan", fontSize = 11.sp, color = PocketColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text("System Tweaks", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                    val undoNote = if (winUtil.addUndoScript && winUtilCount > 0) " · Undo Script" else ""
+                    val presetNote = if (matchedPreset != null) " ($matchedPreset)" else ""
+                    Text(
+                        text = if (winUtilCount > 0) "$winUtilCount active$presetNote$undoNote · Essential, Preferences & Advanced"
+                        else "Optional: Presets, Classic Menu, AI removal, Updates & Power",
+                        fontSize = 11.sp,
+                        color = PocketColors.textSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
                 }
-                Surface(shape = RoundedCornerShape(6.dp), color = if (winUtilCount > 0) PocketColors.accentBg else PocketColors.surfaceSubtle) { Text(if (winUtilCount > 0) "$winUtilCount active" else "Configure", modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.5.dp), style = MaterialTheme.typography.labelSmall, color = if (winUtilCount > 0) PocketColors.accentSoft else PocketColors.textSecondary) }
-                Icon(Icons.Rounded.ChevronRight, null, tint = PocketColors.textMuted, modifier = Modifier.size(18.dp))
+                Surface(shape = RoundedCornerShape(6.dp), color = if (winUtilCount > 0) PocketColors.accentBg else PocketColors.surfaceSubtle) { Text(if (winUtilCount > 0) "$winUtilCount" else "Open", modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = if (winUtilCount > 0) PocketColors.accentSoft else PocketColors.textMuted) }
+                Icon(Icons.Rounded.ChevronRight, null, tint = PocketColors.textSecondary, modifier = Modifier.size(19.dp))
             }
         }
     }
 
-    if (showWinUtilSheet) WinUtilTweaksSheet(config = winUtil, onDismiss = { showWinUtilSheet = false }, onChange = onWinUtilChange)
+    if (showSystemTweaksScreen) {
+        SystemTweaksScreen(
+            config = winUtil,
+            experience = experience,
+            customPresets = systemTweaksPresets,
+            searchHistory = systemTweaksSearchHistory,
+            onApply = { updated ->
+                onWinUtilChange(updated)
+                showSystemTweaksScreen = false
+            },
+            onDismiss = { showSystemTweaksScreen = false },
+            onSaveCustomPreset = onSaveSystemTweaksPreset,
+            onDeleteCustomPreset = onDeleteSystemTweaksPreset,
+            onUpdateSearchHistory = onUpdateSearchHistory
+        )
+    }
     if (showScriptPicker) RootSingleFilePickerSheet("Select Post-Install Script", "Runs automatically at end of SetupComplete.cmd", setOf("cmd", "bat", "ps1"), defaultBrowseDir, { showScriptPicker = false }) { onExperienceChange(experience.copy(customPostInstallScriptPath = it)); showScriptPicker = false }
     if (showSavePresetDialog) {
         AlertDialog(
             onDismissRequest = { showSavePresetDialog = false }, containerColor = PocketColors.surfaceCard,
             title = { Text("Save Unified Preset", color = PocketColors.textPrimary) },
-            text = { Column(verticalArrangement = Arrangement.spacedBy(6.dp)) { Text("Saves both Pane 1 (Windows Experience) and Pane 2 (WinUtil Tweaks) together.", style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary); OutlinedTextField(value = newPresetName, onValueChange = { newPresetName = it.take(26) }, label = { Text("Preset name") }, placeholder = { Text("e.g., Gaming PC or Clean Laptop") }, singleLine = true, modifier = Modifier.fillMaxWidth()) } },
+            text = { Column(verticalArrangement = Arrangement.spacedBy(6.dp)) { Text("Saves both Windows Experience bypasses and System Tweaks together.", style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary); OutlinedTextField(value = newPresetName, onValueChange = { newPresetName = it.take(26) }, label = { Text("Preset name") }, placeholder = { Text("e.g., Gaming PC or Clean Laptop") }, singleLine = true, modifier = Modifier.fillMaxWidth()) } },
             confirmButton = { Button(onClick = { val n = newPresetName.trim(); if (n.isNotEmpty()) { onSavePreset(n); newPresetName = ""; showSavePresetDialog = false } }, enabled = newPresetName.trim().isNotEmpty(), colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)) { Text("Save", fontWeight = FontWeight.SemiBold) } },
             dismissButton = { TextButton(onClick = { showSavePresetDialog = false }) { Text("Cancel", color = PocketColors.textSecondary) } }
         )
@@ -886,6 +1568,7 @@ fun WindowsTwoPaneCustomizer(
         val previewUnattended = selectedEditionIndex != null
         val previewHasXml = previewUnattended || experience.hasPostSetupTweaks() || winUtil.hasAnyActive()
         val previewNeedsScript = experience.needsSpecializeScript() || winUtil.hasAnyActive()
+        val showUndoTab = winUtil.addUndoScript && winUtil.hasAnyActive()
         val xmlText = remember(experience, winUtil, arch, selectedEditionIndex) {
             if (!previewHasXml) {
                 if (experience.bypassRequirements) {
@@ -905,26 +1588,45 @@ fun WindowsTwoPaneCustomizer(
         }
         val scriptText = remember(experience, winUtil) {
             when {
-                previewNeedsScript -> WindowsCustomizationEngine.buildSpecializeScript(experience, winUtil)
+                previewNeedsScript -> WindowsCustomizationEngine.buildSpecializeScript(experience, winUtil) +
+                    "\r\n\r\nREM ===== SetupComplete.cmd (Post-OOBE) =====\r\n" +
+                    WindowsCustomizationEngine.buildSetupCompleteScript(false, experience.customPostInstallScriptPath.isNotBlank(), experience.customPostInstallScriptPath.substringAfterLast('/'), winUtil)
                 !previewHasXml && !experience.bypassRequirements -> "; No Specialize.cmd needed (Pure Stock ISO — zero scripts injected)"
                 else -> "; No Specialize.cmd needed (pure Panther\\unattend.xml + boot.wim LabConfig patch)"
             }
         }
+        val undoText = remember(experience, winUtil) {
+            if (showUndoTab) WindowsCustomizationEngine.buildUndoScript(experience, winUtil)
+            else "; Add Undo Script is OFF — no undo file will be placed on the Desktop."
+        }
+        val tabs = if (showUndoTab) listOf(
+            if (previewUnattended) "Autounattend.xml" else "unattend.xml",
+            "Specialize.cmd",
+            "Undo.cmd"
+        ) else listOf(
+            if (previewUnattended) "boot.wim\\Autounattend.xml" else "Panther\\unattend.xml",
+            "Specialize.cmd"
+        )
         AlertDialog(
             onDismissRequest = { showPreviewDialog = false }, containerColor = PocketColors.surfaceCard,
             title = { Text("Generated Setup Preview", color = PocketColors.textPrimary) },
             text = {
                 Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        listOf(if (previewUnattended) "boot.wim\\Autounattend.xml" else "Panther\\unattend.xml", "Specialize.cmd").forEachIndexed { idx, lbl ->
+                        tabs.forEachIndexed { idx, lbl ->
                             val sel = previewTab == idx
                             Surface(modifier = Modifier.weight(1f).bounceClick { previewTab = idx }, shape = RoundedCornerShape(8.dp), color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput, border = BorderStroke(0.75.dp, if (sel) PocketColors.accent else PocketColors.border)) {
-                                Box(modifier = Modifier.padding(vertical = 6.dp), contentAlignment = Alignment.Center) { Text(lbl, style = MaterialTheme.typography.labelSmall, color = if (sel) PocketColors.accentSoft else PocketColors.textSecondary) }
+                                Box(modifier = Modifier.padding(vertical = 6.dp, horizontal = 4.dp), contentAlignment = Alignment.Center) { Text(lbl, style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis, color = if (sel) PocketColors.accentSoft else PocketColors.textSecondary) }
                             }
                         }
                     }
-                    Surface(modifier = Modifier.fillMaxWidth().height(280.dp), shape = RoundedCornerShape(10.dp), color = PocketColors.bgCanvas, border = BorderStroke(0.5.dp, PocketColors.border)) {
-                        Text(if (previewTab == 0) xmlText else scriptText, style = PocketColors.monoStyle, fontSize = 10.sp, color = PocketColors.textSecondary, modifier = Modifier.padding(10.dp).verticalScroll(rememberScrollState()))
+                    Surface(modifier = Modifier.fillMaxWidth().height(290.dp), shape = RoundedCornerShape(10.dp), color = PocketColors.bgCanvas, border = BorderStroke(0.5.dp, PocketColors.border)) {
+                        val content = when (previewTab) {
+                            0 -> xmlText
+                            1 -> scriptText
+                            else -> undoText
+                        }
+                        Text(content, style = PocketColors.monoStyle, fontSize = 10.sp, color = PocketColors.textSecondary, modifier = Modifier.padding(10.dp).verticalScroll(rememberScrollState()))
                     }
                 }
             },
@@ -933,100 +1635,8 @@ fun WindowsTwoPaneCustomizer(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun WinUtilTweaksSheet(config: WinUtilTweaksConfig, onDismiss: () -> Unit, onChange: (WinUtilTweaksConfig) -> Unit) {
-    var activeTab by remember { mutableIntStateOf(0) }
-    val count = config.activeCount()
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), containerColor = PocketColors.surfaceCard) {
-        Column(modifier = Modifier.fillMaxWidth().fillMaxHeight(0.86f).navigationBarsPadding().imePadding().padding(horizontal = 18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            PocketSheetHeader(icon = Icons.Rounded.Tune, tint = PocketColors.accentSoft, iconBg = PocketColors.accentBg, title = "System Tweaks (WinUtil)", subtitle = "$count active · Applied offline-safe on first boot")
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                Surface(modifier = Modifier.weight(1f).bounceClick { onChange(WinUtilTweaksConfig.desktopPreset()) }, shape = RoundedCornerShape(9.dp), color = PocketColors.accentBg, border = BorderStroke(0.75.dp, PocketColors.accent)) { Box(modifier = Modifier.padding(vertical = 7.dp), contentAlignment = Alignment.Center) { Text("Desktop Preset", style = MaterialTheme.typography.labelSmall, color = PocketColors.accentSoft) } }
-                Surface(modifier = Modifier.weight(1f).bounceClick { onChange(WinUtilTweaksConfig.laptopSafePreset()) }, shape = RoundedCornerShape(9.dp), color = PocketColors.infoBlueBg, border = BorderStroke(0.75.dp, PocketColors.infoBlue)) { Box(modifier = Modifier.padding(vertical = 7.dp), contentAlignment = Alignment.Center) { Text("Laptop Safe", style = MaterialTheme.typography.labelSmall, color = PocketColors.infoBlue) } }
-                Surface(modifier = Modifier.weight(0.75f).bounceClick { onChange(WinUtilTweaksConfig()) }, shape = RoundedCornerShape(9.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.75.dp, PocketColors.border)) { Box(modifier = Modifier.padding(vertical = 7.dp), contentAlignment = Alignment.Center) { Text("Clear All", style = MaterialTheme.typography.labelSmall, color = PocketColors.textSecondary) } }
-            }
-            Surface(shape = RoundedCornerShape(10.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
-                Row(modifier = Modifier.fillMaxWidth().padding(3.dp), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
-                    listOf("Essential", "Preferences", "Advanced").forEachIndexed { idx, lbl ->
-                        val sel = activeTab == idx
-                        Box(modifier = Modifier.weight(1f).clip(RoundedCornerShape(8.dp)).background(if (sel) PocketColors.surfaceSubtle else Color.Transparent).clickable { activeTab = idx }.padding(vertical = 8.dp), contentAlignment = Alignment.Center) {
-                            Text(lbl, style = MaterialTheme.typography.labelMedium, fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Normal, color = when { sel && idx == 2 -> PocketColors.warning; sel -> PocketColors.accentSoft; else -> PocketColors.textSecondary })
-                        }
-                    }
-                }
-            }
-            Column(modifier = Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(7.dp)) {
-                when (activeTab) {
-                    0 -> {
-                        CustomSwitchRow("Disable Activity History", "Turns off Windows Timeline & activity feed", config.disableActivityHistory) { onChange(config.copy(disableActivityHistory = it)) }
-                        CustomSwitchRow("Disable Delivery Optimization", "Stops P2P Windows Update uploads", config.disableDeliveryOptimization) { onChange(config.copy(disableDeliveryOptimization = it)) }
-                        CustomSwitchRow("End Task With Right Click", "Adds End Task to Windows 11 taskbar menu", config.endTaskWithRightClick) { onChange(config.copy(endTaskWithRightClick = it)) }
-                        CustomSwitchRow("Disable Auto Folder Discovery", "Stops Explorer switching folder view templates", config.disableAutoFolderDiscovery) { onChange(config.copy(disableAutoFolderDiscovery = it)) }
-                        CustomSwitchRow("Disable Hibernation", "Frees hiberfil.sys SSD space (best for desktops)", config.disableHibernation) { onChange(config.copy(disableHibernation = it)) }
-                        CustomSwitchRow("Disable Location Tracking", "Disables system geolocation & lfsvc", config.disableLocationTracking) { onChange(config.copy(disableLocationTracking = it)) }
-                        CustomSwitchRow("Prevent Device Companion Apps", "Stops vendor bloatware auto-downloads on plug-in", config.preventDeviceCompanionApps) { onChange(config.copy(preventDeviceCompanionApps = it)) }
-                        CustomSwitchRow("Disable WPBT (BIOS Bloatware)", "Blocks motherboard UEFI from injecting vendor installers", config.disableWpbt) { onChange(config.copy(disableWpbt = it)) }
-                        CustomSwitchRow("Set Non-Essential Services to Manual", "DiagTrack, MapsBroker, WerSvc, Fax, RetailDemo", config.servicesToManual) { onChange(config.copy(servicesToManual = it)) }
-                        CustomSwitchRow("Revert Start Menu Layout", "Restores prior Win 11 Start Menu layout", config.revertStartMenuLayout) { onChange(config.copy(revertStartMenuLayout = it)) }
-                    }
-                    1 -> {
-                        CustomSwitchRow("Dark Theme by Default", "Dark Mode for Windows UI & Apps before first login", config.darkThemeDefault) { onChange(config.copy(darkThemeDefault = it)) }
-                        CustomSwitchRow("Enable Long Paths (>260 chars)", "Removes legacy Win32 path length cap", config.enableLongPaths) { onChange(config.copy(enableLongPaths = it)) }
-                        CustomSwitchRow("Show Hidden Files & Folders", "Visible immediately in File Explorer", config.showHiddenFiles) { onChange(config.copy(showHiddenFiles = it)) }
-                        CustomSwitchRow("Disable Mouse Acceleration", "Raw 1:1 pointer precision", config.disableMouseAcceleration) { onChange(config.copy(disableMouseAcceleration = it)) }
-                        CustomSwitchRow("Num Lock on Startup", "Enables Num Lock at login screen", config.numLockOnStartup) { onChange(config.copy(numLockOnStartup = it)) }
-                        CustomSwitchRow("Disable Sticky Keys Popup", "Stops 5x Shift Sticky Keys beep/dialog", config.disableStickyKeys) { onChange(config.copy(disableStickyKeys = it)) }
-                        CustomSwitchRow("Taskbar Alignment: Left", "Aligns Windows 11 taskbar icons left", config.taskbarAlignLeft) { onChange(config.copy(taskbarAlignLeft = it)) }
-                        CustomSwitchRow("Hide Taskbar Search Icon", "Removes taskbar Search box", config.hideTaskbarSearch) { onChange(config.copy(hideTaskbarSearch = it)) }
-                        CustomSwitchRow("Hide Task View Icon", "Removes taskbar Task View button", config.hideTaskView) { onChange(config.copy(hideTaskView = it)) }
-                        CustomSwitchRow("System Tray Battery Percentage", "Shows exact % on Windows 11 24H2+", config.showBatteryPercentage) { onChange(config.copy(showBatteryPercentage = it)) }
-                        CustomSwitchRow("Disable Lock Screen", "Skips swipe-up screen straight to login", config.disableLockScreen) { onChange(config.copy(disableLockScreen = it)) }
-                        CustomSwitchRow("Disable Logon Acrylic Blur", "Crisp wallpaper without blur on sign-in", config.disableLogonAcrylicBlur) { onChange(config.copy(disableLogonAcrylicBlur = it)) }
-                        CustomSwitchRow("Verbose BSoD & Logon Status", "Detailed boot/shutdown & crash diagnostics", config.verboseBsodAndLogon) { onChange(config.copy(verboseBsodAndLogon = it)) }
-                        CustomSwitchRow("Always Show Scrollbars", "Disables auto-hiding UWP scrollbars", config.alwaysShowScrollbars) { onChange(config.copy(alwaysShowScrollbars = it)) }
-                        CustomSwitchRow("Hide Settings Home Page", "Removes ad-heavy Settings Home screen", config.hideSettingsHome) { onChange(config.copy(hideSettingsHome = it)) }
-                        CustomSwitchRow("Disable Game Mode", "Turns off AutoGameModeEnabled", config.disableGameMode) { onChange(config.copy(disableGameMode = it)) }
-                        CustomSwitchRow("Disable Window Snapping", "Turns off edge drag window snap", config.disableWindowSnapping) { onChange(config.copy(disableWindowSnapping = it)) }
-                        CustomSwitchRow("Disable S0 Standby Network", "Prevents Modern Standby Wi-Fi drain in bag (laptops)", config.disableS0Network) { onChange(config.copy(disableS0Network = it, forceS3Sleep = if (it) false else config.forceS3Sleep)) }
-                        CustomSwitchRow("Disable Multiplane Overlay (MPO)", "Fixes NVIDIA/AMD flicker & browser stutter", config.disableMpo) { onChange(config.copy(disableMpo = it)) }
-                    }
-                    else -> {
-                        Surface(shape = RoundedCornerShape(10.dp), color = PocketColors.warningBg, border = BorderStroke(0.5.dp, PocketColors.warning)) {
-                            Row(modifier = Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Icon(Icons.Rounded.WarningAmber, null, tint = PocketColors.warning, modifier = Modifier.size(16.dp))
-                                Text("Advanced tweaks modify core services, browsers, or power plans. Enable only what you need.", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
-                            }
-                        }
-                        CustomSwitchRow("Disable & Remove Windows AI", "Blocks Recall, Copilot & AI snapshots", config.disableAndRemoveWindowsAi, warningAccent = true) { onChange(config.copy(disableAndRemoveWindowsAi = it)) }
-                        CustomSwitchRow("Remove OneDrive Completely", "Full OneDrive uninstall (beyond QoL block)", config.removeOneDrive, warningAccent = true) { onChange(config.copy(removeOneDrive = it)) }
-                        CustomSwitchRow("Debloat Microsoft Edge", "Disables Sidebar, Shopping, Rewards & Startup Boost", config.debloatEdge, warningAccent = true) { onChange(config.copy(debloatEdge = it, removeEdge = if (it) false else config.removeEdge)) }
-                        CustomSwitchRow("Remove Microsoft Edge", "Uninstalls Edge (keeps WebView2 intact)", config.removeEdge, warningAccent = true) { onChange(config.copy(removeEdge = it, debloatEdge = if (it) false else config.debloatEdge)) }
-                        CustomSwitchRow("Remove Explorer Home & Gallery", "Removes Home & Gallery sidebar nodes (Win 11)", config.removeExplorerHomeGallery, warningAccent = true) { onChange(config.copy(removeExplorerHomeGallery = it)) }
-                        CustomSwitchRow("Set Hardware Clock to UTC", "Fixes 5.5h clock jump when dual-booting Linux", config.setHardwareClockUtc, warningAccent = true) { onChange(config.copy(setHardwareClockUtc = it)) }
-                        CustomSwitchRow("Disable Reserved Storage", "Frees ~7 GB Windows Update reserve on C:", config.disableReservedStorage, warningAccent = true) { onChange(config.copy(disableReservedStorage = it)) }
-                        CustomSwitchRow("Disable Background Apps", "Stops UWP apps running in background", config.disableBackgroundApps, warningAccent = true) { onChange(config.copy(disableBackgroundApps = it)) }
-                        CustomSwitchRow("Disable Storage Sense", "Turns off automatic temp file purging", config.disableStorageSense, warningAccent = true) { onChange(config.copy(disableStorageSense = it)) }
-                        CustomSwitchRow("Disable Windows Search Indexing", "Disables WSearch service (slower file search)", config.disableSearchIndexing, warningAccent = true) { onChange(config.copy(disableSearchIndexing = it)) }
-                        CustomSwitchRow("Block Razer / Logitech Auto-Install", "Stops vendor software popups via Windows Update", config.blockRazerLogitechAutoInstall, warningAccent = true) { onChange(config.copy(blockRazerLogitechAutoInstall = it)) }
-                        CustomSwitchRow("Prefer IPv4 Over IPv6", "Safer than disabling IPv6 completely", config.preferIpv4OverIpv6, warningAccent = true) { onChange(config.copy(preferIpv4OverIpv6 = it, disableIpv6 = if (it) false else config.disableIpv6)) }
-                        CustomSwitchRow("Disable IPv6 Completely", "DisabledComponents = 0xFF (mutually exclusive w/ IPv4 pref)", config.disableIpv6, warningAccent = true) { onChange(config.copy(disableIpv6 = it, preferIpv4OverIpv6 = if (it) false else config.preferIpv4OverIpv6)) }
-                        CustomSwitchRow("Disable Teredo Tunneling", "Disables Teredo IPv6 relay (affects some Xbox P2P)", config.disableTeredo, warningAccent = true) { onChange(config.copy(disableTeredo = it)) }
-                        CustomSwitchRow("Disable svchost.exe Splitting", "Consolidates services (16 GB+ RAM desktops)", config.disableSvchostSplitting, warningAccent = true) { onChange(config.copy(disableSvchostSplitting = it)) }
-                        CustomSwitchRow("Visual Effects: Best Performance", "Disables UI animations & shadows", config.visualEffectsBestPerformance, warningAccent = true) { onChange(config.copy(visualEffectsBestPerformance = it)) }
-                        CustomSwitchRow("Disable Notification Center", "Hides Windows Action/Notification Center", config.disableNotificationCenter, warningAccent = true) { onChange(config.copy(disableNotificationCenter = it)) }
-                        CustomSwitchRow("Force Legacy S3 Sleep", "Caution: breaks sleep on Modern-Standby-only laptops", config.forceS3Sleep, warningAccent = true) { onChange(config.copy(forceS3Sleep = it, disableS0Network = if (it) false else config.disableS0Network)) }
-                        CustomSwitchRow("Ultimate Performance Power Plan", "Desktops only · unlocks hidden max-perf scheme", config.ultimatePerformancePlan, warningAccent = true) { onChange(config.copy(ultimatePerformancePlan = it)) }
-                    }
-                }
-            }
-            Button(onClick = onDismiss, modifier = Modifier.fillMaxWidth().padding(bottom = 18.dp).height(48.dp), shape = RoundedCornerShape(12.dp), colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)) { Text("Done ($count tweaks selected)", fontWeight = FontWeight.SemiBold) }
-        }
-    }
-}
-
-@Composable
-private fun CustomSwitchRow(title: String, subtitle: String, checked: Boolean, warningAccent: Boolean = false, onChange: (Boolean) -> Unit) {
+internal fun CustomSwitchRow(title: String, subtitle: String, checked: Boolean, warningAccent: Boolean = false, onChange: (Boolean) -> Unit) {
     Surface(shape = RoundedCornerShape(10.dp), color = PocketColors.surfaceCard, border = BorderStroke(0.5.dp, if (checked) (if (warningAccent) PocketColors.warning.copy(alpha = 0.6f) else PocketColors.accent.copy(alpha = 0.55f)) else PocketColors.border)) {
         Row(modifier = Modifier.fillMaxWidth().clickable { onChange(!checked) }.padding(horizontal = 11.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
             Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {

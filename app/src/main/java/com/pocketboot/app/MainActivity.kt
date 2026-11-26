@@ -873,6 +873,8 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                 isoFile = isoFile,
                 defaultDir = settings.defaultDir,
                 presets = settings.autounattendPresets,
+                systemTweaksPresets = settings.systemTweaksPresets,
+                systemTweaksSearchHistory = settings.systemTweaksSearchHistory,
                 building = windowsBuildJob != null,
                 progress = windowsBuildProgress,
                 onDismiss = { windowsBuilderTarget = null },
@@ -891,6 +893,19 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                     val updatedPresets = settings.autounattendPresets.filterNot { it.name == presetName }
                     updateSettings(settings.copy(autounattendPresets = updatedPresets), rescan = false)
                     showFeedback("Deleted preset \"$presetName\".")
+                },
+                onSaveSystemTweaksPreset = { tp ->
+                    val updated = settings.systemTweaksPresets.filterNot { it.name.equals(tp.name, true) } + tp
+                    updateSettings(settings.copy(systemTweaksPresets = updated), rescan = false)
+                    showFeedback("Saved System Tweaks preset \"${tp.name}\".")
+                },
+                onDeleteSystemTweaksPreset = { tpName ->
+                    val updated = settings.systemTweaksPresets.filterNot { it.name == tpName }
+                    updateSettings(settings.copy(systemTweaksPresets = updated), rescan = false)
+                    showFeedback("Deleted System Tweaks preset \"$tpName\".")
+                },
+                onUpdateSearchHistory = { hist ->
+                    updateSettings(settings.copy(systemTweaksSearchHistory = hist), rescan = false)
                 },
                 onStartBuild = { cfg ->
                     if (anyBuildActive) {
@@ -981,6 +996,8 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                 defaultDir = settings.defaultDir,
                 initialIso = ventoyBuilderInitialIso,
                 presets = settings.autounattendPresets,
+                systemTweaksPresets = settings.systemTweaksPresets,
+                systemTweaksSearchHistory = settings.systemTweaksSearchHistory,
                 building = ventoyBuildJob != null,
                 onSavePreset = { preset ->
                     val updatedPresets = (settings.autounattendPresets.filterNot { it.name.equals(preset.name, true) } + preset)
@@ -991,6 +1008,19 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                     val updatedPresets = settings.autounattendPresets.filterNot { it.name == presetName }
                     updateSettings(settings.copy(autounattendPresets = updatedPresets), rescan = false)
                     showFeedback("Deleted preset \"$presetName\".")
+                },
+                onSaveSystemTweaksPreset = { tp ->
+                    val updated = settings.systemTweaksPresets.filterNot { it.name.equals(tp.name, true) } + tp
+                    updateSettings(settings.copy(systemTweaksPresets = updated), rescan = false)
+                    showFeedback("Saved System Tweaks preset \"${tp.name}\".")
+                },
+                onDeleteSystemTweaksPreset = { tpName ->
+                    val updated = settings.systemTweaksPresets.filterNot { it.name == tpName }
+                    updateSettings(settings.copy(systemTweaksPresets = updated), rescan = false)
+                    showFeedback("Deleted System Tweaks preset \"$tpName\".")
+                },
+                onUpdateSearchHistory = { hist ->
+                    updateSettings(settings.copy(systemTweaksSearchHistory = hist), rescan = false)
                 },
                 progress = ventoyBuildProgress,
                 onDismiss = {
@@ -1048,6 +1078,8 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                 isMountedToPc = vMountedLun != null,
                 availableIsos = images,
                 presets = settings.autounattendPresets,
+                systemTweaksPresets = settings.systemTweaksPresets,
+                systemTweaksSearchHistory = settings.systemTweaksSearchHistory,
                 defaultDir = settings.defaultDir,
                 onSavePreset = { preset ->
                     val updatedPresets = (settings.autounattendPresets.filterNot { it.name.equals(preset.name, true) } + preset)
@@ -1058,6 +1090,19 @@ fun PocketBootApp(initialShortcutPath: String = "") {
                     val updatedPresets = settings.autounattendPresets.filterNot { it.name == presetName }
                     updateSettings(settings.copy(autounattendPresets = updatedPresets), rescan = false)
                     showFeedback("Deleted preset \"$presetName\".")
+                },
+                onSaveSystemTweaksPreset = { tp ->
+                    val updated = settings.systemTweaksPresets.filterNot { it.name.equals(tp.name, true) } + tp
+                    updateSettings(settings.copy(systemTweaksPresets = updated), rescan = false)
+                    showFeedback("Saved System Tweaks preset \"${tp.name}\".")
+                },
+                onDeleteSystemTweaksPreset = { tpName ->
+                    val updated = settings.systemTweaksPresets.filterNot { it.name == tpName }
+                    updateSettings(settings.copy(systemTweaksPresets = updated), rescan = false)
+                    showFeedback("Deleted System Tweaks preset \"$tpName\".")
+                },
+                onUpdateSearchHistory = { hist ->
+                    updateSettings(settings.copy(systemTweaksSearchHistory = hist), rescan = false)
                 },
                 onDismiss = { ventoyManagerTarget = null },
                 onUnmountFirst = { unmountSlot(vMountedLun) },
