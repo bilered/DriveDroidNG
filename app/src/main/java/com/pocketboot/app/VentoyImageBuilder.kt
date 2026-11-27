@@ -179,7 +179,8 @@ data class VentoyBuildConfig(
     val initialIsoToAdd: ImageFile? = null,
     val moveInitialIso: Boolean = false,
     val autoMountAfterBuild: Boolean = true,
-    val volumeLabel: String = ""
+    val volumeLabel: String = "",
+    val directBlockTarget: OtgUsbDevice? = null
 )
 
 object VentoyImageBuilder {
@@ -1071,25 +1072,48 @@ object VentoyImageBuilder {
         BuildThermalHelper.resetCancelFlag()
         val ts = nowTs()
         val entries = mutableListOf<LogEntry>()
+        val isDirectBlock = config.directBlockTarget != null
         val safeDir = UsbGadgetEngine.resolveDirectPath(config.outputDir).trimEnd('/')
-        val safeName = UsbGadgetEngine.sanitizeOutputFileName(config.outputName, ".img", IsoInspector.DEFAULT_MULTIBOOT_FILE_BASE)
-        val outPath = "$safeDir/$safeName"
-        val qOut = shellQuote(outPath)
+        val safeName = if (isDirectBlock) {
+            config.directBlockTarget?.displayTitle ?: "USB-C OTG Drive"
+        } else {
+            UsbGadgetEngine.sanitizeOutputFileName(config.outputName, ".img", IsoInspector.DEFAULT_MULTIBOOT_FILE_BASE)
+        }
+        var outPath = if (isDirectBlock) config.directBlockTarget?.devPath.orEmpty() else "$safeDir/$safeName"
+        var qOut = shellQuote(outPath)
         val qDir = shellQuote(safeDir)
         var loopDev = ""
+        var loopIsLoopNode = true
         var imgAllocated = false
+        var verifiedOtg: OtgUsbDevice? = null
+
+        fun cleanupVentoyBuild(deletePartial: Boolean) {
+            if (loopDev.isNotEmpty()) {
+                BuildThermalHelper.unmountAndDetachClean(
+                    mountPoints = listOf(TEMP_VENTOY_MNT),
+                    loopDevices = if (loopIsLoopNode) listOf(loopDev) else emptyList(),
+                    removeDirs = true
+                )
+                loopDev = ""
+            }
+            if (deletePartial && imgAllocated && !isDirectBlock) {
+                Shell.cmd("rm -f $qOut 2>/dev/null || true").exec()
+            }
+        }
 
         return@withContext runCatching {
             if (!Shell.getShell().isRoot) {
                 return@withContext ActionResult(false, "Root access is required.", entries = entries)
             }
-            config.initialIsoToAdd?.let { initIso ->
-                if (outPath.equals(UsbGadgetEngine.resolveDirectPath(initIso.path), ignoreCase = true)) {
-                    return@withContext ActionResult(false, "Output drive cannot overwrite the source ISO.", entries = entries)
+            if (!isDirectBlock) {
+                config.initialIsoToAdd?.let { initIso ->
+                    if (outPath.equals(UsbGadgetEngine.resolveDirectPath(initIso.path), ignoreCase = true)) {
+                        return@withContext ActionResult(false, "Output drive cannot overwrite the source ISO.", entries = entries)
+                    }
                 }
-            }
-            if (UsbGadgetEngine.getStatus().mountedLunFor(outPath) != null) {
-                return@withContext ActionResult(false, "$safeName is currently mounted to your PC. Unmount it before overwriting.", entries = entries)
+                if (UsbGadgetEngine.getStatus().mountedLunFor(outPath) != null) {
+                    return@withContext ActionResult(false, "$safeName is currently mounted to your PC. Unmount it before overwriting.", entries = entries)
+                }
             }
 
             onProgress(WindowsBuildProgress("Checking Multi-Boot engine...", "Loading offline boot files", 0.06f, true))
@@ -1100,62 +1124,95 @@ object VentoyImageBuilder {
                     entries = entries
                 )
 
-            val layout = DiskPartitioner.calculateVentoyLayoutMb(config.sizeMb, config.scheme)
-            val sizeLabel = if (config.sizeMb >= 1024) {
-                String.format(Locale.US, "%.1f GB", config.sizeMb / 1024.0).replace(".0 GB", " GB")
-            } else {
-                "${config.sizeMb} MB"
-            }
             val allDriverDirs = (config.extraDriverPackDirs + listOf(config.driversDir))
                 .map { it.trim() }.filter { it.isNotBlank() }.distinct()
             val drvSizeBytes = allDriverDirs.sumOf { UsbGadgetEngine.queryDirSizeBytes(it) }
-            config.initialIsoToAdd?.let { initIso ->
+            val initIsoSizeBytes = config.initialIsoToAdd?.let { initIso ->
                 val resolvedInit = UsbGadgetEngine.resolveDirectPath(initIso.path)
-                val actualIsoSize = Shell.cmd("stat -c '%s' ${shellQuote(resolvedInit)} 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: initIso.sizeBytes
-                if (actualIsoSize <= 0L) {
+                val sz = Shell.cmd("stat -c '%s' ${shellQuote(resolvedInit)} 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: initIso.sizeBytes
+                if (sz <= 0L) {
                     return@withContext ActionResult(false, "Source ISO not found or empty: ${initIso.name}", entries = entries)
                 }
-                val requiredPart1Bytes = actualIsoSize + drvSizeBytes + (192L * 1024L * 1024L)
-                if (layout.part1SizeBytes < requiredPart1Bytes) {
-                    val minGb = ((requiredPart1Bytes + (1024L * 1024L * 1024L) - 1L) / (1024L * 1024L * 1024L)).coerceAtLeast(1L)
-                    return@withContext ActionResult(
-                        false,
-                        "Drive size ($sizeLabel) is too small for ${initIso.name} (${UsbGadgetEngine.formatBytes(actualIsoSize)}). Increase Drive Capacity to at least $minGb GB and try again.",
-                        entries = entries
-                    )
+                sz
+            } ?: 0L
+
+            val effectiveScheme: PartitionScheme
+            val layout: DiskLayoutSpec
+            val sizeLabel: String
+            if (isDirectBlock) {
+                val reqTarget = config.directBlockTarget
+                    ?: return@withContext ActionResult(false, "No physical USB-C OTG drive selected.", entries = entries)
+                onProgress(WindowsBuildProgress("Verifying USB-C drive...", reqTarget.displayTitle, 0.10f, true))
+                val (prepDev, prepErr) = OtgUsbFlasher.verifyPhysicalOtgDisk(reqTarget)
+                if (prepDev == null) {
+                    return@withContext ActionResult(false, prepErr ?: "USB-C OTG drive preparation failed.", entries = entries)
                 }
-                val rawPhoneFreeB = queryHostFreeSpaceBytes(safeDir)
-                val existingOutAllocB = Shell.cmd("stat -c '%b' $qOut 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull()?.times(512L)?.coerceAtLeast(0L) ?: 0L
-                val effectivePhoneFreeB = if (rawPhoneFreeB >= 0L) rawPhoneFreeB + existingOutAllocB else -1L
-                val phoneNeededB = actualIsoSize + drvSizeBytes + (96L * 1024L * 1024L)
-                if (effectivePhoneFreeB in 0L until phoneNeededB) {
-                    return@withContext ActionResult(
-                        false,
-                        "Not enough free phone storage (${UsbGadgetEngine.formatBytes(effectivePhoneFreeB)} available). Need at least ${UsbGadgetEngine.formatBytes(phoneNeededB)} free to copy ${initIso.name}.",
-                        entries = entries
-                    )
+                verifiedOtg = prepDev
+                outPath = prepDev.devPath
+                qOut = shellQuote(outPath)
+                effectiveScheme = DiskPartitioner.effectiveSchemeForDisk(config.scheme, prepDev.sizeBytes)
+                val minPart1Bytes = (initIsoSizeBytes + drvSizeBytes + (192L * 1024L * 1024L)).coerceAtLeast(128L * 1024L * 1024L)
+                layout = DiskPartitioner.calculateFixedVentoyLayout(
+                    totalDiskBytes = prepDev.sizeBytes,
+                    minPart1Bytes = minPart1Bytes,
+                    scheme = effectiveScheme
+                ) ?: return@withContext ActionResult(
+                    false,
+                    "USB pen drive (${UsbGadgetEngine.formatBytes(prepDev.sizeBytes)}) is too small for Multi-Boot + selected ISO/drivers (need at least ${UsbGadgetEngine.formatBytes(minPart1Bytes + 64L * 1024L * 1024L)}).",
+                    entries = entries
+                )
+                sizeLabel = UsbGadgetEngine.formatBytes(prepDev.sizeBytes)
+            } else {
+                effectiveScheme = config.scheme
+                layout = DiskPartitioner.calculateVentoyLayoutMb(config.sizeMb, effectiveScheme)
+                sizeLabel = if (config.sizeMb >= 1024) {
+                    String.format(Locale.US, "%.1f GB", config.sizeMb / 1024.0).replace(".0 GB", " GB")
+                } else {
+                    "${config.sizeMb} MB"
                 }
-            }
-            if (config.initialIsoToAdd == null && drvSizeBytes > 0L) {
-                val requiredDrvPart1Bytes = drvSizeBytes + (192L * 1024L * 1024L)
-                if (layout.part1SizeBytes < requiredDrvPart1Bytes) {
-                    val minGb = ((requiredDrvPart1Bytes + (1024L * 1024L * 1024L) - 1L) / (1024L * 1024L * 1024L)).coerceAtLeast(1L)
-                    return@withContext ActionResult(
-                        false,
-                        "Drive size ($sizeLabel) is too small for the selected Drivers folder (${UsbGadgetEngine.formatBytes(drvSizeBytes)}). Increase Drive Capacity to at least $minGb GB and try again.",
-                        entries = entries
-                    )
+                config.initialIsoToAdd?.let { initIso ->
+                    val requiredPart1Bytes = initIsoSizeBytes + drvSizeBytes + (192L * 1024L * 1024L)
+                    if (layout.part1SizeBytes < requiredPart1Bytes) {
+                        val minGb = ((requiredPart1Bytes + (1024L * 1024L * 1024L) - 1L) / (1024L * 1024L * 1024L)).coerceAtLeast(1L)
+                        return@withContext ActionResult(
+                            false,
+                            "Drive size ($sizeLabel) is too small for ${initIso.name} (${UsbGadgetEngine.formatBytes(initIsoSizeBytes)}). Increase Drive Capacity to at least $minGb GB and try again.",
+                            entries = entries
+                        )
+                    }
+                    val rawPhoneFreeB = queryHostFreeSpaceBytes(safeDir)
+                    val existingOutAllocB = Shell.cmd("stat -c '%b' $qOut 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull()?.times(512L)?.coerceAtLeast(0L) ?: 0L
+                    val effectivePhoneFreeB = if (rawPhoneFreeB >= 0L) rawPhoneFreeB + existingOutAllocB else -1L
+                    val phoneNeededB = initIsoSizeBytes + drvSizeBytes + (96L * 1024L * 1024L)
+                    if (effectivePhoneFreeB in 0L until phoneNeededB) {
+                        return@withContext ActionResult(
+                            false,
+                            "Not enough free phone storage (${UsbGadgetEngine.formatBytes(effectivePhoneFreeB)} available). Need at least ${UsbGadgetEngine.formatBytes(phoneNeededB)} free to copy ${initIso.name}.",
+                            entries = entries
+                        )
+                    }
                 }
-                val rawPhoneFreeB = queryHostFreeSpaceBytes(safeDir)
-                val existingOutAllocB = Shell.cmd("stat -c '%b' $qOut 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull()?.times(512L)?.coerceAtLeast(0L) ?: 0L
-                val effectivePhoneFreeB = if (rawPhoneFreeB >= 0L) rawPhoneFreeB + existingOutAllocB else -1L
-                val phoneNeededB = drvSizeBytes + (96L * 1024L * 1024L)
-                if (effectivePhoneFreeB in 0L until phoneNeededB) {
-                    return@withContext ActionResult(
-                        false,
-                        "Not enough free phone storage (${UsbGadgetEngine.formatBytes(effectivePhoneFreeB)} available). Need at least ${UsbGadgetEngine.formatBytes(phoneNeededB)} free for the Drivers folder.",
-                        entries = entries
-                    )
+                if (config.initialIsoToAdd == null && drvSizeBytes > 0L) {
+                    val requiredDrvPart1Bytes = drvSizeBytes + (192L * 1024L * 1024L)
+                    if (layout.part1SizeBytes < requiredDrvPart1Bytes) {
+                        val minGb = ((requiredDrvPart1Bytes + (1024L * 1024L * 1024L) - 1L) / (1024L * 1024L * 1024L)).coerceAtLeast(1L)
+                        return@withContext ActionResult(
+                            false,
+                            "Drive size ($sizeLabel) is too small for the selected Drivers folder (${UsbGadgetEngine.formatBytes(drvSizeBytes)}). Increase Drive Capacity to at least $minGb GB and try again.",
+                            entries = entries
+                        )
+                    }
+                    val rawPhoneFreeB = queryHostFreeSpaceBytes(safeDir)
+                    val existingOutAllocB = Shell.cmd("stat -c '%b' $qOut 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull()?.times(512L)?.coerceAtLeast(0L) ?: 0L
+                    val effectivePhoneFreeB = if (rawPhoneFreeB >= 0L) rawPhoneFreeB + existingOutAllocB else -1L
+                    val phoneNeededB = drvSizeBytes + (96L * 1024L * 1024L)
+                    if (effectivePhoneFreeB in 0L until phoneNeededB) {
+                        return@withContext ActionResult(
+                            false,
+                            "Not enough free phone storage (${UsbGadgetEngine.formatBytes(effectivePhoneFreeB)} available). Need at least ${UsbGadgetEngine.formatBytes(phoneNeededB)} free for the Drivers folder.",
+                            entries = entries
+                        )
+                    }
                 }
             }
             val procFs = Shell.cmd("cat /proc/filesystems 2>/dev/null").exec().out
@@ -1183,38 +1240,46 @@ object VentoyImageBuilder {
                 return@withContext ActionResult(false, "No NTFS or exFAT formatter found.", entries = entries)
             }
 
-            // Step 1: Allocate SPARSE .img (only uses ~35 MB on phone until ISOs are copied inside!)
-            onProgress(
-                WindowsBuildProgress(
-                    "Creating $sizeLabel sparse Multi-Boot drive...",
-                    "Engine v${bundle.version} (${config.scheme.label} · ${if (useExfat) "exFAT" else "NTFS"})",
-                    0.16f,
-                    false
+            // Step 1: Allocate SPARSE .img (skipped when writing directly to physical OTG drive)
+            if (!isDirectBlock) {
+                onProgress(
+                    WindowsBuildProgress(
+                        "Creating $sizeLabel sparse Multi-Boot drive...",
+                        "Engine v${bundle.version} (${effectiveScheme.label} · ${if (useExfat) "exFAT" else "NTFS"})",
+                        0.16f,
+                        false
+                    )
                 )
-            )
-            val allocRes = Shell.cmd(
-                "mkdir -p $qDir && rm -f $qOut && (truncate -s ${layout.totalBytes} $qOut 2>/dev/null || dd if=/dev/zero of=$qOut bs=1M count=0 seek=${layout.totalBytes / (1024L * 1024L)} 2>/dev/null)"
-            ).exec()
-            if (!allocRes.isSuccess) {
-                return@withContext ActionResult(false, "Failed to create sparse image at $outPath.", entries = entries)
+                val allocRes = Shell.cmd(
+                    "mkdir -p $qDir && rm -f $qOut && (truncate -s ${layout.totalBytes} $qOut 2>/dev/null || dd if=/dev/zero of=$qOut bs=1M count=0 seek=${layout.totalBytes / (1024L * 1024L)} 2>/dev/null)"
+                ).exec()
+                if (!allocRes.isSuccess) {
+                    return@withContext ActionResult(false, "Failed to create sparse image at $outPath.", entries = entries)
+                }
+                imgAllocated = true
+            } else {
+                val otgToWipe = verifiedOtg ?: return@withContext ActionResult(false, "USB-C OTG drive unavailable.", entries = entries)
+                onProgress(WindowsBuildProgress("Unmounting & wiping USB drive...", otgToWipe.displayTitle, 0.18f, true))
+                OtgUsbFlasher.unmountAndWipeOtgDisk(otgToWipe, entries, ts)?.let { err ->
+                    return@withContext ActionResult(false, err, entries = entries)
+                }
             }
-            imgAllocated = true
 
-            // Step 2: Write Ventoy GPT/MBR partition table + boot.img + core.img + 32 MB VTOYEFI
-            onProgress(WindowsBuildProgress("Writing Multi-Boot bootloader...", "Preparing 32 MB EFI boot partition", 0.34f, false))
+            // Step 2: Write Multi-Boot GPT/MBR partition table + boot.img + core.img + 32 MB EFI
+            onProgress(WindowsBuildProgress("Writing Multi-Boot bootloader...", "Preparing 32 MB EFI boot partition (${effectiveScheme.label})", 0.34f, false))
             val writeErr = writeVentoyBootStructures(
                 context = context,
                 outPath = outPath,
-                scheme = config.scheme,
+                scheme = effectiveScheme,
                 layout = layout,
                 bundle = bundle,
                 writePartitionTable = true
             )
             if (writeErr != null) {
-                Shell.cmd("rm -f $qOut 2>/dev/null").exec()
+                cleanupVentoyBuild(deletePartial = true)
                 return@withContext ActionResult(false, "Multi-Boot bootloader write failed: $writeErr", entries = entries)
             }
-            entries.add(LogEntry(ts, "multiboot", "Wrote Multi-Boot v${bundle.version} ${config.scheme.label} + EFI partition at LBA=${layout.part2StartLba}"))
+            entries.add(LogEntry(ts, "multiboot", "Wrote Multi-Boot v${bundle.version} ${effectiveScheme.label} + EFI partition at LBA=${layout.part2StartLba}"))
 
             // Step 3: Attach Partition 1 & format NTFS or exFAT
             onProgress(
@@ -1225,10 +1290,18 @@ object VentoyImageBuilder {
                     false
                 )
             )
-            loopDev = attachPartition1Loop(outPath, layout.part1OffsetBytes, layout.part1SizeBytes)
+            val otgForAttach = verifiedOtg
+            if (otgForAttach != null) {
+                val (attached, isLoop) = OtgUsbFlasher.attachOtgPartitionSlice(otgForAttach, 1, layout.part1OffsetBytes, layout.part1SizeBytes)
+                loopDev = attached
+                loopIsLoopNode = isLoop
+            } else {
+                loopDev = attachPartition1Loop(outPath, layout.part1OffsetBytes, layout.part1SizeBytes)
+                loopIsLoopNode = true
+            }
             if (loopDev.isBlank() || !loopDev.startsWith("/dev/")) {
-                Shell.cmd("rm -f $qOut 2>/dev/null").exec()
-                return@withContext ActionResult(false, "Kernel loop setup failed for Multi-Boot Partition 1.", entries = entries)
+                cleanupVentoyBuild(deletePartial = true)
+                return@withContext ActionResult(false, "Could not attach Multi-Boot Partition 1.", entries = entries)
             }
             val qLoop = shellQuote(loopDev)
 
@@ -1241,24 +1314,21 @@ object VentoyImageBuilder {
             val qVolLbl = shellQuote(volLabel)
             val fmtRes = if (useExfat) {
                 val fmtBin = exfatFormatter ?: run {
-                    unmountVentoyPartition1(loopDev)
-                    Shell.cmd("rm -f $qOut 2>/dev/null").exec()
+                    cleanupVentoyBuild(deletePartial = true)
                     return@withContext ActionResult(false, "exFAT formatter unavailable on device.", entries = entries)
                 }
                 val qFmt = shellQuote(fmtBin)
                 Shell.cmd("$qFmt -L $qVolLbl $qLoop 2>&1 || $qFmt -n $qVolLbl $qLoop 2>&1 || $qFmt $qLoop 2>&1").exec()
             } else {
                 val fmtBin = ntfsFormatter ?: run {
-                    unmountVentoyPartition1(loopDev)
-                    Shell.cmd("rm -f $qOut 2>/dev/null").exec()
+                    cleanupVentoyBuild(deletePartial = true)
                     return@withContext ActionResult(false, "NTFS formatter unavailable on device.", entries = entries)
                 }
                 val qFmt = shellQuote(fmtBin)
                 Shell.cmd("$qFmt -F -Q -c 4096 -L $qVolLbl -H 255 -S 63 -p ${layout.part1StartLba} $qLoop 2>&1").exec()
             }
             if (!fmtRes.isSuccess) {
-                unmountVentoyPartition1(loopDev)
-                Shell.cmd("rm -f $qOut 2>/dev/null").exec()
+                cleanupVentoyBuild(deletePartial = true)
                 val err = (fmtRes.out + fmtRes.err).joinToString(" ").take(200)
                 return@withContext ActionResult(false, "Multi-Boot format failed: $err", entries = entries)
             }
@@ -1267,9 +1337,7 @@ object VentoyImageBuilder {
             onProgress(WindowsBuildProgress("Configuring Multi-Boot...", "Writing boot configuration", 0.70f, false))
             val mntType = mountVentoyPartition1(context, loopDev)
             if (mntType == null) {
-                unmountVentoyPartition1(loopDev)
-                loopDev = ""
-                Shell.cmd("rm -f $qOut 2>/dev/null || true").exec()
+                cleanupVentoyBuild(deletePartial = true)
                 return@withContext ActionResult(false, "Could not mount formatted Partition 1 to configure Multi-Boot drive.", entries = entries)
             }
             config.initialIsoToAdd?.let { iso ->
@@ -1282,9 +1350,7 @@ object VentoyImageBuilder {
                 val requiredInsideB = srcSize + drvSizeBytes + (32L * 1024L * 1024L)
                 if (partFreeB <= 0L || partFreeB < requiredInsideB) {
                     val minGb = ((requiredInsideB + (192L * 1024L * 1024L) + (1024L * 1024L * 1024L) - 1L) / (1024L * 1024L * 1024L)).coerceAtLeast(1L)
-                    unmountVentoyPartition1(loopDev)
-                    loopDev = ""
-                    Shell.cmd("rm -f $qOut 2>/dev/null || true").exec()
+                    cleanupVentoyBuild(deletePartial = true)
                     return@withContext ActionResult(
                         false,
                         "Partition 1 only has ${if (partFreeB > 0L) UsbGadgetEngine.formatBytes(partFreeB) else "insufficient"} usable space for $destName (${UsbGadgetEngine.formatBytes(srcSize)}). Increase Drive Capacity to at least $minGb GB and retry.",
@@ -1299,9 +1365,16 @@ object VentoyImageBuilder {
                         isIndeterminate = false
                     )
                 )
+                var otgYankedMb = false
+                val otgCheckDev = verifiedOtg
                 val copyJob = launch(Dispatchers.IO) {
                     while (isActive) {
                         delay(600L)
+                        if (otgCheckDev != null && !OtgUsbFlasher.isOtgDeviceStillConnected(otgCheckDev.devName)) {
+                            otgYankedMb = true
+                            BuildThermalHelper.cancelActiveBuildProcess()
+                            break
+                        }
                         val cur = Shell.cmd("stat -c '%s' ${shellQuote(destPath)} 2>/dev/null")
                             .exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
                         val frac = (cur.toFloat() / srcSize.toFloat()).coerceIn(0f, 1f)
@@ -1316,31 +1389,34 @@ object VentoyImageBuilder {
                     }
                 }
                 val vProf = BuildThermalHelper.currentDefaultThermalProfile()
-                val cpRes = BuildThermalHelper.runIsolatedRootScript(
-                    context,
-                    "ventoy_cp",
-                    "set -e\n${BuildThermalHelper.thermalExecPrefix(vProf)}\n\$THERM_PFX cp -f ${shellQuote(srcPath)} ${shellQuote(destPath)} 2>&1",
-                    trackPid = true
-                )
-                copyJob.cancel()
+                val cpRes = try {
+                    BuildThermalHelper.runIsolatedRootScript(
+                        context,
+                        "ventoy_cp",
+                        "set -e\n${BuildThermalHelper.thermalExecPrefix(vProf)}\n\$THERM_PFX cp -f ${shellQuote(srcPath)} ${shellQuote(destPath)} 2>&1",
+                        trackPid = true
+                    )
+                } finally {
+                    copyJob.cancel()
+                }
+                if (otgYankedMb) {
+                    cleanupVentoyBuild(deletePartial = true)
+                    return@withContext ActionResult(false, "USB-C pen drive was unplugged while copying $destName.", entries = entries)
+                }
                 if (!isActive || BuildThermalHelper.isBuildCancelled()) {
-                    unmountVentoyPartition1(loopDev)
-                    loopDev = ""
-                    Shell.cmd("rm -f $qOut 2>/dev/null || true").exec()
+                    cleanupVentoyBuild(deletePartial = true)
                     return@withContext ActionResult(false, "Multi-Boot drive build cancelled.", entries = entries)
                 }
                 val copiedBytes = Shell.cmd("stat -c '%s' ${shellQuote(destPath)} 2>/dev/null")
                     .exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
                 if (!cpRes.isSuccess || copiedBytes != srcSize) {
                     Shell.cmd("rm -f ${shellQuote(destPath)} 2>/dev/null || true").exec()
-                    unmountVentoyPartition1(loopDev)
-                    loopDev = ""
-                    Shell.cmd("rm -f $qOut 2>/dev/null || true").exec()
+                    cleanupVentoyBuild(deletePartial = true)
                     val rawErr = (cpRes.out + cpRes.err).joinToString(" ").take(120).trim()
                     entries.add(LogEntry(ts, "multiboot", "Copy failed for $destName ($copiedBytes / $srcSize bytes): $rawErr", true))
                     return@withContext ActionResult(
                         false,
-                        "Failed to copy $destName (wrote ${UsbGadgetEngine.formatBytes(copiedBytes)} of ${UsbGadgetEngine.formatBytes(srcSize)}). Increase drive size or check phone storage and try again.",
+                        "Failed to copy $destName (wrote ${UsbGadgetEngine.formatBytes(copiedBytes)} of ${UsbGadgetEngine.formatBytes(srcSize)}). Check drive capacity and try again.",
                         entries = entries
                     )
                 }
@@ -1355,27 +1431,47 @@ object VentoyImageBuilder {
             }
             entries.add(LogEntry(ts, "multiboot", "Mounted Partition 1 via $mntType ($volLabel) and synced Windows boot config & drivers"))
 
-            onProgress(WindowsBuildProgress("Finalizing Multi-Boot drive...", "Syncing & fixing storage permissions", 0.96f, false))
-            unmountVentoyPartition1(loopDev)
-            loopDev = ""
-
-            UsbGadgetEngine.fixUserStoragePermissions(context, safeDir, isDir = true)
-            UsbGadgetEngine.fixUserStoragePermissions(context, outPath, isDir = false)
-            val vOutBytes = Shell.cmd("stat -c '%s' $qOut 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
-            if (vOutBytes > 0L) UsbGadgetEngine.syncMediaStoreFileSize(context, outPath, vOutBytes)
-            IsoInspector.invalidate(outPath)
-
-            onProgress(WindowsBuildProgress("Done!", safeName, 1f, false))
-            val drvWarn = if (!driversPackedOk && allDriverDirs.isNotEmpty()) " (warning: Drivers failed to pack)" else ""
-            ActionResult(
-                success = true,
-                userMessage = "Created Multi-Boot drive: $safeName ($sizeLabel sparse, ${if (useExfat) "exFAT" else "NTFS"})$drvWarn.",
-                createdPath = outPath,
-                entries = entries
+            onProgress(
+                WindowsBuildProgress(
+                    stage = if (isDirectBlock) "Flushing USB write cache — do NOT unplug..." else "Finalizing Multi-Boot drive...",
+                    detail = if (isDirectBlock) "Syncing partition table on $safeName" else "Syncing & fixing storage permissions",
+                    progress = 0.96f,
+                    isIndeterminate = isDirectBlock
+                )
             )
+            cleanupVentoyBuild(deletePartial = false)
+
+            val drvWarn = if (!driversPackedOk && allDriverDirs.isNotEmpty()) " (warning: Drivers failed to pack)" else ""
+            val otgDone = verifiedOtg
+            if (otgDone != null) {
+                if (!OtgUsbFlasher.isOtgDeviceStillConnected(otgDone.devName)) {
+                    return@withContext ActionResult(false, "USB-C pen drive was disconnected before final flush completed.", entries = entries)
+                }
+                OtgUsbFlasher.finalizeOtgDiskClean(otgDone)
+                onProgress(WindowsBuildProgress("USB Ready!", "Safe to unplug ${otgDone.displayTitle}", 1f, false))
+                ActionResult(
+                    success = true,
+                    userMessage = "Installed Multi-Boot drive on ${otgDone.displayTitle} ($sizeLabel, ${effectiveScheme.label}, ${if (useExfat) "exFAT" else "NTFS"})$drvWarn. Safe to unplug USB-C OTG drive.",
+                    createdPath = null,
+                    entries = entries
+                )
+            } else {
+                UsbGadgetEngine.fixUserStoragePermissions(context, safeDir, isDir = true)
+                UsbGadgetEngine.fixUserStoragePermissions(context, outPath, isDir = false)
+                val vOutBytes = Shell.cmd("stat -c '%s' $qOut 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                if (vOutBytes > 0L) UsbGadgetEngine.syncMediaStoreFileSize(context, outPath, vOutBytes)
+                IsoInspector.invalidate(outPath)
+
+                onProgress(WindowsBuildProgress("Done!", safeName, 1f, false))
+                ActionResult(
+                    success = true,
+                    userMessage = "Created Multi-Boot drive: $safeName ($sizeLabel sparse, ${if (useExfat) "exFAT" else "NTFS"})$drvWarn.",
+                    createdPath = outPath,
+                    entries = entries
+                )
+            }
         }.getOrElse { e ->
-            if (loopDev.isNotEmpty()) unmountVentoyPartition1(loopDev)
-            if (imgAllocated) Shell.cmd("rm -f $qOut 2>/dev/null || true").exec()
+            cleanupVentoyBuild(deletePartial = true)
             entries.add(LogEntry(ts, "multiboot", "Error: ${e.message}", true))
             ActionResult(false, "Multi-Boot build failed: ${e.message ?: "Unexpected error"}", entries = entries)
         }

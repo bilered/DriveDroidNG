@@ -556,6 +556,7 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
         } else if (res.success && evt.kind == UsbBuildKind.OTG_FLASH) {
             showOtgFlasherSheet = false
             otgFlashInitialSource = null
+            refreshAll()
             showFeedback(res.userMessage, false)
         } else if (res.success && res.createdPath != null) {
             when (evt.kind) {
@@ -1155,6 +1156,10 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
             OtgFlasherSheet(
                 initialSource = otgFlashInitialSource,
                 availableImages = images,
+                defaultDir = settings.defaultDir,
+                presets = settings.autounattendPresets,
+                systemTweaksPresets = settings.systemTweaksPresets,
+                systemTweaksSearchHistory = settings.systemTweaksSearchHistory,
                 isAnyVirtualDriveMounted = status.isAnyMounted,
                 flashing = isOtgActive,
                 progress = otgProgress,
@@ -1166,8 +1171,46 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
                 },
                 onUnmountAllVirtual = { unmountSlot(null) },
                 onCancelFlash = { UsbBuildManager.cancelActiveBuild(context) },
-                onStartFlash = { cfg ->
+                onSavePreset = { preset ->
+                    val updatedPresets = (settings.autounattendPresets.filterNot { it.name.equals(preset.name, true) } + preset)
+                    updateSettings(settings.copy(autounattendPresets = updatedPresets), rescan = false)
+                    showFeedback("Saved preset \"${preset.name}\".")
+                },
+                onDeletePreset = { presetName ->
+                    val updatedPresets = settings.autounattendPresets.filterNot { it.name == presetName }
+                    updateSettings(settings.copy(autounattendPresets = updatedPresets), rescan = false)
+                    showFeedback("Deleted preset \"$presetName\".")
+                },
+                onSaveSystemTweaksPreset = { tp ->
+                    val updated = settings.systemTweaksPresets.filterNot { it.name.equals(tp.name, true) } + tp
+                    updateSettings(settings.copy(systemTweaksPresets = updated), rescan = false)
+                    showFeedback("Saved System Tweaks preset \"${tp.name}\".")
+                },
+                onDeleteSystemTweaksPreset = { tpName ->
+                    val updated = settings.systemTweaksPresets.filterNot { it.name == tpName }
+                    updateSettings(settings.copy(systemTweaksPresets = updated), rescan = false)
+                    showFeedback("Deleted System Tweaks preset \"$tpName\".")
+                },
+                onUpdateSearchHistory = { hist ->
+                    updateSettings(settings.copy(systemTweaksSearchHistory = hist), rescan = false)
+                },
+                onStartRawFlash = { cfg ->
                     if (!UsbBuildManager.startOtgFlash(context, cfg)) {
+                        showFeedback("Another build or flash job is already running.", true)
+                    }
+                },
+                onStartWindowsOtgFlash = { cfg ->
+                    if (!UsbBuildManager.startOtgWindowsFlash(context, cfg)) {
+                        showFeedback("Another build or flash job is already running.", true)
+                    }
+                },
+                onStartLinuxOtgFlash = { cfg ->
+                    if (!UsbBuildManager.startOtgLinuxFlash(context, cfg)) {
+                        showFeedback("Another build or flash job is already running.", true)
+                    }
+                },
+                onStartMultiBootOtgFlash = { cfg ->
+                    if (!UsbBuildManager.startOtgMultiBootFlash(context, cfg)) {
                         showFeedback("Another build or flash job is already running.", true)
                     }
                 }

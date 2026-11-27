@@ -358,8 +358,11 @@ object CompressedImageEngine {
                 }
             }
 
-            val res = BuildThermalHelper.runIsolatedRootScript(context, "pb_decompress", script, trackPid = true)
-            pollJob.cancel()
+            val res = try {
+                BuildThermalHelper.runIsolatedRootScript(context, "pb_decompress", script, trackPid = true)
+            } finally {
+                pollJob.cancel()
+            }
 
             if (lowSpaceAborted) {
                 Shell.cmd("rm -f $qTmp 2>/dev/null || true").exec()

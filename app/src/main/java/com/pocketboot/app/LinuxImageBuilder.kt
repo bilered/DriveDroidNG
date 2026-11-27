@@ -51,7 +51,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.topjohnwu.superuser.Shell
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
@@ -86,7 +88,8 @@ data class LinuxBuildConfig(
     val persistenceGb: Int = 2,
     val style: LinuxPersistenceStyle = LinuxPersistenceStyle.UBUNTU_WRITABLE,
     val autoMountAfterBuild: Boolean = true,
-    val volumeLabel: String = ""
+    val volumeLabel: String = "",
+    val directBlockTarget: OtgUsbDevice? = null
 )
 
 object LinuxImageBuilder {
@@ -120,127 +123,302 @@ object LinuxImageBuilder {
     private suspend fun buildHybridDdImage(context: Context, config: LinuxBuildConfig, onProgress: (WindowsBuildProgress) -> Unit): ActionResult = withContext(Dispatchers.IO) {
         val ts = nowTs()
         val entries = mutableListOf<LogEntry>()
+        val isDirectBlock = config.directBlockTarget != null
         val safeDir = UsbGadgetEngine.resolveDirectPath(config.outputDir).trimEnd('/')
-        val safeName = UsbGadgetEngine.sanitizeOutputFileName(config.outputName, ".img", "linux-usb")
-        val outPath = "$safeDir/$safeName"
+        val safeName = if (isDirectBlock) config.directBlockTarget?.displayTitle ?: "USB-C OTG Drive" else UsbGadgetEngine.sanitizeOutputFileName(config.outputName, ".img", "linux-usb")
+        var outPath = if (isDirectBlock) config.directBlockTarget?.devPath.orEmpty() else "$safeDir/$safeName"
         val srcIsoPath = UsbGadgetEngine.resolveDirectPath(config.isoFile.path)
         val qIso = shellQuote(srcIsoPath)
-        val qOut = shellQuote(outPath); val qDir = shellQuote(safeDir)
+        var qOut = shellQuote(outPath); val qDir = shellQuote(safeDir)
         var loopDev = ""
+        var loopIsLoopNode = true
+        var verifiedOtg: OtgUsbDevice? = null
         fun cleanup(deletePartial: Boolean) {
             BuildThermalHelper.unmountAndDetachClean(
                 mountPoints = listOf(TEMP_LINUX_MNT),
-                loopDevices = if (loopDev.isNotBlank()) listOf(loopDev) else emptyList(),
+                loopDevices = if (loopIsLoopNode && loopDev.isNotBlank()) listOf(loopDev) else emptyList(),
                 removeDirs = true
             )
-            if (deletePartial) Shell.cmd("rm -f $qOut 2>/dev/null").exec()
+            if (deletePartial && !isDirectBlock) Shell.cmd("rm -f $qOut 2>/dev/null").exec()
         }
         return@withContext runCatching {
             if (!Shell.getShell().isRoot) return@withContext ActionResult(false, "Root access is required.", entries = entries)
-            if (outPath.equals(srcIsoPath, ignoreCase = true)) return@withContext ActionResult(false, "Output image cannot overwrite the source ISO.", entries = entries)
-            if (UsbGadgetEngine.getStatus().mountedLunFor(outPath) != null) return@withContext ActionResult(false, "$safeName is currently mounted to your PC. Unmount it before overwriting.", entries = entries)
+            if (!isDirectBlock) {
+                if (outPath.equals(srcIsoPath, ignoreCase = true)) return@withContext ActionResult(false, "Output image cannot overwrite the source ISO.", entries = entries)
+                if (UsbGadgetEngine.getStatus().mountedLunFor(outPath) != null) return@withContext ActionResult(false, "$safeName is currently mounted to your PC. Unmount it before overwriting.", entries = entries)
+            }
             onProgress(WindowsBuildProgress("Checking ISO image...", config.isoFile.name, 0.05f, true))
             val isoSize = Shell.cmd("stat -c '%s' $qIso 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: config.isoFile.sizeBytes
             if (isoSize <= 0L) return@withContext ActionResult(false, "Source ISO not found or empty.", entries = entries)
             val withPersistence = config.usbMode == LinuxUsbMode.WITH_PERSISTENCE
-            val persistBytes = if (withPersistence) config.persistenceGb.coerceIn(1, 32).toLong() * 1024L * 1024L * 1024L else 0L
             val alignBytes = 1024L * 1024L
             val persistOffsetBytes = ((isoSize + alignBytes - 1L) / alignBytes) * alignBytes
+            val persistBytes: Long
+            if (isDirectBlock) {
+                val reqTarget = config.directBlockTarget ?: return@withContext ActionResult(false, "No physical USB-C OTG drive selected.", entries = entries)
+                onProgress(WindowsBuildProgress("Verifying USB-C drive...", reqTarget.displayTitle, 0.08f, true))
+                val (prepDev, prepErr) = OtgUsbFlasher.verifyPhysicalOtgDisk(reqTarget)
+                if (prepDev == null) return@withContext ActionResult(false, prepErr ?: "USB-C OTG drive preparation failed.", entries = entries)
+                verifiedOtg = prepDev
+                outPath = prepDev.devPath
+                qOut = shellQuote(outPath)
+                val mbrCapBytes = (prepDev.sizeBytes / 512L).coerceAtMost(DiskPartitioner.MAX_MBR_USABLE_SECTORS) * 512L
+                if (isoSize > prepDev.sizeBytes) {
+                    return@withContext ActionResult(false, "ISO (${UsbGadgetEngine.formatBytes(isoSize)}) is larger than USB drive (${UsbGadgetEngine.formatBytes(prepDev.sizeBytes)}).", entries = entries)
+                }
+                if (withPersistence) {
+                    val maxAvail = ((mbrCapBytes - persistOffsetBytes) / alignBytes) * alignBytes
+                    if (maxAvail < 512L * 1024L * 1024L) {
+                        return@withContext ActionResult(false, "Not enough space remaining on USB drive after ISO for ext4 persistence.", entries = entries)
+                    }
+                    val reqPersist = config.persistenceGb.coerceAtLeast(1).toLong() * 1024L * 1024L * 1024L
+                    persistBytes = reqPersist.coerceAtMost(maxAvail)
+                } else {
+                    persistBytes = 0L
+                }
+            } else {
+                persistBytes = if (withPersistence) config.persistenceGb.coerceIn(1, 32).toLong() * 1024L * 1024L * 1024L else 0L
+                val totalBytes = if (withPersistence) persistOffsetBytes + persistBytes else isoSize
+                val rawFreeSpace = UsbGadgetEngine.getFreeSpaceBytes(safeDir)
+                val freeSpace = if (rawFreeSpace > 0L) rawFreeSpace + UsbGadgetEngine.queryExistingFileAllocatedBytes(outPath) else 0L
+                if (freeSpace > 0L && freeSpace < totalBytes + (64L * 1024L * 1024L)) return@withContext ActionResult(false, "Not enough free space. Need ${UsbGadgetEngine.formatBytes(totalBytes)}, have ${UsbGadgetEngine.formatBytes(freeSpace)}.", entries = entries)
+            }
             val totalBytes = if (withPersistence) persistOffsetBytes + persistBytes else isoSize
-            val rawFreeSpace = UsbGadgetEngine.getFreeSpaceBytes(safeDir)
-            val freeSpace = if (rawFreeSpace > 0L) rawFreeSpace + UsbGadgetEngine.queryExistingFileAllocatedBytes(outPath) else 0L
-            if (freeSpace > 0L && freeSpace < totalBytes + (64L * 1024L * 1024L)) return@withContext ActionResult(false, "Not enough free space. Need ${UsbGadgetEngine.formatBytes(totalBytes)}, have ${UsbGadgetEngine.formatBytes(freeSpace)}.", entries = entries)
-            onProgress(WindowsBuildProgress("Copying ISO image...", if (withPersistence) "${UsbGadgetEngine.formatBytes(isoSize)} + ${config.persistenceGb} GB ${config.style.volumeLabel}" else UsbGadgetEngine.formatBytes(isoSize), 0.28f, true))
+
+            // Fail-closed BEFORE wiping pen drive or copying GBs: verify source ISO LBA 0 has a free non-GPT MBR slot
+            if (withPersistence) {
+                val tmpPreMbr = File(context.cacheDir, "pb_linux_pre_mbr.bin")
+                try {
+                    Shell.cmd("dd if=$qIso of=${shellQuote(tmpPreMbr.absolutePath)} bs=512 count=1 2>/dev/null").exec()
+                    val srcMbr = if (tmpPreMbr.exists()) tmpPreMbr.readBytes() else ByteArray(0)
+                    if (DiskPartitioner.findPersistenceSlotIndex(srcMbr) < 2) {
+                        return@withContext ActionResult(
+                            false,
+                            "This ISO uses a GPT Protective MBR or has all 4 MBR slots occupied, so Hybrid DD persistence cannot append a partition. Switch to Extracted FAT32 mode (or turn off Persistence).",
+                            entries = entries
+                        )
+                    }
+                } finally {
+                    tmpPreMbr.delete()
+                }
+            }
+
+            val persistGbLabel = ((persistBytes / (1024L * 1024L * 1024L)).coerceAtLeast(1L)).toInt()
+            onProgress(WindowsBuildProgress(if (isDirectBlock) "Writing Hybrid ISO to USB..." else "Copying ISO image...", if (withPersistence) "${UsbGadgetEngine.formatBytes(isoSize)} + $persistGbLabel GB ${config.style.volumeLabel}" else UsbGadgetEngine.formatBytes(isoSize), 0.24f, true))
             val linuxProf = BuildThermalHelper.currentDefaultThermalProfile()
             BuildThermalHelper.waitForThermalCooldownIfNeeded(context, linuxProf) { temp, resumeAt ->
                 onProgress(WindowsBuildProgress("Cooling down phone...", String.format(Locale.US, "%.1f°C -> resuming at %.1f°C", temp, resumeAt), 0.25f, true))
             }
             if (!isActive || BuildThermalHelper.isBuildCancelled()) { cleanup(true); return@withContext ActionResult(false, "Build cancelled.", entries = entries) }
-            val cpRes = BuildThermalHelper.runIsolatedRootScript(
-                context,
-                "linux_cp",
-                "set -e\n${BuildThermalHelper.thermalExecPrefix(linuxProf)}\nmkdir -p $qDir && rm -f $qOut && \$THERM_PFX cp -f $qIso $qOut 2>&1",
-                trackPid = true
-            )
-            if (!isActive || BuildThermalHelper.isBuildCancelled()) { cleanup(true); return@withContext ActionResult(false, "Build cancelled.", entries = entries) }
-            val copiedIsoBytes = Shell.cmd("stat -c '%s' $qOut 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
-            if (!cpRes.isSuccess || copiedIsoBytes != isoSize) {
-                cleanup(true)
-                val errTxt = (cpRes.out + cpRes.err).joinToString(" ").take(160).trim()
-                return@withContext ActionResult(
-                    false,
-                    "Failed to copy ISO (wrote ${UsbGadgetEngine.formatBytes(copiedIsoBytes)} of ${UsbGadgetEngine.formatBytes(isoSize)}).${if (errTxt.isNotBlank()) " $errTxt" else ""}",
-                    entries = entries
+
+            val otgToWrite = verifiedOtg
+            if (otgToWrite != null) {
+                onProgress(WindowsBuildProgress("Unmounting & wiping USB drive...", otgToWrite.displayTitle, 0.16f, true))
+                OtgUsbFlasher.unmountAndWipeOtgDisk(otgToWrite, entries, ts)?.let { err ->
+                    return@withContext ActionResult(false, err, entries = entries)
+                }
+            }
+            var otgYankedDd = false
+            val ddWatchJob = if (otgToWrite != null) {
+                val qStat = shellQuote("/sys/block/${otgToWrite.devName}/stat")
+                val startSec = OtgUsbFlasher.parseSectorsWrittenFromStat(
+                    Shell.cmd("cat $qStat 2>/dev/null").exec().out.firstOrNull().orEmpty()
                 )
+                launch(Dispatchers.IO) {
+                    while (isActive) {
+                        delay(600L)
+                        if (!OtgUsbFlasher.isOtgDeviceStillConnected(otgToWrite.devName)) {
+                            otgYankedDd = true
+                            BuildThermalHelper.cancelActiveBuildProcess()
+                            break
+                        }
+                        val curSec = OtgUsbFlasher.parseSectorsWrittenFromStat(
+                            Shell.cmd("cat $qStat 2>/dev/null").exec().out.firstOrNull().orEmpty()
+                        )
+                        val writtenB = ((curSec - startSec).coerceAtLeast(0L)) * 512L
+                        val frac = (writtenB.toFloat() / isoSize.coerceAtLeast(1L).toFloat()).coerceIn(0f, 0.98f)
+                        onProgress(
+                            WindowsBuildProgress(
+                                stage = "Writing Hybrid ISO to USB...",
+                                detail = "${UsbGadgetEngine.formatBytes(writtenB)} / ${UsbGadgetEngine.formatBytes(isoSize)}",
+                                progress = 0.22f + frac * 0.34f,
+                                isIndeterminate = writtenB <= 0L
+                            )
+                        )
+                    }
+                }
+            } else null
+
+            val cpRes = try {
+                if (isDirectBlock) {
+                    val ddScript = "set -e\n${BuildThermalHelper.thermalExecPrefix(linuxProf)}\n\$THERM_PFX dd if=$qIso of=$qOut bs=4M 2>&1\nsync"
+                    BuildThermalHelper.runIsolatedRootScript(context, "linux_otg_dd", ddScript, trackPid = true)
+                } else {
+                    BuildThermalHelper.runIsolatedRootScript(
+                        context,
+                        "linux_cp",
+                        "set -e\n${BuildThermalHelper.thermalExecPrefix(linuxProf)}\nmkdir -p $qDir && rm -f $qOut && \$THERM_PFX cp -f $qIso $qOut 2>&1",
+                        trackPid = true
+                    )
+                }
+            } finally {
+                ddWatchJob?.cancel()
+            }
+            if (otgYankedDd) { cleanup(true); return@withContext ActionResult(false, "USB-C pen drive was unplugged during flashing.", entries = entries) }
+            if (!isActive || BuildThermalHelper.isBuildCancelled()) { cleanup(true); return@withContext ActionResult(false, "Build cancelled.", entries = entries) }
+            if (!isDirectBlock) {
+                val copiedIsoBytes = Shell.cmd("stat -c '%s' $qOut 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                if (!cpRes.isSuccess || copiedIsoBytes != isoSize) {
+                    cleanup(true)
+                    val errTxt = (cpRes.out + cpRes.err).joinToString(" ").take(160).trim()
+                    return@withContext ActionResult(
+                        false,
+                        "Failed to copy ISO (wrote ${UsbGadgetEngine.formatBytes(copiedIsoBytes)} of ${UsbGadgetEngine.formatBytes(isoSize)}).${if (errTxt.isNotBlank()) " $errTxt" else ""}",
+                        entries = entries
+                    )
+                }
+            } else if (!cpRes.isSuccess) {
+                cleanup(true)
+                val errTxt = (cpRes.out + cpRes.err).takeLast(2).joinToString(" ").take(160).trim()
+                return@withContext ActionResult(false, "Failed to flash ISO to USB drive: ${errTxt.ifBlank { "I/O error" }}", entries = entries)
             }
 
             if (withPersistence) {
-                if (!Shell.cmd("truncate -s $totalBytes $qOut 2>&1 || dd if=/dev/zero of=$qOut bs=1M count=0 seek=${totalBytes / (1024L * 1024L)} 2>&1").exec().isSuccess) { cleanup(true); return@withContext ActionResult(false, "Failed to expand image for persistence.", entries = entries) }
+                if (!isDirectBlock) {
+                    if (!Shell.cmd("truncate -s $totalBytes $qOut 2>&1 || dd if=/dev/zero of=$qOut bs=1M count=0 seek=${totalBytes / (1024L * 1024L)} 2>&1").exec().isSuccess) { cleanup(true); return@withContext ActionResult(false, "Failed to expand image for persistence.", entries = entries) }
+                }
                 onProgress(WindowsBuildProgress("Adding persistence partition...", "Updating MBR partition table", 0.58f, false))
                 val tmpIn = File(context.cacheDir, "pb_linux_mbr_in.bin"); val tmpOut = File(context.cacheDir, "pb_linux_mbr_out.bin")
+                val persistSlotNum: Int
                 try {
                     Shell.cmd("dd if=$qOut of=${shellQuote(tmpIn.absolutePath)} bs=512 count=1 2>/dev/null").exec()
-                    val patched = DiskPartitioner.appendLinuxPersistenceMbr(if (tmpIn.exists()) tmpIn.readBytes() else ByteArray(0), persistOffsetBytes / 512L, persistBytes / 512L)
-                    if (patched == null) { cleanup(true); return@withContext ActionResult(false, "Could not append persistence partition (try Extracted FAT32 mode).", entries = entries) }
+                    val origMbr = if (tmpIn.exists()) tmpIn.readBytes() else ByteArray(0)
+                    persistSlotNum = DiskPartitioner.findPersistenceSlotIndex(origMbr)
+                    val patched = DiskPartitioner.appendLinuxPersistenceMbr(origMbr, persistOffsetBytes / 512L, persistBytes / 512L)
+                    if (patched == null || persistSlotNum < 2) { cleanup(true); return@withContext ActionResult(false, "Could not append persistence partition (try Extracted FAT32 mode).", entries = entries) }
                     tmpOut.writeBytes(patched)
                     Shell.cmd("dd if=${shellQuote(tmpOut.absolutePath)} of=$qOut bs=512 count=1 conv=notrunc 2>/dev/null").exec()
                 } finally { tmpIn.delete(); tmpOut.delete() }
                 onProgress(WindowsBuildProgress("Formatting ext4 persistence...", "Label: ${config.style.volumeLabel}", 0.74f, false))
-                loopDev = attachLoopSlice(qOut, persistOffsetBytes, persistBytes)
-                if (loopDev.isBlank() || !loopDev.startsWith("/dev/")) { cleanup(true); return@withContext ActionResult(false, "Could not attach loop device.", entries = entries) }
+                val otgForPersist = verifiedOtg
+                if (otgForPersist != null) {
+                    val (attachedNode, isLoop) = OtgUsbFlasher.attachOtgPartitionSlice(otgForPersist, persistSlotNum, persistOffsetBytes, persistBytes)
+                    loopDev = attachedNode
+                    loopIsLoopNode = isLoop
+                } else {
+                    loopDev = attachLoopSlice(qOut, persistOffsetBytes, persistBytes)
+                    loopIsLoopNode = true
+                }
+                if (loopDev.isBlank() || !loopDev.startsWith("/dev/")) { cleanup(true); return@withContext ActionResult(false, "Could not attach persistence partition.", entries = entries) }
                 formatExt4AndInit(shellQuote(loopDev), config.style, entries, ts)?.let { cleanup(true); return@withContext ActionResult(false, it, entries = entries) }
             }
-            onProgress(WindowsBuildProgress("Finalizing USB image...", "Syncing & fixing permissions", 0.95f, false))
+            onProgress(WindowsBuildProgress(if (isDirectBlock) "Flushing USB write cache — do NOT unplug..." else "Finalizing USB image...", "Syncing partitions", 0.95f, isDirectBlock))
             cleanup(false)
-            UsbGadgetEngine.fixUserStoragePermissions(context, safeDir, isDir = true)
-            UsbGadgetEngine.fixUserStoragePermissions(context, outPath, isDir = false)
-            val lOutBytes = Shell.cmd("stat -c '%s' $qOut 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
-            if (lOutBytes > 0L) UsbGadgetEngine.syncMediaStoreFileSize(context, outPath, lOutBytes)
-            IsoInspector.invalidate(outPath)
-            onProgress(WindowsBuildProgress("Done!", safeName, 1f, false))
-            val msg = if (withPersistence) "Built $safeName with ${config.persistenceGb} GB ${config.style.volumeLabel}." else "Built standard live USB image $safeName."
-            entries.add(LogEntry(ts, "linux-build", msg))
-            ActionResult(true, msg, createdPath = outPath, entries = entries)
+            val otgDone = verifiedOtg
+            if (otgDone != null) {
+                if (!OtgUsbFlasher.isOtgDeviceStillConnected(otgDone.devName)) {
+                    return@withContext ActionResult(false, "USB-C pen drive was disconnected before final flush completed.", entries = entries)
+                }
+                OtgUsbFlasher.finalizeOtgDiskClean(otgDone)
+                onProgress(WindowsBuildProgress("USB Ready!", "Safe to unplug ${otgDone.displayTitle}", 1f, false))
+                val msg = if (withPersistence) "Flashed Linux Hybrid USB + $persistGbLabel GB ${config.style.volumeLabel} to ${otgDone.displayTitle}. Safe to unplug USB-C OTG drive." else "Flashed Linux Hybrid Live USB to ${otgDone.displayTitle}. Safe to unplug USB-C OTG drive."
+                entries.add(LogEntry(ts, "linux-build", msg))
+                ActionResult(true, msg, createdPath = null, entries = entries)
+            } else {
+                UsbGadgetEngine.fixUserStoragePermissions(context, safeDir, isDir = true)
+                UsbGadgetEngine.fixUserStoragePermissions(context, outPath, isDir = false)
+                val lOutBytes = Shell.cmd("stat -c '%s' $qOut 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                if (lOutBytes > 0L) UsbGadgetEngine.syncMediaStoreFileSize(context, outPath, lOutBytes)
+                IsoInspector.invalidate(outPath)
+                onProgress(WindowsBuildProgress("Done!", safeName, 1f, false))
+                val msg = if (withPersistence) "Built $safeName with ${config.persistenceGb} GB ${config.style.volumeLabel}." else "Built standard live USB image $safeName."
+                entries.add(LogEntry(ts, "linux-build", msg))
+                ActionResult(true, msg, createdPath = outPath, entries = entries)
+            }
         }.getOrElse { e -> cleanup(true); ActionResult(false, "Linux/Tool build failed: ${e.message ?: "Unexpected error"}", entries = entries) }
     }
 
     private suspend fun buildExtractedFat32Image(context: Context, config: LinuxBuildConfig, onProgress: (WindowsBuildProgress) -> Unit): ActionResult = withContext(Dispatchers.IO) {
         val ts = nowTs()
         val entries = mutableListOf<LogEntry>()
+        val isDirectBlock = config.directBlockTarget != null
         val safeDir = UsbGadgetEngine.resolveDirectPath(config.outputDir).trimEnd('/')
-        val safeName = UsbGadgetEngine.sanitizeOutputFileName(config.outputName, ".img", "linux-usb")
-        val outPath = "$safeDir/$safeName"
+        val safeName = if (isDirectBlock) config.directBlockTarget?.displayTitle ?: "USB-C OTG Drive" else UsbGadgetEngine.sanitizeOutputFileName(config.outputName, ".img", "linux-usb")
+        var outPath = if (isDirectBlock) config.directBlockTarget?.devPath.orEmpty() else "$safeDir/$safeName"
         val srcIsoPath = UsbGadgetEngine.resolveDirectPath(config.isoFile.path)
-        val qIso = shellQuote(srcIsoPath); val qOut = shellQuote(outPath); val qDir = shellQuote(safeDir)
+        val qIso = shellQuote(srcIsoPath); var qOut = shellQuote(outPath); val qDir = shellQuote(safeDir)
         var fatLoop = ""; var extLoop = ""
+        var fatIsLoop = true; var extIsLoop = true
+        var verifiedOtg: OtgUsbDevice? = null
         fun cleanup(deletePartial: Boolean) {
+            val loopsToDetach = mutableListOf<String>()
+            if (fatIsLoop && fatLoop.isNotBlank()) loopsToDetach.add(fatLoop)
+            if (extIsLoop && extLoop.isNotBlank()) loopsToDetach.add(extLoop)
             BuildThermalHelper.unmountAndDetachClean(
                 mountPoints = listOf(TEMP_FAT_MNT, TEMP_LINUX_MNT),
-                loopDevices = listOf(fatLoop, extLoop).filter { it.isNotBlank() },
+                loopDevices = loopsToDetach,
                 removeDirs = true
             )
-            if (deletePartial) Shell.cmd("rm -f $qOut 2>/dev/null").exec()
+            if (deletePartial && !isDirectBlock) Shell.cmd("rm -f $qOut 2>/dev/null").exec()
         }
         return@withContext runCatching {
             if (!Shell.getShell().isRoot) return@withContext ActionResult(false, "Root access is required.", entries = entries)
-            if (outPath.equals(srcIsoPath, ignoreCase = true)) return@withContext ActionResult(false, "Output image cannot overwrite the source ISO.", entries = entries)
-            if (UsbGadgetEngine.getStatus().mountedLunFor(outPath) != null) return@withContext ActionResult(false, "$safeName is currently mounted to your PC. Unmount it before overwriting.", entries = entries)
+            if (!isDirectBlock) {
+                if (outPath.equals(srcIsoPath, ignoreCase = true)) return@withContext ActionResult(false, "Output image cannot overwrite the source ISO.", entries = entries)
+                if (UsbGadgetEngine.getStatus().mountedLunFor(outPath) != null) return@withContext ActionResult(false, "$safeName is currently mounted to your PC. Unmount it before overwriting.", entries = entries)
+            }
             val bin7z = WindowsImageBuilder.findBundledBinary(context, "lib7zzs.so", listOf("7zz", "7z")) ?: return@withContext ActionResult(false, "Bundled 7zz binary missing.", entries = entries)
             onProgress(WindowsBuildProgress("Checking ISO contents...", config.isoFile.name, 0.05f, true))
             val maxFile = inspectMaxFileBytesInIso(context, srcIsoPath)
             if (maxFile > FAT32_MAX_FILE_BYTES) return@withContext ActionResult(false, "ISO contains a file over 4 GB (${UsbGadgetEngine.formatBytes(maxFile)}). Use Hybrid DD / ISO mode instead.", entries = entries)
             val isoSize = Shell.cmd("stat -c '%s' $qIso 2>/dev/null").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: config.isoFile.sizeBytes
             val withPersistence = config.usbMode == LinuxUsbMode.WITH_PERSISTENCE
-            val fatBytes = ((isoSize / (1024L * 1024L)) + 256L).coerceAtLeast(512L) * 1024L * 1024L
-            val persistBytes = if (withPersistence) config.persistenceGb.coerceIn(1, 32).toLong() * 1024L * 1024L * 1024L else 0L
-            val part1OffsetBytes = 1024L * 1024L
-            val part2OffsetBytes = part1OffsetBytes + fatBytes
-            val totalBytes = part2OffsetBytes + persistBytes + (2L * 1024L * 1024L)
-            val rawFreeSpace = UsbGadgetEngine.getFreeSpaceBytes(safeDir)
-            val freeSpace = if (rawFreeSpace > 0L) rawFreeSpace + UsbGadgetEngine.queryExistingFileAllocatedBytes(outPath) else 0L
-            if (freeSpace > 0L && freeSpace < totalBytes + (64L * 1024L * 1024L)) return@withContext ActionResult(false, "Not enough free space. Need ${UsbGadgetEngine.formatBytes(totalBytes)}, have ${UsbGadgetEngine.formatBytes(freeSpace)}.", entries = entries)
-            onProgress(WindowsBuildProgress("Allocating FAT32 USB image...", UsbGadgetEngine.formatBytes(totalBytes), 0.14f, false))
-            if (!Shell.cmd("mkdir -p $qDir && rm -f $qOut && (truncate -s $totalBytes $qOut 2>/dev/null || dd if=/dev/zero of=$qOut bs=1M count=0 seek=${totalBytes / (1024L * 1024L)} 2>&1)").exec().isSuccess) return@withContext ActionResult(false, "Failed to allocate image file.", entries = entries)
+            val part1OffsetBytes: Long
+            val fatBytes: Long
+            val part2OffsetBytes: Long
+            val persistBytes: Long
+            val totalBytes: Long
+            if (isDirectBlock) {
+                val reqTarget = config.directBlockTarget ?: return@withContext ActionResult(false, "No physical USB-C OTG drive selected.", entries = entries)
+                onProgress(WindowsBuildProgress("Verifying USB-C drive...", reqTarget.displayTitle, 0.09f, true))
+                val (prepDev, prepErr) = OtgUsbFlasher.verifyPhysicalOtgDisk(reqTarget)
+                if (prepDev == null) return@withContext ActionResult(false, prepErr ?: "USB-C OTG drive preparation failed.", entries = entries)
+                verifiedOtg = prepDev
+                outPath = prepDev.devPath
+                qOut = shellQuote(outPath)
+                val fixed = DiskPartitioner.calculateFixedLinuxFat32Layout(
+                    totalDiskBytes = prepDev.sizeBytes,
+                    isoSizeBytes = isoSize,
+                    persistenceGb = config.persistenceGb,
+                    includePersistence = withPersistence
+                ) ?: return@withContext ActionResult(
+                    false,
+                    "USB pen drive (${UsbGadgetEngine.formatBytes(prepDev.sizeBytes)}) is too small for ${config.isoFile.name}${if (withPersistence) " + ext4 persistence" else ""}.",
+                    entries = entries
+                )
+                part1OffsetBytes = fixed.part1OffsetBytes
+                fatBytes = fixed.part1SizeBytes
+                part2OffsetBytes = fixed.part2OffsetBytes
+                persistBytes = fixed.part2Sectors * 512L
+                totalBytes = fixed.totalBytes
+            } else {
+                fatBytes = ((isoSize / (1024L * 1024L)) + 256L).coerceAtLeast(512L) * 1024L * 1024L
+                persistBytes = if (withPersistence) config.persistenceGb.coerceIn(1, 32).toLong() * 1024L * 1024L * 1024L else 0L
+                part1OffsetBytes = 1024L * 1024L
+                part2OffsetBytes = part1OffsetBytes + fatBytes
+                totalBytes = part2OffsetBytes + persistBytes + (2L * 1024L * 1024L)
+                val rawFreeSpace = UsbGadgetEngine.getFreeSpaceBytes(safeDir)
+                val freeSpace = if (rawFreeSpace > 0L) rawFreeSpace + UsbGadgetEngine.queryExistingFileAllocatedBytes(outPath) else 0L
+                if (freeSpace > 0L && freeSpace < totalBytes + (64L * 1024L * 1024L)) return@withContext ActionResult(false, "Not enough free space. Need ${UsbGadgetEngine.formatBytes(totalBytes)}, have ${UsbGadgetEngine.formatBytes(freeSpace)}.", entries = entries)
+                onProgress(WindowsBuildProgress("Allocating FAT32 USB image...", UsbGadgetEngine.formatBytes(totalBytes), 0.14f, false))
+                if (!Shell.cmd("mkdir -p $qDir && rm -f $qOut && (truncate -s $totalBytes $qOut 2>/dev/null || dd if=/dev/zero of=$qOut bs=1M count=0 seek=${totalBytes / (1024L * 1024L)} 2>&1)").exec().isSuccess) return@withContext ActionResult(false, "Failed to allocate image file.", entries = entries)
+            }
+            verifiedOtg?.let { otgToWipe ->
+                onProgress(WindowsBuildProgress("Unmounting & wiping USB drive...", otgToWipe.displayTitle, 0.16f, true))
+                OtgUsbFlasher.unmountAndWipeOtgDisk(otgToWipe, entries, ts)?.let { err ->
+                    return@withContext ActionResult(false, err, entries = entries)
+                }
+            }
             val mbrBytes = DiskPartitioner.buildLinuxFat32MbrSector(
                 part1StartLba = part1OffsetBytes / 512L,
                 part1Sectors = fatBytes / 512L,
@@ -259,7 +437,15 @@ object LinuxImageBuilder {
             }
             val qFatLbl = shellQuote(fatLabel)
             onProgress(WindowsBuildProgress("Formatting FAT32 partition...", "${fatBytes / (1024L * 1024L)} MB · $fatLabel", 0.28f, false))
-            fatLoop = attachLoopSlice(qOut, part1OffsetBytes, fatBytes)
+            val otgForFat = verifiedOtg
+            if (otgForFat != null) {
+                val (attached, isLoop) = OtgUsbFlasher.attachOtgPartitionSlice(otgForFat, 1, part1OffsetBytes, fatBytes)
+                fatLoop = attached
+                fatIsLoop = isLoop
+            } else {
+                fatLoop = attachLoopSlice(qOut, part1OffsetBytes, fatBytes)
+                fatIsLoop = true
+            }
             if (fatLoop.isBlank() || !fatLoop.startsWith("/dev/")) { cleanup(true); return@withContext ActionResult(false, "Could not attach loop device for FAT32.", entries = entries) }
             val qFatLoop = shellQuote(fatLoop)
             val mkFatBin = WindowsImageBuilder.findBundledBinary(context, "libmkfs_fat.so", listOf("mkfs.vfat", "mkfs.fat", "newfs_msdos"))
@@ -278,13 +464,48 @@ object LinuxImageBuilder {
             if (!isActive || BuildThermalHelper.isBuildCancelled()) { cleanup(true); return@withContext ActionResult(false, "Build cancelled.", entries = entries) }
             onProgress(WindowsBuildProgress("Extracting ISO files...", "${config.isoFile.name} · ${linuxProf.shortLabel} thermal", 0.45f, true))
             if (!Shell.cmd("mkdir -p $TEMP_FAT_MNT && mount -t vfat -o rw $qFatLoop $TEMP_FAT_MNT 2>&1").exec().isSuccess) { cleanup(true); return@withContext ActionResult(false, "Could not mount FAT32 partition.", entries = entries) }
+            var otgYankedFat = false
+            val fatWatchJob = verifiedOtg?.let { otgDev ->
+                val qStat = shellQuote("/sys/block/${otgDev.devName}/stat")
+                val startSec = OtgUsbFlasher.parseSectorsWrittenFromStat(
+                    Shell.cmd("cat $qStat 2>/dev/null").exec().out.firstOrNull().orEmpty()
+                )
+                launch(Dispatchers.IO) {
+                    while (isActive) {
+                        delay(700L)
+                        if (!OtgUsbFlasher.isOtgDeviceStillConnected(otgDev.devName)) {
+                            otgYankedFat = true
+                            BuildThermalHelper.cancelActiveBuildProcess()
+                            break
+                        }
+                        val curSec = OtgUsbFlasher.parseSectorsWrittenFromStat(
+                            Shell.cmd("cat $qStat 2>/dev/null").exec().out.firstOrNull().orEmpty()
+                        )
+                        val writtenB = ((curSec - startSec).coerceAtLeast(0L)) * 512L
+                        val frac = (writtenB.toFloat() / isoSize.coerceAtLeast(1L).toFloat()).coerceIn(0f, 0.98f)
+                        onProgress(
+                            WindowsBuildProgress(
+                                stage = "Extracting Linux ISO to USB...",
+                                detail = "${UsbGadgetEngine.formatBytes(writtenB)} / ~${UsbGadgetEngine.formatBytes(isoSize)} · ${linuxProf.shortLabel}",
+                                progress = 0.45f + frac * 0.28f,
+                                isIndeterminate = writtenB <= 0L
+                            )
+                        )
+                    }
+                }
+            }
             val mmtArg = BuildThermalHelper.sevenZipThreadArgFor(linuxProf)
-            val extRes = BuildThermalHelper.runIsolatedRootScript(
-                context,
-                "linux_ext",
-                "set -e\n${BuildThermalHelper.thermalExecPrefix(linuxProf)}\n\$THERM_PFX ${shellQuote(bin7z)} x -y $mmtArg -o$TEMP_FAT_MNT $qIso 2>&1",
-                trackPid = true
-            )
+            val extRes = try {
+                BuildThermalHelper.runIsolatedRootScript(
+                    context,
+                    "linux_ext",
+                    "set -e\n${BuildThermalHelper.thermalExecPrefix(linuxProf)}\n\$THERM_PFX ${shellQuote(bin7z)} x -y $mmtArg -o$TEMP_FAT_MNT $qIso 2>&1",
+                    trackPid = true
+                )
+            } finally {
+                fatWatchJob?.cancel()
+            }
+            if (otgYankedFat) { cleanup(true); return@withContext ActionResult(false, "USB-C pen drive was unplugged during Linux ISO extraction.", entries = entries) }
             if (!isActive || BuildThermalHelper.isBuildCancelled()) { cleanup(true); return@withContext ActionResult(false, "Build cancelled.", entries = entries) }
             if (!extRes.isSuccess) { cleanup(true); return@withContext ActionResult(false, "ISO extraction failed: ${(extRes.out + extRes.err).takeLast(4).joinToString(" ").take(200)}", entries = entries) }
 
@@ -317,23 +538,52 @@ object LinuxImageBuilder {
                     """.trimIndent()
                 ).exec()
                 entries.add(LogEntry(ts, "linux-build", "Injected '$bootParam' kernel boot flag"))
-                onProgress(WindowsBuildProgress("Formatting ext4 persistence...", "${config.persistenceGb} GB ${config.style.volumeLabel}", 0.78f, false))
-                extLoop = attachLoopSlice(qOut, part2OffsetBytes, persistBytes)
-                if (extLoop.isBlank() || !extLoop.startsWith("/dev/")) { cleanup(true); return@withContext ActionResult(false, "Could not attach persistence loop.", entries = entries) }
+                // Unmount & detach Partition 1 cleanly before attaching Partition 2 (eliminates any concurrent partition-node conflict)
+                BuildThermalHelper.unmountAndDetachClean(
+                    mountPoints = listOf(TEMP_FAT_MNT),
+                    loopDevices = if (fatIsLoop && fatLoop.isNotBlank()) listOf(fatLoop) else emptyList(),
+                    removeDirs = true
+                )
+                fatLoop = ""
+                val actualPersistGb = ((persistBytes / (1024L * 1024L * 1024L)).coerceAtLeast(1L)).toInt()
+                onProgress(WindowsBuildProgress("Formatting ext4 persistence...", "$actualPersistGb GB ${config.style.volumeLabel}", 0.78f, false))
+                val otgForExt = verifiedOtg
+                if (otgForExt != null) {
+                    val (attached, isLoop) = OtgUsbFlasher.attachOtgPartitionSlice(otgForExt, 2, part2OffsetBytes, persistBytes)
+                    extLoop = attached
+                    extIsLoop = isLoop
+                } else {
+                    extLoop = attachLoopSlice(qOut, part2OffsetBytes, persistBytes)
+                    extIsLoop = true
+                }
+                if (extLoop.isBlank() || !extLoop.startsWith("/dev/")) { cleanup(true); return@withContext ActionResult(false, "Could not attach persistence partition.", entries = entries) }
                 formatExt4AndInit(shellQuote(extLoop), config.style, entries, ts)?.let { cleanup(true); return@withContext ActionResult(false, it, entries = entries) }
             }
 
-            onProgress(WindowsBuildProgress("Finalizing FAT32 USB...", "Syncing & fixing permissions", 0.95f, false))
+            onProgress(WindowsBuildProgress(if (isDirectBlock) "Flushing USB write cache — do NOT unplug..." else "Finalizing FAT32 USB...", "Syncing partitions", 0.95f, isDirectBlock))
             cleanup(false)
-            UsbGadgetEngine.fixUserStoragePermissions(context, safeDir, isDir = true)
-            UsbGadgetEngine.fixUserStoragePermissions(context, outPath, isDir = false)
-            val lOutBytes = Shell.cmd("stat -c '%s' $qOut 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
-            if (lOutBytes > 0L) UsbGadgetEngine.syncMediaStoreFileSize(context, outPath, lOutBytes)
-            IsoInspector.invalidate(outPath)
-            val msg = if (withPersistence) "Built FAT32 USB $safeName + ${config.persistenceGb} GB ${config.style.volumeLabel}." else "Built Extracted FAT32 USB $safeName."
-            entries.add(LogEntry(ts, "linux-build", msg))
-            onProgress(WindowsBuildProgress("Done!", safeName, 1f, false))
-            ActionResult(true, msg, createdPath = outPath, entries = entries)
+            val otgDone = verifiedOtg
+            if (otgDone != null) {
+                if (!OtgUsbFlasher.isOtgDeviceStillConnected(otgDone.devName)) {
+                    return@withContext ActionResult(false, "USB-C pen drive was disconnected before final flush completed.", entries = entries)
+                }
+                OtgUsbFlasher.finalizeOtgDiskClean(otgDone)
+                val actualPersistGb = ((persistBytes / (1024L * 1024L * 1024L)).coerceAtLeast(1L)).toInt()
+                val msg = if (withPersistence) "Flashed Direct Linux FAT32 + $actualPersistGb GB ${config.style.volumeLabel} to ${otgDone.displayTitle}. Safe to unplug USB-C OTG drive." else "Flashed Direct Linux FAT32 USB to ${otgDone.displayTitle}. Safe to unplug USB-C OTG drive."
+                entries.add(LogEntry(ts, "linux-build", msg))
+                onProgress(WindowsBuildProgress("USB Ready!", "Safe to unplug ${otgDone.displayTitle}", 1f, false))
+                ActionResult(true, msg, createdPath = null, entries = entries)
+            } else {
+                UsbGadgetEngine.fixUserStoragePermissions(context, safeDir, isDir = true)
+                UsbGadgetEngine.fixUserStoragePermissions(context, outPath, isDir = false)
+                val lOutBytes = Shell.cmd("stat -c '%s' $qOut 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                if (lOutBytes > 0L) UsbGadgetEngine.syncMediaStoreFileSize(context, outPath, lOutBytes)
+                IsoInspector.invalidate(outPath)
+                val msg = if (withPersistence) "Built FAT32 USB $safeName + ${config.persistenceGb} GB ${config.style.volumeLabel}." else "Built Extracted FAT32 USB $safeName."
+                entries.add(LogEntry(ts, "linux-build", msg))
+                onProgress(WindowsBuildProgress("Done!", safeName, 1f, false))
+                ActionResult(true, msg, createdPath = outPath, entries = entries)
+            }
         }.getOrElse { e -> cleanup(true); ActionResult(false, "Linux/Tool USB build failed: ${e.message ?: "Unexpected error"}", entries = entries) }
     }
 

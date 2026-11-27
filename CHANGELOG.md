@@ -1,3 +1,16 @@
+## v4.9.0 (2026-11-27) — Wave 5: Direct-Mode USB-C OTG Upgrade (4 Modes)
+- **Fixed-Disk Physical Partition Engine (`DiskPartitioner.kt`):**
+  - Added `calculateFixedDiskLayout()`, `calculateFixedVentoyLayout()`, `calculateFixedLinuxFat32Layout()`, `maxLinuxPersistenceGb()`, `findPersistenceSlotIndex()`, and `effectiveSchemeForDisk()` utilizing 100% of a physical pen drive's capacity, placing Backup GPT at exact `totalSectors - 1`, and enforcing a strict `2 TiB` MBR 32-bit LBA guard (auto-locking `> 2 TiB` USB SSDs to GPT).
+- **9-Layer Anti-Brick OTG Hardening (`OtgUsbFlasher.kt`):**
+  - Added `512 B` logical sector-size verification (`queue/logical_block_size`, rejecting `4Kn` enclosures), multi-namespace Android `sm unmount` (`parseSmPublicVolumeIds`) before `vold` unmount, `4 MiB` header + `2 MiB` tail wipe, silent `losetup`-over-block partition slicing with `blockdev --rereadpt` fallback, live USB-yank disconnect detection, and a safe-to-unplug write-cache flush gate.
+- **4-Mode Direct USB-C OTG Flasher (`OtgUsbFlasher.kt`, `WindowsImageBuilder.kt`, `LinuxImageBuilder.kt`, `VentoyImageBuilder.kt`, `UsbBuildService.kt`, `MainActivity.kt`):**
+  - **Mode 1 — Direct Windows USB:** Writes GPT/MBR + NTFS + UEFI:NTFS directly to `/dev/block/sdX` with Edition Picker, offline `boot.wim` `LabConfig` bypass, full Windows Experience & System Tweaks (`WindowsTwoPaneCustomizer` + saved presets), `ei.cfg`, CA 2023 bootloaders, and **Driver Pack Library** injection into `/Drivers` using **0 GB phone `.img` storage**.
+  - **Mode 2 — Direct Linux + Persistence:** Writes Extracted FAT32 (with auto `grub.cfg`/`syslinux.cfg` label & `persistent` boot-flag patching) or Hybrid DD directly to `/dev/block/sdX` with dynamic ext4 persistence (`writable`, `casper-rw`, `persistence`) scaling up to the pen drive's real remaining space.
+  - **Mode 3 — Direct Multi-Boot Pen Drive:** Installs full-capacity Multi-Boot (GPT/MBR, exFAT/NTFS) + optional initial ISO + Windows tweaks & WinPE driver packs directly onto a physical USB pen drive.
+  - **Mode 4 — Raw / Streaming DD:** Preserves raw `.img`/`.iso` and streaming `.xz`/`.gz`/`.zst` flashing with Head+Tail / Full SHA-256 read-back verification.
+- **Wave 5 JVM Unit Tests (`Wave5OtgRufusTest.kt`):**
+  - Added tests verifying exact physical-end Backup GPT headers, `2 TiB` MBR guard, `32 MiB` Multi-Boot EFI placement, dynamic Linux persistence sizing, `4Kn` sector rejection, and exact `(major:minor)` `sm` public volume isolation.
+
 ## v4.8.0 (2026-11-27) — Wave 4: Compressed Image Engine & Physical USB-C OTG Pen Drive Flasher
 - **Compressed Image Engine (`CompressedImageEngine.kt`, `IsoInspector.kt`, `UsbGadgetEngine.kt`, `BrowseAndBrowserSheets.kt`, `build-apk.yml`):**
   - Cross-compiled and bundled static ARM64 **`zstd`** (`libzstd.so`, stripped ELF, zero `PT_INTERP`) in GitHub Actions CI alongside `lib7zzs.so`.

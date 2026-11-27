@@ -285,6 +285,48 @@ object UsbBuildManager {
         }
     }
 
+    fun startOtgWindowsFlash(context: Context, config: WindowsBuildConfig): Boolean {
+        val appCtx = context.applicationContext
+        val devLbl = config.directBlockTarget?.devName ?: "OTG"
+        return launchBuild(
+            context = appCtx,
+            kind = UsbBuildKind.OTG_FLASH,
+            targetName = "Win USB: ${config.isoFile.name} -> $devLbl",
+            autoMountAfterBuild = false,
+            autoMountMode = MountMode.AUTO
+        ) { onProgress ->
+            WindowsImageBuilder.buildWindowsUsbImage(appCtx, config, onProgress)
+        }
+    }
+
+    fun startOtgLinuxFlash(context: Context, config: LinuxBuildConfig): Boolean {
+        val appCtx = context.applicationContext
+        val devLbl = config.directBlockTarget?.devName ?: "OTG"
+        return launchBuild(
+            context = appCtx,
+            kind = UsbBuildKind.OTG_FLASH,
+            targetName = "Linux USB: ${config.isoFile.name} -> $devLbl",
+            autoMountAfterBuild = false,
+            autoMountMode = MountMode.AUTO
+        ) { onProgress ->
+            LinuxImageBuilder.buildLinuxPersistentImage(appCtx, config, onProgress)
+        }
+    }
+
+    fun startOtgMultiBootFlash(context: Context, config: VentoyBuildConfig): Boolean {
+        val appCtx = context.applicationContext
+        val devLbl = config.directBlockTarget?.devName ?: "OTG"
+        return launchBuild(
+            context = appCtx,
+            kind = UsbBuildKind.OTG_FLASH,
+            targetName = "Multi-Boot -> $devLbl",
+            autoMountAfterBuild = false,
+            autoMountMode = MountMode.AUTO
+        ) { onProgress ->
+            VentoyImageBuilder.buildVentoyImage(appCtx, config, onProgress)
+        }
+    }
+
     fun cancelActiveBuild(context: Context? = null) {
         val activeKind = _state.value?.kind
         cancelRequested.set(true)

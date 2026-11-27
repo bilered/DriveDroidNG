@@ -55,7 +55,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.topjohnwu.superuser.Shell
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.net.HttpURLConnection
@@ -82,7 +84,8 @@ data class WindowsBuildConfig(
     val winUtil: WinUtilTweaksConfig = WinUtilTweaksConfig(),
     val eiCfgUnlock: Boolean = false,
     val extraDriversDir: String = "", val extraDriverPackDirs: List<String> = emptyList(), val autoMountAfterBuild: Boolean = true,
-    val volumeLabel: String = ""
+    val volumeLabel: String = "",
+    val directBlockTarget: OtgUsbDevice? = null
 )
 
 data class WindowsBuildProgress(
@@ -347,23 +350,31 @@ object WindowsImageBuilder {
         val ts = nowTs()
         BuildThermalHelper.resetCancelFlag()
         val entries = mutableListOf<LogEntry>()
+        val isDirectBlock = config.directBlockTarget != null
         val safeDir = UsbGadgetEngine.resolveDirectPath(config.outputDir).trimEnd('/')
-        val safeName = UsbGadgetEngine.sanitizeOutputFileName(config.outputName, ".img", "windows-usb")
-        val outPath = "$safeDir/$safeName"
+        val safeName = if (isDirectBlock) {
+            config.directBlockTarget?.displayTitle ?: "USB-C OTG Drive"
+        } else {
+            UsbGadgetEngine.sanitizeOutputFileName(config.outputName, ".img", "windows-usb")
+        }
+        var outPath = if (isDirectBlock) config.directBlockTarget?.devPath.orEmpty() else "$safeDir/$safeName"
         val srcIsoPath = UsbGadgetEngine.resolveDirectPath(config.isoFile.path)
         val qIso = shellQuote(srcIsoPath)
-        val qOut = shellQuote(outPath)
+        var qOut = shellQuote(outPath)
         val qDir = shellQuote(safeDir)
 
         var loopDev = ""
+        var loopIsLoopNode = true
+        var verifiedOtg: OtgUsbDevice? = null
 
         fun cleanup(deletePartial: Boolean) {
             BuildThermalHelper.unmountAndDetachClean(
                 mountPoints = listOf(TEMP_MNT, TEMP_ISO_MNT),
-                loopDevices = if (loopDev.isNotBlank()) listOf(loopDev) else emptyList(),
+                loopDevices = if (loopIsLoopNode && loopDev.isNotBlank()) listOf(loopDev) else emptyList(),
                 removeDirs = true
             )
-            if (deletePartial) {
+            // NEVER rm -f a physical /dev/block/sdX node!
+            if (deletePartial && !isDirectBlock) {
                 Shell.cmd("rm -f $qOut 2>/dev/null").exec()
             }
         }
@@ -372,11 +383,13 @@ object WindowsImageBuilder {
             if (!Shell.getShell().isRoot) {
                 return@withContext ActionResult(false, "Root access is required to build a bootable USB image.", entries = entries)
             }
-            if (outPath.equals(srcIsoPath, ignoreCase = true)) {
-                return@withContext ActionResult(false, "Output image cannot overwrite the source ISO.", entries = entries)
-            }
-            if (UsbGadgetEngine.getStatus().mountedLunFor(outPath) != null) {
-                return@withContext ActionResult(false, "$safeName is currently mounted to your PC. Unmount it before overwriting.", entries = entries)
+            if (!isDirectBlock) {
+                if (outPath.equals(srcIsoPath, ignoreCase = true)) {
+                    return@withContext ActionResult(false, "Output image cannot overwrite the source ISO.", entries = entries)
+                }
+                if (UsbGadgetEngine.getStatus().mountedLunFor(outPath) != null) {
+                    return@withContext ActionResult(false, "$safeName is currently mounted to your PC. Unmount it before overwriting.", entries = entries)
+                }
             }
 
             onProgress(WindowsBuildProgress("Checking ISO & tools...", config.isoFile.name, 0.04f, true))
@@ -391,17 +404,45 @@ object WindowsImageBuilder {
             val extraDriversBytes = allDriverDirs.sumOf { UsbGadgetEngine.queryDirSizeBytes(it) }
 
             val uefiNtfsBytes = loadUefiNtfsImage(context)
-            val layout = DiskPartitioner.calculateLayout(isoSize + extraDriversBytes, uefiNtfsBytes?.size?.toLong() ?: (1024L * 1024L))
-
-            val rawFreeSpace = UsbGadgetEngine.getFreeSpaceBytes(safeDir)
-            val existingOutAllocB = UsbGadgetEngine.queryExistingFileAllocatedBytes(outPath)
-            val freeSpace = if (rawFreeSpace > 0L) rawFreeSpace + existingOutAllocB else 0L
-            if (freeSpace > 0L && freeSpace < layout.totalBytes + (128L * 1024L * 1024L)) {
-                val needed = UsbGadgetEngine.formatBytes(layout.totalBytes)
-                val avail = UsbGadgetEngine.formatBytes(freeSpace)
-                val reason = "Not enough free space. Need $needed, only $avail available."
-                entries.add(LogEntry(ts, "win-build", reason, true))
-                return@withContext ActionResult(false, reason, entries = entries)
+            val uefiBytesLen = uefiNtfsBytes?.size?.toLong() ?: (1024L * 1024L)
+            val effectiveScheme: PartitionScheme
+            val layout: DiskLayoutSpec
+            if (isDirectBlock) {
+                val reqTarget = config.directBlockTarget
+                    ?: return@withContext ActionResult(false, "No physical USB-C OTG drive selected.", entries = entries)
+                onProgress(WindowsBuildProgress("Verifying USB-C drive...", reqTarget.displayTitle, 0.07f, true))
+                val (prepDev, prepErr) = OtgUsbFlasher.verifyPhysicalOtgDisk(reqTarget)
+                if (prepDev == null) {
+                    return@withContext ActionResult(false, prepErr ?: "USB-C OTG drive preparation failed.", entries = entries)
+                }
+                verifiedOtg = prepDev
+                outPath = prepDev.devPath
+                qOut = shellQuote(outPath)
+                effectiveScheme = DiskPartitioner.effectiveSchemeForDisk(config.scheme, prepDev.sizeBytes)
+                val minPart1Bytes = isoSize + extraDriversBytes + (768L * 1024L * 1024L)
+                layout = DiskPartitioner.calculateFixedDiskLayout(
+                    totalDiskBytes = prepDev.sizeBytes,
+                    minPart1Bytes = minPart1Bytes,
+                    part2Bytes = uefiBytesLen,
+                    scheme = effectiveScheme
+                ) ?: return@withContext ActionResult(
+                    false,
+                    "USB pen drive (${UsbGadgetEngine.formatBytes(prepDev.sizeBytes)}) is too small for ${config.isoFile.name} + drivers + boot.wim patching headroom (need ~${UsbGadgetEngine.formatBytes(minPart1Bytes + uefiBytesLen)}).",
+                    entries = entries
+                )
+            } else {
+                effectiveScheme = config.scheme
+                layout = DiskPartitioner.calculateLayout(isoSize + extraDriversBytes, uefiBytesLen)
+                val rawFreeSpace = UsbGadgetEngine.getFreeSpaceBytes(safeDir)
+                val existingOutAllocB = UsbGadgetEngine.queryExistingFileAllocatedBytes(outPath)
+                val freeSpace = if (rawFreeSpace > 0L) rawFreeSpace + existingOutAllocB else 0L
+                if (freeSpace > 0L && freeSpace < layout.totalBytes + (128L * 1024L * 1024L)) {
+                    val needed = UsbGadgetEngine.formatBytes(layout.totalBytes)
+                    val avail = UsbGadgetEngine.formatBytes(freeSpace)
+                    val reason = "Not enough free space. Need $needed, only $avail available."
+                    entries.add(LogEntry(ts, "win-build", reason, true))
+                    return@withContext ActionResult(false, reason, entries = entries)
+                }
             }
 
             val sevenZip = findBundledBinary(
@@ -471,7 +512,7 @@ object WindowsImageBuilder {
                 return@withContext ActionResult(false, reason, entries = entries)
             }
 
-            val needUefiNtfs = useNtfs && config.scheme == PartitionScheme.GPT
+            val needUefiNtfs = useNtfs && effectiveScheme == PartitionScheme.GPT
             if (needUefiNtfs && uefiNtfsBytes == null) {
                 val reason = "Missing UEFI NTFS boot partition asset. Connect to internet once or rebuild APK."
                 entries.add(LogEntry(ts, "win-build", reason, true))
@@ -480,22 +521,30 @@ object WindowsImageBuilder {
 
             onProgress(
                 WindowsBuildProgress(
-                    stage = "Creating ${config.scheme.label} image...",
+                    stage = if (isDirectBlock) "Partitioning USB-C drive (${effectiveScheme.label})..." else "Creating ${effectiveScheme.label} image...",
                     detail = "${UsbGadgetEngine.formatBytes(layout.totalBytes)} (${if (useNtfs) "NTFS Boot Layout" else "FAT32"})",
                     progress = 0.12f,
                     isIndeterminate = false
                 )
             )
 
-            val allocRes = Shell.cmd(
-                """
-                mkdir -p $qDir && rm -f $qOut &&
-                (truncate -s ${layout.totalBytes} $qOut 2>/dev/null || dd if=/dev/zero of=$qOut bs=1M count=0 seek=${layout.totalBytes / (1024L * 1024L)} 2>/dev/null)
-                """.trimIndent()
-            ).exec()
-            if (!allocRes.isSuccess) {
-                cleanup(deletePartial = true)
-                return@withContext ActionResult(false, "Failed to allocate image file at $outPath.", entries = entries)
+            if (!isDirectBlock) {
+                val allocRes = Shell.cmd(
+                    """
+                    mkdir -p $qDir && rm -f $qOut &&
+                    (truncate -s ${layout.totalBytes} $qOut 2>/dev/null || dd if=/dev/zero of=$qOut bs=1M count=0 seek=${layout.totalBytes / (1024L * 1024L)} 2>/dev/null)
+                    """.trimIndent()
+                ).exec()
+                if (!allocRes.isSuccess) {
+                    cleanup(deletePartial = true)
+                    return@withContext ActionResult(false, "Failed to allocate image file at $outPath.", entries = entries)
+                }
+            } else {
+                val otgToWipe = verifiedOtg ?: return@withContext ActionResult(false, "USB-C OTG drive unavailable.", entries = entries)
+                onProgress(WindowsBuildProgress("Unmounting & wiping USB drive...", otgToWipe.displayTitle, 0.14f, true))
+                OtgUsbFlasher.unmountAndWipeOtgDisk(otgToWipe, entries, ts)?.let { err ->
+                    return@withContext ActionResult(false, err, entries = entries)
+                }
             }
 
             val part1IsFat32 = !useNtfs
@@ -503,7 +552,7 @@ object WindowsImageBuilder {
             val tableErr = writeTablesViaRoot(
                 context = context,
                 outImgPath = outPath,
-                scheme = config.scheme,
+                scheme = effectiveScheme,
                 layout = layout,
                 part1IsFat32 = part1IsFat32,
                 uefiNtfsData = if (includeUefiPart) uefiNtfsBytes else null
@@ -517,34 +566,47 @@ object WindowsImageBuilder {
                 LogEntry(
                     ts,
                     "win-build",
-                    "Wrote ${config.scheme.label}: Part1 ${if (useNtfs) "NTFS" else "FAT32"} LBA=${layout.part1StartLba}" +
+                    "Wrote ${effectiveScheme.label}: Part1 ${if (useNtfs) "NTFS" else "FAT32"} LBA=${layout.part1StartLba}" +
                         if (includeUefiPart) " + Part2 UEFI:NTFS LBA=${layout.part2StartLba}" else ""
                 )
             )
 
             onProgress(WindowsBuildProgress("Formatting Partition 1...", if (useNtfs) "NTFS" else "FAT32", 0.22f, false))
 
-            val loopCmd = """
-                L=${'$'}(losetup -f -s -o ${layout.part1OffsetBytes} -S ${layout.part1SizeBytes} $qOut 2>/dev/null)
-                if [ -z "${'$'}L" ]; then
-                    L=${'$'}(losetup -f --show -o ${layout.part1OffsetBytes} --sizelimit ${layout.part1SizeBytes} $qOut 2>/dev/null)
-                fi
-                if [ -z "${'$'}L" ]; then
-                    CAND=${'$'}(losetup -f 2>/dev/null)
-                    if [ -n "${'$'}CAND" ]; then
-                        if losetup -o ${layout.part1OffsetBytes} -S ${layout.part1SizeBytes} "${'$'}CAND" $qOut 2>/dev/null || \
-                           losetup -o ${layout.part1OffsetBytes} --sizelimit ${layout.part1SizeBytes} "${'$'}CAND" $qOut 2>/dev/null; then
-                            L="${'$'}CAND"
+            val otgDevForAttach = verifiedOtg
+            if (otgDevForAttach != null) {
+                val (attachedNode, isLoop) = OtgUsbFlasher.attachOtgPartitionSlice(
+                    dev = otgDevForAttach,
+                    partIndex = 1,
+                    offsetBytes = layout.part1OffsetBytes,
+                    sizeBytes = layout.part1SizeBytes
+                )
+                loopDev = attachedNode
+                loopIsLoopNode = isLoop
+            } else {
+                val loopCmd = """
+                    L=${'$'}(losetup -f -s -o ${layout.part1OffsetBytes} -S ${layout.part1SizeBytes} $qOut 2>/dev/null)
+                    if [ -z "${'$'}L" ]; then
+                        L=${'$'}(losetup -f --show -o ${layout.part1OffsetBytes} --sizelimit ${layout.part1SizeBytes} $qOut 2>/dev/null)
+                    fi
+                    if [ -z "${'$'}L" ]; then
+                        CAND=${'$'}(losetup -f 2>/dev/null)
+                        if [ -n "${'$'}CAND" ]; then
+                            if losetup -o ${layout.part1OffsetBytes} -S ${layout.part1SizeBytes} "${'$'}CAND" $qOut 2>/dev/null || \
+                               losetup -o ${layout.part1OffsetBytes} --sizelimit ${layout.part1SizeBytes} "${'$'}CAND" $qOut 2>/dev/null; then
+                                L="${'$'}CAND"
+                            fi
                         fi
                     fi
-                fi
-                echo "${'$'}L"
-            """.trimIndent()
-            loopDev = Shell.cmd(loopCmd).exec().out.lastOrNull().orEmpty().trim()
+                    echo "${'$'}L"
+                """.trimIndent()
+                loopDev = Shell.cmd(loopCmd).exec().out.lastOrNull().orEmpty().trim()
+                loopIsLoopNode = true
+            }
             if (loopDev.isBlank() || !loopDev.startsWith("/dev/")) {
-                entries.add(LogEntry(ts, "win-build", "losetup failed to attach Partition 1", true))
+                entries.add(LogEntry(ts, "win-build", "Failed to attach Partition 1 slice", true))
                 cleanup(deletePartial = true)
-                return@withContext ActionResult(false, "Kernel loop device setup failed.", entries = entries)
+                return@withContext ActionResult(false, "Could not attach Partition 1 on target drive.", entries = entries)
             }
             val qLoop = shellQuote(loopDev)
 
@@ -579,7 +641,7 @@ object WindowsImageBuilder {
             }
             entries.add(LogEntry(ts, "win-build", "Formatted Partition 1 (${if (useNtfs) "NTFS 4K, label=$ntfsLabel" else "FAT32, label=$fatLabel"}) on $loopDev"))
 
-            if (config.scheme == PartitionScheme.MBR && msSysBin != null) {
+            if (effectiveScheme == PartitionScheme.MBR && msSysBin != null) {
                 onProgress(WindowsBuildProgress("Writing Windows boot sector...", "Injecting Windows bootmgr VBR & MBR", 0.28f, false))
                 val qMs = shellQuote(msSysBin)
                 val vbrFlag = if (useNtfs) "-n" else "-8"
@@ -637,27 +699,67 @@ object WindowsImageBuilder {
                 )
             )
 
-            val extractRes = if (sevenZip != null) {
-                val mmtArg = BuildThermalHelper.sevenZipThreadArgFor(usbProf)
-                BuildThermalHelper.runIsolatedRootScript(
-                    context,
-                    "winusb_ext",
-                    "set -e\n${BuildThermalHelper.thermalExecPrefix(usbProf)}\n\$THERM_PFX ${shellQuote(sevenZip)} x -y $mmtArg -o$TEMP_MNT $qIso 2>&1",
-                    trackPid = true
+            var otgYanked = false
+            val otgWatchDev = verifiedOtg
+            val otgWatchJob = if (otgWatchDev != null) {
+                val qStat = shellQuote("/sys/block/${otgWatchDev.devName}/stat")
+                val startSec = OtgUsbFlasher.parseSectorsWrittenFromStat(
+                    Shell.cmd("cat $qStat 2>/dev/null").exec().out.firstOrNull().orEmpty()
                 )
-            } else {
-                BuildThermalHelper.runIsolatedRootScript(
-                    context,
-                    "winusb_loopcp",
-                    """
-                    set -e
-                    ${BuildThermalHelper.thermalExecPrefix(usbProf)}
-                    mkdir -p $TEMP_ISO_MNT
-                    (mount -t udf -o loop,ro $qIso $TEMP_ISO_MNT 2>&1 || mount -t iso9660 -o loop,ro $qIso $TEMP_ISO_MNT 2>&1 || mount -o loop,ro $qIso $TEMP_ISO_MNT 2>&1)
-                    ${'$'}THERM_PFX cp -rf $TEMP_ISO_MNT/. $TEMP_MNT/ 2>&1
-                    """.trimIndent(),
-                    trackPid = true
-                )
+                launch(Dispatchers.IO) {
+                    while (isActive) {
+                        delay(700L)
+                        if (!OtgUsbFlasher.isOtgDeviceStillConnected(otgWatchDev.devName)) {
+                            otgYanked = true
+                            BuildThermalHelper.cancelActiveBuildProcess()
+                            break
+                        }
+                        val curSec = OtgUsbFlasher.parseSectorsWrittenFromStat(
+                            Shell.cmd("cat $qStat 2>/dev/null").exec().out.firstOrNull().orEmpty()
+                        )
+                        val writtenB = ((curSec - startSec).coerceAtLeast(0L)) * 512L
+                        val frac = (writtenB.toFloat() / isoSize.coerceAtLeast(1L).toFloat()).coerceIn(0f, 0.98f)
+                        onProgress(
+                            WindowsBuildProgress(
+                                stage = "Extracting Windows ISO to USB...",
+                                detail = "${UsbGadgetEngine.formatBytes(writtenB)} / ~${UsbGadgetEngine.formatBytes(isoSize)} · ${usbProf.shortLabel}",
+                                progress = 0.42f + frac * 0.38f,
+                                isIndeterminate = writtenB <= 0L
+                            )
+                        )
+                    }
+                }
+            } else null
+
+            val extractRes = try {
+                if (sevenZip != null) {
+                    val mmtArg = BuildThermalHelper.sevenZipThreadArgFor(usbProf)
+                    BuildThermalHelper.runIsolatedRootScript(
+                        context,
+                        "winusb_ext",
+                        "set -e\n${BuildThermalHelper.thermalExecPrefix(usbProf)}\n\$THERM_PFX ${shellQuote(sevenZip)} x -y $mmtArg -o$TEMP_MNT $qIso 2>&1",
+                        trackPid = true
+                    )
+                } else {
+                    BuildThermalHelper.runIsolatedRootScript(
+                        context,
+                        "winusb_loopcp",
+                        """
+                        set -e
+                        ${BuildThermalHelper.thermalExecPrefix(usbProf)}
+                        mkdir -p $TEMP_ISO_MNT
+                        (mount -t udf -o loop,ro $qIso $TEMP_ISO_MNT 2>&1 || mount -t iso9660 -o loop,ro $qIso $TEMP_ISO_MNT 2>&1 || mount -o loop,ro $qIso $TEMP_ISO_MNT 2>&1)
+                        ${'$'}THERM_PFX cp -rf $TEMP_ISO_MNT/. $TEMP_MNT/ 2>&1
+                        """.trimIndent(),
+                        trackPid = true
+                    )
+                }
+            } finally {
+                otgWatchJob?.cancel()
+            }
+            if (otgYanked) {
+                cleanup(deletePartial = true)
+                return@withContext ActionResult(false, "USB-C pen drive was unplugged during Windows ISO extraction.", entries = entries)
             }
             if (!isActive || BuildThermalHelper.isBuildCancelled()) {
                 cleanup(deletePartial = true)
@@ -927,10 +1029,17 @@ object WindowsImageBuilder {
                 }
             }
 
-            onProgress(WindowsBuildProgress("Finalizing bootable USB...", "Syncing NTFS & fixing permissions", 0.94f, false))
+            onProgress(
+                WindowsBuildProgress(
+                    stage = if (isDirectBlock) "Flushing USB write cache — do NOT unplug..." else "Finalizing bootable USB...",
+                    detail = if (isDirectBlock) "Syncing NTFS & partition table on $safeName" else "Syncing NTFS & fixing permissions",
+                    progress = 0.94f,
+                    isIndeterminate = isDirectBlock
+                )
+            )
             cleanup(deletePartial = false)
 
-            if (config.scheme == PartitionScheme.MBR && msSysBin != null) {
+            if (effectiveScheme == PartitionScheme.MBR && msSysBin != null) {
                 val qMs = shellQuote(msSysBin)
                 val mbrRes = Shell.cmd("$qMs -7 -f $qOut 2>&1").exec()
                 if (mbrRes.isSuccess) {
@@ -938,21 +1047,37 @@ object WindowsImageBuilder {
                 }
             }
 
-            UsbGadgetEngine.fixUserStoragePermissions(context, safeDir, isDir = true)
-            UsbGadgetEngine.fixUserStoragePermissions(context, outPath, isDir = false)
-            val builtOutBytes = Shell.cmd("stat -c '%s' $qOut 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
-            if (builtOutBytes > 0L) UsbGadgetEngine.syncMediaStoreFileSize(context, outPath, builtOutBytes)
-            IsoInspector.invalidate(outPath)
+            val otgDone = verifiedOtg
+            if (otgDone != null) {
+                if (!OtgUsbFlasher.isOtgDeviceStillConnected(otgDone.devName)) {
+                    return@withContext ActionResult(false, "USB-C pen drive was disconnected before final flush completed.", entries = entries)
+                }
+                OtgUsbFlasher.finalizeOtgDiskClean(otgDone)
+                onProgress(WindowsBuildProgress("USB Ready!", "Safe to unplug ${otgDone.displayTitle}", 1f, false))
+                entries.add(LogEntry(ts, "win-build", "Flashed Direct Windows USB to ${otgDone.devPath}"))
+                ActionResult(
+                    success = true,
+                    userMessage = "Flashed Direct Windows USB to ${otgDone.displayTitle} (${effectiveScheme.label}, ${if (useNtfs) "NTFS" else "FAT32"}). Safe to unplug USB-C OTG drive.",
+                    createdPath = null,
+                    entries = entries
+                )
+            } else {
+                UsbGadgetEngine.fixUserStoragePermissions(context, safeDir, isDir = true)
+                UsbGadgetEngine.fixUserStoragePermissions(context, outPath, isDir = false)
+                val builtOutBytes = Shell.cmd("stat -c '%s' $qOut 2>/dev/null || echo 0").exec().out.firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                if (builtOutBytes > 0L) UsbGadgetEngine.syncMediaStoreFileSize(context, outPath, builtOutBytes)
+                IsoInspector.invalidate(outPath)
 
-            onProgress(WindowsBuildProgress("Done!", safeName, 1f, false))
-            entries.add(LogEntry(ts, "win-build", "Built Windows USB image: $outPath"))
+                onProgress(WindowsBuildProgress("Done!", safeName, 1f, false))
+                entries.add(LogEntry(ts, "win-build", "Built Windows USB image: $outPath"))
 
-            ActionResult(
-                success = true,
-                userMessage = "Built $safeName (${config.scheme.label}, ${if (useNtfs) "NTFS" else "FAT32"}).",
-                createdPath = outPath,
-                entries = entries
-            )
+                ActionResult(
+                    success = true,
+                    userMessage = "Built $safeName (${effectiveScheme.label}, ${if (useNtfs) "NTFS" else "FAT32"}).",
+                    createdPath = outPath,
+                    entries = entries
+                )
+            }
         }.getOrElse { e ->
             cleanup(deletePartial = true)
             entries.add(LogEntry(ts, "win-build", "Build error: ${e.message}", true))

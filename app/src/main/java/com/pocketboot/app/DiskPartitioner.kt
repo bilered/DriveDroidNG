@@ -32,6 +32,14 @@ object DiskPartitioner {
 
     private const val SECTOR_SIZE = 512L
     private const val ALIGN_SECTORS = 2048L // 1 MiB alignment
+    // Safe 32-bit MBR LBA ceiling (slightly under 2^32 - 1 sectors = ~2 TiB)
+    const val MAX_MBR_USABLE_SECTORS = 0xFFFFF800L
+
+    fun isOverMbrLimit(totalDiskBytes: Long): Boolean =
+        (totalDiskBytes / SECTOR_SIZE) > MAX_MBR_USABLE_SECTORS
+
+    fun effectiveSchemeForDisk(requested: PartitionScheme, totalDiskBytes: Long): PartitionScheme =
+        if (isOverMbrLimit(totalDiskBytes)) PartitionScheme.GPT else requested
 
     // Microsoft Basic Data Partition: EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
     private val GUID_BASIC_DATA = uuidToMixedEndianBytes("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7")
@@ -60,6 +68,147 @@ object DiskPartitioner {
         0x7D.toByte(), 0x55.toByte(), 0xAA.toByte(), 0x75.toByte(), 0xD2.toByte(), 0xEA.toByte(), 0x00.toByte(), 0x7C.toByte(),
         0x00.toByte(), 0x00.toByte()
     )
+
+    /**
+     * Exact fixed-capacity physical USB disk layout for Direct Windows OTG.
+     * Places Backup GPT at the exact physical last 33 sectors (`totalSectors - 33 .. totalSectors - 1`)
+     * so 100% of the pen drive is utilized with zero unallocated tail or UEFI GPT warnings.
+     * Returns null if the physical disk is too small for [minPart1Bytes] + [part2Bytes] or overflows MBR (>2 TiB).
+     */
+    fun calculateFixedDiskLayout(
+        totalDiskBytes: Long,
+        minPart1Bytes: Long,
+        part2Bytes: Long,
+        scheme: PartitionScheme
+    ): DiskLayoutSpec? {
+        val totalSectors = totalDiskBytes / SECTOR_SIZE
+        if (totalSectors < ALIGN_SECTORS * 16L) return null
+        if (scheme == PartitionScheme.MBR && totalSectors > MAX_MBR_USABLE_SECTORS) return null
+
+        val part1StartLba = ALIGN_SECTORS
+        val part2Sectors = if (part2Bytes > 0L) {
+            val raw = ((part2Bytes + SECTOR_SIZE - 1L) / SECTOR_SIZE).coerceAtLeast(ALIGN_SECTORS)
+            ((raw + ALIGN_SECTORS - 1L) / ALIGN_SECTORS) * ALIGN_SECTORS
+        } else 0L
+
+        val usableEndExclusive = if (scheme == PartitionScheme.GPT) {
+            ((totalSectors - 33L) / ALIGN_SECTORS) * ALIGN_SECTORS
+        } else {
+            (totalSectors / ALIGN_SECTORS) * ALIGN_SECTORS
+        }
+        if (usableEndExclusive <= part1StartLba + part2Sectors) return null
+
+        val part2StartLba = usableEndExclusive - part2Sectors
+        val part1Sectors = part2StartLba - part1StartLba
+        if (part1Sectors < ALIGN_SECTORS || part1Sectors * SECTOR_SIZE < minPart1Bytes) return null
+
+        return DiskLayoutSpec(
+            totalBytes = totalSectors * SECTOR_SIZE,
+            totalSectors = totalSectors,
+            part1StartLba = part1StartLba,
+            part1Sectors = part1Sectors,
+            part2StartLba = if (part2Sectors > 0L) part2StartLba else 0L,
+            part2Sectors = part2Sectors
+        )
+    }
+
+    /**
+     * Exact fixed-capacity physical USB disk layout for Direct Multi-Boot Pen Drive (Mode 3).
+     * Reserves exact 32 MiB (`VENTOY_EFI_SECTORS`) for Partition 2 immediately after Partition 1,
+     * with GPT Backup Header at exact `totalSectors - 1`.
+     */
+    fun calculateFixedVentoyLayout(
+        totalDiskBytes: Long,
+        minPart1Bytes: Long,
+        scheme: PartitionScheme
+    ): DiskLayoutSpec? {
+        val totalSectors = totalDiskBytes / SECTOR_SIZE
+        if (totalSectors < ALIGN_SECTORS * 64L) return null
+        if (scheme == PartitionScheme.MBR && totalSectors > MAX_MBR_USABLE_SECTORS) return null
+
+        val part1StartLba = ALIGN_SECTORS
+        val usableEndExclusive = if (scheme == PartitionScheme.GPT) {
+            ((totalSectors - 33L) / ALIGN_SECTORS) * ALIGN_SECTORS
+        } else {
+            (totalSectors / ALIGN_SECTORS) * ALIGN_SECTORS
+        }
+        val part2StartLba = usableEndExclusive - VENTOY_EFI_SECTORS
+        val part1Sectors = part2StartLba - part1StartLba
+        if (part1Sectors < ALIGN_SECTORS * 32L || part1Sectors * SECTOR_SIZE < minPart1Bytes) return null
+
+        return DiskLayoutSpec(
+            totalBytes = totalSectors * SECTOR_SIZE,
+            totalSectors = totalSectors,
+            part1StartLba = part1StartLba,
+            part1Sectors = part1Sectors,
+            part2StartLba = part2StartLba,
+            part2Sectors = VENTOY_EFI_SECTORS
+        )
+    }
+
+    /**
+     * Computes maximum safe ext4 persistence GB for a physical USB pen drive given [isoSizeBytes].
+     * Clamped to MBR 2 TiB limit and leaves at least (isoSize + 512 MiB) for Partition 1.
+     */
+    fun maxLinuxPersistenceGb(totalDiskBytes: Long, isoSizeBytes: Long): Int {
+        val usableBytes = (totalDiskBytes / SECTOR_SIZE).coerceAtMost(MAX_MBR_USABLE_SECTORS) * SECTOR_SIZE
+        val minPart1 = (((isoSizeBytes + (512L * 1024L * 1024L)) + (1024L * 1024L) - 1L) / (1024L * 1024L)) * (1024L * 1024L)
+        val avail = usableBytes - minPart1 - (4L * 1024L * 1024L)
+        if (avail < 1024L * 1024L * 1024L) return 0
+        return (avail / (1024L * 1024L * 1024L)).coerceIn(1L, 128L).toInt()
+    }
+
+    /**
+     * Fixed-capacity MBR layout for Linux Extracted FAT32 (+ optional ext4 persistence Partition 2).
+     * Automatically clamps to `MAX_MBR_USABLE_SECTORS` on >2 TiB USB drives and allocates 100% of remaining
+     * space to Partition 1 FAT32 so no space on the pen drive is wasted.
+     */
+    fun calculateFixedLinuxFat32Layout(
+        totalDiskBytes: Long,
+        isoSizeBytes: Long,
+        persistenceGb: Int,
+        includePersistence: Boolean
+    ): DiskLayoutSpec? {
+        val totalSectors = totalDiskBytes / SECTOR_SIZE
+        val usableEndExclusive = (totalSectors.coerceAtMost(MAX_MBR_USABLE_SECTORS) / ALIGN_SECTORS) * ALIGN_SECTORS
+        val part1StartLba = ALIGN_SECTORS
+        val minPart1Bytes = ((isoSizeBytes + (256L * 1024L * 1024L)).coerceAtLeast(512L * 1024L * 1024L))
+        val minPart1Sectors = (((minPart1Bytes + (ALIGN_SECTORS * SECTOR_SIZE) - 1L) / (ALIGN_SECTORS * SECTOR_SIZE)) * ALIGN_SECTORS)
+
+        if (!includePersistence) {
+            val part1Sectors = usableEndExclusive - part1StartLba
+            if (part1Sectors < minPart1Sectors) return null
+            return DiskLayoutSpec(
+                totalBytes = totalSectors * SECTOR_SIZE,
+                totalSectors = totalSectors,
+                part1StartLba = part1StartLba,
+                part1Sectors = part1Sectors,
+                part2StartLba = 0L,
+                part2Sectors = 0L
+            )
+        }
+
+        val maxAvailForPart2 = usableEndExclusive - part1StartLba - minPart1Sectors
+        val minPersistSectors = (512L * 1024L * 1024L) / SECTOR_SIZE
+        if (maxAvailForPart2 < minPersistSectors) return null
+
+        val desiredPart2Sectors = (persistenceGb.coerceAtLeast(1).toLong() * 1024L * 1024L * 1024L) / SECTOR_SIZE
+        val actualPart2Sectors = (desiredPart2Sectors.coerceAtMost(maxAvailForPart2) / ALIGN_SECTORS) * ALIGN_SECTORS
+        if (actualPart2Sectors < minPersistSectors) return null
+
+        val part2StartLba = usableEndExclusive - actualPart2Sectors
+        val part1Sectors = part2StartLba - part1StartLba
+        if (part1Sectors < minPart1Sectors) return null
+
+        return DiskLayoutSpec(
+            totalBytes = totalSectors * SECTOR_SIZE,
+            totalSectors = totalSectors,
+            part1StartLba = part1StartLba,
+            part1Sectors = part1Sectors,
+            part2StartLba = part2StartLba,
+            part2Sectors = actualPart2Sectors
+        )
+    }
 
     fun calculateLayout(isoSizeBytes: Long, uefiNtfsBytes: Long): DiskLayoutSpec {
         // Allocate ISO size + 12.5% overhead (min 384 MiB) so filesystem metadata + autounattend.xml always fit cleanly
@@ -386,26 +535,35 @@ object DiskPartitioner {
      * Appends a Linux ext4 persistence partition entry (type 0x83) into the first unused
      * MBR slot (entries 1..3, 0-indexed) of an isohybrid .img file's LBA 0 sector.
      */
+    /**
+     * Returns the 1-based MBR partition number (2, 3, or 4) that `appendLinuxPersistenceMbr` will populate,
+     * or -1 if all MBR partition slots are occupied.
+     */
+    fun findPersistenceSlotIndex(originalMbrSector: ByteArray): Int {
+        if (originalMbrSector.size < 512) return -1
+        // Reject GPT Protective MBR (slot 0 type 0xEE): appending an MBR 0x83 entry would violate GPT spec
+        val slot0Type = originalMbrSector[446 + 4].toInt() and 0xFF
+        if (slot0Type == 0xEE) return -1
+        val buf = ByteBuffer.wrap(originalMbrSector).order(ByteOrder.LITTLE_ENDIAN)
+        for (slot in 1..3) {
+            val off = 446 + slot * 16
+            val pType = originalMbrSector[off + 4].toInt() and 0xFF
+            val pSectors = buf.getInt(off + 12)
+            if (pType == 0 && pSectors == 0) return slot + 1
+        }
+        return -1
+    }
+
     fun appendLinuxPersistenceMbr(
         originalMbrSector: ByteArray,
         startLba: Long,
         sectors: Long
     ): ByteArray? {
-        if (originalMbrSector.size < 512) return null
+        val slotNum = findPersistenceSlotIndex(originalMbrSector)
+        if (slotNum < 2) return null
         val mbr = originalMbrSector.copyOf(512)
         val buf = ByteBuffer.wrap(mbr).order(ByteOrder.LITTLE_ENDIAN)
-
-        var targetOffset = -1
-        for (slot in 1..3) {
-            val off = 446 + slot * 16
-            val pType = mbr[off + 4].toInt() and 0xFF
-            val pSectors = buf.getInt(off + 12)
-            if (pType == 0 && pSectors == 0) {
-                targetOffset = off
-                break
-            }
-        }
-        if (targetOffset < 0) return null
+        val targetOffset = 446 + (slotNum - 1) * 16
 
         writeMbrEntry(
             buf = buf,

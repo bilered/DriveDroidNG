@@ -1,6 +1,12 @@
 # PocketBoot Development Progress
 
-## Current Milestone: v4.8.0 — Wave 4 (Compressed Image Engine & Physical USB-C OTG Pen Drive Flasher)
+## Current Milestone: v4.9.0 — Wave 5 (Direct-Mode USB-C OTG Upgrade — 4 Modes)
+- **Wave 5 Complete (`v4.9.0`, `versionCode = 40`):**
+  - **Direct 4-Mode USB-C OTG Flasher (`OtgUsbFlasher.kt`, `DiskPartitioner.kt`, `WindowsImageBuilder.kt`, `LinuxImageBuilder.kt`, `VentoyImageBuilder.kt`):** Direct-to-pen-drive **Direct Windows USB** (full tweaks, `boot.wim` bypass, Driver Packs), **Direct Linux + Persistence** (Extracted FAT32 / Hybrid DD + dynamic ext4 persistence), **Direct Multi-Boot USB** (full-capacity physical Multi-Boot + tweaks/drivers), and **Raw / Streaming DD**, with **0 GB phone `.img` overhead**.
+  - **9-Layer Anti-Brick Protection:** Adds `512 B` sector guard, multi-namespace `sm unmount`, `4 MiB` head + `2 MiB` tail wipe, silent `losetup` + `rereadpt` fallback, `2 TiB` MBR lock, live disconnect watchdog, and safe-to-unplug write-cache flush.
+  - **Wave 5 JVM Unit Tests (`Wave5OtgRufusTest.kt`):** 8th JUnit suite covering fixed-disk GPT/MBR layouts, 2 TiB/4Kn guards, and `sm` volume isolation.
+
+## Previous Milestone: v4.8.0 — Wave 4 (Compressed Image Engine & Physical USB-C OTG Pen Drive Flasher)
 - **Wave 4 Complete (`v4.8.0`, `versionCode = 39`):**
   - **Compressed Image Engine (`CompressedImageEngine.kt`, `build-apk.yml`):** Bundled static ARM64 `libzstd.so` + `lib7zzs.so` background extraction for `.img`/`.iso` `.xz`/`.gz`/`.zst` archives with gzip wrap guard, live 256 MB storage floor monitor, atomic temp-file swap, and mount/combo isolation.
   - **Physical USB-C OTG Pen Drive Flasher (`OtgUsbFlasher.kt`, `UsbBuildService.kt`, `MainActivity.kt`):** 7-layer anti-brick sysfs + `/proc/mounts` lock, clean `vold` unmount gate, raw + streaming compressed flash, `/sys/block/<dev>/stat` progress, Head+Tail / Full SHA-256 read-back verification, and typed `FLASH` confirmation.

@@ -1,6 +1,7 @@
 package com.pocketboot.app
 
 import android.content.Context
+import android.widget.Toast
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -23,6 +24,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Eject
+import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Storage
 import androidx.compose.material.icons.rounded.Usb
@@ -55,6 +57,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -69,6 +72,13 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+enum class OtgFlashMode(val shortLabel: String, val title: String, val subtitle: String) {
+    DIRECT_WINDOWS("Windows", "Direct Windows USB", "GPT/MBR + NTFS + UEFI:NTFS, Tweaks, Bypass & Drivers"),
+    DIRECT_LINUX("Linux", "Direct Linux + Persistence", "Extracted FAT32 or Hybrid DD + ext4 Persistence"),
+    DIRECT_MULTIBOOT("Multi-Boot", "Direct Multi-Boot USB", "Full-capacity Multi-Boot pen drive + Tweaks & Drivers"),
+    RAW_DD("Raw DD", "Raw / Streaming DD", "Sector-for-sector .img / .xz / .gz / .zst + Verify")
+}
+
 data class OtgUsbDevice(
     val devName: String,
     val devPath: String,
@@ -77,7 +87,8 @@ data class OtgUsbDevice(
     val sizeBytes: Long,
     val sysfsRealPath: String,
     val readOnly: Boolean,
-    val mountedPoints: List<String> = emptyList()
+    val mountedPoints: List<String> = emptyList(),
+    val logicalBlockSize: Int = 512
 ) {
     val displayTitle: String
         get() = listOf(vendor, model).map { it.trim() }.filter { it.isNotEmpty() }
@@ -92,14 +103,16 @@ data class OtgFlashConfig(
 )
 
 /**
- * Physical USB-C OTG pen drive flasher with a 7-layer anti-brick safety lock:
+ * Physical USB-C OTG pen drive flasher with a 9-layer anti-brick safety lock:
  * 1. Whole-disk regex (`^sd[a-z]+$`), never partitions or mmcblk/loop/dm/zram.
  * 2. Strict canonical sysfs USB bus proof (`/usb\d+/`) + internal bus denylist (`ufshc`, `mmc`, `nvme`, `virtual`).
  * 3. `/proc/mounts` system-mount cross-check (disqualifies any disk touching `/`, `/system`, `/data`, `/vendor`, etc.).
  * 4. Writable (`ro == 0`) & minimum capacity >= 64 MB check.
- * 5. Source size <= target disk capacity fail-closed check.
- * 6. USB-C port mutual-exclusion guard (cannot run while ConfigFS LUN is mounted to PC).
- * 7. Clean Android `vold` unmount gate + explicit `FLASH` typed confirmation.
+ * 5. 512-byte logical sector size guard (rejects 4Kn enclosures that would corrupt 512-byte LBA tables).
+ * 6. Source size <= target disk capacity fail-closed check (+ 768 MiB Windows boot.wim headroom).
+ * 7. USB-C port mutual-exclusion guard (cannot run while ConfigFS LUN is mounted to PC).
+ * 8. Multi-namespace Android `sm unmount` + exact `(major,minor)` `vold` unmount gate.
+ * 9. Explicit typed `FLASH` confirmation displaying exact hardware fingerprint & mode summary.
  */
 object OtgUsbFlasher {
 
@@ -125,16 +138,30 @@ object OtgUsbFlasher {
         BuildThermalHelper.cancelActiveBuildProcess()
     }
 
+    fun recommendModeForSource(source: ImageFile?): OtgFlashMode {
+        if (source == null) return OtgFlashMode.RAW_DD
+        val name = source.name
+        if (IsoInspector.isCompressedImageName(name) || name.endsWith(".img", ignoreCase = true)) {
+            return OtgFlashMode.RAW_DD
+        }
+        return when (IsoInspector.quickGuessByName(name)) {
+            IsoOsType.WINDOWS -> OtgFlashMode.DIRECT_WINDOWS
+            IsoOsType.LINUX, IsoOsType.UTILITY -> OtgFlashMode.DIRECT_LINUX
+            else -> OtgFlashMode.RAW_DD
+        }
+    }
+
     /**
-     * Pure-JVM testable 7-layer hardware safety validator.
-     * Returns `(true, "OK")` ONLY if the block device is proven to be a writable external USB pen drive.
+     * Pure-JVM testable hardware safety validator.
+     * Returns `(true, "OK")` ONLY if the block device is proven to be a writable 512 B external USB pen drive.
      */
     fun evaluateBlockDeviceSafety(
         devName: String,
         sysfsRealPath: String,
         readOnly: Boolean,
         sizeBytes: Long,
-        procMountsLines: List<String>
+        procMountsLines: List<String>,
+        logicalBlockSize: Int = 512
     ): Pair<Boolean, String> {
         val cleanName = devName.trim()
         if (!WHOLE_SD_DISK_RE.matches(cleanName)) {
@@ -149,6 +176,9 @@ object OtgUsbFlasher {
         }
         if (readOnly) {
             return false to "Rejected $cleanName: drive is hardware write-protected (read-only)."
+        }
+        if (logicalBlockSize != 512) {
+            return false to "Rejected $cleanName: unsupported logical sector size ($logicalBlockSize B; 512 B required)."
         }
         if (sizeBytes < MIN_OTG_BYTES) {
             return false to "Rejected $cleanName: capacity too small (${UsbGadgetEngine.formatBytes(sizeBytes)})."
@@ -187,13 +217,37 @@ object OtgUsbFlasher {
 
     fun parseSectorsWrittenFromStat(statLine: String): Long {
         val fields = statLine.trim().split(Regex("\\s+"))
-        // Linux /sys/block/<dev>/stat field index 6 (7th field) = sectors written (512-byte units)
         return fields.getOrNull(6)?.toLongOrNull() ?: 0L
     }
 
     /**
+     * Pure-JVM testable parser extracting ONLY Android `sm` public volume IDs (`public:major,minor`)
+     * matching [targetDevNumbers] so sibling USB drives on a hub are never unmounted.
+     */
+    fun parseSmPublicVolumeIds(smLines: List<String>, targetDevNumbers: Set<String>): List<String> {
+        val exactIds = targetDevNumbers
+            .map { it.trim().replace(':', ',') }
+            .filter { Regex("^\\d+,\\d+$").matches(it) }
+            .map { "public:$it" }
+            .toSet()
+        if (exactIds.isEmpty()) return emptyList()
+        val found = linkedSetOf<String>()
+        for (raw in smLines) {
+            val cols = raw.trim().split(Regex("\\s+"))
+            if (cols.size >= 2) {
+                val volId = cols[0]
+                val state = cols[1].lowercase(Locale.US)
+                if (volId in exactIds && state != "unmounted" && state != "ejected") {
+                    found.add(volId)
+                }
+            }
+        }
+        return found.toList()
+    }
+
+    /**
      * Pure-JVM testable parser returning ONLY mount points belonging to [devName], its numeric partitions,
-     * or the exact `(major:minor)` pairs in [targetDevNumbers] (never unmounting sibling `sd*` drives on major 8!).
+     * or the exact `(major:minor)` pairs in [targetDevNumbers] (never unmounting sibling `sd*` drives on major 8).
      * Decodes `/proc/mounts` octal space escapes (`\040`).
      */
     fun extractTargetMountPoints(
@@ -244,26 +298,29 @@ object OtgUsbFlasher {
                 real=${'$'}(readlink -f "${'$'}d" 2>/dev/null || echo "")
                 sectors=${'$'}(cat "${'$'}d/size" 2>/dev/null || echo 0)
                 ro=${'$'}(cat "${'$'}d/ro" 2>/dev/null || echo 1)
+                lbs=${'$'}(cat "${'$'}d/queue/logical_block_size" 2>/dev/null || echo 512)
                 vendor=${'$'}(cat "${'$'}d/device/vendor" 2>/dev/null | tr '\n\r|' '   ' || echo "")
                 model=${'$'}(cat "${'$'}d/device/model" 2>/dev/null | tr '\n\r|' '   ' || echo "")
-                printf '%s|%s|%s|%s|%s|%s\n' "${'$'}name" "${'$'}real" "${'$'}sectors" "${'$'}ro" "${'$'}vendor" "${'$'}model"
+                printf '%s|%s|%s|%s|%s|%s|%s\n' "${'$'}name" "${'$'}real" "${'$'}sectors" "${'$'}ro" "${'$'}lbs" "${'$'}vendor" "${'$'}model"
             done
             """.trimIndent()
         ).exec().out
 
         val devices = mutableListOf<OtgUsbDevice>()
         for (line in rawOut) {
-            val p = line.split("|", limit = 6)
-            if (p.size < 6) continue
+            val p = line.split("|", limit = 7)
+            if (p.size < 7) continue
             val name = p[0].trim()
             val real = p[1].trim()
             val sectors = p[2].trim().toLongOrNull() ?: 0L
             val ro = p[3].trim() != "0"
-            val vendor = p[4].trim()
-            val model = p[5].trim()
+            val lbs = p[4].trim().toIntOrNull() ?: 512
+            val vendor = p[5].trim()
+            val model = p[6].trim()
+            // Linux kernel ABI (/sys/block/<dev>/size) is ALWAYS reported in 512-byte units regardless of logical_block_size
             val sizeBytes = sectors * 512L
 
-            val (safe, _) = evaluateBlockDeviceSafety(name, real, ro, sizeBytes, procMounts)
+            val (safe, _) = evaluateBlockDeviceSafety(name, real, ro, sizeBytes, procMounts, logicalBlockSize = lbs)
             if (!safe) continue
 
             val devPath = if (Shell.cmd("[ -b ${shellQuote("/dev/block/$name")} ]").exec().isSuccess) {
@@ -290,11 +347,19 @@ object OtgUsbFlasher {
                     sizeBytes = sizeBytes,
                     sysfsRealPath = real,
                     readOnly = ro,
-                    mountedPoints = mntPoints
+                    mountedPoints = mntPoints,
+                    logicalBlockSize = lbs
                 )
             )
         }
         devices
+    }
+
+    internal fun computeTailWipeSectorRange(totalDiskBytes: Long): Pair<Long, Long>? {
+        val totalSectors = totalDiskBytes / 512L
+        if (totalSectors <= 8192L) return null
+        val wipeCount = 4096L // Exact 2 MiB right up to physical last sector (totalSectors - 1)
+        return (totalSectors - wipeCount) to wipeCount
     }
 
     private fun queryTargetDevNumbers(devName: String): Set<String> {
@@ -310,8 +375,17 @@ object OtgUsbFlasher {
         return out.map { it.trim() }.filter { Regex("^\\d+:\\d+$").matches(it) }.toSet()
     }
 
-    private fun unmountOtgPartitionsClean(devName: String): Pair<Boolean, String> {
+    internal fun unmountOtgPartitionsClean(devName: String): Pair<Boolean, String> {
         val devNums = queryTargetDevNumbers(devName)
+        val smOut = Shell.cmd("sm list-volumes public 2>/dev/null || true").exec().out
+        val smVols = parseSmPublicVolumeIds(smOut, devNums)
+        if (smVols.isNotEmpty()) {
+            for (volId in smVols) {
+                Shell.cmd("sm unmount ${shellQuote(volId)} 2>/dev/null || true").exec()
+            }
+            Shell.cmd("sleep 0.3").exec()
+        }
+
         val initialMounts = extractTargetMountPoints(
             devName,
             devNums,
@@ -319,13 +393,13 @@ object OtgUsbFlasher {
         )
         if (initialMounts.isNotEmpty()) {
             Shell.cmd("sync").exec()
-            // Unmount deepest paths first (handles nested bind mounts cleanly)
             for (mp in initialMounts.sortedByDescending { it.length }) {
                 val qMp = shellQuote(mp)
                 Shell.cmd("umount $qMp 2>/dev/null || umount -l $qMp 2>/dev/null || true").exec()
             }
             Shell.cmd("sync").exec()
         }
+
         val remaining = extractTargetMountPoints(
             devName,
             devNums,
@@ -336,6 +410,160 @@ object OtgUsbFlasher {
         } else {
             false to "USB drive partition is still busy/mounted (${remaining.first()}). Close any file manager using it and retry."
         }
+    }
+
+    internal fun isOtgDeviceStillConnected(devName: String): Boolean {
+        if (!WHOLE_SD_DISK_RE.matches(devName.trim())) return false
+        val qSys = shellQuote("/sys/block/$devName")
+        val qBlk1 = shellQuote("/dev/block/$devName")
+        val qBlk2 = shellQuote("/dev/$devName")
+        return Shell.cmd("[ -d $qSys ] && ( [ -b $qBlk1 ] || [ -b $qBlk2 ] )").exec().isSuccess
+    }
+
+    /**
+     * Full pre-flight preparation for direct writing on a physical OTG drive:
+     * 1. ConfigFS mutual-exclusion guard.
+     * 2. Re-scan & verify exact sysfs + 512 B sector safety.
+     * 3. Multi-namespace `sm unmount` + exact `vold` unmount gate.
+     * 4. Zero first 4 MiB + last 2 MiB to destroy stale MBR, primary/backup GPT, and filesystem signatures.
+     */
+    /**
+     * Read-only pre-flight hardware verification (writes 0 bytes to disk).
+     * Must be called BEFORE checking capacity, layouts, tools, and assets so a failed check NEVER wipes the USB drive.
+     */
+    internal suspend fun verifyPhysicalOtgDisk(
+        requestedTarget: OtgUsbDevice
+    ): Pair<OtgUsbDevice?, String?> = withContext(Dispatchers.IO) {
+        if (UsbGadgetEngine.getStatus().isAnyMounted) {
+            return@withContext null to "Unmount your virtual PC drive before flashing a physical USB-C OTG pen drive."
+        }
+        val freshList = scanUsbOtgDevices()
+        val verified = freshList.firstOrNull {
+            it.devName == requestedTarget.devName &&
+                it.sysfsRealPath == requestedTarget.sysfsRealPath &&
+                it.logicalBlockSize == 512
+        } ?: return@withContext null to "Target USB drive (${requestedTarget.devPath}) disconnected or failed safety verification. Re-scan and retry."
+        verified to null
+    }
+
+    /**
+     * Destructive disk preparation called ONLY AFTER all capacity, layout, tool, and asset checks pass:
+     * 1. Multi-namespace `sm unmount` + exact `(major:minor)` `vold` unmount gate.
+     * 2. Zero first 4 MiB + exact final 4096 sectors (`totalSectors - 4096 .. totalSectors - 1`)
+     *    so stale Backup GPT headers are destroyed even on non-MiB-aligned consumer pen drives.
+     */
+    internal suspend fun unmountAndWipeOtgDisk(
+        verified: OtgUsbDevice,
+        entries: MutableList<LogEntry>,
+        ts: String
+    ): String? = withContext(Dispatchers.IO) {
+        val (unmountedOk, umntErr) = unmountOtgPartitionsClean(verified.devName)
+        if (!unmountedOk) {
+            return@withContext umntErr
+        }
+        val qDev = shellQuote(verified.devPath)
+        val wipeHead = Shell.cmd("dd if=/dev/zero of=$qDev bs=1048576 count=4 2>&1").exec()
+        if (!wipeHead.isSuccess) {
+            val err = (wipeHead.out + wipeHead.err).takeLast(2).joinToString(" ").take(120)
+            return@withContext "Could not erase USB drive header: ${err.ifBlank { "I/O error" }}"
+        }
+        computeTailWipeSectorRange(verified.sizeBytes)?.let { (tailSeekSec, tailCountSec) ->
+            Shell.cmd("dd if=/dev/zero of=$qDev bs=512 seek=$tailSeekSec count=$tailCountSec 2>/dev/null || true").exec()
+        }
+        Shell.cmd("sync").exec()
+        entries.add(LogEntry(ts, "otg-prep", "Unmounted & wiped header/tail on ${verified.devPath} (${verified.displayTitle}, ${UsbGadgetEngine.formatBytes(verified.sizeBytes)}, 512B sectors)"))
+        null
+    }
+
+    private fun unmountSinglePartitionNode(devName: String, partIndex: Int) {
+        val partName = "$devName$partIndex"
+        val qSysPart = shellQuote("/sys/block/$devName/$partName/dev")
+        val partDevNum = Shell.cmd("cat $qSysPart 2>/dev/null || true").exec().out.firstOrNull().orEmpty().trim()
+        val devNums = if (Regex("^\\d+:\\d+$").matches(partDevNum)) setOf(partDevNum) else emptySet()
+        if (devNums.isNotEmpty()) {
+            val smOut = Shell.cmd("sm list-volumes public 2>/dev/null || true").exec().out
+            for (volId in parseSmPublicVolumeIds(smOut, devNums)) {
+                Shell.cmd("sm unmount ${shellQuote(volId)} 2>/dev/null || true").exec()
+            }
+            Shell.cmd("sleep 0.2").exec()
+        }
+        val exactVold = devNums.map { "/dev/block/vold/public:${it.replace(':', ',')}" }.toSet()
+        val p1 = "/dev/block/$partName"
+        val p2 = "/dev/$partName"
+        val mps = Shell.cmd("cat /proc/mounts 2>/dev/null").exec().out.mapNotNull { line ->
+            val cols = line.trim().split(Regex("\\s+"))
+            if (cols.size >= 2 && (cols[0] == p1 || cols[0] == p2 || cols[0] in exactVold)) {
+                cols[1].replace("\\040", " ").replace("\\011", "\t").replace("\\134", "\\")
+            } else null
+        }.distinct().sortedByDescending { it.length }
+        for (mp in mps) {
+            val qMp = shellQuote(mp)
+            Shell.cmd("umount $qMp 2>/dev/null || umount -l $qMp 2>/dev/null || true").exec()
+        }
+    }
+
+    /**
+     * Attaches a partition slice on a physical OTG block device for formatting/mounting.
+     * Prefers silent `losetup -o/-S` over `/dev/block/sdX` (zero kernel uevent -> Android `vold` cannot hijack mid-build).
+     * Automatically falls back to `blockdev --rereadpt` + `/dev/block/sdX<partIndex>` if the kernel refuses loop-on-block.
+     * Returns `(blockNodeToUse, isLoopDevice)`.
+     */
+    internal fun attachOtgPartitionSlice(
+        dev: OtgUsbDevice,
+        partIndex: Int,
+        offsetBytes: Long,
+        sizeBytes: Long
+    ): Pair<String, Boolean> {
+        val qDev = shellQuote(dev.devPath)
+        val loopCmd = """
+            L=${'$'}(losetup -f -s -o $offsetBytes -S $sizeBytes $qDev 2>/dev/null)
+            if [ -z "${'$'}L" ]; then
+                L=${'$'}(losetup -f --show -o $offsetBytes --sizelimit $sizeBytes $qDev 2>/dev/null)
+            fi
+            if [ -z "${'$'}L" ]; then
+                CAND=${'$'}(losetup -f 2>/dev/null)
+                if [ -n "${'$'}CAND" ]; then
+                    if losetup -o $offsetBytes -S $sizeBytes "${'$'}CAND" $qDev 2>/dev/null || \
+                       losetup -o $offsetBytes --sizelimit $sizeBytes "${'$'}CAND" $qDev 2>/dev/null; then
+                        L="${'$'}CAND"
+                    fi
+                fi
+            fi
+            echo "${'$'}L"
+        """.trimIndent()
+        val loopNode = Shell.cmd(loopCmd).exec().out.lastOrNull().orEmpty().trim()
+        if (loopNode.startsWith("/dev/")) {
+            return loopNode to true
+        }
+
+        Shell.cmd("sync && blockdev --rereadpt $qDev 2>/dev/null || true").exec()
+        val p1 = "/dev/block/${dev.devName}$partIndex"
+        val p2 = "/dev/${dev.devName}$partIndex"
+        var foundNode = ""
+        for (attempt in 0 until 12) {
+            if (Shell.cmd("[ -b ${shellQuote(p1)} ]").exec().isSuccess) {
+                foundNode = p1
+                break
+            }
+            if (Shell.cmd("[ -b ${shellQuote(p2)} ]").exec().isSuccess) {
+                foundNode = p2
+                break
+            }
+            Shell.cmd("sleep 0.2").exec()
+        }
+        if (foundNode.isNotBlank()) {
+            // Unmount ONLY the specific partition being attached so sibling partitions stay intact
+            unmountSinglePartitionNode(dev.devName, partIndex)
+            return foundNode to false
+        }
+        return "" to false
+    }
+
+    internal fun finalizeOtgDiskClean(dev: OtgUsbDevice) {
+        val qDev = shellQuote(dev.devPath)
+        Shell.cmd("sync && blockdev --flushbufs $qDev 2>/dev/null || true").exec()
+        Shell.cmd("blockdev --rereadpt $qDev 2>/dev/null || true").exec()
+        Shell.cmd("sync").exec()
     }
 
     internal fun buildSha256RangeCommand(fileOrDevPath: String, totalBytesToRead: Long): String {
@@ -380,7 +608,6 @@ object OtgUsbFlasher {
         val srcName = srcPath.substringAfterLast('/')
         val compFmt = CompressedImageEngine.detectFormat(srcName)
 
-        // Layer 6: USB-C Port Mutual-Exclusion Guard
         if (UsbGadgetEngine.getStatus().isAnyMounted) {
             return@withContext ActionResult(
                 false,
@@ -389,7 +616,6 @@ object OtgUsbFlasher {
             )
         }
 
-        // Re-verify hardware safety immediately before writing byte 0
         val freshList = scanUsbOtgDevices()
         val verifiedTarget = freshList.firstOrNull {
             it.devName == target.devName && it.sysfsRealPath == target.sysfsRealPath
@@ -455,7 +681,6 @@ object OtgUsbFlasher {
             val headTmpFile = "/data/local/tmp/pb_otg_head_chk.bin"
             val qHeadTmp = shellQuote(headTmpFile)
 
-            // Toybox/BusyBox/GNU portable dd (no GNU-only `conv=fsync`; `ibs=64k obs=4M` guarantees aligned block writes from pipes)
             val flashScript = if (compFmt == null) {
                 """
                 set -e
@@ -464,7 +689,6 @@ object OtgUsbFlasher {
                 sync
                 """.trimIndent()
             } else {
-                // POSIX-safe pipe error capture (no bash `pipefail` required)
                 """
                 set -e
                 ${BuildThermalHelper.thermalExecPrefix(prof)}
@@ -477,9 +701,15 @@ object OtgUsbFlasher {
                 """.trimIndent()
             }
 
+            var disconnectedMidFlash = false
             val pollJob = launch(Dispatchers.IO) {
                 while (isActive) {
                     delay(500L)
+                    if (!isOtgDeviceStillConnected(verifiedTarget.devName)) {
+                        disconnectedMidFlash = true
+                        BuildThermalHelper.cancelActiveBuildProcess()
+                        break
+                    }
                     val curSectors = parseSectorsWrittenFromStat(
                         Shell.cmd("cat $qStat 2>/dev/null").exec().out.firstOrNull().orEmpty()
                     )
@@ -508,9 +738,16 @@ object OtgUsbFlasher {
                 }
             }
 
-            val flashRes = BuildThermalHelper.runIsolatedRootScript(context, "pb_otg_flash", flashScript, trackPid = true)
-            pollJob.cancel()
+            val flashRes = try {
+                BuildThermalHelper.runIsolatedRootScript(context, "pb_otg_flash", flashScript, trackPid = true)
+            } finally {
+                pollJob.cancel()
+            }
 
+            if (disconnectedMidFlash) {
+                Shell.cmd("rm -f $qRc $qHeadTmp 2>/dev/null || true").exec()
+                return@withContext ActionResult(false, "USB-C pen drive was unplugged during flashing.", entries = entries)
+            }
             if (!isActive || BuildThermalHelper.isBuildCancelled()) {
                 Shell.cmd("rm -f $qRc $qHeadTmp 2>/dev/null || true; sync; blockdev --flushbufs $qDev 2>/dev/null || true").exec()
                 return@withContext ActionResult(false, "USB-C OTG flash cancelled.", entries = entries)
@@ -522,10 +759,9 @@ object OtgUsbFlasher {
                 return@withContext ActionResult(false, "USB-C OTG flash failed: ${errHint.ifBlank { "I/O error writing to pen drive" }}", entries = entries)
             }
 
-            // Flush host page cache & re-read partition table
+            onProgress(WindowsBuildProgress("Flushing USB write cache — do NOT unplug...", verifiedTarget.displayTitle, 0.85f, true))
             Shell.cmd("sync && blockdev --flushbufs $qDev 2>/dev/null || true").exec()
 
-            // Post-Flash Read-Back Verification (100% Toybox/BusyBox universal `dd`, zero `head -c`)
             var verifySummary = "Verification skipped"
             if (config.verifyAfterFlash) {
                 if (!isActive || BuildThermalHelper.isBuildCancelled()) {
@@ -569,8 +805,6 @@ object OtgUsbFlasher {
                 } else {
                     onProgress(WindowsBuildProgress("Verifying written head blocks...", verifiedTarget.devName, 0.88f, true))
                     val checkBytes = if (expectedWriteBytes > 0L) expectedWriteBytes.coerceAtMost(VERIFY_CHUNK_BYTES) else VERIFY_CHUNK_BYTES
-                    // Capture exact streamed head into a small <=16 MB temp file, then measure actual bytes
-                    // so pipe partial-reads can NEVER cause a false hash mismatch against the raw USB block device.
                     val capRes = try {
                         Shell.cmd(
                             """
@@ -597,16 +831,16 @@ object OtgUsbFlasher {
                     }
                     val (verifiedBytes, srcHead, dstHead) = capRes
                     if (verifiedBytes <= 0L || srcHead.length != 64 || srcHead != dstHead) {
-                        entries.add(LogEntry(ts, "otg-flash", "Streamed head block mismatch (${verifiedBytes} B)! src=$srcHead dst=$dstHead", true))
+                        entries.add(LogEntry(ts, "otg-flash", "Streamed head block mismatch ($verifiedBytes B)! src=$srcHead dst=$dstHead", true))
                         return@withContext ActionResult(false, "Verification FAILED on written head blocks.", entries = entries)
                     }
                     verifySummary = "Head ${UsbGadgetEngine.formatBytes(verifiedBytes)} verified"
                 }
             }
 
-            Shell.cmd("sync && blockdev --rereadpt $qDev 2>/dev/null || true").exec()
+            finalizeOtgDiskClean(verifiedTarget)
             entries.add(LogEntry(ts, "otg-flash", "Flashed $srcName to ${verifiedTarget.displayTitle} cleanly ($verifySummary)"))
-            onProgress(WindowsBuildProgress("Flash Complete!", verifySummary, 1f, false))
+            onProgress(WindowsBuildProgress("USB Ready!", verifySummary, 1f, false))
             ActionResult(
                 success = true,
                 userMessage = "Flashed $srcName to ${verifiedTarget.displayTitle} ($verifySummary). Safe to unplug USB-C OTG drive.",
@@ -625,14 +859,31 @@ object OtgUsbFlasher {
 fun OtgFlasherSheet(
     initialSource: ImageFile?,
     availableImages: List<ImageFile>,
+    defaultDir: String,
+    presets: List<AutounattendPreset>,
+    systemTweaksPresets: List<SystemTweaksPreset>,
+    systemTweaksSearchHistory: List<String>,
     isAnyVirtualDriveMounted: Boolean,
     flashing: Boolean,
     progress: WindowsBuildProgress,
     onDismiss: () -> Unit,
     onUnmountAllVirtual: () -> Unit,
     onCancelFlash: () -> Unit,
-    onStartFlash: (OtgFlashConfig) -> Unit
+    onSavePreset: (AutounattendPreset) -> Unit,
+    onDeletePreset: (String) -> Unit,
+    onSaveSystemTweaksPreset: (SystemTweaksPreset) -> Unit,
+    onDeleteSystemTweaksPreset: (String) -> Unit,
+    onUpdateSearchHistory: (List<String>) -> Unit,
+    onStartRawFlash: (OtgFlashConfig) -> Unit,
+    onStartWindowsOtgFlash: (WindowsBuildConfig) -> Unit,
+    onStartLinuxOtgFlash: (LinuxBuildConfig) -> Unit,
+    onStartMultiBootOtgFlash: (VentoyBuildConfig) -> Unit
 ) {
+    val context = LocalContext.current
+    val isoImages = remember(availableImages) { availableImages.filter { it.name.endsWith(".iso", ignoreCase = true) } }
+    var selectedMode by remember(initialSource?.path) {
+        mutableStateOf(OtgUsbFlasher.recommendModeForSource(initialSource))
+    }
     var selectedSource by remember(initialSource?.path) {
         mutableStateOf(initialSource ?: availableImages.firstOrNull())
     }
@@ -640,8 +891,52 @@ fun OtgFlasherSheet(
     var selectedDevice by remember { mutableStateOf<OtgUsbDevice?>(null) }
     var scanning by remember { mutableStateOf(true) }
     var scanNonce by remember { mutableIntStateOf(0) }
+
+    // Raw DD options
     var verifyAfterFlash by remember { mutableStateOf(true) }
     var fullSha256Verify by remember { mutableStateOf(false) }
+
+    // Direct Windows OTG options
+    var winScheme by remember { mutableStateOf(PartitionScheme.GPT) }
+    var winEditions by remember { mutableStateOf<List<WindowsEditionItem>>(emptyList()) }
+    var winSelectedEdIdx by remember { mutableStateOf<Int?>(null) }
+    var winLoadingEditions by remember { mutableStateOf(false) }
+    var winExp by remember { mutableStateOf(WindowsExperienceConfig()) }
+    var winTweaksCfg by remember { mutableStateOf(WinUtilTweaksConfig()) }
+    var winEiCfgUnlock by remember { mutableStateOf(false) }
+    var winVolumeLabel by remember { mutableStateOf("") }
+    var winDriversDir by remember { mutableStateOf("") }
+    var savedDriverPacks by remember { mutableStateOf<List<DriverPackItem>>(emptyList()) }
+    var selectedDriverPackDirs by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var driverPackReloadNonce by remember { mutableIntStateOf(0) }
+    var showDriversFolderPicker by remember { mutableStateOf(false) }
+    var showDriverPackManager by remember { mutableStateOf(false) }
+
+    // Direct Linux OTG options
+    var linuxUsbMode by remember { mutableStateOf(LinuxUsbMode.WITH_PERSISTENCE) }
+    var linuxWriteMethod by remember { mutableStateOf(LinuxWriteMethod.EXTRACTED_FAT32) }
+    var linuxPersistGb by remember { mutableIntStateOf(4) }
+    var linuxStyle by remember { mutableStateOf(LinuxPersistenceStyle.UBUNTU_WRITABLE) }
+    var linuxVolumeLabel by remember { mutableStateOf("") }
+    var linuxIsoHasOver4Gb by remember { mutableStateOf(false) }
+    var linuxProbingIso by remember { mutableStateOf(false) }
+
+    // Direct Multi-Boot OTG options
+    var mbScheme by remember { mutableStateOf(PartitionScheme.GPT) }
+    var mbFs by remember { mutableStateOf(VentoyFilesystem.AUTO) }
+    var mbVolumeLabel by remember { mutableStateOf("POCKETBOOT") }
+    var mbInitialIso by remember(initialSource?.path) {
+        mutableStateOf(initialSource?.takeIf { it.name.endsWith(".iso", ignoreCase = true) })
+    }
+    var mbMoveInitialIso by remember { mutableStateOf(false) }
+    var mbShowTweaks by remember { mutableStateOf(false) }
+    var mbExp by remember { mutableStateOf(WindowsExperienceConfig()) }
+    var mbTweaksCfg by remember { mutableStateOf(WinUtilTweaksConfig()) }
+    var mbDriversDir by remember { mutableStateOf("") }
+    var mbSelectedPackDirs by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var showMbDriversPicker by remember { mutableStateOf(false) }
+
+    // Confirm Dialog state
     var showConfirmFlashDialog by remember { mutableStateOf(false) }
     var confirmInput by remember { mutableStateOf("") }
 
@@ -659,12 +954,146 @@ fun OtgFlasherSheet(
         scanning = false
     }
 
+    LaunchedEffect(defaultDir, driverPackReloadNonce) {
+        val loaded = DriverPackManager.listPacks(defaultDir)
+        savedDriverPacks = loaded
+        val valid = loaded.map { it.dirPath }.toSet()
+        selectedDriverPackDirs = selectedDriverPackDirs.intersect(valid)
+        mbSelectedPackDirs = mbSelectedPackDirs.intersect(valid)
+    }
+
+    LaunchedEffect(selectedMode, isoImages) {
+        if (selectedMode == OtgFlashMode.DIRECT_WINDOWS || selectedMode == OtgFlashMode.DIRECT_LINUX) {
+            val cur = selectedSource
+            if (cur == null || !cur.name.endsWith(".iso", ignoreCase = true)) {
+                selectedSource = when (selectedMode) {
+                    OtgFlashMode.DIRECT_WINDOWS -> isoImages.firstOrNull { IsoInspector.quickGuessByName(it.name) == IsoOsType.WINDOWS } ?: isoImages.firstOrNull()
+                    OtgFlashMode.DIRECT_LINUX -> isoImages.firstOrNull { IsoInspector.quickGuessByName(it.name) != IsoOsType.WINDOWS } ?: isoImages.firstOrNull()
+                    else -> cur
+                }
+            }
+        }
+    }
+
     val activeSource = selectedSource
     val activeTarget = selectedDevice
+    LaunchedEffect(selectedMode, activeSource?.path) {
+        if (selectedMode == OtgFlashMode.DIRECT_WINDOWS && activeSource != null && activeSource.name.endsWith(".iso", true)) {
+            winLoadingEditions = true
+            winSelectedEdIdx = null
+            winEditions = WindowsImageBuilder.inspectWindowsEditions(context, activeSource.path)
+            winLoadingEditions = false
+        } else {
+            winEditions = emptyList()
+            winSelectedEdIdx = null
+            winLoadingEditions = false
+        }
+        if (selectedMode == OtgFlashMode.DIRECT_LINUX && activeSource != null && activeSource.name.endsWith(".iso", true)) {
+            linuxProbingIso = true
+            val maxF = LinuxImageBuilder.inspectMaxFileBytesInIso(context, activeSource.path)
+            linuxIsoHasOver4Gb = maxF > 4_294_967_295L
+            if (linuxIsoHasOver4Gb) {
+                linuxWriteMethod = LinuxWriteMethod.HYBRID_DD
+            }
+            val low = activeSource.name.lowercase(Locale.US)
+            linuxStyle = when {
+                low.contains("kali") || low.contains("debian") || low.contains("tails") || low.contains("gparted") -> LinuxPersistenceStyle.DEBIAN_KALI
+                low.contains("pop") -> LinuxPersistenceStyle.CASPER_RW
+                else -> LinuxPersistenceStyle.UBUNTU_WRITABLE
+            }
+            linuxProbingIso = false
+        } else {
+            linuxIsoHasOver4Gb = false
+            linuxProbingIso = false
+        }
+    }
+
+    val over2TiB = activeTarget != null && DiskPartitioner.isOverMbrLimit(activeTarget.sizeBytes)
+    LaunchedEffect(over2TiB) {
+        if (over2TiB) {
+            winScheme = PartitionScheme.GPT
+            mbScheme = PartitionScheme.GPT
+        }
+    }
+
+    val maxLinuxPersist = remember(activeTarget?.sizeBytes, activeSource?.sizeBytes) {
+        if (activeTarget != null && activeSource != null) {
+            DiskPartitioner.maxLinuxPersistenceGb(activeTarget.sizeBytes, activeSource.sizeBytes)
+        } else 16
+    }
+    LaunchedEffect(maxLinuxPersist) {
+        if (maxLinuxPersist > 0) {
+            linuxPersistGb = linuxPersistGb.coerceIn(1, maxLinuxPersist)
+        }
+    }
+
     val isCompressedSrc = activeSource != null && CompressedImageEngine.detectFormat(activeSource.name) != null
-    val fitError = if (activeSource != null && activeTarget != null && !isCompressedSrc) {
-        OtgUsbFlasher.validateSourceFitsDevice(activeSource.sizeBytes, activeTarget.sizeBytes)
-    } else null
+    val detectedWinOs = remember(activeSource?.name) {
+        if (activeSource != null) WindowsCustomizationEngine.detectWindowsOsKind(activeSource.name) else WindowsOsKind.WIN11
+    }
+    val detectedWinArch = remember(activeSource?.name) {
+        if (activeSource != null) WindowsCustomizationEngine.detectProcessorArchitecture(activeSource.name) else "amd64"
+    }
+
+    val winPacksBytes = remember(savedDriverPacks, selectedDriverPackDirs) {
+        savedDriverPacks.filter { it.dirPath in selectedDriverPackDirs }.sumOf { it.sizeBytes }
+    }
+    val mbPacksBytes = remember(savedDriverPacks, mbSelectedPackDirs) {
+        savedDriverPacks.filter { it.dirPath in mbSelectedPackDirs }.sumOf { it.sizeBytes }
+    }
+
+    val validationError: String? = when (selectedMode) {
+        OtgFlashMode.DIRECT_WINDOWS -> when {
+            activeTarget == null -> null
+            activeSource == null || !activeSource.name.endsWith(".iso", true) -> "Select a Windows .iso file for Direct Windows USB Mode."
+            activeTarget.sizeBytes < activeSource.sizeBytes + winPacksBytes + (768L * 1024L * 1024L) ->
+                "USB drive (${UsbGadgetEngine.formatBytes(activeTarget.sizeBytes)}) needs at least ${UsbGadgetEngine.formatBytes(activeSource.sizeBytes + winPacksBytes + 768L * 1024L * 1024L)} for ISO + Driver Packs + boot.wim patching."
+            else -> null
+        }
+        OtgFlashMode.DIRECT_LINUX -> when {
+            activeTarget == null -> null
+            activeSource == null || !activeSource.name.endsWith(".iso", true) -> "Select a Linux or Rescue .iso file."
+            activeTarget.sizeBytes < activeSource.sizeBytes + (256L * 1024L * 1024L) ->
+                "USB drive (${UsbGadgetEngine.formatBytes(activeTarget.sizeBytes)}) is too small for ${activeSource.name}."
+            linuxUsbMode == LinuxUsbMode.WITH_PERSISTENCE && maxLinuxPersist < 1 ->
+                "Not enough remaining space on USB drive for a 1 GB persistence partition. Turn off Persistence or use a larger drive."
+            else -> null
+        }
+        OtgFlashMode.DIRECT_MULTIBOOT -> when {
+            activeTarget == null -> null
+            activeTarget.sizeBytes < (mbInitialIso?.sizeBytes ?: 0L) + mbPacksBytes + (256L * 1024L * 1024L) ->
+                "USB drive (${UsbGadgetEngine.formatBytes(activeTarget.sizeBytes)}) is too small for Multi-Boot + selected ISO & Driver Packs."
+            else -> null
+        }
+        OtgFlashMode.RAW_DD -> when {
+            activeTarget == null -> null
+            activeSource == null -> "Select an image file to flash."
+            !isCompressedSrc -> OtgUsbFlasher.validateSourceFitsDevice(activeSource.sizeBytes, activeTarget.sizeBytes)
+            else -> null
+        }
+    }
+
+    val canStartFlash = activeTarget != null && validationError == null &&
+        !(selectedMode == OtgFlashMode.DIRECT_LINUX && linuxProbingIso) &&
+        (selectedMode == OtgFlashMode.DIRECT_MULTIBOOT || activeSource != null)
+
+    val modeSummaryForConfirm = when (selectedMode) {
+        OtgFlashMode.DIRECT_WINDOWS -> {
+            val effSch = if (activeTarget != null) DiskPartitioner.effectiveSchemeForDisk(winScheme, activeTarget.sizeBytes) else winScheme
+            val drvs = selectedDriverPackDirs.size + if (winDriversDir.isNotBlank()) 1 else 0
+            "Direct Windows (${effSch.label}, NTFS) · ${activeSource?.name ?: ""} · ${winExp.activeCount()} Exp / ${winTweaksCfg.activeCount()} Tweaks" +
+                if (drvs > 0) " · $drvs Driver Source(s)" else ""
+        }
+        OtgFlashMode.DIRECT_LINUX -> {
+            val pTxt = if (linuxUsbMode == LinuxUsbMode.WITH_PERSISTENCE) " + $linuxPersistGb GB ${linuxStyle.volumeLabel}" else " (Live only)"
+            "Direct Linux (${linuxWriteMethod.title})$pTxt · ${activeSource?.name ?: ""}"
+        }
+        OtgFlashMode.DIRECT_MULTIBOOT -> {
+            val effSch = if (activeTarget != null) DiskPartitioner.effectiveSchemeForDisk(mbScheme, activeTarget.sizeBytes) else mbScheme
+            "Direct Multi-Boot (${effSch.label}, ${mbFs.label})" + (mbInitialIso?.let { " + ${it.name}" } ?: " (Empty ready for ISOs)")
+        }
+        OtgFlashMode.RAW_DD -> "Raw / Stream DD · ${activeSource?.name ?: ""}"
+    }
 
     ModalBottomSheet(
         onDismissRequest = { if (!flashing) onDismiss() },
@@ -689,7 +1118,7 @@ fun OtgFlasherSheet(
                 }
                 Column(modifier = Modifier.weight(1f)) {
                     Text("USB-C OTG Pen Drive Flasher", style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary)
-                    Text("Write ISO, IMG, or .xz/.gz/.zst directly to a physical USB drive", style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary)
+                    Text("Direct Windows, Linux Persistence, Multi-Boot & Raw DD", style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary)
                 }
                 if (!flashing && !isAnyVirtualDriveMounted) {
                     IconButton(onClick = { scanNonce++ }) {
@@ -771,7 +1200,7 @@ fun OtgFlasherSheet(
                         Column(modifier = Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                             Text("No external USB-C pen drive detected", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
                             Text(
-                                "Plug a physical USB pen drive into your phone via a USB-C OTG adapter (make sure OTG is enabled in Android Settings if your phone requires it), then tap Refresh above. Internal UFS/eMMC phone storage is permanently blocked from appearing here.",
+                                "Plug a physical USB pen drive into your phone via a USB-C OTG adapter, then tap Refresh above. Internal UFS/eMMC phone storage and 4Kn enclosures are permanently blocked.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = PocketColors.textSecondary
                             )
@@ -796,7 +1225,7 @@ fun OtgFlasherSheet(
                                     Column(modifier = Modifier.weight(1f)) {
                                         Text(dev.displayTitle, style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                         Text(
-                                            "${dev.devPath} · ${UsbGadgetEngine.formatBytes(dev.sizeBytes)} · External USB verified",
+                                            "${dev.devPath} · ${UsbGadgetEngine.formatBytes(dev.sizeBytes)} · ${dev.logicalBlockSize} B verified",
                                             style = PocketColors.monoStyle,
                                             color = PocketColors.textSecondary,
                                             maxLines = 1,
@@ -810,75 +1239,491 @@ fun OtgFlasherSheet(
                     }
                 }
 
-                // Step 2: Source Image Selector
-                Text("2. Source Image (${availableImages.size} available)", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
-                if (availableImages.isEmpty()) {
-                    Surface(shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
-                        Text("No .iso, .img, or compressed images found in Your Drives.", modifier = Modifier.padding(14.dp), style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary)
+                // Step 2: Flash Mode Selector (4 Modes)
+                Text("2. Flash Mode (0 GB Phone Storage Used)", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OtgFlashMode.entries.forEach { mode ->
+                        val sel = selectedMode == mode
+                        Surface(
+                            modifier = Modifier.weight(1f).bounceClick { selectedMode = mode },
+                            shape = RoundedCornerShape(9.dp),
+                            color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput,
+                            border = BorderStroke(if (sel) 1.25.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                        ) {
+                            Box(modifier = Modifier.padding(vertical = 8.dp, horizontal = 3.dp), contentAlignment = Alignment.Center) {
+                                Text(
+                                    text = mode.shortLabel,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = if (sel) PocketColors.accentSoft else PocketColors.textPrimary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
                     }
-                } else {
-                    Column(
-                        modifier = Modifier.fillMaxWidth().heightIn(max = 172.dp).verticalScroll(rememberScrollState()),
-                        verticalArrangement = Arrangement.spacedBy(5.dp)
-                    ) {
-                        availableImages.forEach { img ->
-                            val sel = selectedSource?.path == img.path
-                            Surface(
-                                modifier = Modifier.fillMaxWidth().bounceClick { selectedSource = img },
-                                shape = RoundedCornerShape(9.dp),
-                                color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput,
-                                border = BorderStroke(if (sel) 1.25.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
-                            ) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
+                }
+                Text(selectedMode.subtitle, fontSize = 11.sp, color = PocketColors.textSecondary)
+
+                // Step 3: Source Selector (for Windows, Linux, Raw DD; optional for Multi-Boot)
+                if (selectedMode != OtgFlashMode.DIRECT_MULTIBOOT) {
+                    val candidates = if (selectedMode == OtgFlashMode.RAW_DD) availableImages else isoImages
+                    Text(
+                        if (selectedMode == OtgFlashMode.RAW_DD) "3. Source Image (${candidates.size} available)" else "3. Source ISO (${candidates.size} .iso files)",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = PocketColors.textPrimary
+                    )
+                    if (candidates.isEmpty()) {
+                        Surface(shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
+                            Text("No matching files found in Your Drives.", modifier = Modifier.padding(14.dp), style = MaterialTheme.typography.bodySmall, color = PocketColors.textSecondary)
+                        }
+                    } else {
+                        Column(
+                            modifier = Modifier.fillMaxWidth().heightIn(max = 152.dp).verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(5.dp)
+                        ) {
+                            candidates.forEach { img ->
+                                val sel = selectedSource?.path == img.path
+                                Surface(
+                                    modifier = Modifier.fillMaxWidth().bounceClick { selectedSource = img },
+                                    shape = RoundedCornerShape(9.dp),
+                                    color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput,
+                                    border = BorderStroke(if (sel) 1.25.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
                                 ) {
-                                    Text(img.name, modifier = Modifier.weight(1f), fontSize = 12.sp, color = if (sel) PocketColors.accentSoft else PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text(UsbGadgetEngine.formatBytes(img.sizeBytes), style = PocketColors.monoStyle, color = PocketColors.textMuted)
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(img.name, modifier = Modifier.weight(1f), fontSize = 12.sp, color = if (sel) PocketColors.accentSoft else PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(UsbGadgetEngine.formatBytes(img.sizeBytes), style = PocketColors.monoStyle, color = PocketColors.textMuted)
+                                    }
                                 }
                             }
                         }
                     }
                 }
 
-                // Step 3: Post-Flash Verification Options
-                Surface(shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
-                    Column {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().clickable { verifyAfterFlash = !verifyAfterFlash }.padding(horizontal = 13.dp, vertical = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text("Read-Back Verification (Recommended)", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
-                                Text("Catches faulty or fake-capacity USB drives immediately", fontSize = 11.sp, color = PocketColors.textSecondary)
+                // Step 4: Mode-Specific Controls
+                when (selectedMode) {
+                    OtgFlashMode.DIRECT_WINDOWS -> {
+                        Text("4. Windows USB Options", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            PartitionScheme.entries.forEach { s ->
+                                val disabledMbr = over2TiB && s == PartitionScheme.MBR
+                                val sel = winScheme == s
+                                Surface(
+                                    modifier = Modifier.weight(1f).bounceClick(enabled = !disabledMbr) { winScheme = s },
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput,
+                                    border = BorderStroke(if (sel) 1.25.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                                ) {
+                                    Column(modifier = Modifier.padding(10.dp)) {
+                                        Text(s.label, style = MaterialTheme.typography.labelMedium, color = if (sel) PocketColors.accentSoft else if (disabledMbr) PocketColors.textMuted else PocketColors.textPrimary)
+                                        Text(if (disabledMbr) "Locked (>2 TiB)" else s.subtitle, fontSize = 10.sp, color = PocketColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    }
+                                }
                             }
-                            PocketSwitch(checked = verifyAfterFlash, onCheckedChange = { verifyAfterFlash = it }, activeColor = PocketColors.success)
                         }
-                        if (verifyAfterFlash && !isCompressedSrc) {
-                            PocketHairlineDivider()
+
+                        if (winLoadingEditions) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = PocketColors.accent)
+                                Text("Inspecting Windows editions inside install.wim/esd...", fontSize = 11.sp, color = PocketColors.textSecondary)
+                            }
+                        } else if (winEditions.isNotEmpty()) {
+                            Text("Windows Edition (Optional Pre-Select)", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                            Column(
+                                modifier = Modifier.fillMaxWidth().heightIn(max = 128.dp).verticalScroll(rememberScrollState()),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Surface(
+                                    modifier = Modifier.fillMaxWidth().bounceClick { winSelectedEdIdx = null },
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = if (winSelectedEdIdx == null) PocketColors.accentBg else PocketColors.surfaceInput,
+                                    border = BorderStroke(if (winSelectedEdIdx == null) 1.dp else 0.5.dp, if (winSelectedEdIdx == null) PocketColors.accent else PocketColors.border)
+                                ) {
+                                    Text("Ask during Windows Setup (Default)", modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp), fontSize = 11.5.sp, color = PocketColors.textPrimary)
+                                }
+                                winEditions.forEach { ed ->
+                                    val sel = winSelectedEdIdx == ed.index
+                                    Surface(
+                                        modifier = Modifier.fillMaxWidth().bounceClick { winSelectedEdIdx = ed.index },
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput,
+                                        border = BorderStroke(if (sel) 1.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                                    ) {
+                                        Text("${ed.index}. ${ed.name}", modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp), fontSize = 11.5.sp, color = if (sel) PocketColors.accentSoft else PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    }
+                                }
+                            }
+                        }
+
+                        WindowsTwoPaneCustomizer(
+                            osKind = detectedWinOs,
+                            arch = detectedWinArch,
+                            experience = winExp,
+                            winUtil = winTweaksCfg,
+                            presets = presets,
+                            systemTweaksPresets = systemTweaksPresets,
+                            systemTweaksSearchHistory = systemTweaksSearchHistory,
+                            showCa2023Option = true,
+                            showCustomScriptOption = true,
+                            defaultBrowseDir = defaultDir,
+                            selectedEditionIndex = winSelectedEdIdx,
+                            onExperienceChange = { winExp = it },
+                            onWinUtilChange = { winTweaksCfg = it },
+                            onApplyPreset = { p ->
+                                winScheme = if (over2TiB) PartitionScheme.GPT else runCatching { PartitionScheme.valueOf(p.scheme) }.getOrDefault(PartitionScheme.GPT)
+                                winExp = WindowsExperienceConfig(p.bypassRequirements, p.bypassMicrosoftAccount, p.disableDataCollection, p.disableBitLocker, p.qolImprovements, p.disableSponsoredApps, p.skipDomainJoin, p.skipWifiSetup, p.createLocalUser, p.localUsername, "", p.skipOobe, p.useCa2023Bootloaders, p.applySkuSiPolicy)
+                                winTweaksCfg = WinUtilTweaksConfig.fromJsonString(p.winUtilJson, legacyClassicContextMenu = p.classicContextMenu)
+                            },
+                            onSavePreset = { n -> onSavePreset(AutounattendPreset(n, winScheme.name, winExp.bypassRequirements, winExp.bypassMicrosoftAccount, winExp.disableDataCollection, winExp.disableBitLocker, winExp.disableSponsoredApps, winExp.skipDomainJoin, winExp.skipWifiSetup, winExp.createLocalUser, winExp.localUsername, winExp.skipOobe, winExp.qolImprovements, winExp.useCa2023Bootloaders, winExp.applySkuSiPolicy, winTweaksCfg.toJsonString())) },
+                            onDeletePreset = onDeletePreset,
+                            onSaveSystemTweaksPreset = onSaveSystemTweaksPreset,
+                            onDeleteSystemTweaksPreset = onDeleteSystemTweaksPreset,
+                            onUpdateSearchHistory = onUpdateSearchHistory
+                        )
+
+                        DriverPackMultiSelectorSection(
+                            packs = savedDriverPacks,
+                            selectedPackDirs = selectedDriverPackDirs,
+                            onTogglePack = { dir ->
+                                selectedDriverPackDirs = if (dir in selectedDriverPackDirs) selectedDriverPackDirs - dir else selectedDriverPackDirs + dir
+                            },
+                            onOpenManager = { showDriverPackManager = true }
+                        )
+
+                        Surface(
+                            modifier = Modifier.fillMaxWidth().bounceClick { showDriversFolderPicker = true },
+                            shape = RoundedCornerShape(12.dp),
+                            color = PocketColors.surfaceInput,
+                            border = BorderStroke(0.5.dp, if (winDriversDir.isNotBlank()) PocketColors.accent else PocketColors.border)
+                        ) {
+                            Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+                                Icon(Icons.Rounded.FolderOpen, null, tint = PocketColors.accentSoft, modifier = Modifier.size(18.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text("Extra Drivers / Apps Folder (/Drivers)", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                                    Text(if (winDriversDir.isNotBlank()) winDriversDir.replace("/data/media/0", "/sdcard") else "Optional — tap to browse", fontSize = 11.sp, color = PocketColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                                if (winDriversDir.isNotBlank()) {
+                                    IconButton(onClick = { winDriversDir = "" }, modifier = Modifier.size(28.dp)) {
+                                        Icon(Icons.Rounded.Close, "Clear folder", tint = PocketColors.textMuted, modifier = Modifier.size(15.dp))
+                                    }
+                                }
+                            }
+                        }
+
+                        Surface(shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
                             Row(
-                                modifier = Modifier.fillMaxWidth().clickable { fullSha256Verify = !fullSha256Verify }.padding(horizontal = 13.dp, vertical = 10.dp),
+                                modifier = Modifier.fillMaxWidth().clickable { winEiCfgUnlock = !winEiCfgUnlock }.padding(horizontal = 13.dp, vertical = 10.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.SpaceBetween
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Text("Full Drive SHA-256 Check (Slower)", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
-                                    Text("Off = fast Head 16 MB + Tail 16 MB verification", fontSize = 11.sp, color = PocketColors.textSecondary)
+                                    Text("Unlock All Editions (ei.cfg)", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                                    Text("Bypass OEM motherboard Home key lock", fontSize = 11.sp, color = PocketColors.textSecondary)
                                 }
-                                PocketSwitch(checked = fullSha256Verify, onCheckedChange = { fullSha256Verify = it }, activeColor = PocketColors.accent)
+                                PocketSwitch(checked = winEiCfgUnlock, onCheckedChange = { winEiCfgUnlock = it }, activeColor = PocketColors.accent)
+                            }
+                        }
+
+                        OutlinedTextField(
+                            value = winVolumeLabel,
+                            onValueChange = { winVolumeLabel = it.take(32) },
+                            label = { Text("USB Volume Label (Optional)") },
+                            placeholder = { Text("Auto (e.g., WIN11_USB)") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+
+                    OtgFlashMode.DIRECT_LINUX -> {
+                        Text("4. Linux USB & Persistence Options", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                        if (linuxProbingIso) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = PocketColors.accent)
+                                Text("Checking ISO file sizes for FAT32 compatibility...", fontSize = 11.sp, color = PocketColors.textSecondary)
+                            }
+                        }
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            LinuxUsbMode.entries.forEach { m ->
+                                val sel = linuxUsbMode == m
+                                Surface(
+                                    modifier = Modifier.weight(1f).bounceClick { linuxUsbMode = m },
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput,
+                                    border = BorderStroke(if (sel) 1.25.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                                ) {
+                                    Column(modifier = Modifier.padding(10.dp)) {
+                                        Text(m.title, style = MaterialTheme.typography.labelMedium, color = if (sel) PocketColors.accentSoft else PocketColors.textPrimary)
+                                        Text(m.subtitle, fontSize = 10.sp, color = PocketColors.textSecondary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                    }
+                                }
+                            }
+                        }
+
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            LinuxWriteMethod.entries.forEach { wm ->
+                                val lockedFat = linuxIsoHasOver4Gb && wm == LinuxWriteMethod.EXTRACTED_FAT32
+                                val sel = linuxWriteMethod == wm
+                                Surface(
+                                    modifier = Modifier.weight(1f).bounceClick(enabled = !lockedFat) { linuxWriteMethod = wm },
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput,
+                                    border = BorderStroke(if (sel) 1.25.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                                ) {
+                                    Column(modifier = Modifier.padding(10.dp)) {
+                                        Text(wm.title, style = MaterialTheme.typography.labelMedium, color = if (sel) PocketColors.accentSoft else if (lockedFat) PocketColors.textMuted else PocketColors.textPrimary)
+                                        Text(if (lockedFat) "ISO has >4 GB file" else wm.subtitle, fontSize = 10.sp, color = PocketColors.textSecondary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                    }
+                                }
+                            }
+                        }
+
+                        if (linuxUsbMode == LinuxUsbMode.WITH_PERSISTENCE) {
+                            Text(
+                                "Persistence Partition Size: $linuxPersistGb GB (Max $maxLinuxPersist GB on this drive)",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = PocketColors.textPrimary
+                            )
+                            val presetsGb = listOf(1, 2, 4, 8, 16, maxLinuxPersist).filter { it in 1..maxLinuxPersist.coerceAtLeast(1) }.distinct()
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                presetsGb.take(5).forEach { gb ->
+                                    val sel = linuxPersistGb == gb
+                                    Surface(
+                                        modifier = Modifier.weight(1f).bounceClick { linuxPersistGb = gb },
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput,
+                                        border = BorderStroke(if (sel) 1.25.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                                    ) {
+                                        Box(modifier = Modifier.padding(vertical = 8.dp), contentAlignment = Alignment.Center) {
+                                            Text(if (gb == maxLinuxPersist && gb > 16) "Max (${gb}G)" else "${gb} GB", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = if (sel) PocketColors.accentSoft else PocketColors.textPrimary)
+                                        }
+                                    }
+                                }
+                            }
+
+                            Text("Persistence Style", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                            Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                                LinuxPersistenceStyle.entries.forEach { st ->
+                                    val sel = linuxStyle == st
+                                    Surface(
+                                        modifier = Modifier.fillMaxWidth().bounceClick { linuxStyle = st },
+                                        shape = RoundedCornerShape(9.dp),
+                                        color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput,
+                                        border = BorderStroke(if (sel) 1.25.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                                    ) {
+                                        Column(modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp)) {
+                                            Text("${st.title} (${st.volumeLabel})", style = MaterialTheme.typography.labelMedium, color = if (sel) PocketColors.accentSoft else PocketColors.textPrimary)
+                                            Text(st.subtitle, fontSize = 10.5.sp, color = PocketColors.textSecondary)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (linuxWriteMethod == LinuxWriteMethod.EXTRACTED_FAT32) {
+                            OutlinedTextField(
+                                value = linuxVolumeLabel,
+                                onValueChange = { linuxVolumeLabel = it.take(11) },
+                                label = { Text("FAT32 Volume Label (Optional)") },
+                                placeholder = { Text("Auto from ISO") },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                    }
+
+                    OtgFlashMode.DIRECT_MULTIBOOT -> {
+                        Text("3. Direct Multi-Boot Pen Drive Options", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            PartitionScheme.entries.forEach { s ->
+                                val disabledMbr = over2TiB && s == PartitionScheme.MBR
+                                val sel = mbScheme == s
+                                Surface(
+                                    modifier = Modifier.weight(1f).bounceClick(enabled = !disabledMbr) { mbScheme = s },
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput,
+                                    border = BorderStroke(if (sel) 1.25.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                                ) {
+                                    Column(modifier = Modifier.padding(10.dp)) {
+                                        Text(s.label, style = MaterialTheme.typography.labelMedium, color = if (sel) PocketColors.accentSoft else if (disabledMbr) PocketColors.textMuted else PocketColors.textPrimary)
+                                        Text(if (disabledMbr) "Locked (>2 TiB)" else s.subtitle, fontSize = 10.sp, color = PocketColors.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    }
+                                }
+                            }
+                        }
+
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            VentoyFilesystem.entries.forEach { fs ->
+                                val sel = mbFs == fs
+                                Surface(
+                                    modifier = Modifier.weight(1f).bounceClick { mbFs = fs },
+                                    shape = RoundedCornerShape(9.dp),
+                                    color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput,
+                                    border = BorderStroke(if (sel) 1.25.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                                ) {
+                                    Box(modifier = Modifier.padding(vertical = 8.dp), contentAlignment = Alignment.Center) {
+                                        Text(fs.label, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = if (sel) PocketColors.accentSoft else PocketColors.textPrimary)
+                                    }
+                                }
+                            }
+                        }
+
+                        OutlinedTextField(
+                            value = mbVolumeLabel,
+                            onValueChange = { mbVolumeLabel = it.take(16) },
+                            label = { Text("Multi-Boot Partition Label") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+
+                        Text("Initial ISO to Copy (Optional)", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                        Column(
+                            modifier = Modifier.fillMaxWidth().heightIn(max = 128.dp).verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Surface(
+                                modifier = Modifier.fillMaxWidth().bounceClick { mbInitialIso = null },
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (mbInitialIso == null) PocketColors.accentBg else PocketColors.surfaceInput,
+                                border = BorderStroke(if (mbInitialIso == null) 1.dp else 0.5.dp, if (mbInitialIso == null) PocketColors.accent else PocketColors.border)
+                            ) {
+                                Text("None — install clean Multi-Boot pen drive only", modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp), fontSize = 11.5.sp, color = PocketColors.textPrimary)
+                            }
+                            isoImages.forEach { img ->
+                                val sel = mbInitialIso?.path == img.path
+                                Surface(
+                                    modifier = Modifier.fillMaxWidth().bounceClick { mbInitialIso = img },
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = if (sel) PocketColors.accentBg else PocketColors.surfaceInput,
+                                    border = BorderStroke(if (sel) 1.dp else 0.5.dp, if (sel) PocketColors.accent else PocketColors.border)
+                                ) {
+                                    Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 7.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+                                        Text(img.name, modifier = Modifier.weight(1f), fontSize = 11.5.sp, color = if (sel) PocketColors.accentSoft else PocketColors.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        Text(UsbGadgetEngine.formatBytes(img.sizeBytes), style = PocketColors.monoStyle, color = PocketColors.textMuted)
+                                    }
+                                }
+                            }
+                        }
+
+                        if (mbInitialIso != null) {
+                            Surface(shape = RoundedCornerShape(10.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().clickable { mbMoveInitialIso = !mbMoveInitialIso }.padding(horizontal = 12.dp, vertical = 9.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text("Delete source ISO from phone after verified copy", fontSize = 11.5.sp, color = PocketColors.textPrimary, modifier = Modifier.weight(1f))
+                                    PocketSwitch(checked = mbMoveInitialIso, onCheckedChange = { mbMoveInitialIso = it }, activeColor = PocketColors.accent)
+                                }
+                            }
+                        }
+
+                        val mbExpCnt = mbExp.activeCount()
+                        val mbTweaksCnt = mbTweaksCfg.activeCount()
+                        Surface(
+                            modifier = Modifier.fillMaxWidth().bounceClick { mbShowTweaks = !mbShowTweaks },
+                            shape = RoundedCornerShape(11.dp),
+                            color = PocketColors.accentBg,
+                            border = BorderStroke(0.75.dp, PocketColors.accent)
+                        ) {
+                            Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                Text("Windows Tweaks & WinPE Drivers ($mbExpCnt Exp · $mbTweaksCnt Tweaks)", style = MaterialTheme.typography.labelMedium, color = PocketColors.accentSoft)
+                                Text(if (mbShowTweaks) "Hide" else "Configure", style = MaterialTheme.typography.labelSmall, color = PocketColors.accentSoft)
+                            }
+                        }
+                        if (mbShowTweaks) {
+                            WindowsTwoPaneCustomizer(
+                                osKind = WindowsOsKind.WIN11,
+                                arch = "amd64",
+                                experience = mbExp,
+                                winUtil = mbTweaksCfg,
+                                presets = presets,
+                                systemTweaksPresets = systemTweaksPresets,
+                                systemTweaksSearchHistory = systemTweaksSearchHistory,
+                                showCa2023Option = false,
+                                showCustomScriptOption = false,
+                                defaultBrowseDir = defaultDir,
+                                onExperienceChange = { mbExp = it },
+                                onWinUtilChange = { mbTweaksCfg = it },
+                                onApplyPreset = { p ->
+                                    mbExp = WindowsExperienceConfig(p.bypassRequirements, p.bypassMicrosoftAccount, p.disableDataCollection, p.disableBitLocker, p.qolImprovements, p.disableSponsoredApps, false, p.skipWifiSetup, p.createLocalUser, p.localUsername, "", p.skipOobe, p.useCa2023Bootloaders, p.applySkuSiPolicy)
+                                    mbTweaksCfg = WinUtilTweaksConfig.fromJsonString(p.winUtilJson, legacyClassicContextMenu = p.classicContextMenu)
+                                },
+                                onSavePreset = { n -> onSavePreset(AutounattendPreset(n, mbScheme.name, mbExp.bypassRequirements, mbExp.bypassMicrosoftAccount, mbExp.disableDataCollection, mbExp.disableBitLocker, mbExp.disableSponsoredApps, false, mbExp.skipWifiSetup, mbExp.createLocalUser, mbExp.localUsername, mbExp.skipOobe, mbExp.qolImprovements, mbExp.useCa2023Bootloaders, mbExp.applySkuSiPolicy, mbTweaksCfg.toJsonString())) },
+                                onDeletePreset = onDeletePreset,
+                                onSaveSystemTweaksPreset = onSaveSystemTweaksPreset,
+                                onDeleteSystemTweaksPreset = onDeleteSystemTweaksPreset,
+                                onUpdateSearchHistory = onUpdateSearchHistory
+                            )
+                            DriverPackMultiSelectorSection(
+                                packs = savedDriverPacks,
+                                selectedPackDirs = mbSelectedPackDirs,
+                                onTogglePack = { dir ->
+                                    mbSelectedPackDirs = if (dir in mbSelectedPackDirs) mbSelectedPackDirs - dir else mbSelectedPackDirs + dir
+                                },
+                                onOpenManager = { showDriverPackManager = true }
+                            )
+                            Surface(
+                                modifier = Modifier.fillMaxWidth().bounceClick { showMbDriversPicker = true },
+                                shape = RoundedCornerShape(11.dp),
+                                color = PocketColors.surfaceInput,
+                                border = BorderStroke(0.5.dp, if (mbDriversDir.isNotBlank()) PocketColors.accent else PocketColors.border)
+                            ) {
+                                Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Icon(Icons.Rounded.FolderOpen, null, tint = PocketColors.accentSoft, modifier = Modifier.size(17.dp))
+                                    Text(if (mbDriversDir.isNotBlank()) mbDriversDir.replace("/data/media/0", "/sdcard") else "Extra WinPE Drivers Folder (Optional)", fontSize = 11.5.sp, color = PocketColors.textSecondary, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    if (mbDriversDir.isNotBlank()) {
+                                        IconButton(onClick = { mbDriversDir = "" }, modifier = Modifier.size(26.dp)) {
+                                            Icon(Icons.Rounded.Close, "Clear", tint = PocketColors.textMuted, modifier = Modifier.size(14.dp))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    OtgFlashMode.RAW_DD -> {
+                        Surface(shape = RoundedCornerShape(12.dp), color = PocketColors.surfaceInput, border = BorderStroke(0.5.dp, PocketColors.border)) {
+                            Column {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().clickable { verifyAfterFlash = !verifyAfterFlash }.padding(horizontal = 13.dp, vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text("Read-Back Verification (Recommended)", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                                        Text("Catches faulty or fake-capacity USB drives immediately", fontSize = 11.sp, color = PocketColors.textSecondary)
+                                    }
+                                    PocketSwitch(checked = verifyAfterFlash, onCheckedChange = { verifyAfterFlash = it }, activeColor = PocketColors.success)
+                                }
+                                if (verifyAfterFlash && !isCompressedSrc) {
+                                    PocketHairlineDivider()
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().clickable { fullSha256Verify = !fullSha256Verify }.padding(horizontal = 13.dp, vertical = 10.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text("Full Drive SHA-256 Check (Slower)", style = MaterialTheme.typography.labelMedium, color = PocketColors.textPrimary)
+                                            Text("Off = fast Head 16 MB + Tail 16 MB verification", fontSize = 11.sp, color = PocketColors.textSecondary)
+                                        }
+                                        PocketSwitch(checked = fullSha256Verify, onCheckedChange = { fullSha256Verify = it }, activeColor = PocketColors.accent)
+                                    }
+                                }
                             }
                         }
                     }
                 }
 
-                if (fitError != null) {
+                if (validationError != null) {
                     Surface(shape = RoundedCornerShape(10.dp), color = PocketColors.dangerBg, border = BorderStroke(0.75.dp, PocketColors.danger)) {
                         Row(modifier = Modifier.fillMaxWidth().padding(10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                             Icon(Icons.Rounded.WarningAmber, null, tint = PocketColors.danger, modifier = Modifier.size(16.dp))
-                            Text(fitError, style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
+                            Text(validationError, style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
                         }
                     }
                 }
@@ -888,14 +1733,14 @@ fun OtgFlasherSheet(
                         confirmInput = ""
                         showConfirmFlashDialog = true
                     },
-                    enabled = activeSource != null && activeTarget != null && fitError == null,
+                    enabled = canStartFlash,
                     modifier = Modifier.fillMaxWidth().height(48.dp),
                     shape = RoundedCornerShape(12.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = PocketColors.danger, contentColor = Color.White)
                 ) {
                     Icon(Icons.Rounded.WarningAmber, null, modifier = Modifier.size(17.dp))
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text("Erase & Flash USB Pen Drive...", fontWeight = FontWeight.SemiBold)
+                    Text("Erase & Flash ${selectedMode.title}...", fontWeight = FontWeight.SemiBold)
                 }
             }
 
@@ -903,7 +1748,28 @@ fun OtgFlasherSheet(
         }
     }
 
-    if (showConfirmFlashDialog && activeSource != null && activeTarget != null) {
+    if (showDriversFolderPicker) {
+        RootFolderPickerSheet("Select Drivers / Apps Folder", "Files inside will be copied to /Drivers on the USB drive", winDriversDir.ifBlank { defaultDir }, { showDriversFolderPicker = false }) {
+            winDriversDir = it
+            showDriversFolderPicker = false
+        }
+    }
+    if (showMbDriversPicker) {
+        RootFolderPickerSheet("Select WinPE Drivers Folder", "Packed into drivers_inject.zip on the Multi-Boot USB", mbDriversDir.ifBlank { defaultDir }, { showMbDriversPicker = false }) {
+            mbDriversDir = it
+            showMbDriversPicker = false
+        }
+    }
+    if (showDriverPackManager) {
+        DriverPackManagerSheet(
+            defaultDir = defaultDir,
+            onDismiss = { showDriverPackManager = false },
+            onPacksChanged = { driverPackReloadNonce++ },
+            onMessage = { msg, _ -> Toast.makeText(context, msg, Toast.LENGTH_LONG).show() }
+        )
+    }
+
+    if (showConfirmFlashDialog && activeTarget != null && canStartFlash) {
         val typedOk = confirmInput.trim().equals("FLASH", ignoreCase = true)
         AlertDialog(
             onDismissRequest = { showConfirmFlashDialog = false },
@@ -920,7 +1786,7 @@ fun OtgFlasherSheet(
                         Column(modifier = Modifier.fillMaxWidth().padding(10.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                             Text("Target: ${activeTarget.displayTitle}", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
                             Text("Device: ${activeTarget.devPath} (${UsbGadgetEngine.formatBytes(activeTarget.sizeBytes)})", style = PocketColors.monoStyle, color = PocketColors.textSecondary)
-                            Text("Source: ${activeSource.name}", style = PocketColors.monoStyle, color = PocketColors.textSecondary)
+                            Text("Mode: $modeSummaryForConfirm", style = PocketColors.monoStyle, color = PocketColors.textSecondary)
                         }
                     }
                     OutlinedTextField(
@@ -937,14 +1803,82 @@ fun OtgFlasherSheet(
                 Button(
                     onClick = {
                         showConfirmFlashDialog = false
-                        onStartFlash(
-                            OtgFlashConfig(
-                                sourceFile = activeSource,
-                                targetDevice = activeTarget,
-                                verifyAfterFlash = verifyAfterFlash,
-                                fullSha256Verify = fullSha256Verify && !isCompressedSrc
-                            )
-                        )
+                        when (selectedMode) {
+                            OtgFlashMode.DIRECT_WINDOWS -> {
+                                val src = activeSource ?: return@Button
+                                onStartWindowsOtgFlash(
+                                    WindowsBuildConfig(
+                                        isoFile = src,
+                                        outputDir = defaultDir,
+                                        outputName = activeTarget.displayTitle,
+                                        scheme = DiskPartitioner.effectiveSchemeForDisk(winScheme, activeTarget.sizeBytes),
+                                        selectedEditionIndex = winSelectedEdIdx,
+                                        selectedEditionName = winEditions.firstOrNull { it.index == winSelectedEdIdx }?.name,
+                                        osKind = detectedWinOs,
+                                        arch = detectedWinArch,
+                                        experience = winExp,
+                                        winUtil = winTweaksCfg,
+                                        eiCfgUnlock = winEiCfgUnlock,
+                                        extraDriversDir = winDriversDir,
+                                        extraDriverPackDirs = selectedDriverPackDirs.toList(),
+                                        autoMountAfterBuild = false,
+                                        volumeLabel = winVolumeLabel.trim(),
+                                        directBlockTarget = activeTarget
+                                    )
+                                )
+                            }
+                            OtgFlashMode.DIRECT_LINUX -> {
+                                val src = activeSource ?: return@Button
+                                onStartLinuxOtgFlash(
+                                    LinuxBuildConfig(
+                                        isoFile = src,
+                                        outputDir = defaultDir,
+                                        outputName = activeTarget.displayTitle,
+                                        usbMode = linuxUsbMode,
+                                        writeMethod = if (linuxIsoHasOver4Gb) LinuxWriteMethod.HYBRID_DD else linuxWriteMethod,
+                                        scheme = PartitionScheme.MBR,
+                                        persistenceGb = linuxPersistGb.coerceIn(1, maxLinuxPersist.coerceAtLeast(1)),
+                                        style = linuxStyle,
+                                        autoMountAfterBuild = false,
+                                        volumeLabel = linuxVolumeLabel.trim(),
+                                        directBlockTarget = activeTarget
+                                    )
+                                )
+                            }
+                            OtgFlashMode.DIRECT_MULTIBOOT -> {
+                                onStartMultiBootOtgFlash(
+                                    VentoyBuildConfig(
+                                        outputDir = defaultDir,
+                                        outputName = activeTarget.displayTitle,
+                                        sizeMb = ((activeTarget.sizeBytes / 1_048_576L).coerceIn(512L, 131072L)).toInt(),
+                                        scheme = DiskPartitioner.effectiveSchemeForDisk(mbScheme, activeTarget.sizeBytes),
+                                        filesystem = mbFs,
+                                        win11BypassCheck = mbExp.bypassRequirements,
+                                        win11BypassNro = mbExp.bypassMicrosoftAccount,
+                                        experience = mbExp,
+                                        winUtil = mbTweaksCfg,
+                                        driversDir = mbDriversDir,
+                                        extraDriverPackDirs = mbSelectedPackDirs.toList(),
+                                        initialIsoToAdd = mbInitialIso,
+                                        moveInitialIso = mbMoveInitialIso,
+                                        autoMountAfterBuild = false,
+                                        volumeLabel = mbVolumeLabel.trim().ifBlank { "POCKETBOOT" },
+                                        directBlockTarget = activeTarget
+                                    )
+                                )
+                            }
+                            OtgFlashMode.RAW_DD -> {
+                                val src = activeSource ?: return@Button
+                                onStartRawFlash(
+                                    OtgFlashConfig(
+                                        sourceFile = src,
+                                        targetDevice = activeTarget,
+                                        verifyAfterFlash = verifyAfterFlash,
+                                        fullSha256Verify = fullSha256Verify && !isCompressedSrc
+                                    )
+                                )
+                            }
+                        }
                     },
                     enabled = typedOk,
                     colors = ButtonDefaults.buttonColors(containerColor = PocketColors.danger, contentColor = Color.White)

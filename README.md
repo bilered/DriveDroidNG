@@ -1,4 +1,4 @@
-# PocketBoot v4.8.0
+# PocketBoot v4.9.0
 
 Rooted Android USB Gadget ISO/IMG boot utility, multi-boot Ventoy drive manager, official OS downloader, and Rufus-style Windows & Linux bootable USB builder.
 
@@ -11,4 +11,4 @@ Rooted Android USB Gadget ISO/IMG boot utility, multi-boot Ventoy drive manager,
 - **In-App Release Updater & Automated JVM Tests (`AppUpdateChecker.kt`, `app/src/test`):** HTTPS-enforced GitHub release checks against `bilered/PocketBoot` and JUnit regression tests in CI.
 - **Ventoy Multi-Boot & Disk Tools (`VentoyImageBuilder.kt`, `VentoyPersistenceHelper.kt`, `VentoyThemeCatalog.kt`, `ImageLoopExplorer.kt`, `DiskPartitioner.kt`):** Create, resize, reclaim sparse space, attach per-ISO Linux ext4 persistence `.dat` volumes, customize boot menu aliases/timeouts/GRUB themes, assign per-ISO multi-template Windows tweak profiles, and explore/edit Partition 1 of any `.img` directly on-phone.
 - **Compressed Image Engine (`CompressedImageEngine.kt`):** Detect, inspect, and atomically extract `.img.xz`, `.img.gz`, `.img.zst`, `.iso.xz`, `.iso.gz`, and `.iso.zst` archives using bundled static ARM64 `lib7zzs.so` and `libzstd.so` with gzip 4 GiB wrap protection and live storage floor guards.
-- **Physical USB-C OTG Pen Drive Flasher (`OtgUsbFlasher.kt`):** Write raw `.iso`/`.img` or stream-flash compressed images directly onto physical USB-C OTG pen drives with a 7-layer anti-brick sysfs safety lock, clean `vold` unmount, `/sys/block/<dev>/stat` live progress, and read-back block/SHA-256 verification.
+- **True Direct-Mode USB-C OTG Pen Drive Flasher (`OtgUsbFlasher.kt`, `DiskPartitioner.kt`):** Flash physical USB-C OTG pen drives directly with **0 GB phone `.img` overhead** across 4 modes — **Direct Windows USB** (GPT/MBR + NTFS + UEFI:NTFS, Edition Picker, `boot.wim` `LabConfig`, System Tweaks & Driver Packs), **Direct Linux + Persistence** (Extracted FAT32 or Hybrid DD + full-drive dynamic ext4 persistence), **Direct Multi-Boot USB** (full-capacity physical Multi-Boot + tweaks & drivers), and **Raw / Streaming DD** (`.img`/`.xz`/`.gz`/`.zst` + read-back verification) — protected by a 9-layer anti-brick hardware safety lock.
