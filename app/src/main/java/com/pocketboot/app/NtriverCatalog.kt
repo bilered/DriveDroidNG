@@ -46,11 +46,15 @@ data class NtriverReleaseSection(
     val id: String,
     val title: String,
     val shortChipLabel: String,
+    val majorVersion: String = "",
+    val editionLabel: String = "",
     val buildBadge: String = "",
     val note: String = "",
     val isRecommended: Boolean = true,
     val entries: List<NtriverIsoEntry>
 ) {
+    val effectiveMajorVersion: String get() = majorVersion.ifBlank { shortChipLabel }
+    val effectiveEditionLabel: String get() = editionLabel.ifBlank { shortChipLabel }
     val hasMicrosoftStaticLinks: Boolean get() = entries.any { it.isMicrosoftStatic }
     val distinctLanguages: List<String> get() = entries.map { it.language }.distinct()
     val distinctArches: List<String> get() = entries.map { it.arch }.distinct()
@@ -66,10 +70,12 @@ data class NtriverResolveResult(
 
 /**
  * Direct Windows RTM ISO archive client for ntriver.org (CC-BY-4.0) with:
- * - Dynamic index page route discovery (`/download-windows-office`) + verified fallback slugs
- * - Primary HTML table parser + GitHub tree raw-Markdown fallback (`ntriver-org/ntriver-org-site`)
+ * - Zero-backtracking O(N) linear HTML scanner (safe on 2+ MB Windows 11/10/8.1 pages without ICU regex overflow)
+ * - Dynamic index route discovery (`/download-windows-office`) + verified fallback slugs
+ * - Fixed GitHub tree raw-Markdown/MDX fallback (`ntriver-org/ntriver-org-site`, excluding `i18n/` and `-esd` pages)
+ * - Parent H2 -> Child H3 hierarchy extracting clean `majorVersion` + `editionLabel` sub-categories
  * - Automatic preference for permanent Microsoft Static Links before `/api/drive/generate-link`
- * - Short-lived headless WebView fallback if Cloudflare challenges the JSON link endpoint
+ * - Hardened headless WebView fallback if Cloudflare challenges the JSON link endpoint
  * - Strict `.iso`-only & bootable-PC filtering (rejects `.esd`, IA-64, ARM32 RT, SDK/WDK/Symbols)
  */
 object NtriverCatalog {
@@ -86,6 +92,7 @@ object NtriverCatalog {
     private val ISO_FILENAME_RE = Regex("""([A-Za-z0-9._()+\-]+\.iso)\b""", RegexOption.IGNORE_CASE)
     private val HTML_TAG_RE = Regex("<[^>]+>")
     private val MULTISPACE_RE = Regex("\\s+")
+    private val MD_LINK_RE = Regex("""\[([^\]]+)]\((https?://[^)\s]+)\)""")
 
     private val FALLBACK_SLUGS = mapOf(
         "win11" to "/download-windows-11",
@@ -96,6 +103,17 @@ object NtriverCatalog {
         "server2025" to "/download-windows-server-2025",
         "server2022" to "/download-windows-server-2022",
         "server2019" to "/download-windows-server-2019"
+    )
+
+    private val FALLBACK_MD_PATHS = mapOf(
+        "win11" to listOf("docs/download-windows-11.md", "docs/download-windows-11.mdx"),
+        "win10" to listOf("docs/download-windows-10.md", "docs/download-windows-10.mdx"),
+        "ltsc" to listOf("docs/download-windows-ltsc.md", "docs/download-windows-ltsc.mdx"),
+        "win81" to listOf("docs/download-windows-8.1.md", "docs/download-windows-8.1.mdx"),
+        "win7" to listOf("docs/download-windows-7.md", "docs/download-windows-7.mdx"),
+        "server2025" to listOf("docs/download-windows-server-2025.md", "docs/download-windows-server-2025.mdx"),
+        "server2022" to listOf("docs/download-windows-server-2022.md", "docs/download-windows-server-2022.mdx"),
+        "server2019" to listOf("docs/download-windows-server-2019.md", "docs/download-windows-server-2019.mdx")
     )
 
     private val EXCLUDED_KEYWORDS = listOf(
@@ -110,18 +128,8 @@ object NtriverCatalog {
 
     private val NICHE_EDITION_KEYWORDS = listOf(
         "azure edition", "evaluation", "embedded", "china", "cmge",
-        " n ", "(n)", "editions n", "single language", "foundation", "essentials"
-    )
-
-    private val FALLBACK_MD_PATHS = mapOf(
-        "win11" to "docs/download-windows-11.md",
-        "win10" to "docs/download-windows-10.md",
-        "ltsc" to "docs/download-windows-ltsc.md",
-        "win81" to "docs/download-windows-8.1.md",
-        "win7" to "docs/download-windows-7.md",
-        "server2025" to "docs/download-windows-server-2025.md",
-        "server2022" to "docs/download-windows-server-2022.md",
-        "server2019" to "docs/download-windows-server-2019.md"
+        " n ", "(n)", "editions n", "core / pro n", "pro n", "enterprise n",
+        "single language", "foundation", "essentials", "with bing", "pro student"
     )
 
     private val indexLock = Any()
@@ -193,28 +201,259 @@ object NtriverCatalog {
             .replace("\u2764\uFE0F", "")
             .replace("\u2764", "")
             .replace("#", "")
+            .replace("\u200B", "")
             .replace(MULTISPACE_RE, " ")
             .trim()
 
-    internal fun buildShortChipLabel(fullTitle: String, pagePrefix: String = ""): String {
-        var s = cleanSectionTitle(fullTitle)
+    private fun stripLeadingOsPrefix(title: String): String {
+        var s = cleanSectionTitle(title)
         listOf(
             "Windows 11 ", "Windows 10 / 11 ", "Windows 10 ", "Windows 8.1 ",
             "Windows 7 ", "Windows Server "
         ).forEach { pref ->
-            if (s.startsWith(pref, ignoreCase = true) && s.length > pref.length + 2) {
+            if (s.startsWith(pref, ignoreCase = true) && s.length > pref.length + 1) {
                 s = s.substring(pref.length).trim()
             }
         }
-        s = s.removePrefix("-").removePrefix("—").removePrefix("–").trim()
+        return s.removePrefix("-").removePrefix("—").removePrefix("–").trim()
+    }
+
+    internal fun buildShortChipLabel(fullTitle: String, pagePrefix: String = ""): String {
+        val s = stripLeadingOsPrefix(fullTitle)
         val combined = if (pagePrefix.isNotBlank() && !s.contains(pagePrefix, ignoreCase = true)) {
             "$pagePrefix $s"
         } else s
         return if (combined.length > 32) combined.take(30).trimEnd() + "…" else combined.ifBlank { fullTitle.take(28) }
     }
 
+    /**
+     * Derives clean 2-level hierarchy: `(majorVersion, editionLabel)` for decluttered UI sub-categories.
+     * Examples:
+     * - Parent H2 "Windows 11 25H2" + H3 "Consumer (November 2026)" -> ("25H2", "Consumer (November 2026)")
+     * - H2 "Windows 8.1 with Update 3 - Core / Pro" -> ("Update 3", "Core / Pro")
+     * - H2 "Windows Server 2022 (November 2026)" with prefix "Server 2022" -> ("Server 2022", "November 2026")
+     * - H2 "Windows 11 Enterprise LTSC 2024" -> ("Win 11 LTSC 2024", "Enterprise LTSC 2024")
+     */
+    internal fun deriveVersionAndEdition(
+        parentH2: String,
+        headingTitle: String,
+        pagePrefix: String = ""
+    ): Pair<String, String> {
+        val cleanHead = cleanSectionTitle(headingTitle)
+        val cleanParent = cleanSectionTitle(parentH2)
+
+        // 1. Server multi-page merge uses pagePrefix ("Server 2025" / "Server 2022" / "Server 2019") as Main Version
+        if (pagePrefix.isNotBlank()) {
+            var ed = cleanHead
+                .replace(Regex("""^Windows\s+$pagePrefix\b""", RegexOption.IGNORE_CASE), "")
+                .replace(Regex("""^$pagePrefix\b""", RegexOption.IGNORE_CASE), "")
+                .trim()
+                .removePrefix("-").removePrefix("—").removePrefix("–").trim()
+            if (ed.startsWith("(") && ed.endsWith(")") && ed.length > 2) {
+                ed = ed.substring(1, ed.length - 1).trim()
+            }
+            return pagePrefix to ed.ifBlank { "Standard / Datacenter" }
+        }
+
+        // 2. Explicit H2 -> H3 hierarchy (e.g., H2 = "Windows 11 25H2", H3 = "Consumer (November 2026)")
+        if (cleanParent.isNotBlank() && !cleanParent.equals(cleanHead, ignoreCase = true)) {
+            val major = stripLeadingOsPrefix(cleanParent)
+                .replace(Regex("""^with\s+""", RegexOption.IGNORE_CASE), "")
+                .trim()
+                .ifBlank { cleanParent }
+            val ed = cleanHead
+                .removePrefix(cleanParent)
+                .trim()
+                .removePrefix("-").removePrefix("—").removePrefix("–").trim()
+                .ifBlank { cleanHead }
+            return major.take(28) to ed.take(40)
+        }
+
+        // 3. Single H2 with " - " separator (e.g. "Windows 8.1 with Update 3 - Core / Pro", "Windows 11 26H2 - Consumer")
+        val dashIdx = cleanHead.indexOf(" - ").takeIf { it > 0 }
+            ?: cleanHead.indexOf(" – ").takeIf { it > 0 }
+            ?: cleanHead.indexOf(" — ").takeIf { it > 0 }
+        if (dashIdx != null) {
+            val left = cleanHead.substring(0, dashIdx).trim()
+            val right = cleanHead.substring(dashIdx + 3).trim()
+            val major = stripLeadingOsPrefix(left)
+                .replace(Regex("""^with\s+""", RegexOption.IGNORE_CASE), "")
+                .trim()
+                .ifBlank { if (left.contains("8.1")) "RTM" else if (left.contains("Windows 7", true)) "RTM" else left }
+            return major.take(28) to right.take(40)
+        }
+
+        // 4. LTSC / LTSB versions
+        val low = cleanHead.lowercase(Locale.US)
+        if (low.contains("ltsc") || low.contains("ltsb")) {
+            val osTag = if (low.contains("windows 11") || low.contains("win 11") || low.contains("2024")) "Win 11" else "Win 10"
+            val yr = Regex("""\b(2024|2021|2019|2016|2015)\b""").find(cleanHead)?.value.orEmpty()
+            val kind = if (low.contains("ltsb")) "LTSB" else "LTSC"
+            val major = listOf(osTag, kind, yr).filter { it.isNotBlank() }.joinToString(" ")
+            val ed = stripLeadingOsPrefix(cleanHead).ifBlank { cleanHead }
+            return major.take(28) to ed.take(40)
+        }
+
+        // 5. Windows 11/10 Feature Update token (26H2, 25H2, 24H2, 22H2, 2004, 1909, 1809, etc.)
+        val verMatch = Regex("""\b(2[0-9]H[12]|2004|1909|1903|1809|1803|1709|1703|1607|1511|1507)\b""", RegexOption.IGNORE_CASE).find(cleanHead)
+        if (verMatch != null) {
+            val ver = verMatch.value.uppercase(Locale.US)
+            val rest = stripLeadingOsPrefix(cleanHead)
+                .replace(Regex("""\b${Regex.escape(ver)}\b""", RegexOption.IGNORE_CASE), "")
+                .trim()
+                .removePrefix("-").removePrefix("—").removePrefix("–").trim()
+                .ifBlank { "Standard" }
+            return ver to rest.take(40)
+        }
+
+        // 6. Windows 7 / 8.1 SP1 / Update fallback
+        if (low.contains("sp1")) {
+            val rest = stripLeadingOsPrefix(cleanHead)
+                .replace(Regex("""with\s+sp1|sp1""", RegexOption.IGNORE_CASE), "")
+                .trim().removePrefix("-").trim().ifBlank { "Standard" }
+            return "SP1" to rest.take(40)
+        }
+        val short = buildShortChipLabel(cleanHead)
+        return short to short
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ZERO-BACKTRACKING LINEAR HTML SCANNER (O(N), constant stack depth on 2+ MB pages!)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private fun isTagBoundary(html: String, pos: Int): Boolean {
+        if (pos >= html.length) return true
+        val c = html[pos]
+        return c == '>' || c == '/' || c.isWhitespace()
+    }
+
+    private fun findTagOpen(html: String, tag: String, fromIndex: Int): Pair<Int, Int>? {
+        val openNeedle = "<$tag"
+        var pos = fromIndex
+        while (pos < html.length) {
+            val idx = html.indexOf(openNeedle, pos, ignoreCase = true)
+            if (idx < 0) return null
+            val afterTag = idx + openNeedle.length
+            if (isTagBoundary(html, afterTag)) {
+                val closeGt = html.indexOf('>', afterTag)
+                if (closeGt < 0) return null
+                return idx to (closeGt + 1)
+            }
+            pos = afterTag
+        }
+        return null
+    }
+
+    private fun extractFirstTagInner(html: String, tag: String): String? {
+        val open = findTagOpen(html, tag, 0) ?: return null
+        val closeNeedle = "</$tag>"
+        val closeIdx = html.indexOf(closeNeedle, open.second, ignoreCase = true)
+        return if (closeIdx > open.second) html.substring(open.second, closeIdx) else null
+    }
+
+    private fun stripTagBlocksLinear(html: String, tag: String): String {
+        val closeNeedle = "</$tag>"
+        val sb = StringBuilder(html.length)
+        var cursor = 0
+        while (cursor < html.length) {
+            val open = findTagOpen(html, tag, cursor) ?: break
+            sb.append(html, cursor, open.first)
+            val closeIdx = html.indexOf(closeNeedle, open.second, ignoreCase = true)
+            cursor = if (closeIdx >= 0) closeIdx + closeNeedle.length else html.length
+        }
+        if (cursor < html.length) sb.append(html, cursor, html.length)
+        return sb.toString()
+    }
+
+    private fun findTagBlocksLinear(html: String, tag: String): List<Triple<Int, Int, String>> {
+        val closeNeedle = "</$tag>"
+        val out = ArrayList<Triple<Int, Int, String>>()
+        var cursor = 0
+        while (cursor < html.length) {
+            val open = findTagOpen(html, tag, cursor) ?: break
+            val closeIdx = html.indexOf(closeNeedle, open.second, ignoreCase = true)
+            if (closeIdx < 0) break
+            out.add(Triple(open.first, closeIdx + closeNeedle.length, html.substring(open.second, closeIdx)))
+            cursor = closeIdx + closeNeedle.length
+        }
+        return out
+    }
+
+    private data class LinearHeading(val level: Int, val start: Int, val end: Int, val innerHtml: String)
+
+    private fun findHeadingsLinear(html: String): List<LinearHeading> {
+        val out = ArrayList<LinearHeading>()
+        var cursor = 0
+        while (cursor < html.length - 4) {
+            val idx = html.indexOf('<', cursor)
+            if (idx < 0 || idx + 3 >= html.length) break
+            val c1 = html[idx + 1]
+            val c2 = html[idx + 2]
+            if ((c1 == 'h' || c1 == 'H') && (c2 == '2' || c2 == '3' || c2 == '4') && isTagBoundary(html, idx + 3)) {
+                val gt = html.indexOf('>', idx + 3)
+                if (gt > idx) {
+                    val closeNeedle = "</h$c2>"
+                    val closeIdx = html.indexOf(closeNeedle, gt + 1, ignoreCase = true)
+                    if (closeIdx > gt) {
+                        out.add(LinearHeading(c2 - '0', idx, closeIdx + closeNeedle.length, html.substring(gt + 1, closeIdx)))
+                        cursor = closeIdx + closeNeedle.length
+                        continue
+                    }
+                }
+            }
+            cursor = idx + 1
+        }
+        return out
+    }
+
+    private fun findCellsLinear(trHtml: String): List<String> {
+        val out = ArrayList<String>(4)
+        var cursor = 0
+        while (cursor < trHtml.length - 4) {
+            val idx = trHtml.indexOf('<', cursor)
+            if (idx < 0 || idx + 3 >= trHtml.length) break
+            val c1 = trHtml[idx + 1]
+            val c2 = trHtml[idx + 2]
+            val isTd = (c1 == 't' || c1 == 'T') && (c2 == 'd' || c2 == 'D')
+            val isTh = (c1 == 't' || c1 == 'T') && (c2 == 'h' || c2 == 'H')
+            if ((isTd || isTh) && isTagBoundary(trHtml, idx + 3)) {
+                val gt = trHtml.indexOf('>', idx + 3)
+                if (gt > idx) {
+                    val closeNeedle = if (isTd) "</td>" else "</th>"
+                    val closeIdx = trHtml.indexOf(closeNeedle, gt + 1, ignoreCase = true)
+                    if (closeIdx >= gt + 1) {
+                        out.add(trHtml.substring(gt + 1, closeIdx))
+                        cursor = closeIdx + closeNeedle.length
+                        continue
+                    }
+                }
+            }
+            cursor = idx + 1
+        }
+        return out
+    }
+
+    private fun findAnchorsLinear(html: String): List<Pair<String, String>> {
+        val out = ArrayList<Pair<String, String>>()
+        val hrefRe = Regex("""\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')""", RegexOption.IGNORE_CASE)
+        var cursor = 0
+        while (cursor < html.length) {
+            val open = findTagOpen(html, "a", cursor) ?: break
+            val openTag = html.substring(open.first, open.second)
+            val closeIdx = html.indexOf("</a>", open.second, ignoreCase = true)
+            if (closeIdx < 0) break
+            val hrefMatch = hrefRe.find(openTag)
+            val href = (hrefMatch?.groupValues?.getOrNull(1)?.ifEmpty { hrefMatch.groupValues.getOrNull(2) }).orEmpty()
+            if (href.isNotBlank()) {
+                out.add(href to html.substring(open.second, closeIdx))
+            }
+            cursor = closeIdx + 4
+        }
+        return out
+    }
+
     private fun isCloudflareChallenge(code: Int, body: String): Boolean {
-        val low = body.lowercase(Locale.US)
+        val low = body.take(8_192).lowercase(Locale.US)
         if (code == 403 || code == 503 || code == 429) {
             if (low.contains("just a moment") || low.contains("cf-browser-verification") ||
                 low.contains("challenge-platform") || low.contains("cloudflare")
@@ -228,8 +467,8 @@ object NtriverCatalog {
         require(url.protocol.equals("https", ignoreCase = true)) { "HTTPS is required for catalog requests." }
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
-            connectTimeout = 12_000
-            readTimeout = 18_000
+            connectTimeout = 15_000
+            readTimeout = 30_000
             instanceFollowRedirects = true
             setRequestProperty("User-Agent", UA)
             setRequestProperty("Accept", if (acceptJson) "application/json, text/plain, */*" else "text/html, text/plain, */*")
@@ -253,9 +492,8 @@ object NtriverCatalog {
     fun parseIndexPageLinks(html: String): Map<String, String> {
         val exact = LinkedHashMap<String, String>()
         val fallback = LinkedHashMap<String, String>()
-        val aRe = Regex("""<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)</a>""", RegexOption.IGNORE_CASE)
-        for (m in aRe.findAll(html)) {
-            val rawHref = decodeHtmlEntities(m.groupValues[1]).trim()
+        for ((rawHrefRaw, innerText) in findAnchorsLinear(html)) {
+            val rawHref = decodeHtmlEntities(rawHrefRaw).trim()
             if (rawHref.startsWith("#") || rawHref.startsWith("mailto:") || rawHref.startsWith("javascript:")) continue
             val path = when {
                 rawHref.startsWith(SITE_ORIGIN, ignoreCase = true) -> rawHref.substring(SITE_ORIGIN.length)
@@ -264,7 +502,7 @@ object NtriverCatalog {
             }.substringBefore('#').substringBefore('?').trimEnd('/')
             if (path.isBlank() || path == "/download-windows-office") continue
             val lowPath = path.lowercase(Locale.US)
-            val lowText = stripHtml(m.groupValues[2]).lowercase(Locale.US)
+            val lowText = stripHtml(innerText).lowercase(Locale.US)
             if (lowPath.contains("office") || lowPath.contains("esd")) continue
 
             when {
@@ -327,7 +565,6 @@ object NtriverCatalog {
             path.substringAfter("/drive/", "")
         }
         if (candidate.isBlank()) return null
-        // Preserve literal `+` in ISO filenames while decoding `%20` / `%XX` percent-escapes cleanly
         val decoded = runCatching { URLDecoder.decode(candidate.replace("+", "%2B"), "UTF-8") }
             .getOrDefault(candidate).trim()
         return if (decoded.endsWith(".iso", ignoreCase = true) && !decoded.contains('/') && !decoded.contains('\\')) decoded else null
@@ -361,7 +598,6 @@ object NtriverCatalog {
 
     internal fun disambiguateEntries(entries: List<NtriverIsoEntry>): List<NtriverIsoEntry> {
         if (entries.isEmpty()) return emptyList()
-        // Merge accidental duplicate (arch, fileName) rows so each ISO appears once with best available metadata/links
         val mergedMap = LinkedHashMap<String, NtriverIsoEntry>()
         for (e in entries) {
             val k = "${e.arch.lowercase(Locale.US)}|${e.fileName.lowercase(Locale.US)}"
@@ -424,7 +660,7 @@ object NtriverCatalog {
     private fun extractMetaFromIntro(introText: String): Pair<String, String> {
         val clean = introText
             .replace("\r", "")
-            .replace(Regex("""\[([^\]]+)]\(https?://[^)\s]+\)"""), "$1")
+            .replace(MD_LINK_RE, "$1")
             .replace("**", "")
             .replace("__", "")
             .replace("`", "")
@@ -436,117 +672,135 @@ object NtriverCatalog {
         return buildBadge to note
     }
 
+    private fun parseHtmlTablesFromBlock(block: String, sectionTitle: String): List<NtriverIsoEntry> {
+        val entries = mutableListOf<NtriverIsoEntry>()
+        for ((_, _, tblBody) in findTagBlocksLinear(block, "table")) {
+            val rows = findTagBlocksLinear(tblBody, "tr")
+            if (rows.isEmpty()) continue
+            val headerText = stripHtml(rows.first().third).lowercase(Locale.US)
+            if (headerText.contains("windows version") && headerText.contains("iso links")) continue
+
+            for (rowIdx in rows.indices) {
+                val cells = findCellsLinear(rows[rowIdx].third)
+                if (cells.size < 2) continue
+                val col0 = stripHtml(cells[0])
+                val col1 = stripHtml(cells[1])
+                if (rowIdx == 0 && (col0.equals("Language", true) || col1.equals("Arch", true))) continue
+                val detailsHtml = if (cells.size >= 3) cells.drop(2).joinToString(" ") else cells[1]
+                val detailsText = stripHtml(detailsHtml)
+                val textFileName = ISO_FILENAME_RE.find(detailsText)?.groupValues?.get(1)?.trim()
+                val sha = SHA256_RE.find(detailsText)?.groupValues?.get(1)?.lowercase(Locale.US).orEmpty()
+
+                var directStatic: String? = null
+                var driveFile: String? = null
+                var hasGenericDriveLink = false
+                for ((rawHref, rawLbl) in findAnchorsLinear(detailsHtml)) {
+                    val href = decodeHtmlEntities(rawHref).trim()
+                    val label = stripHtml(rawLbl).lowercase(Locale.US)
+                    if (href.contains("rg-adguard", true) || label.contains("rg-adguard")) continue
+                    if (directStatic == null && isDirectMicrosoftIsoUrl(href)) {
+                        directStatic = href
+                    }
+                    if (driveFile == null) {
+                        val extracted = extractDriveFilenameFromUrl(href)
+                        if (extracted != null) {
+                            driveFile = extracted
+                        } else if (isNtriverDriveHref(href)) {
+                            hasGenericDriveLink = true
+                        }
+                    }
+                }
+                val staticUrlFile = directStatic?.substringBefore('?')?.substringAfterLast('/')
+                    ?.takeIf { it.endsWith(".iso", ignoreCase = true) }
+                val fileName = textFileName ?: driveFile ?: staticUrlFile ?: continue
+                if (driveFile == null && hasGenericDriveLink) driveFile = fileName
+                val archHint = if (cells.size >= 3) col1 else WindowsCustomizationEngine.detectProcessorArchitecture(fileName)
+                if (isExcludedSectionOrEntry(sectionTitle, archHint, fileName)) continue
+                if (directStatic == null && driveFile == null) continue
+
+                entries.add(
+                    NtriverIsoEntry(
+                        language = col0.ifBlank { "English" },
+                        arch = normalizeArch(archHint),
+                        fileName = fileName,
+                        sha256 = sha,
+                        directStaticUrl = directStatic,
+                        ntriverDriveFilename = driveFile
+                    )
+                )
+            }
+        }
+        return entries
+    }
+
     /**
-     * Pure-JVM parser for rendered Docusaurus HTML pages on ntriver.org.
-     * Skips top `Index` / `Misc` tables, filters non-bootable/non-ISO rows, and extracts SHA-256 & links.
+     * Zero-backtracking linear parser for rendered Docusaurus HTML pages on ntriver.org.
+     * Preserves H2 -> H3 hierarchy (e.g., `Windows 11 25H2` -> `Consumer (November 2026)`) and never overflows Android's regex stack.
      */
     fun parseHtmlCatalogPage(html: String, pagePrefix: String = ""): List<NtriverReleaseSection> {
-        // Isolate <article> or <main> if present to avoid sidebar/nav false matches
-        val scoped = Regex("""<article\b[^>]*>([\s\S]*?)</article>""", RegexOption.IGNORE_CASE).find(html)?.groupValues?.get(1)
-            ?: Regex("""<main\b[^>]*>([\s\S]*?)</main>""", RegexOption.IGNORE_CASE).find(html)?.groupValues?.get(1)
+        val scoped = extractFirstTagInner(html, "article")
+            ?: extractFirstTagInner(html, "main")
             ?: html
-        val cleanedHtml = scoped
-            .replace(Regex("""<script\b[^>]*>[\s\S]*?</script>""", RegexOption.IGNORE_CASE), "")
-            .replace(Regex("""<style\b[^>]*>[\s\S]*?</style>""", RegexOption.IGNORE_CASE), "")
+        val cleanedHtml = stripTagBlocksLinear(stripTagBlocksLinear(scoped, "script"), "style")
 
-        val headingRe = Regex("""<h([2-4])\b[^>]*>([\s\S]*?)</h\1>""", RegexOption.IGNORE_CASE)
-        val headings = headingRe.findAll(cleanedHtml).toList()
+        val headings = findHeadingsLinear(cleanedHtml)
         if (headings.isEmpty()) return emptyList()
 
-        val tableRe = Regex("""<table\b[^>]*>([\s\S]*?)</table>""", RegexOption.IGNORE_CASE)
-        val trRe = Regex("""<tr\b[^>]*>([\s\S]*?)</tr>""", RegexOption.IGNORE_CASE)
-        val cellRe = Regex("""<t[dh]\b[^>]*>([\s\S]*?)</t[dh]>""", RegexOption.IGNORE_CASE)
-        val anchorRe = Regex("""<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)</a>""", RegexOption.IGNORE_CASE)
-
         val sections = mutableListOf<NtriverReleaseSection>()
+        var activeH2Raw = ""
+        var activeH2Clean = ""
+        var activeH2Excluded = false
+
         for (i in headings.indices) {
-            val hMatch = headings[i]
-            val rawHeadingText = stripHtml(hMatch.groupValues[2])
+            val h = headings[i]
+            val rawHeadingText = stripHtml(h.innerHtml)
             val cleanTitle = cleanSectionTitle(rawHeadingText)
             if (cleanTitle.isBlank()) continue
             val lowTitle = cleanTitle.lowercase(Locale.US)
-            if (lowTitle == "index" || lowTitle == "misc" || lowTitle == "missing files" || lowTitle == "overview") continue
-            if (isExcludedSectionOrEntry(cleanTitle)) continue
+            val isMetaHeading = lowTitle == "index" || lowTitle == "misc" || lowTitle == "missing files" ||
+                lowTitle == "overview" || lowTitle == "installation keys" || lowTitle == "to do"
 
-            val blockStart = hMatch.range.last + 1
-            val blockEnd = if (i + 1 < headings.size) headings[i + 1].range.first else cleanedHtml.length
+            if (h.level == 2) {
+                activeH2Raw = rawHeadingText
+                activeH2Clean = cleanTitle
+                activeH2Excluded = isMetaHeading || isExcludedSectionOrEntry(cleanTitle)
+            }
+            if (isMetaHeading || isExcludedSectionOrEntry(cleanTitle) || (h.level > 2 && activeH2Excluded)) continue
+
+            val blockStart = h.end
+            val blockEnd = if (i + 1 < headings.size) headings[i + 1].start else cleanedHtml.length
+            if (blockStart >= blockEnd) continue
             val block = cleanedHtml.substring(blockStart, blockEnd)
 
-            val firstTable = tableRe.find(block) ?: continue
-            val introHtml = block.substring(0, firstTable.range.first)
+            val firstTableOpen = findTagOpen(block, "table", 0) ?: continue
+            val introHtml = block.substring(0, firstTableOpen.first)
             val introLines = introHtml
                 .replace(Regex("""</(?:p|li|div|br)\s*>|<br\s*/?>""", RegexOption.IGNORE_CASE), "\n")
                 .let { decodeHtmlEntities(HTML_TAG_RE.replace(it, " ")) }
             val (buildBadge, note) = extractMetaFromIntro(introLines)
 
-            val entries = mutableListOf<NtriverIsoEntry>()
-            for (tblMatch in tableRe.findAll(block)) {
-                val tblBody = tblMatch.groupValues[1]
-                val rows = trRe.findAll(tblBody).toList()
-                if (rows.isEmpty()) continue
-                val headerText = stripHtml(rows.first().groupValues[1]).lowercase(Locale.US)
-                if (headerText.contains("windows version") && headerText.contains("iso links")) continue
-
-                for (rowIdx in rows.indices) {
-                    val cells = cellRe.findAll(rows[rowIdx].groupValues[1]).map { it.groupValues[1] }.toList()
-                    if (cells.size < 2) continue
-                    val col0 = stripHtml(cells[0])
-                    val col1 = stripHtml(cells[1])
-                    if (rowIdx == 0 && (col0.equals("Language", true) || col1.equals("Arch", true))) continue
-                    val detailsHtml = if (cells.size >= 3) cells.drop(2).joinToString(" ") else cells[1]
-                    val detailsText = stripHtml(detailsHtml)
-                    val textFileName = ISO_FILENAME_RE.find(detailsText)?.groupValues?.get(1)?.trim()
-                    val sha = SHA256_RE.find(detailsText)?.groupValues?.get(1)?.lowercase(Locale.US).orEmpty()
-
-                    var directStatic: String? = null
-                    var driveFile: String? = null
-                    var hasGenericDriveLink = false
-                    for (am in anchorRe.findAll(detailsHtml)) {
-                        val href = decodeHtmlEntities(am.groupValues[1]).trim()
-                        val label = stripHtml(am.groupValues[2]).lowercase(Locale.US)
-                        if (href.contains("rg-adguard", true) || label.contains("rg-adguard")) continue
-                        if (directStatic == null && isDirectMicrosoftIsoUrl(href)) {
-                            directStatic = href
-                        }
-                        if (driveFile == null) {
-                            val extracted = extractDriveFilenameFromUrl(href)
-                            if (extracted != null) {
-                                driveFile = extracted
-                            } else if (isNtriverDriveHref(href)) {
-                                hasGenericDriveLink = true
-                            }
-                        }
-                    }
-                    val staticUrlFile = directStatic?.substringBefore('?')?.substringAfterLast('/')
-                        ?.takeIf { it.endsWith(".iso", ignoreCase = true) }
-                    val fileName = textFileName ?: driveFile ?: staticUrlFile ?: continue
-                    if (driveFile == null && hasGenericDriveLink) driveFile = fileName
-                    val archHint = if (cells.size >= 3) col1 else WindowsCustomizationEngine.detectProcessorArchitecture(fileName)
-                    if (isExcludedSectionOrEntry(cleanTitle, archHint, fileName)) continue
-                    if (directStatic == null && driveFile == null) continue
-
-                    entries.add(
-                        NtriverIsoEntry(
-                            language = col0.ifBlank { "English" },
-                            arch = normalizeArch(archHint),
-                            fileName = fileName,
-                            sha256 = sha,
-                            directStaticUrl = directStatic,
-                            ntriverDriveFilename = driveFile
-                        )
-                    )
-                }
-            }
+            val parentForHeading = if (h.level > 2) activeH2Clean else ""
+            val combinedTitleForFilter = if (parentForHeading.isNotBlank() && !cleanTitle.contains(parentForHeading, true)) {
+                "$parentForHeading - $cleanTitle"
+            } else cleanTitle
+            val entries = parseHtmlTablesFromBlock(block, combinedTitleForFilter)
 
             if (entries.isNotEmpty()) {
+                val (majorVersion, editionLabel) = deriveVersionAndEdition(parentForHeading, cleanTitle, pagePrefix)
+                val fullTitle = if (pagePrefix.isNotBlank() && !combinedTitleForFilter.contains(pagePrefix, true)) {
+                    "$pagePrefix · $combinedTitleForFilter"
+                } else combinedTitleForFilter
+                val recRaw = if (h.level > 2) "$activeH2Raw $rawHeadingText" else rawHeadingText
                 sections.add(
                     NtriverReleaseSection(
-                        id = "${pagePrefix}_${cleanTitle}_${sections.size}",
-                        title = if (pagePrefix.isNotBlank() && !cleanTitle.contains(pagePrefix, true)) "$pagePrefix · $cleanTitle" else cleanTitle,
-                        shortChipLabel = buildShortChipLabel(cleanTitle, pagePrefix),
+                        id = "${pagePrefix}_${majorVersion}_${editionLabel}_${sections.size}",
+                        title = fullTitle,
+                        shortChipLabel = buildShortChipLabel(combinedTitleForFilter, pagePrefix),
+                        majorVersion = majorVersion,
+                        editionLabel = editionLabel,
                         buildBadge = buildBadge,
                         note = note,
-                        isRecommended = isRecommendedSection(rawHeadingText, cleanTitle),
+                        isRecommended = isRecommendedSection(recRaw, combinedTitleForFilter),
                         entries = disambiguateEntries(entries)
                     )
                 )
@@ -556,65 +810,101 @@ object NtriverCatalog {
     }
 
     /**
-     * Pure-JVM fallback parser for raw GitHub Markdown pages from `ntriver-org/ntriver-org-site`.
+     * Pure-JVM fallback parser for raw GitHub Markdown / MDX pages from `ntriver-org/ntriver-org-site`.
+     * Supports H2 -> H3 hierarchy, pipe tables, AND inline HTML `<table>` blocks inside MDX docs.
      */
     fun parseMarkdownCatalogPage(markdown: String, pagePrefix: String = ""): List<NtriverReleaseSection> {
         val lines = markdown.replace("\r\n", "\n").split('\n')
         val sections = mutableListOf<NtriverReleaseSection>()
-        val mdLinkRe = Regex("""\[([^\]]+)]\((https?://[^)\s]+)\)""")
 
+        var activeH2Raw = ""
+        var activeH2Clean = ""
+        var activeH2Excluded = false
+        var curLevel = 2
         var curRawHeading = ""
         var curTitle = ""
         val curIntro = StringBuilder()
+        val curRawBody = StringBuilder()
         val curEntries = mutableListOf<NtriverIsoEntry>()
         var skipCurrentSection = true
 
         fun flushSection() {
-            if (!skipCurrentSection && curTitle.isNotBlank() && curEntries.isNotEmpty()) {
-                val (buildBadge, note) = extractMetaFromIntro(curIntro.toString())
-                sections.add(
-                    NtriverReleaseSection(
-                        id = "${pagePrefix}_${curTitle}_${sections.size}",
-                        title = if (pagePrefix.isNotBlank() && !curTitle.contains(pagePrefix, true)) "$pagePrefix · $curTitle" else curTitle,
-                        shortChipLabel = buildShortChipLabel(curTitle, pagePrefix),
-                        buildBadge = buildBadge,
-                        note = note,
-                        isRecommended = isRecommendedSection(curRawHeading, curTitle),
-                        entries = disambiguateEntries(curEntries.toList())
+            if (!skipCurrentSection && curTitle.isNotBlank()) {
+                val parentForHeading = if (curLevel > 2) activeH2Clean else ""
+                val combinedTitle = if (parentForHeading.isNotBlank() && !curTitle.contains(parentForHeading, true)) {
+                    "$parentForHeading - $curTitle"
+                } else curTitle
+                // Also support MDX files that render inline HTML <table> blocks!
+                val rawBodyStr = curRawBody.toString()
+                if (rawBodyStr.contains("<table", ignoreCase = true)) {
+                    curEntries.addAll(parseHtmlTablesFromBlock(rawBodyStr, combinedTitle))
+                }
+                if (curEntries.isNotEmpty()) {
+                    val (buildBadge, note) = extractMetaFromIntro(curIntro.toString())
+                    val (majorVersion, editionLabel) = deriveVersionAndEdition(parentForHeading, curTitle, pagePrefix)
+                    val fullTitle = if (pagePrefix.isNotBlank() && !combinedTitle.contains(pagePrefix, true)) {
+                        "$pagePrefix · $combinedTitle"
+                    } else combinedTitle
+                    val recRaw = if (curLevel > 2) "$activeH2Raw $curRawHeading" else curRawHeading
+                    sections.add(
+                        NtriverReleaseSection(
+                            id = "${pagePrefix}_${majorVersion}_${editionLabel}_${sections.size}",
+                            title = fullTitle,
+                            shortChipLabel = buildShortChipLabel(combinedTitle, pagePrefix),
+                            majorVersion = majorVersion,
+                            editionLabel = editionLabel,
+                            buildBadge = buildBadge,
+                            note = note,
+                            isRecommended = isRecommendedSection(recRaw, combinedTitle),
+                            entries = disambiguateEntries(curEntries.toList())
+                        )
                     )
-                )
+                }
             }
             curIntro.setLength(0)
+            curRawBody.setLength(0)
             curEntries.clear()
         }
 
+        val headingLineRe = Regex("""^(#{2,4})\s+(.+)$""")
+        val sepRe = Regex("""^:?-{3,}:?$""")
+        val splitPipeRe = Regex("""(?<!\\)\|""")
+
         for (rawLine in lines) {
             val line = rawLine.trim()
-            val hMatch = Regex("""^#{2,4}\s+(.+)$""").find(line)
+            val hMatch = headingLineRe.find(line)
             if (hMatch != null) {
                 flushSection()
-                curRawHeading = hMatch.groupValues[1].trim()
+                curLevel = hMatch.groupValues[1].length
+                curRawHeading = hMatch.groupValues[2].trim()
                 curTitle = cleanSectionTitle(curRawHeading)
                 val low = curTitle.lowercase(Locale.US)
-                skipCurrentSection = curTitle.isBlank() ||
+                val isMeta = curTitle.isBlank() ||
                     low == "index" || low == "misc" || low == "missing files" || low == "overview" ||
-                    isExcludedSectionOrEntry(curTitle)
+                    low == "installation keys" || low == "to do"
+                if (curLevel == 2) {
+                    activeH2Raw = curRawHeading
+                    activeH2Clean = curTitle
+                    activeH2Excluded = isMeta || isExcludedSectionOrEntry(curTitle)
+                }
+                skipCurrentSection = isMeta || isExcludedSectionOrEntry(curTitle) || (curLevel > 2 && activeH2Excluded)
                 continue
             }
             if (skipCurrentSection) continue
 
             if (!line.startsWith("|")) {
-                if (curEntries.isEmpty() && line.isNotBlank()) {
+                curRawBody.append(rawLine).append('\n')
+                if (curEntries.isEmpty() && line.isNotBlank() && !line.startsWith("<")) {
                     curIntro.append(line.removePrefix("*").removePrefix("-").trim()).append('\n')
                 }
                 continue
             }
 
             val cols = line.trim('|')
-                .split(Regex("""(?<!\\)\|"""))
+                .split(splitPipeRe)
                 .map { it.replace("\\|", "|").trim() }
             if (cols.size < 2) continue
-            if (Regex("""^:?-{3,}:?$""").matches(cols[0]) ||
+            if (sepRe.matches(cols[0]) ||
                 cols[0].equals("Language", true) ||
                 cols[0].equals("Windows Version", true) ||
                 cols[1].equals("Arch", true)
@@ -628,7 +918,7 @@ object NtriverCatalog {
             var directStatic: String? = null
             var driveFile: String? = null
             var hasGenericDriveLink = false
-            for (lm in mdLinkRe.findAll(detailsRaw)) {
+            for (lm in MD_LINK_RE.findAll(detailsRaw)) {
                 val lbl = lm.groupValues[1].lowercase(Locale.US)
                 val href = lm.groupValues[2].trim()
                 if (href.contains("rg-adguard", true) || lbl.contains("rg-adguard")) continue
@@ -644,11 +934,9 @@ object NtriverCatalog {
                     }
                 }
             }
-            // Also scan inline HTML <a> inside MDX tables unconditionally so mixed Markdown+HTML rows find MS Static links
-            val aRe = Regex("""<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)</a>""", RegexOption.IGNORE_CASE)
-            for (am in aRe.findAll(detailsRaw)) {
-                val href = decodeHtmlEntities(am.groupValues[1]).trim()
-                val lbl = stripHtml(am.groupValues[2]).lowercase(Locale.US)
+            for ((rawHref, rawLbl) in findAnchorsLinear(detailsRaw)) {
+                val href = decodeHtmlEntities(rawHref).trim()
+                val lbl = stripHtml(rawLbl).lowercase(Locale.US)
                 if (href.contains("rg-adguard", true) || lbl.contains("rg-adguard")) continue
                 if (directStatic == null && isDirectMicrosoftIsoUrl(href)) directStatic = href
                 if (driveFile == null) {
@@ -665,7 +953,8 @@ object NtriverCatalog {
             val fileName = textFileName ?: driveFile ?: staticUrlFile ?: continue
             if (driveFile == null && hasGenericDriveLink) driveFile = fileName
             val archRaw = if (cols.size >= 3) stripHtml(cols[1]) else WindowsCustomizationEngine.detectProcessorArchitecture(fileName)
-            if (isExcludedSectionOrEntry(curTitle, archRaw, fileName)) continue
+            val parentTitle = if (curLevel > 2) "$activeH2Clean $curTitle" else curTitle
+            if (isExcludedSectionOrEntry(parentTitle, archRaw, fileName)) continue
             if (directStatic == null && driveFile == null) continue
 
             curEntries.add(
@@ -743,23 +1032,50 @@ object NtriverCatalog {
         }
     }
 
+    /**
+     * Maps GitHub repository tree paths to OS keys, strictly skipping `i18n/` and `-esd` files
+     * and prioritizing exact canonical basenames (`download-windows-11.md`/`.mdx`, etc.) over partial matches.
+     */
     internal fun mapGithubTreePaths(paths: List<String>): Map<String, String> {
-        val mapped = LinkedHashMap<String, String>()
+        val exact = LinkedHashMap<String, String>()
+        val fallback = LinkedHashMap<String, String>()
         for (path in paths) {
             if (!path.endsWith(".md", true) && !path.endsWith(".mdx", true)) continue
             val low = path.lowercase(Locale.US)
+            if (low.startsWith("i18n/") || low.contains("/i18n/") ||
+                low.contains("-esd") || low.contains("_esd") || low.contains("/esd") ||
+                low.contains("office") || low.contains("readme")
+            ) continue
+            val base = low.substringAfterLast('/').removeSuffix(".mdx").removeSuffix(".md")
             when {
-                low.contains("ltsc") -> mapped.putIfAbsent("ltsc", path)
-                (low.contains("windows-11") || low.contains("windows_11")) && !low.contains("ltsc") -> mapped.putIfAbsent("win11", path)
-                (low.contains("windows-10") || low.contains("windows_10")) && !low.contains("ltsc") && !low.contains("cmge") -> mapped.putIfAbsent("win10", path)
-                low.contains("windows-8.1") || low.contains("windows_8.1") || low.contains("windows-8-1") -> mapped.putIfAbsent("win81", path)
-                (low.contains("windows-7") || low.contains("windows_7")) && !low.contains("embedded") -> mapped.putIfAbsent("win7", path)
-                low.contains("server-2025") || low.contains("server_2025") -> mapped.putIfAbsent("server2025", path)
-                low.contains("server-2022") || low.contains("server_2022") -> mapped.putIfAbsent("server2022", path)
-                low.contains("server-2019") || low.contains("server_2019") -> mapped.putIfAbsent("server2019", path)
+                base == "download-windows-11" || base == "windows-11" -> exact["win11"] = path
+                (base.contains("windows-11") || base.contains("windows_11")) && !base.contains("ltsc") && !base.contains("arm") -> fallback.putIfAbsent("win11", path)
+
+                base == "download-windows-10" || base == "windows-10" -> exact["win10"] = path
+                (base.contains("windows-10") || base.contains("windows_10")) && !base.contains("ltsc") && !base.contains("cmge") && !base.contains("arm") -> fallback.putIfAbsent("win10", path)
+
+                base == "download-windows-ltsc" || base == "windows-ltsc" -> exact["ltsc"] = path
+                base.contains("ltsc") -> fallback.putIfAbsent("ltsc", path)
+
+                base == "download-windows-8.1" || base == "download-windows-8-1" || base == "windows-8.1" -> exact["win81"] = path
+                base.contains("windows-8.1") || base.contains("windows_8.1") || base.contains("windows-8-1") -> fallback.putIfAbsent("win81", path)
+
+                base == "download-windows-7" || base == "windows-7" -> exact["win7"] = path
+                (base.contains("windows-7") || base.contains("windows_7")) && !base.contains("embedded") -> fallback.putIfAbsent("win7", path)
+
+                base == "download-windows-server-2025" || base == "windows-server-2025" -> exact["server2025"] = path
+                base.contains("server-2025") || base.contains("server_2025") -> fallback.putIfAbsent("server2025", path)
+
+                base == "download-windows-server-2022" || base == "windows-server-2022" -> exact["server2022"] = path
+                base.contains("server-2022") || base.contains("server_2022") -> fallback.putIfAbsent("server2022", path)
+
+                base == "download-windows-server-2019" || base == "windows-server-2019" -> exact["server2019"] = path
+                base.contains("server-2019") || base.contains("server_2019") -> fallback.putIfAbsent("server2019", path)
             }
         }
-        return mapped
+        val merged = LinkedHashMap<String, String>(fallback)
+        merged.putAll(exact)
+        return merged
     }
 
     private fun ensureGithubTreeLoaded(forceRefresh: Boolean) {
@@ -796,15 +1112,22 @@ object NtriverCatalog {
         }.getOrDefault(emptyList())
         if (htmlSections.isNotEmpty()) return htmlSections
 
-        // Fallback: dynamically locate Markdown file in ntriver-org/ntriver-org-site via GitHub tree API (+ static backup if GitHub API is rate-limited)
+        // Fallback: dynamically locate Markdown/MDX file in ntriver-org/ntriver-org-site via GitHub tree API (+ static .md/.mdx backups)
         ensureGithubTreeLoaded(forceRefresh)
-        val mdPath = githubTreeCache[key] ?: FALLBACK_MD_PATHS[key] ?: return emptyList()
-        return runCatching {
-            val (code, md) = httpGet("$GITHUB_RAW_BASE${mdPath.trimStart('/')}")
-            if (code in 200..299 && md.isNotBlank()) {
-                parseMarkdownCatalogPage(md, pagePrefix = pagePrefix)
-            } else emptyList()
-        }.getOrDefault(emptyList())
+        val candidatePaths = buildList {
+            githubTreeCache[key]?.let { add(it) }
+            FALLBACK_MD_PATHS[key]?.forEach { p -> if (p !in this) add(p) }
+        }
+        for (mdPath in candidatePaths) {
+            val mdSections = runCatching {
+                val (code, md) = httpGet("$GITHUB_RAW_BASE${mdPath.trimStart('/')}")
+                if (code in 200..299 && md.isNotBlank()) {
+                    parseMarkdownCatalogPage(md, pagePrefix = pagePrefix)
+                } else emptyList()
+            }.getOrDefault(emptyList())
+            if (mdSections.isNotEmpty()) return mdSections
+        }
+        return emptyList()
     }
 
     suspend fun fetchSections(

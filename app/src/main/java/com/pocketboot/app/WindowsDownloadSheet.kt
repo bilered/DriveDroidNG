@@ -94,6 +94,7 @@ fun WindowsDownloadSheet(
     var ntLoading by remember(family.id) { mutableStateOf(false) }
     var ntSections by remember(family.id) { mutableStateOf<List<NtriverReleaseSection>>(emptyList()) }
     var ntShowAllEditions by remember(family.id) { mutableStateOf(false) }
+    var selectedNtMajorVersion by remember(family.id) { mutableStateOf("") }
     var selectedNtSection by remember(family.id) { mutableStateOf<NtriverReleaseSection?>(null) }
     var selectedNtArch by remember(family.id) { mutableStateOf("x64") }
     var selectedNtFileName by remember(family.id) { mutableStateOf("") }
@@ -122,11 +123,18 @@ fun WindowsDownloadSheet(
     var langMenuOpen by remember { mutableStateOf(false) }
     var langSearch by remember { mutableStateOf("") }
 
-    val visibleNtSections: List<NtriverReleaseSection> = remember(ntSections, ntShowAllEditions) {
-        if (ntShowAllEditions) ntSections
-        else ntSections.filter { it.isRecommended }.ifEmpty { ntSections }
+    val ntMajorVersions: List<String> = remember(ntSections) {
+        ntSections.map { it.effectiveMajorVersion }.distinct()
     }
-    val hiddenNicheCount = (ntSections.size - ntSections.count { it.isRecommended }).coerceAtLeast(0)
+    val sectionsInSelectedMajor: List<NtriverReleaseSection> = remember(ntSections, selectedNtMajorVersion) {
+        if (selectedNtMajorVersion.isBlank()) ntSections
+        else ntSections.filter { it.effectiveMajorVersion.equals(selectedNtMajorVersion, ignoreCase = true) }.ifEmpty { ntSections }
+    }
+    val visibleNtSections: List<NtriverReleaseSection> = remember(sectionsInSelectedMajor, ntShowAllEditions) {
+        if (ntShowAllEditions) sectionsInSelectedMajor
+        else sectionsInSelectedMajor.filter { it.isRecommended }.ifEmpty { sectionsInSelectedMajor }
+    }
+    val hiddenNicheCount = (sectionsInSelectedMajor.size - sectionsInSelectedMajor.count { it.isRecommended }).coerceAtLeast(0)
 
     val ntArchesForSection: List<String> = remember(selectedNtSection) {
         selectedNtSection?.distinctArches.orEmpty()
@@ -145,10 +153,12 @@ fun WindowsDownloadSheet(
         ntEntriesForArch.firstOrNull { it.fileName.equals(selectedNtFileName, ignoreCase = true) }
             ?: pickDefaultNtEntry(ntEntriesForArch)
     }
-    val fullLangFallbackSection: NtriverReleaseSection? = remember(selectedNtSection, visibleNtSections) {
+    val fullLangFallbackSection: NtriverReleaseSection? = remember(selectedNtSection, visibleNtSections, ntSections) {
         val cur = selectedNtSection ?: return@remember null
         if (cur.distinctLanguages.size >= 5) return@remember null
         visibleNtSections.firstOrNull { it.id != cur.id && it.distinctLanguages.size >= 5 }
+            ?: ntSections.firstOrNull { it.id != cur.id && it.isRecommended && it.distinctLanguages.size >= 5 }
+            ?: ntSections.firstOrNull { it.id != cur.id && it.distinctLanguages.size >= 5 }
     }
 
     val activeDirectRelease: DirectWindowsRelease? = remember(selectedDirectGroup, directWantArm64) {
@@ -158,6 +168,9 @@ fun WindowsDownloadSheet(
 
     fun selectNtSectionAndDefaults(sec: NtriverReleaseSection?) {
         selectedNtSection = sec
+        if (sec != null) {
+            selectedNtMajorVersion = sec.effectiveMajorVersion
+        }
         ntError = null
         ntResolveGen++
         ntResolving = false
@@ -180,10 +193,14 @@ fun WindowsDownloadSheet(
         val res = NtriverCatalog.fetchSections(family, forceRefresh = ntRetryNonce > 0)
         if (res.data != null) {
             ntSections = res.data
-            val initialList = if (ntShowAllEditions) res.data else res.data.filter { it.isRecommended }.ifEmpty { res.data }
-            selectNtSectionAndDefaults(initialList.firstOrNull())
+            val firstMajor = res.data.firstOrNull()?.effectiveMajorVersion.orEmpty()
+            selectedNtMajorVersion = firstMajor
+            val inFirstMajor = res.data.filter { it.effectiveMajorVersion.equals(firstMajor, true) }.ifEmpty { res.data }
+            val initialSec = if (ntShowAllEditions) inFirstMajor.firstOrNull() else inFirstMajor.firstOrNull { it.isRecommended } ?: inFirstMajor.firstOrNull()
+            selectNtSectionAndDefaults(initialSec)
         } else {
             ntSections = emptyList()
+            selectedNtMajorVersion = ""
             selectNtSectionAndDefaults(null)
             ntError = res.errorMessage
         }
@@ -362,22 +379,24 @@ fun WindowsDownloadSheet(
                         }
                     }
                 } else {
-                    if (visibleNtSections.isNotEmpty()) {
+                    // Level 1: Main Version chips (e.g., 26H2, 25H2, 24H2 / Update 3, Update 1 / Server 2025, 2022, 2019)
+                    if (ntMajorVersions.size > 1) {
                         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            PocketSectionHeader(
-                                title = "Release / Edition",
-                                trailing = if (hiddenNicheCount > 0) {
-                                    if (ntShowAllEditions) "Showing all (${ntSections.size})" else "${visibleNtSections.size} recommended"
-                                } else "${visibleNtSections.size} available"
-                            )
+                            PocketSectionHeader("Main Version", trailing = "${ntMajorVersions.size} releases")
                             Row(
                                 modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                                 horizontalArrangement = Arrangement.spacedBy(7.dp)
                             ) {
-                                visibleNtSections.forEachIndexed { idx, sec ->
-                                    val isSel = sec.id == selectedNtSection?.id
+                                ntMajorVersions.forEachIndexed { idx, ver ->
+                                    val isSel = ver.equals(selectedNtMajorVersion, ignoreCase = true)
                                     Surface(
-                                        modifier = Modifier.bounceClick { selectNtSectionAndDefaults(sec) },
+                                        modifier = Modifier.bounceClick {
+                                            selectedNtMajorVersion = ver
+                                            ntShowAllEditions = false
+                                            val inVer = ntSections.filter { it.effectiveMajorVersion.equals(ver, true) }
+                                            val pick = inVer.firstOrNull { it.isRecommended } ?: inVer.firstOrNull()
+                                            selectNtSectionAndDefaults(pick)
+                                        },
                                         shape = RoundedCornerShape(10.dp),
                                         color = if (isSel) PocketColors.accentBg else PocketColors.surfaceInput,
                                         border = BorderStroke(if (isSel) 1.dp else 0.5.dp, if (isSel) PocketColors.accent else PocketColors.border)
@@ -388,12 +407,55 @@ fun WindowsDownloadSheet(
                                             horizontalArrangement = Arrangement.spacedBy(5.dp)
                                         ) {
                                             Text(
-                                                text = sec.shortChipLabel,
+                                                text = ver,
                                                 style = MaterialTheme.typography.labelMedium,
                                                 fontWeight = if (isSel) FontWeight.SemiBold else FontWeight.Medium,
                                                 color = if (isSel) PocketColors.accentSoft else PocketColors.textSecondary
                                             )
                                             if (idx == 0) {
+                                                Text("Latest", fontSize = 9.5.sp, fontWeight = FontWeight.SemiBold, color = PocketColors.success)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Level 2: Sub-Category / Edition chips belonging ONLY to the chosen Main Version
+                    if (visibleNtSections.isNotEmpty() && (visibleNtSections.size > 1 || hiddenNicheCount > 0 || ntMajorVersions.size <= 1)) {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            PocketSectionHeader(
+                                title = if (ntMajorVersions.size > 1) "Edition · $selectedNtMajorVersion" else "Release / Edition",
+                                trailing = if (hiddenNicheCount > 0) {
+                                    if (ntShowAllEditions) "All (${sectionsInSelectedMajor.size})" else "${visibleNtSections.size} recommended"
+                                } else "${visibleNtSections.size} available"
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(7.dp)
+                            ) {
+                                visibleNtSections.forEachIndexed { idx, sec ->
+                                    val isSel = sec.id == selectedNtSection?.id
+                                    val chipText = if (ntMajorVersions.size > 1) sec.effectiveEditionLabel else sec.shortChipLabel
+                                    Surface(
+                                        modifier = Modifier.bounceClick { selectNtSectionAndDefaults(sec) },
+                                        shape = RoundedCornerShape(10.dp),
+                                        color = if (isSel) PocketColors.infoBlueBg else PocketColors.surfaceInput,
+                                        border = BorderStroke(if (isSel) 1.dp else 0.5.dp, if (isSel) PocketColors.infoBlue else PocketColors.border)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                        ) {
+                                            Text(
+                                                text = chipText,
+                                                style = MaterialTheme.typography.labelMedium,
+                                                fontWeight = if (isSel) FontWeight.SemiBold else FontWeight.Medium,
+                                                color = if (isSel) PocketColors.infoBlue else PocketColors.textSecondary
+                                            )
+                                            if (idx == 0 && ntMajorVersions.size <= 1) {
                                                 Text("Latest", fontSize = 9.5.sp, fontWeight = FontWeight.SemiBold, color = PocketColors.success)
                                             }
                                         }
@@ -407,8 +469,8 @@ fun WindowsDownloadSheet(
                                         border = BorderStroke(0.5.dp, PocketColors.border)
                                     ) {
                                         Text(
-                                            text = if (ntShowAllEditions) "Recommended Only" else "+$hiddenNicheCount More Editions",
-                                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp),
+                                            text = if (ntShowAllEditions) "Recommended Only" else "+$hiddenNicheCount More",
+                                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp),
                                             style = MaterialTheme.typography.labelSmall,
                                             color = PocketColors.textSecondary
                                         )

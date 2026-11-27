@@ -36,7 +36,8 @@ enum class WindowsCatalogFamily(
     val sizeHint: String,
     val supportsMicrosoftCdn: Boolean,
     val ntriverKey: String,
-    val searchTags: String = ""
+    val searchTags: String = "",
+    val isPrimaryFamily: Boolean = false
 ) {
     WIN11(
         id = "win11",
@@ -46,7 +47,8 @@ enum class WindowsCatalogFamily(
         sizeHint = "~5.5–8.5 GB",
         supportsMicrosoftCdn = true,
         ntriverKey = "win11",
-        searchTags = "win11 26h2 25h2 24h2 consumer business arm64"
+        searchTags = "win11 26h2 25h2 24h2 consumer business arm64",
+        isPrimaryFamily = true
     ),
     WIN10(
         id = "win10",
@@ -56,7 +58,8 @@ enum class WindowsCatalogFamily(
         sizeHint = "~4.8–6.0 GB",
         supportsMicrosoftCdn = true,
         ntriverKey = "win10",
-        searchTags = "win10 22h2 consumer business x86 x64"
+        searchTags = "win10 22h2 consumer business x86 x64",
+        isPrimaryFamily = true
     ),
     WIN_LTSC(
         id = "win_ltsc",
@@ -66,7 +69,8 @@ enum class WindowsCatalogFamily(
         sizeHint = "~4.2–5.6 GB",
         supportsMicrosoftCdn = false,
         ntriverKey = "ltsc",
-        searchTags = "ltsc iot enterprise 2024 2021 2019 win11 win10"
+        searchTags = "ltsc iot enterprise 2024 2021 2019 win11 win10",
+        isPrimaryFamily = false
     ),
     WIN81(
         id = "win81",
@@ -76,7 +80,8 @@ enum class WindowsCatalogFamily(
         sizeHint = "~3.6–4.3 GB",
         supportsMicrosoftCdn = true,
         ntriverKey = "win81",
-        searchTags = "win8.1 win81 8.1 update 3"
+        searchTags = "win8.1 win81 8.1 update 3",
+        isPrimaryFamily = false
     ),
     WIN7(
         id = "win7",
@@ -86,7 +91,8 @@ enum class WindowsCatalogFamily(
         sizeHint = "~2.4–3.2 GB",
         supportsMicrosoftCdn = false,
         ntriverKey = "win7",
-        searchTags = "win7 win 7 sp1 ultimate professional"
+        searchTags = "win7 win 7 sp1 ultimate professional",
+        isPrimaryFamily = false
     ),
     WIN_SERVER(
         id = "win_server",
@@ -96,7 +102,8 @@ enum class WindowsCatalogFamily(
         sizeHint = "~4.5–6.2 GB",
         supportsMicrosoftCdn = false,
         ntriverKey = "server",
-        searchTags = "server 2025 2022 2019 datacenter standard"
+        searchTags = "server 2025 2022 2019 datacenter standard",
+        isPrimaryFamily = false
     )
 }
 

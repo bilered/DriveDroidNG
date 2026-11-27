@@ -317,5 +317,79 @@ class Wave6NtriverTest {
         assertTrue(FastIsoDownloader.isUnexpectedSmallErrorPayload("application/xml", 512L))
         assertFalse(FastIsoDownloader.isUnexpectedSmallErrorPayload("application/octet-stream", 512L))
         assertFalse(FastIsoDownloader.isUnexpectedSmallErrorPayload("application/json", 5_000_000_000L))
+
+        // 6) Root-cause fix: GitHub tree MUST skip `-esd` and `i18n/` files that sort alphabetically before canonical Win 11/10/8.1 docs!
+        val esdPoisonedTree = listOf(
+            "i18n/zh/docusaurus-plugin-content-docs/current/download-windows-11.md",
+            "docs/download-windows-10-1507-esd.md",
+            "docs/download-windows-10.md",
+            "docs/download-windows-11-21h2-esd.md",
+            "docs/download-windows-11-26h2-esd.md",
+            "docs/download-windows-11.md",
+            "docs/download-windows-8.1-esd.md",
+            "docs/download-windows-8.1.md"
+        )
+        val cleanMapped = NtriverCatalog.mapGithubTreePaths(esdPoisonedTree)
+        assertEquals("docs/download-windows-11.md", cleanMapped["win11"])
+        assertEquals("docs/download-windows-10.md", cleanMapped["win10"])
+        assertEquals("docs/download-windows-8.1.md", cleanMapped["win81"])
+
+        // 7) Parent H2 -> Child H3 hierarchy + 2-level majorVersion / editionLabel grouping (Win 11 26H2 / 25H2)
+        val nestedWin11Html = """
+            <article>
+              <h2>Windows 11 26H2</h2>
+              <h3>Consumer (November 2026) ❤️</h3>
+              <p>Build: [26300.9974]</p>
+              <table>
+                <tr><th>Language</th><th>Arch</th><th>File Details</th></tr>
+                <tr><td>English</td><td>ARM64</td><td>en-us_windows_11_consumer_editions_version_26h2_updated_nov_2026_arm64_dvd_699230be.iso <a href="https://ntriver.org/drive?en-us_windows_11_consumer_editions_version_26h2_updated_nov_2026_arm64_dvd_699230be.iso">NTriver</a></td></tr>
+              </table>
+              <h2>Windows 11 25H2</h2>
+              <h3>Business (November 2026)</h3>
+              <table>
+                <tr><th>Language</th><th>Arch</th><th>File Details</th></tr>
+                <tr><td>English</td><td>x64</td><td>en-us_windows_11_business_editions_version_25h2_updated_nov_2026_x64_dvd_11111111.iso <a href="https://ntriver.org/drive?en-us_windows_11_business_editions_version_25h2_updated_nov_2026_x64_dvd_11111111.iso">NTriver</a></td></tr>
+              </table>
+            </article>
+        """.trimIndent()
+        val win11Secs = NtriverCatalog.parseHtmlCatalogPage(nestedWin11Html)
+        assertEquals(2, win11Secs.size)
+        assertEquals("26H2", win11Secs[0].effectiveMajorVersion)
+        assertEquals("Consumer (November 2026)", win11Secs[0].effectiveEditionLabel)
+        assertEquals("25H2", win11Secs[1].effectiveMajorVersion)
+        assertEquals("Business (November 2026)", win11Secs[1].effectiveEditionLabel)
+
+        // 8) MDX with inline HTML <table> + Large 1MB HTML stress test (proves zero regex StackOverflowError!)
+        val mdxWithHtmlTable = """
+            ## Windows 10 22H2
+            ### Consumer ❤️
+            <table>
+              <tr><th>Language</th><th>Arch</th><th>File Details</th></tr>
+              <tr><td>English</td><td>x64</td><td>Win10_22H2_English_x64.iso <a href="https://ntriver.org/drive?Win10_22H2_English_x64.iso">NTriver</a></td></tr>
+            </table>
+        """.trimIndent()
+        val mdxSecs = NtriverCatalog.parseMarkdownCatalogPage(mdxWithHtmlTable)
+        assertEquals(1, mdxSecs.size)
+        assertEquals("22H2", mdxSecs[0].effectiveMajorVersion)
+        assertEquals("Consumer", mdxSecs[0].effectiveEditionLabel)
+
+        val hugeHtml = buildString(1_100_000) {
+            append("<html><body><article><h2>Windows 11 25H2</h2><h3>Consumer ❤️</h3><table><tr><th>Language</th><th>Arch</th><th>File Details</th></tr>")
+            repeat(2500) { idx ->
+                append("<tr><td>Lang$idx</td><td>x64</td><td>win11_lang_$idx.iso SHA-256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa <a href=\"https://ntriver.org/drive?win11_lang_$idx.iso\">NTriver</a></td></tr>")
+            }
+            append("</table></article></body></html>")
+        }
+        val hugeSecs = NtriverCatalog.parseHtmlCatalogPage(hugeHtml)
+        assertEquals(1, hugeSecs.size)
+        assertEquals(2500, hugeSecs[0].entries.size)
+
+        // 9) Primary vs Sub-Category WindowsCatalogFamily declutter check
+        assertTrue(WindowsCatalogFamily.WIN11.isPrimaryFamily)
+        assertTrue(WindowsCatalogFamily.WIN10.isPrimaryFamily)
+        assertFalse(WindowsCatalogFamily.WIN_LTSC.isPrimaryFamily)
+        assertFalse(WindowsCatalogFamily.WIN81.isPrimaryFamily)
+        assertFalse(WindowsCatalogFamily.WIN7.isPrimaryFamily)
+        assertFalse(WindowsCatalogFamily.WIN_SERVER.isPrimaryFamily)
     }
 }

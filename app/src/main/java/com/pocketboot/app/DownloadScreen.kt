@@ -69,6 +69,7 @@ import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material.icons.rounded.VerifiedUser
 import androidx.compose.material.icons.rounded.WarningAmber
 import androidx.compose.material.icons.rounded.Window
+import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -648,6 +649,7 @@ fun DownloadScreen(
     var showAddFolderDialog by remember { mutableStateOf(false) }
 
     var selectedWindowsFamily by remember { mutableStateOf<WindowsCatalogFamily?>(null) }
+    var showOtherWindowsVersions by remember { mutableStateOf(false) }
     var selectedDistroForVersion by remember { mutableStateOf<CuratedIso?>(null) }
     var longPressedDistro by remember { mutableStateOf<CuratedIso?>(null) }
     var longPressedWindows by remember { mutableStateOf<WindowsCatalogFamily?>(null) }
@@ -1507,12 +1509,82 @@ fun DownloadScreen(
                                     tint = PocketColors.infoBlue,
                                     bg = PocketColors.infoBlueBg
                                 )
-                                matchedWinFamilies.forEach { fam ->
+                                val primaryWin = matchedWinFamilies.filter { it.isPrimaryFamily }
+                                val secondaryWin = matchedWinFamilies.filterNot { it.isPrimaryFamily }
+                                primaryWin.forEach { fam ->
                                     WindowsFamilyCard(
                                         fam = fam,
                                         onClick = { selectedWindowsFamily = fam },
                                         onLongClick = { longPressedWindows = fam }
                                     )
+                                }
+                                if (secondaryWin.isNotEmpty()) {
+                                    val expandedOther = showOtherWindowsVersions || q.isNotEmpty()
+                                    Surface(
+                                        modifier = Modifier.fillMaxWidth().bounceClick { showOtherWindowsVersions = !showOtherWindowsVersions },
+                                        shape = RoundedCornerShape(13.dp),
+                                        color = PocketColors.surfaceInput,
+                                        border = BorderStroke(0.75.dp, if (expandedOther) PocketColors.infoBlue.copy(alpha = 0.6f) else PocketColors.border)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 10.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                        ) {
+                                            Box(
+                                                modifier = Modifier.size(34.dp).clip(RoundedCornerShape(9.dp)).background(PocketColors.infoBlueBg),
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                Icon(Icons.Rounded.Window, null, tint = PocketColors.infoBlue, modifier = Modifier.size(18.dp))
+                                            }
+                                            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                                                Text(
+                                                    "Other Windows Versions",
+                                                    style = MaterialTheme.typography.labelLarge,
+                                                    color = PocketColors.textPrimary
+                                                )
+                                                Text(
+                                                    secondaryWin.joinToString(" · ") { it.title.removePrefix("Windows ") },
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = PocketColors.textSecondary,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                            }
+                                            Surface(shape = RoundedCornerShape(6.dp), color = PocketColors.infoBlueBg) {
+                                                Text(
+                                                    "${secondaryWin.size}",
+                                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = PocketColors.infoBlue
+                                                )
+                                            }
+                                            Icon(
+                                                imageVector = if (expandedOther) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
+                                                contentDescription = null,
+                                                tint = PocketColors.textSecondary,
+                                                modifier = Modifier.size(19.dp)
+                                            )
+                                        }
+                                    }
+                                    AnimatedVisibility(
+                                        visible = expandedOther,
+                                        enter = fadeIn(tween(180)) + expandVertically(),
+                                        exit = fadeOut(tween(150)) + shrinkVertically()
+                                    ) {
+                                        Column(
+                                            modifier = Modifier.padding(start = 10.dp),
+                                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            secondaryWin.forEach { fam ->
+                                                WindowsFamilyCard(
+                                                    fam = fam,
+                                                    onClick = { selectedWindowsFamily = fam },
+                                                    onLongClick = { longPressedWindows = fam }
+                                                )
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1548,13 +1620,74 @@ fun DownloadScreen(
                     }
                 }
             } else if (selectedCategory.equals("Windows", true)) {
-                Column(verticalArrangement = Arrangement.spacedBy(9.dp)) {
-                    matchedWinFamilies.forEach { fam ->
+                val primaryWin = matchedWinFamilies.filter { it.isPrimaryFamily }
+                val secondaryWin = matchedWinFamilies.filterNot { it.isPrimaryFamily }
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    primaryWin.forEach { fam ->
                         WindowsFamilyCard(
                             fam = fam,
                             onClick = { selectedWindowsFamily = fam },
                             onLongClick = { longPressedWindows = fam }
                         )
+                    }
+                    if (secondaryWin.isNotEmpty()) {
+                        val expandedOther = showOtherWindowsVersions || q.isNotEmpty()
+                        Surface(
+                            modifier = Modifier.fillMaxWidth().bounceClick { showOtherWindowsVersions = !showOtherWindowsVersions },
+                            shape = RoundedCornerShape(13.dp),
+                            color = PocketColors.surfaceInput,
+                            border = BorderStroke(0.75.dp, if (expandedOther) PocketColors.infoBlue.copy(alpha = 0.6f) else PocketColors.border)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier.size(34.dp).clip(RoundedCornerShape(9.dp)).background(PocketColors.infoBlueBg),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(Icons.Rounded.Window, null, tint = PocketColors.infoBlue, modifier = Modifier.size(18.dp))
+                                }
+                                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                                    Text("Other Windows Versions", style = MaterialTheme.typography.labelLarge, color = PocketColors.textPrimary)
+                                    Text(
+                                        secondaryWin.joinToString(" · ") { it.title.removePrefix("Windows ") },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = PocketColors.textSecondary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                                Surface(shape = RoundedCornerShape(6.dp), color = PocketColors.infoBlueBg) {
+                                    Text("${secondaryWin.size}", modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = PocketColors.infoBlue)
+                                }
+                                Icon(
+                                    imageVector = if (expandedOther) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
+                                    contentDescription = null,
+                                    tint = PocketColors.textSecondary,
+                                    modifier = Modifier.size(19.dp)
+                                )
+                            }
+                        }
+                        AnimatedVisibility(
+                            visible = expandedOther,
+                            enter = fadeIn(tween(180)) + expandVertically(),
+                            exit = fadeOut(tween(150)) + shrinkVertically()
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(start = 10.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                secondaryWin.forEach { fam ->
+                                    WindowsFamilyCard(
+                                        fam = fam,
+                                        onClick = { selectedWindowsFamily = fam },
+                                        onLongClick = { longPressedWindows = fam }
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
             } else {
