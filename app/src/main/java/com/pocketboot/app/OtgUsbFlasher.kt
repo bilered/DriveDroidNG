@@ -1375,11 +1375,11 @@ fun OtgFlasherSheet(
                             onExperienceChange = { winExp = it },
                             onWinUtilChange = { winTweaksCfg = it },
                             onApplyPreset = { p ->
-                                winScheme = if (over2TiB) PartitionScheme.GPT else runCatching { PartitionScheme.valueOf(p.scheme) }.getOrDefault(PartitionScheme.GPT)
-                                winExp = WindowsExperienceConfig(p.bypassRequirements, p.bypassMicrosoftAccount, p.disableDataCollection, p.disableBitLocker, p.qolImprovements, p.disableSponsoredApps, p.skipDomainJoin, p.skipWifiSetup, p.createLocalUser, p.localUsername, "", p.skipOobe, p.useCa2023Bootloaders, p.applySkuSiPolicy)
+                                winScheme = if (over2TiB) PartitionScheme.GPT else runCatching { PartitionScheme.valueOf(p.schemeName) }.getOrDefault(PartitionScheme.GPT)
+                                winExp = WindowsExperienceConfig(p.bypassRequirements, p.bypassMicrosoftAccount, p.disableDataCollection, p.disableBitLocker, p.qolImprovements, p.disableSponsoredApps, false, p.skipWifiSetup, p.createLocalUser, p.localUsername, "", p.skipOobe, p.useCa2023Bootloaders, p.applySkuSiPolicy)
                                 winTweaksCfg = WinUtilTweaksConfig.fromJsonString(p.winUtilJson, legacyClassicContextMenu = p.classicContextMenu)
                             },
-                            onSavePreset = { n -> onSavePreset(AutounattendPreset(n, winScheme.name, winExp.bypassRequirements, winExp.bypassMicrosoftAccount, winExp.disableDataCollection, winExp.disableBitLocker, winExp.disableSponsoredApps, winExp.skipDomainJoin, winExp.skipWifiSetup, winExp.createLocalUser, winExp.localUsername, winExp.skipOobe, winExp.qolImprovements, winExp.useCa2023Bootloaders, winExp.applySkuSiPolicy, winTweaksCfg.toJsonString())) },
+                            onSavePreset = { n -> onSavePreset(AutounattendPreset(n, winScheme.name, winExp.bypassRequirements, winExp.bypassMicrosoftAccount, winExp.disableDataCollection, winExp.disableBitLocker, winExp.disableSponsoredApps, false, winExp.skipWifiSetup, winExp.createLocalUser, winExp.localUsername, winExp.skipOobe, winExp.qolImprovements, winExp.useCa2023Bootloaders, winExp.applySkuSiPolicy, winTweaksCfg.toJsonString())) },
                             onDeletePreset = onDeletePreset,
                             onSaveSystemTweaksPreset = onSaveSystemTweaksPreset,
                             onDeleteSystemTweaksPreset = onDeleteSystemTweaksPreset,
