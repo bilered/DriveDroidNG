@@ -34,7 +34,7 @@ class Wave5OtgRufusTest {
 
         // Verify Backup GPT header points to exact physical last sector (totalSectors - 1)
         val gpt = DiskPartitioner.buildGptBuffers(l, includeUefiPart = true)
-        val backupHdr = ByteBuffer.wrap(gpt.backupSectors, 32 * 512, 512).order(ByteOrder.LITTLE_ENDIAN)
+        val backupHdr = ByteBuffer.wrap(gpt.backupSectors.copyOfRange(32 * 512, 33 * 512)).order(ByteOrder.LITTLE_ENDIAN)
         assertEquals(l.totalSectors - 1L, backupHdr.getLong(24))
         assertEquals(1L, backupHdr.getLong(32))
         assertEquals(l.totalSectors - 34L, backupHdr.getLong(48))
