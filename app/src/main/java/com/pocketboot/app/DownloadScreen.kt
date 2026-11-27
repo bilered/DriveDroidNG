@@ -1713,6 +1713,7 @@ fun DownloadScreen(
             family = fam,
             turboConnections = settings.downloadConnections,
             existingFileNames = existingFileNames,
+            onAppendLog = onAppendLog,
             onDismiss = { selectedWindowsFamily = null },
             onStartDirectDownload = { title, url, fileName, sha, refreshKey ->
                 startTurboDownload(title, url, fileName, expectedSha256 = sha, refreshSourceKey = refreshKey)
@@ -1853,7 +1854,7 @@ fun DownloadScreen(
                             fetchingLink = true
                             var copiedUrl: String? = null
                             // Primary: NTriver Archive (works for all 6 families including latest monthly MVS, LTSC, Win7, Server)
-                            val ntRes = NtriverCatalog.fetchSections(fam)
+                            val ntRes = NtriverCatalog.fetchSections(context, fam, onLog = onAppendLog)
                             val ntSections = ntRes.data.orEmpty()
                             val prefSec = ntSections.firstOrNull { it.isRecommended } ?: ntSections.firstOrNull()
                             val x64Entries = prefSec?.entries?.filter { it.arch.equals("x64", true) }.orEmpty()

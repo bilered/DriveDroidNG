@@ -17,13 +17,19 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLDecoder
 import java.net.URLEncoder
+import java.net.UnknownHostException
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -69,22 +75,23 @@ data class NtriverResolveResult(
 )
 
 /**
- * Direct Windows RTM ISO archive client for ntriver.org (CC-BY-4.0) with:
- * - Zero-backtracking O(N) linear HTML scanner (safe on 2+ MB Windows 11/10/8.1 pages without ICU regex overflow)
- * - Dynamic index route discovery (`/download-windows-office`) + verified fallback slugs
- * - Fixed GitHub tree raw-Markdown/MDX fallback (`ntriver-org/ntriver-org-site`, excluding `i18n/` and `-esd` pages)
- * - Parent H2 -> Child H3 hierarchy extracting clean `majorVersion` + `editionLabel` sub-categories
- * - Automatic preference for permanent Microsoft Static Links before `/api/drive/generate-link`
- * - Hardened headless WebView fallback if Cloudflare challenges the JSON link endpoint
- * - Strict `.iso`-only & bootable-PC filtering (rejects `.esd`, IA-64, ARM32 RT, SDK/WDK/Symbols)
+ * Direct Windows RTM ISO archive client for ntriver.org (CC-BY-4.0) with a 4-tier fail-safe pipeline:
+ * 1) Direct HTTPS fetch from `ntriver.org` parsed with a zero-backtracking O(N) linear HTML scanner
+ * 2) Hardened headless Chromium WebView DOM fetch (passes Cloudflare challenges & hydrates Docusaurus/React)
+ * 3) Zero-rate-limit jsDelivr + GitHub Raw source fallback (`ntriver-org/ntriver-org-site`, supporting relative links & MDX)
+ * 4) Full-document + loose ISO-link sweep fallback + real tier-by-tier diagnostic trace in UI & Activity Log
  */
 object NtriverCatalog {
 
     private const val SITE_ORIGIN = "https://ntriver.org"
     private const val INDEX_PAGE_URL = "$SITE_ORIGIN/download-windows-office"
     private const val GENERATE_LINK_API = "$SITE_ORIGIN/api/drive/generate-link"
-    private const val GITHUB_TREE_API = "https://api.github.com/repos/ntriver-org/ntriver-org-site/git/trees/main?recursive=1"
-    private const val GITHUB_RAW_BASE = "https://raw.githubusercontent.com/ntriver-org/ntriver-org-site/main/"
+    private const val JSDELIVR_TREE_MAIN = "https://data.jsdelivr.com/v1/packages/gh/ntriver-org/ntriver-org-site@main?structure=flat"
+    private const val JSDELIVR_TREE_MASTER = "https://data.jsdelivr.com/v1/packages/gh/ntriver-org/ntriver-org-site@master?structure=flat"
+    private const val JSDELIVR_RAW_BASE = "https://cdn.jsdelivr.net/gh/ntriver-org/ntriver-org-site@"
+    private const val GITHUB_TREE_MAIN = "https://api.github.com/repos/ntriver-org/ntriver-org-site/git/trees/main?recursive=1"
+    private const val GITHUB_TREE_MASTER = "https://api.github.com/repos/ntriver-org/ntriver-org-site/git/trees/master?recursive=1"
+    private const val GITHUB_RAW_BASE = "https://raw.githubusercontent.com/ntriver-org/ntriver-org-site/"
     private const val REFRESH_PREFIX = "ntriver:"
     private const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 
@@ -92,7 +99,8 @@ object NtriverCatalog {
     private val ISO_FILENAME_RE = Regex("""([A-Za-z0-9._()+\-]+\.iso)\b""", RegexOption.IGNORE_CASE)
     private val HTML_TAG_RE = Regex("<[^>]+>")
     private val MULTISPACE_RE = Regex("\\s+")
-    private val MD_LINK_RE = Regex("""\[([^\]]+)]\((https?://[^)\s]+)\)""")
+    // Matches BOTH absolute (https://...) AND relative (/drive?..., drive?..., ../drive?...) Markdown links!
+    private val MD_LINK_RE = Regex("""\[([^\]]+)]\(([^)\s]+)\)""")
 
     private val FALLBACK_SLUGS = mapOf(
         "win11" to "/download-windows-11",
@@ -106,14 +114,14 @@ object NtriverCatalog {
     )
 
     private val FALLBACK_MD_PATHS = mapOf(
-        "win11" to listOf("docs/download-windows-11.md", "docs/download-windows-11.mdx"),
-        "win10" to listOf("docs/download-windows-10.md", "docs/download-windows-10.mdx"),
-        "ltsc" to listOf("docs/download-windows-ltsc.md", "docs/download-windows-ltsc.mdx"),
-        "win81" to listOf("docs/download-windows-8.1.md", "docs/download-windows-8.1.mdx"),
-        "win7" to listOf("docs/download-windows-7.md", "docs/download-windows-7.mdx"),
-        "server2025" to listOf("docs/download-windows-server-2025.md", "docs/download-windows-server-2025.mdx"),
-        "server2022" to listOf("docs/download-windows-server-2022.md", "docs/download-windows-server-2022.mdx"),
-        "server2019" to listOf("docs/download-windows-server-2019.md", "docs/download-windows-server-2019.mdx")
+        "win11" to listOf("docs/download-windows-11.md", "docs/download-windows-11.mdx", "docs/windows-iso/download-windows-11.md", "docs/windows-iso/download-windows-11.mdx"),
+        "win10" to listOf("docs/download-windows-10.md", "docs/download-windows-10.mdx", "docs/windows-iso/download-windows-10.md", "docs/windows-iso/download-windows-10.mdx"),
+        "ltsc" to listOf("docs/download-windows-ltsc.md", "docs/download-windows-ltsc.mdx", "docs/windows-iso/download-windows-ltsc.md", "docs/windows-iso/download-windows-ltsc.mdx"),
+        "win81" to listOf("docs/download-windows-8.1.md", "docs/download-windows-8.1.mdx", "docs/windows-iso/download-windows-8.1.md", "docs/windows-iso/download-windows-8.1.mdx"),
+        "win7" to listOf("docs/download-windows-7.md", "docs/download-windows-7.mdx", "docs/windows-iso/download-windows-7.md", "docs/windows-iso/download-windows-7.mdx"),
+        "server2025" to listOf("docs/download-windows-server-2025.md", "docs/download-windows-server-2025.mdx", "docs/windows-server-iso/download-windows-server-2025.md"),
+        "server2022" to listOf("docs/download-windows-server-2022.md", "docs/download-windows-server-2022.mdx", "docs/windows-server-iso/download-windows-server-2022.md"),
+        "server2019" to listOf("docs/download-windows-server-2019.md", "docs/download-windows-server-2019.mdx", "docs/windows-server-iso/download-windows-server-2019.md")
     )
 
     private val EXCLUDED_KEYWORDS = listOf(
@@ -134,11 +142,17 @@ object NtriverCatalog {
 
     private val indexLock = Any()
     private val treeLock = Any()
+    private val webViewMutex = Mutex()
     @Volatile private var lastIndexRefreshMs = 0L
     @Volatile private var lastTreeRefreshMs = 0L
+    @Volatile private var detectedRepoBranch = "main"
     private val indexLinksCache = ConcurrentHashMap<String, String>()
     private val sectionsCache = ConcurrentHashMap<String, List<NtriverReleaseSection>>()
-    private val githubTreeCache = ConcurrentHashMap<String, String>()
+    private val repoTreeCache = ConcurrentHashMap<String, String>()
+
+    private fun emitLog(onLog: ((LogEntry) -> Unit)?, message: String, isError: Boolean = false) {
+        onLog?.invoke(LogEntry(SimpleDateFormat("HH:mm:ss", Locale.US).format(Date()), "ntriver", message, isError))
+    }
 
     fun buildRefreshKey(entry: NtriverIsoEntry): String {
         if (entry.isMicrosoftStatic) return ""
@@ -158,7 +172,7 @@ object NtriverCatalog {
     fun normalizeArch(raw: String): String {
         val low = raw.trim().lowercase(Locale.US)
         return when {
-            low.contains("arm64") || low.contains("aarch64") -> "ARM64"
+            low.contains("arm64") || low.contains("aarch64") || low.contains("a64fre") -> "ARM64"
             low.contains("x64") || low.contains("amd64") || low.contains("64-bit") || low == "64" -> "x64"
             low.contains("x32") || low.contains("x86") || low.contains("i386") || low.contains("32-bit") || low == "32" -> "x86"
             else -> raw.trim().ifBlank { "x64" }
@@ -226,14 +240,6 @@ object NtriverCatalog {
         return if (combined.length > 32) combined.take(30).trimEnd() + "…" else combined.ifBlank { fullTitle.take(28) }
     }
 
-    /**
-     * Derives clean 2-level hierarchy: `(majorVersion, editionLabel)` for decluttered UI sub-categories.
-     * Examples:
-     * - Parent H2 "Windows 11 25H2" + H3 "Consumer (November 2026)" -> ("25H2", "Consumer (November 2026)")
-     * - H2 "Windows 8.1 with Update 3 - Core / Pro" -> ("Update 3", "Core / Pro")
-     * - H2 "Windows Server 2022 (November 2026)" with prefix "Server 2022" -> ("Server 2022", "November 2026")
-     * - H2 "Windows 11 Enterprise LTSC 2024" -> ("Win 11 LTSC 2024", "Enterprise LTSC 2024")
-     */
     internal fun deriveVersionAndEdition(
         parentH2: String,
         headingTitle: String,
@@ -242,7 +248,6 @@ object NtriverCatalog {
         val cleanHead = cleanSectionTitle(headingTitle)
         val cleanParent = cleanSectionTitle(parentH2)
 
-        // 1. Server multi-page merge uses pagePrefix ("Server 2025" / "Server 2022" / "Server 2019") as Main Version
         if (pagePrefix.isNotBlank()) {
             var ed = cleanHead
                 .replace(Regex("""^Windows\s+$pagePrefix\b""", RegexOption.IGNORE_CASE), "")
@@ -255,7 +260,6 @@ object NtriverCatalog {
             return pagePrefix to ed.ifBlank { "Standard / Datacenter" }
         }
 
-        // 2. Explicit H2 -> H3 hierarchy (e.g., H2 = "Windows 11 25H2", H3 = "Consumer (November 2026)")
         if (cleanParent.isNotBlank() && !cleanParent.equals(cleanHead, ignoreCase = true)) {
             val major = stripLeadingOsPrefix(cleanParent)
                 .replace(Regex("""^with\s+""", RegexOption.IGNORE_CASE), "")
@@ -269,7 +273,6 @@ object NtriverCatalog {
             return major.take(28) to ed.take(40)
         }
 
-        // 3. Single H2 with " - " separator (e.g. "Windows 8.1 with Update 3 - Core / Pro", "Windows 11 26H2 - Consumer")
         val dashIdx = cleanHead.indexOf(" - ").takeIf { it > 0 }
             ?: cleanHead.indexOf(" – ").takeIf { it > 0 }
             ?: cleanHead.indexOf(" — ").takeIf { it > 0 }
@@ -283,7 +286,6 @@ object NtriverCatalog {
             return major.take(28) to right.take(40)
         }
 
-        // 4. LTSC / LTSB versions
         val low = cleanHead.lowercase(Locale.US)
         if (low.contains("ltsc") || low.contains("ltsb")) {
             val osTag = if (low.contains("windows 11") || low.contains("win 11") || low.contains("2024")) "Win 11" else "Win 10"
@@ -294,7 +296,6 @@ object NtriverCatalog {
             return major.take(28) to ed.take(40)
         }
 
-        // 5. Windows 11/10 Feature Update token (26H2, 25H2, 24H2, 22H2, 2004, 1909, 1809, etc.)
         val verMatch = Regex("""\b(2[0-9]H[12]|2004|1909|1903|1809|1803|1709|1703|1607|1511|1507)\b""", RegexOption.IGNORE_CASE).find(cleanHead)
         if (verMatch != null) {
             val ver = verMatch.value.uppercase(Locale.US)
@@ -306,7 +307,6 @@ object NtriverCatalog {
             return ver to rest.take(40)
         }
 
-        // 6. Windows 7 / 8.1 SP1 / Update fallback
         if (low.contains("sp1")) {
             val rest = stripLeadingOsPrefix(cleanHead)
                 .replace(Regex("""with\s+sp1|sp1""", RegexOption.IGNORE_CASE), "")
@@ -344,11 +344,18 @@ object NtriverCatalog {
         return null
     }
 
-    private fun extractFirstTagInner(html: String, tag: String): String? {
-        val open = findTagOpen(html, tag, 0) ?: return null
+    private fun extractTagInners(html: String, tag: String): List<String> {
         val closeNeedle = "</$tag>"
-        val closeIdx = html.indexOf(closeNeedle, open.second, ignoreCase = true)
-        return if (closeIdx > open.second) html.substring(open.second, closeIdx) else null
+        val out = ArrayList<String>()
+        var cursor = 0
+        while (cursor < html.length) {
+            val open = findTagOpen(html, tag, cursor) ?: break
+            val closeIdx = html.indexOf(closeNeedle, open.second, ignoreCase = true)
+            if (closeIdx < 0) break
+            out.add(html.substring(open.second, closeIdx))
+            cursor = closeIdx + closeNeedle.length
+        }
+        return out
     }
 
     private fun stripTagBlocksLinear(html: String, tag: String): String {
@@ -435,7 +442,8 @@ object NtriverCatalog {
 
     private fun findAnchorsLinear(html: String): List<Pair<String, String>> {
         val out = ArrayList<Pair<String, String>>()
-        val hrefRe = Regex("""\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')""", RegexOption.IGNORE_CASE)
+        // Supports double-quoted, single-quoted, AND unquoted minified HTML href=... attributes!
+        val hrefRe = Regex("""\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>`]+))""", RegexOption.IGNORE_CASE)
         var cursor = 0
         while (cursor < html.length) {
             val open = findTagOpen(html, "a", cursor) ?: break
@@ -443,7 +451,9 @@ object NtriverCatalog {
             val closeIdx = html.indexOf("</a>", open.second, ignoreCase = true)
             if (closeIdx < 0) break
             val hrefMatch = hrefRe.find(openTag)
-            val href = (hrefMatch?.groupValues?.getOrNull(1)?.ifEmpty { hrefMatch.groupValues.getOrNull(2) }).orEmpty()
+            val href = (hrefMatch?.groupValues?.getOrNull(1)?.ifEmpty {
+                hrefMatch.groupValues.getOrNull(2)?.ifEmpty { hrefMatch.groupValues.getOrNull(3) }
+            }).orEmpty()
             if (href.isNotBlank()) {
                 out.add(href to html.substring(open.second, closeIdx))
             }
@@ -542,13 +552,25 @@ object NtriverCatalog {
         return h == d || h.endsWith(".$d")
     }
 
-    internal fun extractDriveFilenameFromUrl(href: String): String? {
+    private fun normalizeRelativeDriveUrl(href: String): String? {
         val clean = decodeHtmlEntities(href).trim()
-        val fullUrlStr = when {
-            clean.startsWith("/drive", ignoreCase = true) -> "$SITE_ORIGIN$clean"
-            clean.startsWith("https://", ignoreCase = true) -> clean
-            else -> return null
+        if (clean.isBlank()) return null
+        if (clean.startsWith("https://", ignoreCase = true)) return clean
+        if (clean.startsWith("http://", ignoreCase = true)) return null
+        var rel = clean
+        while (rel.startsWith("../") || rel.startsWith("./")) {
+            rel = if (rel.startsWith("../")) rel.substring(3) else rel.substring(2)
         }
+        val low = rel.lowercase(Locale.US)
+        return when {
+            low.startsWith("/drive") -> "$SITE_ORIGIN$rel"
+            low.startsWith("drive?") || low.startsWith("drive/") || low == "drive" -> "$SITE_ORIGIN/$rel"
+            else -> null
+        }
+    }
+
+    internal fun extractDriveFilenameFromUrl(href: String): String? {
+        val fullUrlStr = normalizeRelativeDriveUrl(href) ?: return null
         val parsed = runCatching { URL(fullUrlStr) }.getOrNull() ?: return null
         if (!isHostOrSubdomain(parsed.host.orEmpty(), "ntriver.org")) return null
         val path = parsed.path.orEmpty()
@@ -579,21 +601,43 @@ object NtriverCatalog {
         val isMsHost = isHostOrSubdomain(host, "microsoft.com") ||
             isHostOrSubdomain(host, "microsoft.net") ||
             isHostOrSubdomain(host, "msecnd.net") ||
-            isHostOrSubdomain(host, "azureedge.net")
+            isHostOrSubdomain(host, "azureedge.net") ||
+            isHostOrSubdomain(host, "windowsupdate.com") ||
+            isHostOrSubdomain(host, "msedge.net")
         return isMsHost && parsed.path.orEmpty().lowercase(Locale.US).endsWith(".iso")
     }
 
     internal fun isNtriverDriveHref(href: String): Boolean {
-        val clean = decodeHtmlEntities(href).trim()
-        val full = when {
-            clean.startsWith("/drive", ignoreCase = true) -> "$SITE_ORIGIN$clean"
-            clean.startsWith("https://", ignoreCase = true) -> clean
-            else -> return false
-        }
+        val full = normalizeRelativeDriveUrl(href) ?: return false
         val parsed = runCatching { URL(full) }.getOrNull() ?: return false
         if (!isHostOrSubdomain(parsed.host.orEmpty(), "ntriver.org")) return false
         val path = parsed.path.orEmpty()
         return path.equals("/drive", ignoreCase = true) || path.startsWith("/drive/", ignoreCase = true)
+    }
+
+    private fun guessLanguageFromFileName(fileName: String): String {
+        val low = fileName.lowercase(Locale.US)
+        return when {
+            low.startsWith("en-us") || low.contains("_en-us") || low.contains("_en_us") -> "English (US)"
+            low.startsWith("en-gb") || low.contains("_en-gb") || low.contains("englishinternational") -> "English (International)"
+            low.startsWith("en_") || low.contains("english") -> "English"
+            low.startsWith("hi-in") || low.contains("hindi") -> "Hindi"
+            low.startsWith("de-de") || low.contains("german") -> "German"
+            low.startsWith("fr-fr") || low.contains("french") -> "French"
+            low.startsWith("es-es") || low.startsWith("es-mx") || low.contains("spanish") -> "Spanish"
+            low.startsWith("pt-br") || low.startsWith("pt-pt") -> "Portuguese"
+            low.startsWith("ru-ru") || low.contains("russian") -> "Russian"
+            low.startsWith("ja-jp") || low.contains("japanese") -> "Japanese"
+            low.startsWith("ko-kr") || low.contains("korean") -> "Korean"
+            low.startsWith("zh-cn") -> "Chinese (Simplified)"
+            low.startsWith("zh-tw") -> "Chinese (Traditional)"
+            low.startsWith("ar-sa") -> "Arabic"
+            low.startsWith("it-it") -> "Italian"
+            low.startsWith("nl-nl") -> "Dutch"
+            low.startsWith("pl-pl") -> "Polish"
+            low.startsWith("tr-tr") -> "Turkish"
+            else -> "English"
+        }
     }
 
     internal fun disambiguateEntries(entries: List<NtriverIsoEntry>): List<NtriverIsoEntry> {
@@ -664,10 +708,11 @@ object NtriverCatalog {
             .replace("**", "")
             .replace("__", "")
             .replace("`", "")
-        val buildMatch = Regex("""Build\s*:\s*([^\n•|]+)""", RegexOption.IGNORE_CASE).find(clean)
+        // Supports BOTH `Build: 26300.9974` AND `Build - 26300.9457 (September 2026)`
+        val buildMatch = Regex("""Build\s*[:\-–—]\s*([^\n•|]+)""", RegexOption.IGNORE_CASE).find(clean)
         val buildBadge = buildMatch?.groupValues?.getOrNull(1)?.trim()
             ?.replace("[", "")?.replace("]", "")?.take(56).orEmpty()
-        val noteMatch = Regex("""Note\s*:\s*([^\n]+)""", RegexOption.IGNORE_CASE).find(clean)
+        val noteMatch = Regex("""Note\s*[:\-–—]\s*([^\n]+)""", RegexOption.IGNORE_CASE).find(clean)
         val note = noteMatch?.groupValues?.getOrNull(1)?.trim()?.take(180).orEmpty()
         return buildBadge to note
     }
@@ -720,7 +765,7 @@ object NtriverCatalog {
 
                 entries.add(
                     NtriverIsoEntry(
-                        language = col0.ifBlank { "English" },
+                        language = col0.ifBlank { guessLanguageFromFileName(fileName) },
                         arch = normalizeArch(archHint),
                         fileName = fileName,
                         sha256 = sha,
@@ -734,15 +779,58 @@ object NtriverCatalog {
     }
 
     /**
-     * Zero-backtracking linear parser for rendered Docusaurus HTML pages on ntriver.org.
-     * Preserves H2 -> H3 hierarchy (e.g., `Windows 11 25H2` -> `Consumer (November 2026)`) and never overflows Android's regex stack.
+     * Universal fallback sweep if a page wraps ISO links in non-table elements (`<details>`, React `<Tabs>`, `<li>`, cards).
      */
-    fun parseHtmlCatalogPage(html: String, pagePrefix: String = ""): List<NtriverReleaseSection> {
-        val scoped = extractFirstTagInner(html, "article")
-            ?: extractFirstTagInner(html, "main")
-            ?: html
-        val cleanedHtml = stripTagBlocksLinear(stripTagBlocksLinear(scoped, "script"), "style")
+    internal fun parseLooseIsoLinksFallback(cleanedHtml: String, pagePrefix: String = ""): List<NtriverReleaseSection> {
+        val entries = mutableListOf<NtriverIsoEntry>()
+        // First try all <tr> rows across the document regardless of heading hierarchy
+        val trEntries = parseHtmlTablesFromBlock("<table>$cleanedHtml</table>", pagePrefix)
+        entries.addAll(trEntries)
 
+        // If still empty, sweep every anchor on the page for drive/MS static `.iso` links
+        if (entries.isEmpty()) {
+            for ((rawHref, rawLbl) in findAnchorsLinear(cleanedHtml)) {
+                val href = decodeHtmlEntities(rawHref).trim()
+                val lbl = stripHtml(rawLbl)
+                if (href.contains("rg-adguard", true) || lbl.contains("rg-adguard", true)) continue
+                val directStatic = if (isDirectMicrosoftIsoUrl(href)) href else null
+                val driveFile = extractDriveFilenameFromUrl(href)
+                val staticFile = directStatic?.substringBefore('?')?.substringAfterLast('/')
+                    ?.takeIf { it.endsWith(".iso", ignoreCase = true) }
+                val lblFile = ISO_FILENAME_RE.find(lbl)?.groupValues?.get(1)?.trim()
+                val fileName = driveFile ?: staticFile ?: lblFile ?: continue
+                val effectiveDrive = driveFile ?: if (isNtriverDriveHref(href)) fileName else null
+                if (directStatic == null && effectiveDrive == null) continue
+                val arch = normalizeArch(WindowsCustomizationEngine.detectProcessorArchitecture(fileName))
+                if (isExcludedSectionOrEntry(pagePrefix, arch, fileName)) continue
+                entries.add(
+                    NtriverIsoEntry(
+                        language = guessLanguageFromFileName(fileName),
+                        arch = arch,
+                        fileName = fileName,
+                        sha256 = "",
+                        directStaticUrl = directStatic,
+                        ntriverDriveFilename = effectiveDrive
+                    )
+                )
+            }
+        }
+        if (entries.isEmpty()) return emptyList()
+        val label = pagePrefix.ifBlank { "Available ISOs" }
+        return listOf(
+            NtriverReleaseSection(
+                id = "${pagePrefix}_fallback_0",
+                title = label,
+                shortChipLabel = label,
+                majorVersion = label,
+                editionLabel = "All Editions",
+                isRecommended = true,
+                entries = disambiguateEntries(entries)
+            )
+        )
+    }
+
+    private fun parseHtmlRegion(cleanedHtml: String, pagePrefix: String): List<NtriverReleaseSection> {
         val headings = findHeadingsLinear(cleanedHtml)
         if (headings.isEmpty()) return emptyList()
 
@@ -772,8 +860,8 @@ object NtriverCatalog {
             if (blockStart >= blockEnd) continue
             val block = cleanedHtml.substring(blockStart, blockEnd)
 
-            val firstTableOpen = findTagOpen(block, "table", 0) ?: continue
-            val introHtml = block.substring(0, firstTableOpen.first)
+            val firstTableOpen = findTagOpen(block, "table", 0)
+            val introHtml = if (firstTableOpen != null) block.substring(0, firstTableOpen.first) else block
             val introLines = introHtml
                 .replace(Regex("""</(?:p|li|div|br)\s*>|<br\s*/?>""", RegexOption.IGNORE_CASE), "\n")
                 .let { decodeHtmlEntities(HTML_TAG_RE.replace(it, " ")) }
@@ -783,7 +871,7 @@ object NtriverCatalog {
             val combinedTitleForFilter = if (parentForHeading.isNotBlank() && !cleanTitle.contains(parentForHeading, true)) {
                 "$parentForHeading - $cleanTitle"
             } else cleanTitle
-            val entries = parseHtmlTablesFromBlock(block, combinedTitleForFilter)
+            val entries = if (firstTableOpen != null) parseHtmlTablesFromBlock(block, combinedTitleForFilter) else emptyList()
 
             if (entries.isNotEmpty()) {
                 val (majorVersion, editionLabel) = deriveVersionAndEdition(parentForHeading, cleanTitle, pagePrefix)
@@ -810,8 +898,30 @@ object NtriverCatalog {
     }
 
     /**
-     * Pure-JVM fallback parser for raw GitHub Markdown / MDX pages from `ntriver-org/ntriver-org-site`.
-     * Supports H2 -> H3 hierarchy, pipe tables, AND inline HTML `<table>` blocks inside MDX docs.
+     * Zero-backtracking linear parser for rendered Docusaurus HTML pages on ntriver.org.
+     * Tries every `<article>` block, then `<main>`, then full document, then loose ISO sweep.
+     */
+    fun parseHtmlCatalogPage(html: String, pagePrefix: String = ""): List<NtriverReleaseSection> {
+        val cleanFull = stripTagBlocksLinear(stripTagBlocksLinear(html, "script"), "style")
+
+        for (art in extractTagInners(cleanFull, "article")) {
+            val res = parseHtmlRegion(art, pagePrefix)
+            if (res.isNotEmpty()) return res
+        }
+        for (main in extractTagInners(cleanFull, "main")) {
+            val res = parseHtmlRegion(main, pagePrefix)
+            if (res.isNotEmpty()) return res
+        }
+        val fullRes = parseHtmlRegion(cleanFull, pagePrefix)
+        if (fullRes.isNotEmpty()) return fullRes
+
+        return parseLooseIsoLinksFallback(cleanFull, pagePrefix)
+    }
+
+    /**
+     * Pure-JVM fallback parser for raw GitHub / jsDelivr Markdown & MDX pages from `ntriver-org/ntriver-org-site`.
+     * Supports relative links (`/drive?...`, `drive?...`), GFM pipe tables with or without leading `|`,
+     * inline HTML `<table>` blocks inside MDX, and a loose link sweep fallback.
      */
     fun parseMarkdownCatalogPage(markdown: String, pagePrefix: String = ""): List<NtriverReleaseSection> {
         val lines = markdown.replace("\r\n", "\n").split('\n')
@@ -834,7 +944,6 @@ object NtriverCatalog {
                 val combinedTitle = if (parentForHeading.isNotBlank() && !curTitle.contains(parentForHeading, true)) {
                     "$parentForHeading - $curTitle"
                 } else curTitle
-                // Also support MDX files that render inline HTML <table> blocks!
                 val rawBodyStr = curRawBody.toString()
                 if (rawBodyStr.contains("<table", ignoreCase = true)) {
                     curEntries.addAll(parseHtmlTablesFromBlock(rawBodyStr, combinedTitle))
@@ -892,7 +1001,9 @@ object NtriverCatalog {
             }
             if (skipCurrentSection) continue
 
-            if (!line.startsWith("|")) {
+            // Accept GFM pipe table rows BOTH with leading `|` AND without leading `|` (e.g. `English | x64 | ...`)
+            val looksLikeTableRow = line.startsWith("|") || (line.contains("|") && (line.contains(".iso", true) || line.contains("drive", true) || line.contains("http", true)))
+            if (!looksLikeTableRow) {
                 curRawBody.append(rawLine).append('\n')
                 if (curEntries.isEmpty() && line.isNotBlank() && !line.startsWith("<")) {
                     curIntro.append(line.removePrefix("*").removePrefix("-").trim()).append('\n')
@@ -969,7 +1080,47 @@ object NtriverCatalog {
             )
         }
         flushSection()
-        return sections
+        if (sections.isNotEmpty()) return sections
+
+        // Universal loose Markdown fallback if page uses non-table bullet lists or JSX components
+        val looseEntries = mutableListOf<NtriverIsoEntry>()
+        for (lm in MD_LINK_RE.findAll(markdown)) {
+            val lbl = lm.groupValues[1]
+            val href = lm.groupValues[2].trim()
+            if (href.contains("rg-adguard", true) || lbl.contains("rg-adguard", true)) continue
+            val directStatic = if (isDirectMicrosoftIsoUrl(href)) href else null
+            val driveFile = extractDriveFilenameFromUrl(href)
+            val staticFile = directStatic?.substringBefore('?')?.substringAfterLast('/')?.takeIf { it.endsWith(".iso", true) }
+            val lblFile = ISO_FILENAME_RE.find(lbl)?.groupValues?.get(1)?.trim()
+            val fileName = driveFile ?: staticFile ?: lblFile ?: continue
+            val effectiveDrive = driveFile ?: if (isNtriverDriveHref(href)) fileName else null
+            if (directStatic == null && effectiveDrive == null) continue
+            val arch = normalizeArch(WindowsCustomizationEngine.detectProcessorArchitecture(fileName))
+            if (isExcludedSectionOrEntry(pagePrefix, arch, fileName)) continue
+            looseEntries.add(
+                NtriverIsoEntry(
+                    language = guessLanguageFromFileName(fileName),
+                    arch = arch,
+                    fileName = fileName,
+                    sha256 = "",
+                    directStaticUrl = directStatic,
+                    ntriverDriveFilename = effectiveDrive
+                )
+            )
+        }
+        if (looseEntries.isEmpty()) return emptyList()
+        val label = pagePrefix.ifBlank { "Available ISOs" }
+        return listOf(
+            NtriverReleaseSection(
+                id = "${pagePrefix}_md_fallback_0",
+                title = label,
+                shortChipLabel = label,
+                majorVersion = label,
+                editionLabel = "All Editions",
+                isRecommended = true,
+                entries = disambiguateEntries(looseEntries)
+            )
+        )
     }
 
     /**
@@ -1033,13 +1184,14 @@ object NtriverCatalog {
     }
 
     /**
-     * Maps GitHub repository tree paths to OS keys, strictly skipping `i18n/` and `-esd` files
+     * Maps repository tree paths to OS keys, strictly skipping `i18n/` and `-esd` files
      * and prioritizing exact canonical basenames (`download-windows-11.md`/`.mdx`, etc.) over partial matches.
      */
     internal fun mapGithubTreePaths(paths: List<String>): Map<String, String> {
         val exact = LinkedHashMap<String, String>()
         val fallback = LinkedHashMap<String, String>()
-        for (path in paths) {
+        for (rawPath in paths) {
+            val path = rawPath.trimStart('/')
             if (!path.endsWith(".md", true) && !path.endsWith(".mdx", true)) continue
             val low = path.lowercase(Locale.US)
             if (low.startsWith("i18n/") || low.contains("/i18n/") ||
@@ -1078,61 +1230,288 @@ object NtriverCatalog {
         return merged
     }
 
-    private fun ensureGithubTreeLoaded(forceRefresh: Boolean) {
+    /**
+     * Pure-JVM parser for jsDelivr GitHub package tree JSON (supports BOTH flat `?structure=flat` AND nested directory trees).
+     */
+    internal fun parseJsDelivrTreeJson(body: String): Map<String, String> {
+        val rawPaths = ArrayList<String>()
+        fun walk(arr: JSONArray?, prefix: String) {
+            if (arr == null) return
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val name = obj.optString("name", "").trim()
+                if (name.isBlank()) continue
+                val type = obj.optString("type", "")
+                val full = if (name.startsWith("/")) name.trimStart('/') else if (prefix.isBlank()) name else "$prefix/$name"
+                if (type.equals("directory", ignoreCase = true) || obj.has("files")) {
+                    walk(obj.optJSONArray("files"), full)
+                } else {
+                    rawPaths.add(full)
+                }
+            }
+        }
+        runCatching {
+            val root = JSONObject(body)
+            walk(root.optJSONArray("files"), "")
+        }
+        return mapGithubTreePaths(rawPaths)
+    }
+
+    private fun ensureRepoTreeLoaded(forceRefresh: Boolean, trace: MutableList<String>) {
         synchronized(treeLock) {
             val now = System.currentTimeMillis()
-            if (githubTreeCache.isNotEmpty() && (!forceRefresh || (now - lastTreeRefreshMs) < 5_000L)) return
-            runCatching {
-                val (code, body) = httpGet(GITHUB_TREE_API, acceptJson = true)
-                if (code !in 200..299 || body.isBlank()) return
-                val tree = JSONObject(body).optJSONArray("tree") ?: return
-                val rawPaths = ArrayList<String>(tree.length())
-                for (i in 0 until tree.length()) {
-                    val p = tree.optJSONObject(i)?.optString("path", "").orEmpty()
-                    if (p.isNotBlank()) rawPaths.add(p)
-                }
-                val mapped = mapGithubTreePaths(rawPaths)
+            if (repoTreeCache.isNotEmpty() && (!forceRefresh || (now - lastTreeRefreshMs) < 5_000L)) return
+
+            // 1. Zero-rate-limit jsDelivr CDN tree (tries main then master)
+            for ((branch, treeUrl) in listOf("main" to JSDELIVR_TREE_MAIN, "master" to JSDELIVR_TREE_MASTER)) {
+                val mapped = runCatching {
+                    val (code, body) = httpGet(treeUrl, acceptJson = true)
+                    if (code in 200..299 && body.isNotBlank()) parseJsDelivrTreeJson(body) else emptyMap()
+                }.getOrDefault(emptyMap())
                 if (mapped.isNotEmpty()) {
-                    githubTreeCache.clear()
-                    mapped.forEach { (k, v) -> githubTreeCache[k] = v }
+                    repoTreeCache.clear()
+                    mapped.forEach { (k, v) -> repoTreeCache[k] = v }
+                    detectedRepoBranch = branch
                     lastTreeRefreshMs = System.currentTimeMillis()
+                    return
+                }
+            }
+
+            // 2. Fallback: GitHub Git Trees API (tries main then master)
+            for ((branch, treeUrl) in listOf("main" to GITHUB_TREE_MAIN, "master" to GITHUB_TREE_MASTER)) {
+                val mapped = runCatching {
+                    val (code, body) = httpGet(treeUrl, acceptJson = true)
+                    if (code !in 200..299 || body.isBlank()) {
+                        trace.add("ghTree($branch): HTTP $code")
+                        emptyMap()
+                    } else {
+                        val tree = JSONObject(body).optJSONArray("tree") ?: return@runCatching emptyMap()
+                        val rawPaths = ArrayList<String>(tree.length())
+                        for (i in 0 until tree.length()) {
+                            val p = tree.optJSONObject(i)?.optString("path", "").orEmpty()
+                            if (p.isNotBlank()) rawPaths.add(p)
+                        }
+                        mapGithubTreePaths(rawPaths)
+                    }
+                }.getOrElse { e ->
+                    trace.add("ghTree($branch): ${e.javaClass.simpleName}")
+                    emptyMap()
+                }
+                if (mapped.isNotEmpty()) {
+                    repoTreeCache.clear()
+                    mapped.forEach { (k, v) -> repoTreeCache[k] = v }
+                    detectedRepoBranch = branch
+                    lastTreeRefreshMs = System.currentTimeMillis()
+                    return
                 }
             }
         }
     }
 
-    private fun fetchSinglePageSections(key: String, pagePrefix: String, forceRefresh: Boolean): List<NtriverReleaseSection> {
-        val slug = indexLinksCache[key] ?: FALLBACK_SLUGS[key] ?: return emptyList()
+    /**
+     * Tier 2: Hardened headless Chromium WebView DOM fetcher.
+     * Solves Cloudflare JS challenges, hydrates React/Docusaurus tables, and returns rendered DOM HTML.
+     */
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun fetchHtmlViaHeadlessWebView(context: Context, pageUrl: String): Pair<String?, String> {
+        return webViewMutex.withLock {
+            var errDetail = "timeout"
+            val html = withTimeoutOrNull(18_000L) {
+                suspendCancellableCoroutine<String?> { cont ->
+                    val mainHandler = Handler(Looper.getMainLooper())
+                    val done = AtomicBoolean(false)
+                    var wv: WebView? = null
+
+                    fun finish(res: String?, detail: String = "ok") {
+                        if (!done.compareAndSet(false, true)) return
+                        errDetail = detail
+                        mainHandler.post {
+                            runCatching {
+                                wv?.stopLoading()
+                                wv?.loadUrl("about:blank")
+                                wv?.removeJavascriptInterface("PBPage")
+                                wv?.destroy()
+                            }
+                            wv = null
+                        }
+                        if (cont.isActive) cont.resume(res)
+                    }
+
+                    cont.invokeOnCancellation { finish(null, "cancelled") }
+
+                    mainHandler.post {
+                        if (!cont.isActive || done.get()) return@post
+                        runCatching {
+                            val webView = WebView(context.applicationContext)
+                            wv = webView
+                            webView.settings.apply {
+                                javaScriptEnabled = true
+                                domStorageEnabled = true
+                                allowFileAccess = false
+                                allowContentAccess = false
+                                loadsImagesAutomatically = false
+                                blockNetworkImage = true
+                                userAgentString = UA
+                            }
+                            WebCookieManager.getInstance().setAcceptCookie(true)
+                            WebCookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+                            val bridge = object {
+                                @JavascriptInterface
+                                fun onHtml(dom: String) = finish(dom, "ok(${dom.length}B)")
+
+                                @JavascriptInterface
+                                fun onFail(reason: String) = finish(null, reason)
+                            }
+                            webView.addJavascriptInterface(bridge, "PBPage")
+                            val fired = AtomicBoolean(false)
+                            webView.webViewClient = object : WebViewClient() {
+                                override fun onPageFinished(view: WebView?, url: String?) {
+                                    val u = url.orEmpty()
+                                    if (!u.startsWith(SITE_ORIGIN, true) || fired.get()) return
+                                    val titleLow = view?.title.orEmpty().lowercase(Locale.US)
+                                    if (titleLow.contains("just a moment") || titleLow.contains("attention required")) return
+                                    if (!fired.compareAndSet(false, true)) return
+                                    val js = """
+                                        (function(){
+                                          function grab(attempt){
+                                            var t = (document.title || '').toLowerCase();
+                                            var cf = !!(document.getElementById('challenge-running') || document.getElementById('cf-challenge-running') || document.getElementById('challenge-form'));
+                                            var hasContent = document.querySelectorAll('table, a[href*=".iso"]').length > 0;
+                                            if ((cf || t.indexOf('just a moment') >= 0 || !hasContent) && attempt < 5) {
+                                              setTimeout(function(){ grab(attempt + 1); }, 1200);
+                                              return;
+                                            }
+                                            var root = document.querySelector('article') || document.querySelector('main') || document.body;
+                                            if (root && root.innerHTML) {
+                                              PBPage.onHtml(root.innerHTML);
+                                            } else {
+                                              PBPage.onFail('empty-dom');
+                                            }
+                                          }
+                                          grab(0);
+                                        })();
+                                    """.trimIndent()
+                                    view?.evaluateJavascript(js, null)
+                                }
+
+                                override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                                    if (request?.isForMainFrame == true) {
+                                        finish(null, "err:${error?.errorCode ?: -1}")
+                                    }
+                                }
+
+                                override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
+                                    handler?.cancel()
+                                    finish(null, "ssl-error")
+                                }
+                            }
+                            webView.loadUrl(pageUrl)
+                        }.onFailure { e -> finish(null, e.javaClass.simpleName) }
+                    }
+                }
+            }
+            html to errDetail
+        }
+    }
+
+    private suspend fun fetchSinglePageSections(
+        context: Context,
+        key: String,
+        pagePrefix: String,
+        forceRefresh: Boolean,
+        trace: MutableList<String>
+    ): Pair<List<NtriverReleaseSection>, Boolean> {
+        val slug = indexLinksCache[key] ?: FALLBACK_SLUGS[key] ?: return emptyList<NtriverReleaseSection>() to false
         val pageUrl = if (slug.startsWith("https://", true)) slug else "$SITE_ORIGIN/${slug.trimStart('/')}"
-        val htmlSections = runCatching {
+        var dnsBlocked = false
+
+        // ── Tier 1: Direct HTTPS ntriver.org ──────────────────────────────────
+        var tier1FailedForWebView = false
+        val tier1Sections = try {
             val (code, html) = httpGet(pageUrl, referer = INDEX_PAGE_URL)
             if (code in 200..299 && !isCloudflareChallenge(code, html)) {
-                parseHtmlCatalogPage(html, pagePrefix = pagePrefix)
-            } else emptyList()
-        }.getOrDefault(emptyList())
-        if (htmlSections.isNotEmpty()) return htmlSections
+                val parsed = parseHtmlCatalogPage(html, pagePrefix = pagePrefix)
+                if (parsed.isNotEmpty()) {
+                    trace.add("$key direct: HTTP $code (${parsed.size} sec)")
+                    parsed
+                } else {
+                    trace.add("$key direct: HTTP $code (0 sec, ${html.length}B)")
+                    tier1FailedForWebView = true
+                    emptyList()
+                }
+            } else {
+                trace.add("$key direct: HTTP $code${if (isCloudflareChallenge(code, html)) " CF" else ""}")
+                tier1FailedForWebView = true
+                emptyList()
+            }
+        } catch (e: UnknownHostException) {
+            dnsBlocked = true
+            trace.add("$key direct: DNS blocked")
+            emptyList()
+        } catch (e: Exception) {
+            trace.add("$key direct: ${e.javaClass.simpleName}")
+            tier1FailedForWebView = true
+            emptyList()
+        }
+        if (tier1Sections.isNotEmpty()) return tier1Sections to false
 
-        // Fallback: dynamically locate Markdown/MDX file in ntriver-org/ntriver-org-site via GitHub tree API (+ static .md/.mdx backups)
-        ensureGithubTreeLoaded(forceRefresh)
+        // ── Tier 2: Headless Chromium WebView DOM Fetch (skip if DNS blocked) ─
+        if (tier1FailedForWebView && !dnsBlocked) {
+            val (domHtml, wvDetail) = fetchHtmlViaHeadlessWebView(context, pageUrl)
+            if (!domHtml.isNullOrBlank()) {
+                val wvSections = parseHtmlCatalogPage(domHtml, pagePrefix = pagePrefix)
+                if (wvSections.isNotEmpty()) {
+                    trace.add("$key webview: ${wvSections.size} sec")
+                    return wvSections to false
+                }
+                trace.add("$key webview: 0 sec ($wvDetail)")
+            } else {
+                trace.add("$key webview: $wvDetail")
+            }
+        }
+
+        // ── Tier 3: Zero-Rate-Limit jsDelivr CDN + GitHub Raw Markdown/MDX ───
+        ensureRepoTreeLoaded(forceRefresh, trace)
         val candidatePaths = buildList {
-            githubTreeCache[key]?.let { add(it) }
+            repoTreeCache[key]?.let { add(it) }
             FALLBACK_MD_PATHS[key]?.forEach { p -> if (p !in this) add(p) }
         }
+        val branch = detectedRepoBranch
         for (mdPath in candidatePaths) {
-            val mdSections = runCatching {
-                val (code, md) = httpGet("$GITHUB_RAW_BASE${mdPath.trimStart('/')}")
+            val cleanPath = mdPath.trimStart('/')
+            // 3a. jsDelivr CDN raw mirror (fast, zero GitHub API limits, bypasses ISP blocks on ntriver.org)
+            val jsdSections = runCatching {
+                val (code, md) = httpGet("$JSDELIVR_RAW_BASE$branch/$cleanPath")
                 if (code in 200..299 && md.isNotBlank()) {
                     parseMarkdownCatalogPage(md, pagePrefix = pagePrefix)
                 } else emptyList()
             }.getOrDefault(emptyList())
-            if (mdSections.isNotEmpty()) return mdSections
+            if (jsdSections.isNotEmpty()) {
+                trace.add("$key jsDelivr: ${jsdSections.size} sec ($cleanPath)")
+                return jsdSections to dnsBlocked
+            }
+
+            // 3b. raw.githubusercontent.com mirror
+            val ghSections = runCatching {
+                val (code, md) = httpGet("$GITHUB_RAW_BASE$branch/$cleanPath")
+                if (code in 200..299 && md.isNotBlank()) {
+                    parseMarkdownCatalogPage(md, pagePrefix = pagePrefix)
+                } else emptyList()
+            }.getOrDefault(emptyList())
+            if (ghSections.isNotEmpty()) {
+                trace.add("$key ghRaw: ${ghSections.size} sec ($cleanPath)")
+                return ghSections to dnsBlocked
+            }
         }
-        return emptyList()
+        trace.add("$key mirrors: 0/${candidatePaths.size} matched")
+        return emptyList<NtriverReleaseSection>() to dnsBlocked
     }
 
     suspend fun fetchSections(
+        context: Context,
         family: WindowsCatalogFamily,
-        forceRefresh: Boolean = false
+        forceRefresh: Boolean = false,
+        onLog: ((LogEntry) -> Unit)? = null
     ): DirectApiResult<List<NtriverReleaseSection>> = withContext(Dispatchers.IO) {
         if (!forceRefresh) {
             sectionsCache[family.id]?.takeIf { it.isNotEmpty() }?.let {
@@ -1142,6 +1521,8 @@ object NtriverCatalog {
 
         ensureIndexLinksLoaded(forceRefresh)
 
+        val trace = java.util.Collections.synchronizedList(ArrayList<String>())
+        var anyDnsBlocked = false
         val sections = if (family == WindowsCatalogFamily.WIN_SERVER) {
             coroutineScope {
                 listOf(
@@ -1149,124 +1530,139 @@ object NtriverCatalog {
                     "server2022" to "Server 2022",
                     "server2019" to "Server 2019"
                 ).map { (key, prefix) ->
-                    async(Dispatchers.IO) { fetchSinglePageSections(key, prefix, forceRefresh) }
-                }.awaitAll().flatten()
+                    async(Dispatchers.IO) { fetchSinglePageSections(context, key, prefix, forceRefresh, trace) }
+                }.awaitAll().flatMap { (list, dns) ->
+                    if (dns) anyDnsBlocked = true
+                    list
+                }
             }
         } else {
-            fetchSinglePageSections(family.ntriverKey, "", forceRefresh)
+            val (list, dns) = fetchSinglePageSections(context, family.ntriverKey, "", forceRefresh, trace)
+            anyDnsBlocked = dns
+            list
         }
 
+        val traceStr = trace.joinToString(" -> ")
         if (sections.isNotEmpty()) {
             sectionsCache[family.id] = sections
+            emitLog(onLog, "Loaded ${family.title}: ${sections.size} section(s) [$traceStr]")
             DirectApiResult(data = sections)
         } else {
-            DirectApiResult(
-                errorMessage = "Could not load ${family.title} catalog from NTriver Archive. Check your connection or switch networks and tap Retry."
-            )
+            emitLog(onLog, "Failed ${family.title} catalog: $traceStr", isError = true)
+            val msg = if (anyDnsBlocked) {
+                "Your ISP/DNS could not resolve ntriver.org and mirror fallbacks failed. Enable Android Private DNS (1.1.1.1 or dns.google) or switch to Microsoft CDN.\n($traceStr)"
+            } else {
+                "Could not load ${family.title} catalog from NTriver Archive.\n($traceStr)"
+            }
+            DirectApiResult(errorMessage = msg)
         }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun resolveViaHeadlessWebView(context: Context, fileName: String): NtriverResolveResult {
-        val enc = encodeUrlQueryParam(fileName)
-        val apiPath = "/api/drive/generate-link?filename=$enc"
-        val body = withTimeoutOrNull(18_000L) {
-            suspendCancellableCoroutine<String?> { cont ->
-                val mainHandler = Handler(Looper.getMainLooper())
-                val done = AtomicBoolean(false)
-                var wv: WebView? = null
+        return webViewMutex.withLock {
+            val enc = encodeUrlQueryParam(fileName)
+            val apiPath = "/api/drive/generate-link?filename=$enc"
+            val body = withTimeoutOrNull(18_000L) {
+                suspendCancellableCoroutine<String?> { cont ->
+                    val mainHandler = Handler(Looper.getMainLooper())
+                    val done = AtomicBoolean(false)
+                    var wv: WebView? = null
 
-                fun finish(res: String?) {
-                    if (!done.compareAndSet(false, true)) return
-                    mainHandler.post {
-                        runCatching {
-                            wv?.stopLoading()
-                            wv?.loadUrl("about:blank")
-                            wv?.removeJavascriptInterface("PBDrive")
-                            wv?.destroy()
+                    fun finish(res: String?) {
+                        if (!done.compareAndSet(false, true)) return
+                        mainHandler.post {
+                            runCatching {
+                                wv?.stopLoading()
+                                wv?.loadUrl("about:blank")
+                                wv?.removeJavascriptInterface("PBDrive")
+                                wv?.destroy()
+                            }
+                            wv = null
                         }
-                        wv = null
+                        if (cont.isActive) cont.resume(res)
                     }
-                    if (cont.isActive) cont.resume(res)
-                }
 
-                cont.invokeOnCancellation { finish(null) }
+                    cont.invokeOnCancellation { finish(null) }
 
-                mainHandler.post {
-                    if (!cont.isActive || done.get()) return@post
-                    runCatching {
-                        val webView = WebView(context.applicationContext)
-                        wv = webView
-                        webView.settings.apply {
-                            javaScriptEnabled = true
-                            domStorageEnabled = true
-                            allowFileAccess = false
-                            allowContentAccess = false
-                            userAgentString = UA
-                        }
-                        WebCookieManager.getInstance().setAcceptCookie(true)
-                        WebCookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
-                        val bridge = object {
-                            @JavascriptInterface
-                            fun onResult(json: String) = finish(json)
+                    mainHandler.post {
+                        if (!cont.isActive || done.get()) return@post
+                        runCatching {
+                            val webView = WebView(context.applicationContext)
+                            wv = webView
+                            webView.settings.apply {
+                                javaScriptEnabled = true
+                                domStorageEnabled = true
+                                allowFileAccess = false
+                                allowContentAccess = false
+                                loadsImagesAutomatically = false
+                                blockNetworkImage = true
+                                userAgentString = UA
+                            }
+                            WebCookieManager.getInstance().setAcceptCookie(true)
+                            WebCookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+                            val bridge = object {
+                                @JavascriptInterface
+                                fun onResult(json: String) = finish(json)
 
-                            @JavascriptInterface
-                            fun onError(err: String) = finish("{\"error\":${JSONObject.quote(err)}}")
-                        }
-                        webView.addJavascriptInterface(bridge, "PBDrive")
-                        val fired = AtomicBoolean(false)
-                        webView.webViewClient = object : WebViewClient() {
-                            override fun onPageFinished(view: WebView?, url: String?) {
-                                val u = url.orEmpty()
-                                if (!u.startsWith(SITE_ORIGIN, true) || fired.get()) return
-                                val pageTitle = view?.title.orEmpty().lowercase(Locale.US)
-                                if (pageTitle.contains("just a moment") || pageTitle.contains("attention required")) {
-                                    return
-                                }
-                                if (!fired.compareAndSet(false, true)) return
-                                val js = """
-                                    (function(){
-                                      function run(attempt){
-                                        var titleLow = (document.title || '').toLowerCase();
-                                        var hasCfDom = !!(document.getElementById('challenge-running') || document.getElementById('cf-challenge-running') || document.getElementById('challenge-form'));
-                                        if ((hasCfDom || titleLow.indexOf('just a moment') >= 0 || titleLow.indexOf('attention required') >= 0) && attempt < 4) {
-                                          setTimeout(function(){ run(attempt + 1); }, 1500);
-                                          return;
-                                        }
-                                        fetch(${JSONObject.quote(apiPath)}, {credentials:'include', headers:{'Accept':'application/json'}})
-                                          .then(function(r){ return r.text(); })
-                                          .then(function(t){
-                                            var s = (t || '').trim();
-                                            if (!s.startsWith('{') && attempt < 4) {
+                                @JavascriptInterface
+                                fun onError(err: String) = finish("{\"error\":${JSONObject.quote(err)}}")
+                            }
+                            webView.addJavascriptInterface(bridge, "PBDrive")
+                            val fired = AtomicBoolean(false)
+                            webView.webViewClient = object : WebViewClient() {
+                                override fun onPageFinished(view: WebView?, url: String?) {
+                                    val u = url.orEmpty()
+                                    if (!u.startsWith(SITE_ORIGIN, true) || fired.get()) return
+                                    val pageTitle = view?.title.orEmpty().lowercase(Locale.US)
+                                    if (pageTitle.contains("just a moment") || pageTitle.contains("attention required")) {
+                                        return
+                                    }
+                                    if (!fired.compareAndSet(false, true)) return
+                                    val js = """
+                                        (function(){
+                                          function run(attempt){
+                                            var titleLow = (document.title || '').toLowerCase();
+                                            var hasCfDom = !!(document.getElementById('challenge-running') || document.getElementById('cf-challenge-running') || document.getElementById('challenge-form'));
+                                            if ((hasCfDom || titleLow.indexOf('just a moment') >= 0 || titleLow.indexOf('attention required') >= 0) && attempt < 4) {
                                               setTimeout(function(){ run(attempt + 1); }, 1500);
-                                            } else {
-                                              PBDrive.onResult(t);
+                                              return;
                                             }
-                                          })
-                                          .catch(function(e){ PBDrive.onError(String(e)); });
-                                      }
-                                      run(0);
-                                    })();
-                                """.trimIndent()
-                                view?.evaluateJavascript(js, null)
-                            }
+                                            fetch(${JSONObject.quote(apiPath)}, {credentials:'include', headers:{'Accept':'application/json'}})
+                                              .then(function(r){ return r.text(); })
+                                              .then(function(t){
+                                                var s = (t || '').trim();
+                                                if (!s.startsWith('{') && attempt < 4) {
+                                                  setTimeout(function(){ run(attempt + 1); }, 1500);
+                                                } else {
+                                                  PBDrive.onResult(t);
+                                                }
+                                              })
+                                              .catch(function(e){ PBDrive.onError(String(e)); });
+                                          }
+                                          run(0);
+                                        })();
+                                    """.trimIndent()
+                                    view?.evaluateJavascript(js, null)
+                                }
 
-                            override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
-                                if (request?.isForMainFrame == true) finish(null)
-                            }
+                                override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                                    if (request?.isForMainFrame == true) finish(null)
+                                }
 
-                            override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
-                                handler?.cancel()
-                                finish(null)
+                                override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
+                                    handler?.cancel()
+                                    finish(null)
+                                }
                             }
-                        }
-                        webView.loadUrl("$SITE_ORIGIN/drive?$enc")
-                    }.onFailure { finish(null) }
+                            webView.loadUrl("$SITE_ORIGIN/drive?$enc")
+                        }.onFailure { finish(null) }
+                    }
                 }
-            }
-        } ?: return NtriverResolveResult(errorMessage = "Timed out generating direct link from NTriver Drive. Tap Retry.", isRateLimited = true)
+            } ?: return@withLock NtriverResolveResult(errorMessage = "Timed out generating direct link from NTriver Drive. Tap Retry.", isRateLimited = true)
 
-        return parseGenerateLinkJson(body)
+            parseGenerateLinkJson(body)
+        }
     }
 
     suspend fun resolveDownloadUrl(context: Context, entry: NtriverIsoEntry): NtriverResolveResult =
@@ -1289,7 +1685,7 @@ object NtriverCatalog {
     private suspend fun resolveDriveFilename(context: Context, driveFile: String): NtriverResolveResult {
         val enc = encodeUrlQueryParam(driveFile)
         val apiUrl = "$GENERATE_LINK_API?filename=$enc"
-        val directRes = runCatching {
+        val directRes = try {
             val (code, body) = httpGet(apiUrl, acceptJson = true, referer = "$SITE_ORIGIN/drive?$enc")
             when {
                 code == 429 -> NtriverResolveResult(
@@ -1302,7 +1698,11 @@ object NtriverCatalog {
                 )
                 else -> parseGenerateLinkJson(body)
             }
-        }.getOrElse { e ->
+        } catch (_: UnknownHostException) {
+            NtriverResolveResult(
+                errorMessage = "Your ISP/DNS is blocking ntriver.org. Enable Android Private DNS (one.one.one.one or dns.google) or a VPN, or pick an MS Static / Microsoft CDN ISO."
+            )
+        } catch (e: Exception) {
             NtriverResolveResult(errorMessage = "Network error contacting NTriver Drive: ${e.message ?: "connection failed"}")
         }
 

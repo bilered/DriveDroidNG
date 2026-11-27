@@ -12,5 +12,7 @@
         <domain includeSubdomains="true">github.com</domain>
         <domain includeSubdomains="true">githubusercontent.com</domain>
         <domain includeSubdomains="true">ntriver.org</domain>
+        <domain includeSubdomains="true">jsdelivr.net</domain>
+        <domain includeSubdomains="true">jsdelivr.com</domain>
     </domain-config>
 </network-security-config>

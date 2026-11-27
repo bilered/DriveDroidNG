@@ -391,5 +391,54 @@ class Wave6NtriverTest {
         assertFalse(WindowsCatalogFamily.WIN81.isPrimaryFamily)
         assertFalse(WindowsCatalogFamily.WIN7.isPrimaryFamily)
         assertFalse(WindowsCatalogFamily.WIN_SERVER.isPrimaryFamily)
+
+        // 10) R7 fixes: Relative Markdown links (`/drive?...`, `drive?...`), GFM table without leading `|`, hyphen `Build - ...`
+        val relMd = """
+            ## Windows 11 26H2 Consumer ❤️
+            Build - 26300.9457 (September 2026)
+            Language | Arch | Link
+            --- | --- | ---
+            English | x64 | [en-us_windows_11_consumer_editions_version_26h2_x64_dvd_e4fa21a2.iso](/drive?en-us_windows_11_consumer_editions_version_26h2_x64_dvd_e4fa21a2.iso)
+            German | x64 | [NTriver](drive?de-de_windows_11_consumer_editions_version_26h2_x64_dvd_11111111.iso)
+        """.trimIndent()
+        val relSecs = NtriverCatalog.parseMarkdownCatalogPage(relMd)
+        assertEquals(1, relSecs.size)
+        assertTrue(relSecs[0].buildBadge.contains("26300.9457"))
+        assertEquals(2, relSecs[0].entries.size)
+        assertEquals("en-us_windows_11_consumer_editions_version_26h2_x64_dvd_e4fa21a2.iso", relSecs[0].entries[0].ntriverDriveFilename)
+        assertEquals("de-de_windows_11_consumer_editions_version_26h2_x64_dvd_11111111.iso", relSecs[0].entries[1].ntriverDriveFilename)
+
+        // 11) Wrapper `<article>` + unquoted `href=/drive?...` + loose ISO fallback (no heading/table)
+        val trickyHtml = """
+            <article class="banner"><p>Notice banner</p></article>
+            <article class="doc">
+              <h2>Windows 10 22H2 Consumer ❤️</h2>
+              <table>
+                <tr><th>Language</th><th>Arch</th><th>Link</th></tr>
+                <tr><td>English</td><td>x64</td><td><a href=/drive?Win10_22H2_English_x64.iso>NTriver</a></td></tr>
+              </table>
+            </article>
+        """.trimIndent()
+        val trickySecs = NtriverCatalog.parseHtmlCatalogPage(trickyHtml)
+        assertEquals(1, trickySecs.size)
+        assertEquals("Win10_22H2_English_x64.iso", trickySecs[0].entries[0].fileName)
+
+        val looseHtml = """<div class="cards"><a href="https://ntriver.org/drive?en-us_windows_11_26h2_x64.iso">Download Win11</a></div>"""
+        val looseSecs = NtriverCatalog.parseHtmlCatalogPage(looseHtml, pagePrefix = "Windows 11")
+        assertEquals(1, looseSecs.size)
+        assertEquals("en-us_windows_11_26h2_x64.iso", looseSecs[0].entries[0].fileName)
+
+        // 12) jsDelivr flat & nested JSON tree parsing + windowsupdate.com static URL support
+        val flatJsd = """{"files":[{"name":"/i18n/zh/download-windows-11.md"},{"name":"/docs/download-windows-11-esd.md"},{"name":"/docs/windows-iso/download-windows-11.md"},{"name":"/docs/windows-iso/download-windows-10.mdx"}]}"""
+        val flatMap = NtriverCatalog.parseJsDelivrTreeJson(flatJsd)
+        assertEquals("docs/windows-iso/download-windows-11.md", flatMap["win11"])
+        assertEquals("docs/windows-iso/download-windows-10.mdx", flatMap["win10"])
+
+        val nestedJsd = """{"files":[{"type":"directory","name":"docs","files":[{"type":"file","name":"download-windows-8.1.md"}]}]}"""
+        assertEquals("docs/download-windows-8.1.md", NtriverCatalog.parseJsDelivrTreeJson(nestedJsd)["win81"])
+
+        assertTrue(NtriverCatalog.isDirectMicrosoftIsoUrl("https://dl.delivery.mp.microsoft.com/filestreamingservice/files/win11.iso"))
+        assertTrue(NtriverCatalog.isDirectMicrosoftIsoUrl("https://download.windowsupdate.com/d/msdownload/win10.iso"))
+        assertFalse(NtriverCatalog.isDirectMicrosoftIsoUrl("https://evilwindowsupdate.com/win10.iso"))
     }
 }

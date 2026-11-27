@@ -82,6 +82,7 @@ fun WindowsDownloadSheet(
     family: WindowsCatalogFamily,
     turboConnections: Int,
     existingFileNames: Set<String> = emptySet(),
+    onAppendLog: (LogEntry) -> Unit = {},
     onDismiss: () -> Unit,
     onStartDirectDownload: (title: String, url: String, fileName: String, expectedSha256: String, refreshSourceKey: String) -> Unit
 ) {
@@ -190,7 +191,7 @@ fun WindowsDownloadSheet(
     LaunchedEffect(family.id, ntRetryNonce) {
         ntLoading = true
         ntError = null
-        val res = NtriverCatalog.fetchSections(family, forceRefresh = ntRetryNonce > 0)
+        val res = NtriverCatalog.fetchSections(context, family, forceRefresh = ntRetryNonce > 0, onLog = onAppendLog)
         if (res.data != null) {
             ntSections = res.data
             val firstMajor = res.data.firstOrNull()?.effectiveMajorVersion.orEmpty()
