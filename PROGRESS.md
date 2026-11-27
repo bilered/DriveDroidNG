@@ -1,6 +1,12 @@
 # PocketBoot Development Progress
 
-## Current Milestone: v4.9.0 — Wave 5 (Direct-Mode USB-C OTG Upgrade — 4 Modes)
+## Current Milestone: v4.10.0 — Wave 6 (NTriver Direct Windows Archive & Downloader Hardening)
+- **Wave 6 Complete (`v4.10.0`, `versionCode = 41`):**
+  - **NTriver Direct Windows Archive (`NtriverCatalog.kt`, `WindowsDownloadSheet.kt`, `DownloadScreen.kt`):** Added NTriver Archive as default tab (with Microsoft CDN preserved as Tab 2 on Win 11/10/8.1) and expanded Windows cards to 6 families (**Windows 11**, **Windows 10**, **Windows 10 / 11 LTSC**, **Windows 8.1**, **Windows 7 SP1**, **Windows Server 2025/2022/2019**) with official SHA-256 auto-verification, MS Static Link priority, dynamic GitHub Markdown fallback, and partial-language previous-month shortcut.
+  - **Turbo Downloader & Security Hardening (`FastIsoDownloader.kt`, `network_security_config.xml`):** Host-scoped redirect cookies, `Mutex` single-flight expired-URL refresh on resume & `401/403/404/410`, verified `206` range probe, strict HTTPS on `ntriver.org`, and RTM `windows_7`/`_x32`/`serverdc` detection.
+  - **Wave 6 JVM Unit Tests (`Wave6NtriverTest.kt`):** 9th JUnit suite verifying parsers, clutter filtering, JSON validation, cookie isolation, and fail-closed guards.
+
+## Previous Milestone: v4.9.0 — Wave 5 (Direct-Mode USB-C OTG Upgrade — 4 Modes)
 - **Wave 5 Complete (`v4.9.0`, `versionCode = 40`):**
   - **Direct 4-Mode USB-C OTG Flasher (`OtgUsbFlasher.kt`, `DiskPartitioner.kt`, `WindowsImageBuilder.kt`, `LinuxImageBuilder.kt`, `VentoyImageBuilder.kt`):** Direct-to-pen-drive **Direct Windows USB** (full tweaks, `boot.wim` bypass, Driver Packs), **Direct Linux + Persistence** (Extracted FAT32 / Hybrid DD + dynamic ext4 persistence), **Direct Multi-Boot USB** (full-capacity physical Multi-Boot + tweaks/drivers), and **Raw / Streaming DD**, with **0 GB phone `.img` overhead**.
   - **9-Layer Anti-Brick Protection:** Adds `512 B` sector guard, multi-namespace `sm unmount`, `4 MiB` head + `2 MiB` tail wipe, silent `losetup` + `rereadpt` fallback, `2 TiB` MBR lock, live disconnect watchdog, and safe-to-unplug write-cache flush.

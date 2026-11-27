@@ -1,3 +1,18 @@
+## v4.10.0 (2026-11-27) — Wave 6: NTriver Direct Windows Archive & Downloader Hardening
+- **NTriver Direct Windows Archive Engine (`NtriverCatalog.kt`):**
+  - Dynamically discovers OS routes from `https://ntriver.org/download-windows-office` (with verified fallback slugs), parses rendered Docusaurus HTML tables, and automatically falls back to raw GitHub Markdown (`ntriver-org/ntriver-org-site` via dynamic tree lookup) if Cloudflare blocks plain HTTP.
+  - Automatically prefers permanent **Microsoft Static Links** (`MS Static`) whenever listed on a row before calling `GET https://ntriver.org/api/drive/generate-link?filename=...` (with a strict-SSL headless WebView fallback on browser challenge).
+  - Strictly filters non-`.iso` files (`.esd`, `.exe`) and non-bootable clutter (`IA-64`, `ARM32 RT`, `SDK`, `WDK`, `WAIK`, `Symbols`, `Language Packs`, `rg-adguard`), defaults to recommended PC editions with a **"More Editions"** toggle, and surfaces partial-language notes plus a 1-tap **"Switch to previous month"** shortcut.
+- **Expanded Windows Catalog & Dual-Source Sheet (`WindowsDirectCatalog.kt`, `WindowsDownloadSheet.kt`, `DownloadScreen.kt`):**
+  - Adds **Windows 10 / 11 LTSC**, **Windows 7 SP1**, and **Windows Server 2025 / 2022 / 2019** cards alongside **Windows 11**, **Windows 10**, and **Windows 8.1** with a 2-tab **NTriver Archive / Microsoft CDN** switcher, SHA-256 auto-verification badge, **"Saved"** local-library detection, and NTriver-first long-press quick link copy.
+- **Turbo Downloader & Detection Hardening (`FastIsoDownloader.kt`, `WindowsCustomization.kt`, `IsoInspector.kt`, `network_security_config.xml`):**
+  - Scoped redirect cookies strictly by hostname (`selectCookiesForHost`) so foreign Cloudflare cookies never leak to external storage mirrors.
+  - Added `Mutex`-guarded single-flight expired-URL auto-refresh (`refreshSourceKey` persisted in `.pbmeta`) on sidecar resume, in-memory resume, and mid-download HTTP `401`/`403`/`404`/`410`, with fail-closed `Content-Length` verification.
+  - Switched range probing to verified `GET bytes=0-32767` (`206 Partial Content`) checks and enforced strict HTTPS on `ntriver.org`.
+  - Extended filename OS/architecture detection for `windows_7`, `windows_8`, `_x32`, and `serverdc` RTM filenames.
+- **Wave 6 JVM Unit Tests (`Wave6NtriverTest.kt`):**
+  - Added 9th JUnit suite covering index discovery, HTML & Markdown table parsing, `.esd`/clutter filtering, `generate-link` JSON validation, host-scoped cookie isolation, CDN fail-closed guard, and RTM filename detection.
+
 ## v4.9.0 (2026-11-27) — Wave 5: Direct-Mode USB-C OTG Upgrade (4 Modes)
 - **Fixed-Disk Physical Partition Engine (`DiskPartitioner.kt`):**
   - Added `calculateFixedDiskLayout()`, `calculateFixedVentoyLayout()`, `calculateFixedLinuxFat32Layout()`, `maxLinuxPersistenceGb()`, `findPersistenceSlotIndex()`, and `effectiveSchemeForDisk()` utilizing 100% of a physical pen drive's capacity, placing Backup GPT at exact `totalSectors - 1`, and enforcing a strict `2 TiB` MBR 32-bit LBA guard (auto-locking `> 2 TiB` USB SSDs to GPT).

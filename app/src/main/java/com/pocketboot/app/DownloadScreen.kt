@@ -719,7 +719,8 @@ fun DownloadScreen(
         url: String,
         fileName: String,
         approxBytes: Long = 0L,
-        expectedSha256: String = ""
+        expectedSha256: String = "",
+        refreshSourceKey: String = ""
     ) {
         val cleanUrl = url.trim()
         if (!cleanUrl.startsWith("http://") && !cleanUrl.startsWith("https://")) {
@@ -739,6 +740,7 @@ fun DownloadScreen(
             targetMultiBootPath = mbTargetPath,
             approxBytes = approxBytes,
             expectedSha256 = expectedSha256,
+            refreshSourceKey = refreshSourceKey,
             connections = settings.downloadConnections,
             autoMount = autoMount,
             autoVerifySha256 = settings.autoVerifySha256,
@@ -1262,7 +1264,8 @@ fun DownloadScreen(
                                                 pendingResumables = FastIsoDownloader.scanPendingResumableDownloads(context)
                                                 onMessage(err, true)
                                             }
-                                        }
+                                        },
+                                        onLog = { entry -> scope.launch { onAppendLog(entry) } }
                                     )
                                 },
                                 shape = RoundedCornerShape(999.dp),
@@ -1462,7 +1465,10 @@ fun DownloadScreen(
             val matchedWinFamilies = remember(q) {
                 if (q.isEmpty()) WindowsCatalogFamily.entries.toList()
                 else WindowsCatalogFamily.entries.filter {
-                    it.title.lowercase().contains(q) || it.subtitle.lowercase().contains(q) || "windows".contains(q)
+                    it.title.lowercase().contains(q) ||
+                        it.subtitle.lowercase().contains(q) ||
+                        it.searchTags.lowercase().contains(q) ||
+                        "windows".contains(q)
                 }
             }
             val matchedNonWin = remember(nonWinDistros, q) {
@@ -1573,9 +1579,10 @@ fun DownloadScreen(
         WindowsDownloadSheet(
             family = fam,
             turboConnections = settings.downloadConnections,
+            existingFileNames = existingFileNames,
             onDismiss = { selectedWindowsFamily = null },
-            onStartDirectDownload = { title, url, fileName, sha ->
-                startTurboDownload(title, url, fileName, expectedSha256 = sha)
+            onStartDirectDownload = { title, url, fileName, sha, refreshKey ->
+                startTurboDownload(title, url, fileName, expectedSha256 = sha, refreshSourceKey = refreshKey)
             }
         )
     }
@@ -1701,7 +1708,7 @@ fun DownloadScreen(
             title = { Text(fam.title, color = PocketColors.textPrimary) },
             text = {
                 Text(
-                    text = "Copy the latest English (x64) official Microsoft CDN link for external download managers, or open the selector to choose another version, architecture, or language.",
+                    text = "Copy the latest English (x64) direct ISO link for external download managers, or open the selector to pick another release, architecture, or language.",
                     style = MaterialTheme.typography.bodySmall,
                     color = PocketColors.textSecondary
                 )
@@ -1712,16 +1719,32 @@ fun DownloadScreen(
                         scope.launch {
                             fetchingLink = true
                             var copiedUrl: String? = null
-                            val rel = WindowsDirectCatalog.fetchReleases(fam).let { list -> list.firstOrNull { !it.isArm64Only } ?: list.firstOrNull() }
-                            if (rel != null) {
-                                val skuRes = WindowsDirectCatalog.fetchLanguages(context, rel)
-                                val data = skuRes.data
-                                if (data != null) {
-                                    val enSku = data.second.firstOrNull { it.localizedLanguage.contains("English (United States)", true) }
-                                        ?: data.second.firstOrNull()
-                                    if (enSku != null) {
-                                        val dlRes = WindowsDirectCatalog.fetchDownloadLinks(context, rel, data.first, enSku.skuId)
-                                        copiedUrl = (dlRes.data?.firstOrNull { it.arch.equals("x64", true) } ?: dlRes.data?.firstOrNull())?.url
+                            // Primary: NTriver Archive (works for all 6 families including latest monthly MVS, LTSC, Win7, Server)
+                            val ntRes = NtriverCatalog.fetchSections(fam)
+                            val ntSections = ntRes.data.orEmpty()
+                            val prefSec = ntSections.firstOrNull { it.isRecommended } ?: ntSections.firstOrNull()
+                            val x64Entries = prefSec?.entries?.filter { it.arch.equals("x64", true) }.orEmpty()
+                                .ifEmpty { prefSec?.entries.orEmpty() }
+                            val prefEntry = x64Entries.firstOrNull {
+                                it.effectiveLanguageLabel.equals("English (US)", true) || it.effectiveLanguageLabel.equals("English", true)
+                            } ?: x64Entries.firstOrNull { it.language.contains("English", true) }
+                                ?: x64Entries.firstOrNull()
+                            if (prefEntry != null) {
+                                copiedUrl = NtriverCatalog.resolveDownloadUrl(context, prefEntry).url
+                            }
+                            // Fallback: Microsoft Direct CDN (for supported retail families)
+                            if (copiedUrl == null && fam.supportsMicrosoftCdn) {
+                                val rel = WindowsDirectCatalog.fetchReleases(fam).let { list -> list.firstOrNull { !it.isArm64Only } ?: list.firstOrNull() }
+                                if (rel != null) {
+                                    val skuRes = WindowsDirectCatalog.fetchLanguages(context, rel)
+                                    val data = skuRes.data
+                                    if (data != null) {
+                                        val enSku = data.second.firstOrNull { it.localizedLanguage.contains("English (United States)", true) }
+                                            ?: data.second.firstOrNull()
+                                        if (enSku != null) {
+                                            val dlRes = WindowsDirectCatalog.fetchDownloadLinks(context, rel, data.first, enSku.skuId)
+                                            copiedUrl = (dlRes.data?.firstOrNull { it.arch.equals("x64", true) } ?: dlRes.data?.firstOrNull())?.url
+                                        }
                                     }
                                 }
                             }
@@ -1730,7 +1753,7 @@ fun DownloadScreen(
                             if (copiedUrl != null) {
                                 copyLinkToClipboard("${fam.title} (English x64)", copiedUrl)
                             } else {
-                                onMessage("Microsoft CDN link unavailable right now. Open selector and tap Retry.", true)
+                                onMessage("Direct link unavailable right now. Open selector and tap Retry.", true)
                             }
                         }
                     },

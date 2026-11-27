@@ -1,10 +1,10 @@
-# PocketBoot v4.9.0
+# PocketBoot v4.10.0
 
 Rooted Android USB Gadget ISO/IMG boot utility, multi-boot Ventoy drive manager, official OS downloader, and Rufus-style Windows & Linux bootable USB builder.
 
 ## Core Capabilities
 - **USB Gadget Booting & Dual-LUN Combos (`UsbGadgetEngine.kt`):** Mount any ISO or disk `.img` over USB ConfigFS as a bootable CD-ROM or Mass Storage drive, save 1-tap atomic Dual-LUN (LUN 0 + LUN 1) combos, with Quick Settings tile and foreground keep-alive watchdog.
-- **Direct Official Windows ISOs (`WindowsDirectCatalog.kt`):** Download official Microsoft Retail ISOs for Windows 11 (26H2 / 25H2 / 24H2), Windows 10 (22H2), and Windows 8.1 directly from Microsoft CDN — with full Edge, Store Apps, WinRE, and OOBE working out of the box.
+- **NTriver Windows Archive & Official Microsoft CDN (`NtriverCatalog.kt`, `WindowsDirectCatalog.kt`, `WindowsDownloadSheet.kt`):** Download the latest monthly Windows 11 (26H2 / 25H2 / 24H2), Windows 10 (22H2), Windows 10/11 Enterprise LTSC, Windows 8.1, Windows 7 SP1, and Windows Server 2025 / 2022 / 2019 RTM ISOs with official SHA-256 auto-verification, permanent Microsoft Static Link priority, dynamic GitHub Markdown fallback, host-scoped redirect cookies, and single-flight expired-URL auto-refresh on resume — alongside Microsoft Direct CDN.
 - **Linux & Rescue Distro Catalog (`DownloadScreen.kt`, `FastIsoDownloader.kt`):** Multi-connection resumable turbo downloads with SHA-256 verification and FAT32 Linux USB image creation.
 - **Rufus-Style Windows USB Builder & Driver Pack Library (`WindowsImageBuilder.kt`, `DriverPackManager.kt`):** Convert any Windows ISO into a bootable GPT/MBR NTFS or UEFI:NTFS `.img` with TPM/RAM/Secure Boot bypass, local account creation, WinUtil tweaks, reusable `.inf`/`.zip`/`.7z` Storage & Wi-Fi driver packs, CA 2023 bootloaders, and Win 7 UEFI fix.
 - **Foreground USB Build Service & Thermal Control (`UsbBuildService.kt`, `BuildThermalHelper.kt`):** Background-safe foreground service with wake lock, live notification + Cancel action, and Cool / Balanced / Max Speed CPU core-affinity & Auto Thermal Cooldown.

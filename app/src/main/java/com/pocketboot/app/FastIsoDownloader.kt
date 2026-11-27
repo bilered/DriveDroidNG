@@ -24,6 +24,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -68,7 +70,8 @@ data class PendingResumableDownload(
     val downloadedBytes: Long,
     val totalBytes: Long,
     val expectedSha256: String,
-    val autoMount: Boolean
+    val autoMount: Boolean,
+    val refreshSourceKey: String = ""
 ) {
     val progress: Float
         get() = if (totalBytes > 0L) (downloadedBytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f) else 0f
@@ -89,7 +92,8 @@ data class TurboDownloadState(
     val isPaused: Boolean = false,
     val isVerifying: Boolean = false,
     val isInjectingMultiBoot: Boolean = false,
-    val statusText: String = "Connecting..."
+    val statusText: String = "Connecting...",
+    val refreshSourceKey: String = ""
 ) {
     val progress: Float
         get() = if (totalBytes > 0L) (downloadedBytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f) else 0f
@@ -214,18 +218,21 @@ object FastIsoDownloader {
     private var chunkCursors: LongArray = LongArray(0)
     private var stagingFile: File? = null
     private var sidecarFile: File? = null
-    private var cachedFinalUrl: String = ""
+    @Volatile private var cachedFinalUrl: String = ""
     private var cachedTotalBytes: Long = 0L
     private var cachedThreads: Int = 8
     private var cachedAutoMount: Boolean = true
     private var cachedAutoVerifySha256: Boolean = true
     private var cachedExpectedSha256: String = ""
     private var cachedTargetMultiBootPath: String = ""
+    @Volatile private var cachedRefreshSourceKey: String = ""
+    private val urlRefreshMutex = Mutex()
+    @Volatile private var lastUrlRefreshMs: Long = 0L
     private var cachedOnComplete: ((DownloadCompletionEvent) -> Unit)? = null
     private var cachedOnError: ((String) -> Unit)? = null
     private var cachedOnLog: ((LogEntry) -> Unit)? = null
     @Volatile private var cachedUserAgent: String = BROWSER_UA
-    private const val BROWSER_UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.9.0"
+    private const val BROWSER_UA = "Mozilla/5.0 (Linux; Android 15) PocketBoot/4.10.0"
     private const val WGET_UA = "Wget/1.21.4"
     private const val CURL_UA = "curl/8.5.0"
     private fun logDl(msg: String, isError: Boolean = false) { cachedOnLog?.invoke(LogEntry(SimpleDateFormat("HH:mm:ss", Locale.US).format(Date()), "download", msg, isError)) }
@@ -298,7 +305,8 @@ object FastIsoDownloader {
                         downloadedBytes = done,
                         totalBytes = obj.optLong("totalBytes", 0L),
                         expectedSha256 = obj.optString("expectedSha256", ""),
-                        autoMount = obj.optBoolean("autoMount", true)
+                        autoMount = obj.optBoolean("autoMount", true),
+                        refreshSourceKey = obj.optString("refreshSourceKey", "")
                     )
                 }.getOrNull()
             }
@@ -328,6 +336,7 @@ object FastIsoDownloader {
                 put("partFilePath", part.absolutePath)
                 put("totalBytes", cachedTotalBytes)
                 put("expectedSha256", cachedExpectedSha256)
+                put("refreshSourceKey", cachedRefreshSourceKey)
                 put("autoMount", cachedAutoMount)
                 put("autoVerifySha256", cachedAutoVerifySha256)
                 put("threadCount", chunkStarts.size)
@@ -377,18 +386,49 @@ object FastIsoDownloader {
         return Triple(rawUrl, null, null)
     }
     private fun prefersCliUserAgent(urlStr: String): Boolean { val low = urlStr.lowercase(); return low.contains("sourceforge.net") || low.contains("osdn.net") || low.contains("fosshub.com") }
+    /**
+     * Pure-JVM testable host-scoped cookie selector so foreign cookies (e.g. Cloudflare cookies from an index host)
+     * are NEVER leaked to redirected S3/R2/OneDrive/CDN storage mirrors (which reject foreign cookies with HTTP 400/403).
+     */
+    internal fun selectCookiesForHost(cookiesByHost: Map<String, Map<String, String>>, host: String): String {
+        val h = host.trim().lowercase(Locale.US)
+        if (h.isEmpty()) return ""
+        val hostJar = cookiesByHost[h].orEmpty()
+        return if (hostJar.isEmpty()) "" else hostJar.entries.joinToString("; ") { "${it.key}=${it.value}" }
+    }
+
     private fun openFollowingRedirects(urlStr: String, method: String, rangeHeader: String? = null, userAgent: String = cachedUserAgent): HttpURLConnection {
-        var current = urlStr; var redirects = 0; val cookies = LinkedHashMap<String, String>()
+        var current = urlStr; var redirects = 0
+        val cookiesByHost = LinkedHashMap<String, LinkedHashMap<String, String>>()
         while (redirects < 12) {
-            val conn = (URL(current).openConnection() as HttpURLConnection).apply {
+            val curUrl = URL(current)
+            val curHost = curUrl.host.orEmpty().lowercase(Locale.US)
+            val cookieHeader = selectCookiesForHost(cookiesByHost, curHost)
+            val conn = (curUrl.openConnection() as HttpURLConnection).apply {
                 requestMethod = method; instanceFollowRedirects = false; connectTimeout = 15_000; readTimeout = 25_000
                 setRequestProperty("User-Agent", userAgent); setRequestProperty("Accept", "*/*"); setRequestProperty("Accept-Encoding", "identity"); setRequestProperty("Connection", "keep-alive")
-                if (cookies.isNotEmpty()) setRequestProperty("Cookie", cookies.entries.joinToString("; ") { "${it.key}=${it.value}" })
+                if (cookieHeader.isNotEmpty()) setRequestProperty("Cookie", cookieHeader)
                 if (rangeHeader != null) setRequestProperty("Range", rangeHeader)
             }
             val code = conn.responseCode
-            conn.headerFields["Set-Cookie"]?.forEach { rc -> val pair = rc.substringBefore(';').trim(); val eq = pair.indexOf('='); if (eq > 0) cookies[pair.substring(0, eq).trim()] = pair.substring(eq + 1).trim() }
-            if (code in listOf(301, 302, 303, 307, 308)) { val loc = conn.getHeaderField("Location"); conn.disconnect(); if (loc.isNullOrBlank()) throw IllegalStateException("Redirect without Location header"); current = URL(URL(current), loc).toString(); redirects++ } else return conn
+            val hostJar = cookiesByHost.getOrPut(curHost) { LinkedHashMap() }
+            conn.headerFields.entries
+                .filter { it.key.equals("Set-Cookie", ignoreCase = true) }
+                .flatMap { it.value.orEmpty() }
+                .forEach { rc ->
+                    val pair = rc.substringBefore(';').trim()
+                    val eq = pair.indexOf('=')
+                    if (eq > 0) hostJar[pair.substring(0, eq).trim()] = pair.substring(eq + 1).trim()
+                }
+            if (code in listOf(301, 302, 303, 307, 308)) {
+                val loc = conn.getHeaderField("Location")
+                conn.disconnect()
+                if (loc.isNullOrBlank()) throw IllegalStateException("Redirect without Location header")
+                current = URL(curUrl, loc).toString()
+                redirects++
+            } else {
+                return conn
+            }
         }
         throw IllegalStateException("Too many redirects (12+)")
     }
@@ -399,28 +439,61 @@ object FastIsoDownloader {
         }
         return Regex("""href=["'](https?://[^"']+\.(?:iso|img|iso\.zip|img\.zip)(?:\?[^"']*)?)["']""", RegexOption.IGNORE_CASE).find(html)?.groupValues?.getOrNull(1)?.replace("&amp;", "&")
     }
+    internal fun isUnexpectedSmallErrorPayload(contentType: String, contentLength: Long): Boolean {
+        val ct = contentType.trim().lowercase(Locale.US)
+        val isStructuredError = ct.contains("application/json") || ct.contains("application/xml") || ct.contains("text/xml")
+        return isStructuredError && contentLength in 0L..65_535L
+    }
+
     private fun probeWithUa(urlStr: String, ua: String): Pair<ProbeResult, String?> {
-        runCatching {
-            val conn = openFollowingRedirects(urlStr, "HEAD", userAgent = ua)
-            try {
-                val code = conn.responseCode; val cType = conn.contentType.orEmpty().lowercase()
-                if (code in 200..299 && !cType.contains("text/html")) {
-                    val len = conn.contentLengthLong; val acceptRanges = conn.getHeaderField("Accept-Ranges")?.equals("bytes", true) == true
-                    if (len > 0L && acceptRanges) return ProbeResult(conn.url.toString(), len, true, false, code, cType, ua) to null
-                }
-            } finally { conn.disconnect() }
-        }
         val conn = openFollowingRedirects(urlStr, "GET", rangeHeader = "bytes=0-32767", userAgent = ua)
+        var retryWithoutRange = false
         try {
-            val code = conn.responseCode; val finalUrl = conn.url.toString(); val cType = conn.contentType.orEmpty().lowercase()
-            if (cType.contains("text/html") || cType.contains("application/xhtml")) {
-                val snippet = runCatching { val buf = ByteArray(32_768); val n = conn.inputStream.read(buf); if (n > 0) String(buf, 0, n, Charsets.UTF_8) else "" }.getOrDefault("")
-                return ProbeResult(finalUrl, -1L, false, true, code, cType, ua) to extractMirrorUrlFromHtml(finalUrl, snippet)
+            val code = conn.responseCode; val finalUrl = conn.url.toString(); val cType = conn.contentType.orEmpty().lowercase(Locale.US)
+            if (code == 416) {
+                retryWithoutRange = true
+            } else {
+                if (cType.contains("text/html") || cType.contains("application/xhtml")) {
+                    val snippet = runCatching { val s = if (code in 200..399) conn.inputStream else conn.errorStream; val buf = ByteArray(32_768); val n = s?.read(buf) ?: -1; if (n > 0) String(buf, 0, n, Charsets.UTF_8) else "" }.getOrDefault("")
+                    return ProbeResult(finalUrl, -1L, false, true, code, cType, ua) to extractMirrorUrlFromHtml(finalUrl, snippet)
+                }
+                if (code == 206) {
+                    val total = conn.getHeaderField("Content-Range").orEmpty().substringAfter('/', "").trim().toLongOrNull() ?: -1L
+                    if (isUnexpectedSmallErrorPayload(cType, total)) {
+                        throw IllegalStateException("Server returned unexpected $cType payload instead of binary image")
+                    }
+                    return ProbeResult(finalUrl, total, total > 0L, false, code, cType, ua) to null
+                }
+                if (code in 200..299) {
+                    val len = conn.contentLengthLong
+                    if (isUnexpectedSmallErrorPayload(cType, len)) {
+                        throw IllegalStateException("Server returned unexpected $cType payload instead of binary image")
+                    }
+                    return ProbeResult(finalUrl, len, false, false, code, cType, ua) to null
+                }
+                throw IllegalStateException("Server returned HTTP $code ($finalUrl)")
             }
-            if (code == 206) { val total = conn.getHeaderField("Content-Range").orEmpty().substringAfter('/', "").trim().toLongOrNull() ?: -1L; return ProbeResult(finalUrl, total, total > 0L, false, code, cType, ua) to null }
-            if (code in 200..299) return ProbeResult(finalUrl, conn.contentLengthLong, false, false, code, cType, ua) to null
-            throw IllegalStateException("Server returned HTTP $code ($finalUrl)")
         } finally { conn.disconnect() }
+
+        if (retryWithoutRange) {
+            val plainConn = openFollowingRedirects(urlStr, "GET", rangeHeader = null, userAgent = ua)
+            try {
+                val code = plainConn.responseCode; val finalUrl = plainConn.url.toString(); val cType = plainConn.contentType.orEmpty().lowercase(Locale.US)
+                if (cType.contains("text/html") || cType.contains("application/xhtml")) {
+                    val snippet = runCatching { val s = if (code in 200..399) plainConn.inputStream else plainConn.errorStream; val buf = ByteArray(32_768); val n = s?.read(buf) ?: -1; if (n > 0) String(buf, 0, n, Charsets.UTF_8) else "" }.getOrDefault("")
+                    return ProbeResult(finalUrl, -1L, false, true, code, cType, ua) to extractMirrorUrlFromHtml(finalUrl, snippet)
+                }
+                if (code in 200..299) {
+                    val len = plainConn.contentLengthLong
+                    if (isUnexpectedSmallErrorPayload(cType, len)) {
+                        throw IllegalStateException("Server returned unexpected $cType payload instead of binary image")
+                    }
+                    return ProbeResult(finalUrl, len, false, false, code, cType, ua) to null
+                }
+                throw IllegalStateException("Server returned HTTP $code ($finalUrl)")
+            } finally { plainConn.disconnect() }
+        }
+        throw IllegalStateException("Probe failed unexpectedly for $urlStr")
     }
     private fun probeServer(urlStr: String): ProbeResult {
         val uaOrder = if (prefersCliUserAgent(urlStr)) listOf(WGET_UA, CURL_UA, BROWSER_UA) else listOf(BROWSER_UA, WGET_UA, CURL_UA)
@@ -450,6 +523,7 @@ object FastIsoDownloader {
         targetMultiBootPath: String = "",
         approxBytes: Long = 0L,
         expectedSha256: String = "",
+        refreshSourceKey: String = "",
         connections: Int = 8,
         autoMount: Boolean = true,
         autoVerifySha256: Boolean = true,
@@ -476,6 +550,8 @@ object FastIsoDownloader {
         cachedAutoVerifySha256 = autoVerifySha256
         cachedExpectedSha256 = expectedSha256.trim().lowercase()
         cachedTargetMultiBootPath = targetMultiBootPath.trim()
+        cachedRefreshSourceKey = refreshSourceKey.trim()
+        lastUrlRefreshMs = 0L
         cachedOnComplete = onComplete
         cachedOnError = onError
         cachedOnLog = onLog
@@ -489,7 +565,8 @@ object FastIsoDownloader {
             targetMultiBootPath = cachedTargetMultiBootPath,
             totalBytes = approxBytes,
             activeThreads = clampedThreads,
-            statusText = "Probing server..."
+            statusText = "Probing server...",
+            refreshSourceKey = cachedRefreshSourceKey
         )
         TurboDownloadService.start(context.applicationContext)
 
@@ -578,7 +655,8 @@ object FastIsoDownloader {
         pending: PendingResumableDownload,
         autoVerifySha256: Boolean,
         onComplete: (DownloadCompletionEvent) -> Unit,
-        onError: (String) -> Unit
+        onError: (String) -> Unit,
+        onLog: (LogEntry) -> Unit = {}
     ) {
         val metaFile = File(pending.metaFilePath)
         val partFile = File(pending.partFilePath)
@@ -618,8 +696,12 @@ object FastIsoDownloader {
         cachedAutoVerifySha256 = autoVerifySha256
         cachedExpectedSha256 = obj.optString("expectedSha256", pending.expectedSha256)
         cachedTargetMultiBootPath = obj.optString("targetMultiBootPath", pending.targetMultiBootPath)
+        cachedRefreshSourceKey = obj.optString("refreshSourceKey", pending.refreshSourceKey)
+        lastUrlRefreshMs = 0L
+        cachedUserAgent = BROWSER_UA
         cachedOnComplete = onComplete
         cachedOnError = onError
+        cachedOnLog = onLog
 
         val done = (0 until n).sumOf { i -> (chunkCursors[i] - chunkStarts[i]).coerceAtLeast(0L) }
         _state.value = TurboDownloadState(
@@ -633,16 +715,33 @@ object FastIsoDownloader {
             activeThreads = n,
             supportsRange = true,
             isPaused = false,
-            statusText = "Resuming · $n connections"
+            statusText = "Resuming · $n connections",
+            refreshSourceKey = cachedRefreshSourceKey
         )
         TurboDownloadService.start(context.applicationContext)
 
         currentJob = scope.launch {
             try {
-                runCatching {
-                    val probe = probeServer(pending.url)
-                    if (!probe.isHtmlPage && probe.finalUrl.isNotBlank()) {
+                val candidateUrl = cachedFinalUrl.ifBlank { pending.url }
+                val reqStartedMs = System.currentTimeMillis()
+                var remoteSizeMismatch = false
+                val probeOk = runCatching {
+                    val probe = probeServer(candidateUrl)
+                    val sizeOk = cachedTotalBytes <= 0L || probe.totalBytes <= 0L || probe.totalBytes == cachedTotalBytes
+                    if (!sizeOk) remoteSizeMismatch = true
+                    if (!probe.isHtmlPage && probe.finalUrl.isNotBlank() && probe.acceptsRanges && sizeOk) {
                         cachedFinalUrl = probe.finalUrl
+                        cachedUserAgent = probe.negotiatedUserAgent
+                        true
+                    } else false
+                }.getOrDefault(false)
+                if (!probeOk) {
+                    if (cachedRefreshSourceKey.isNotBlank()) {
+                        if (!tryRefreshExpiredUrl(candidateUrl, reqStartedMs)) {
+                            throw IllegalStateException("Download link expired and could not be refreshed. Tap Retry or re-download from the catalog.")
+                        }
+                    } else if (remoteSizeMismatch) {
+                        throw IllegalStateException("Remote file size changed since download was paused; discard and restart to prevent a corrupt ISO.")
                     }
                 }
                 runDownloadWorkers(n, true)
@@ -682,6 +781,24 @@ object FastIsoDownloader {
         cachedContext?.let { TurboDownloadService.start(it) }
         currentJob = scope.launch {
             try {
+                if (cachedRefreshSourceKey.isNotBlank()) {
+                    val reqStartedMs = System.currentTimeMillis()
+                    val stillAlive = runCatching {
+                        val p = probeServer(cachedFinalUrl)
+                        val rangeOk = !cur.supportsRange || p.acceptsRanges
+                        val sizeOk = cachedTotalBytes <= 0L || p.totalBytes <= 0L || p.totalBytes == cachedTotalBytes
+                        if (!p.isHtmlPage && p.httpCode in 200..299 && rangeOk && sizeOk) {
+                            cachedFinalUrl = p.finalUrl
+                            cachedUserAgent = p.negotiatedUserAgent
+                            true
+                        } else false
+                    }.getOrDefault(false)
+                    if (!stillAlive) {
+                        if (!tryRefreshExpiredUrl(cachedFinalUrl, reqStartedMs)) {
+                            throw IllegalStateException("Download link expired while paused and could not be refreshed.")
+                        }
+                    }
+                }
                 runDownloadWorkers(cur.activeThreads, cur.supportsRange)
             } catch (_: CancellationException) {
                 // Paused or cancelled
@@ -709,6 +826,7 @@ object FastIsoDownloader {
             runCatching { sidecarFile?.delete() }
             stagingFile = null
             sidecarFile = null
+            cachedRefreshSourceKey = ""
         }
         _state.value = null
         cachedContext?.let { TurboDownloadService.stop(it) }
@@ -755,7 +873,7 @@ object FastIsoDownloader {
         }
 
         try {
-            if (useRanges && threadCount > 1 && cachedTotalBytes > 0L) {
+            if (useRanges && threadCount >= 1 && cachedTotalBytes > 0L && chunkStarts.size >= threadCount) {
                 coroutineScope {
                     (0 until threadCount).map { idx ->
                         async(Dispatchers.IO) {
@@ -837,7 +955,7 @@ object FastIsoDownloader {
 
         IsoInspector.invalidate(savedPath)
         runCatching { sidecarFile?.delete() }
-        stagingFile = null; sidecarFile = null
+        stagingFile = null; sidecarFile = null; cachedRefreshSourceKey = ""
         var effectiveSavedPath = savedPath; var effectiveFileName = destName
         if (effectiveFileName.endsWith(".iso.zip", true) || effectiveFileName.endsWith(".img.zip", true)) {
             _state.value = finalState.copy(statusText = "Extracting ISO from zip archive...")
@@ -976,22 +1094,68 @@ object FastIsoDownloader {
         }
     }.getOrNull()
 
+    private suspend fun tryRefreshExpiredUrl(failedUrl: String, failedAtMs: Long = System.currentTimeMillis()): Boolean {
+        val key = cachedRefreshSourceKey
+        val ctx = cachedContext ?: return false
+        if (key.isBlank()) return false
+        return urlRefreshMutex.withLock {
+            if (pausedFlag.get() || cancelledFlag.get()) return@withLock false
+            if (lastUrlRefreshMs >= failedAtMs && cachedFinalUrl.isNotBlank()) {
+                return@withLock true
+            }
+            if (cachedFinalUrl != failedUrl && (System.currentTimeMillis() - lastUrlRefreshMs) < 15_000L) {
+                return@withLock true
+            }
+            logDl("Signed URL expired — refreshing download link ($key)...")
+            val res = NtriverCatalog.resolveByRefreshKey(ctx, key)
+            if (pausedFlag.get() || cancelledFlag.get()) return@withLock false
+            val freshUrl = res.url ?: return@withLock false
+            val probe = runCatching { probeServer(freshUrl) }.getOrNull() ?: return@withLock false
+            if (pausedFlag.get() || cancelledFlag.get()) return@withLock false
+            if (probe.isHtmlPage || probe.finalUrl.isBlank()) return@withLock false
+            if ((chunkStarts.size > 1 || _state.value?.supportsRange == true) && !probe.acceptsRanges) {
+                logDl("Refreshed URL does not support HTTP byte ranges; refusing to corrupt partial resume.", isError = true)
+                return@withLock false
+            }
+            if (cachedTotalBytes > 0L && probe.totalBytes > 0L && probe.totalBytes != cachedTotalBytes) {
+                logDl("Refreshed URL size mismatch (${probe.totalBytes} != $cachedTotalBytes); refusing to corrupt partial file.", isError = true)
+                return@withLock false
+            }
+            cachedFinalUrl = probe.finalUrl
+            cachedUserAgent = probe.negotiatedUserAgent
+            lastUrlRefreshMs = System.currentTimeMillis()
+            _state.value = _state.value?.copy(url = freshUrl)
+            saveSidecarMeta()
+            logDl("Refreshed signed download URL cleanly.")
+            true
+        }
+    }
+
     private suspend fun downloadChunkWithRetries(file: File, idx: Int, totalCounter: AtomicLong) {
         val end = chunkEnds[idx]
         var attempt = 0
+        var refreshCount = 0
         val buf = ByteArray(262_144)
         while (chunkCursors[idx] <= end && !pausedFlag.get() && !cancelledFlag.get()) {
+            val usedUrl = cachedFinalUrl
+            val reqStartedMs = System.currentTimeMillis()
+            var needRefresh = false
             try {
                 val startPos = chunkCursors[idx]
-                val conn = openFollowingRedirects(cachedFinalUrl, "GET", rangeHeader = "bytes=$startPos-$end")
+                val conn = openFollowingRedirects(usedUrl, "GET", rangeHeader = "bytes=$startPos-$end")
                 try {
                     val code = conn.responseCode
                     if (startPos > 0L && code == 200) {
                         throw IllegalStateException("Server ignored Range header (HTTP 200 at offset $startPos) on chunk $idx")
                     }
-                    if (code != 206 && code != 200) {
-                        throw IllegalStateException("HTTP $code on chunk $idx")
+                    if (code in listOf(401, 403, 404, 410) && cachedRefreshSourceKey.isNotBlank() && refreshCount < 3) {
+                        needRefresh = true
+                    } else {
+                        if (code != 206 && code != 200) {
+                            throw IllegalStateException("HTTP $code on chunk $idx")
+                        }
                     }
+                    if (!needRefresh) {
                     RandomAccessFile(file, "rw").use { raf ->
                         raf.seek(startPos)
                         conn.inputStream.use { input ->
@@ -1007,8 +1171,20 @@ object FastIsoDownloader {
                             }
                         }
                     }
+                    }
                 } finally {
                     conn.disconnect()
+                }
+                if (needRefresh) {
+                    refreshCount++
+                    if (tryRefreshExpiredUrl(usedUrl, reqStartedMs)) {
+                        attempt = 0
+                        continue
+                    }
+                    throw IllegalStateException("Signed download link expired and could not be refreshed on chunk $idx")
+                }
+                if (chunkCursors[idx] <= startPos && !pausedFlag.get() && !cancelledFlag.get()) {
+                    throw IllegalStateException("Server closed stream with 0 bytes read on chunk $idx")
                 }
                 attempt = 0
             } catch (e: CancellationException) {

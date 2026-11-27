@@ -918,7 +918,7 @@ fun SettingsScreen(
                             Icon(Icons.Rounded.Usb, null, tint = PocketColors.onAccent, modifier = Modifier.size(22.dp))
                         }
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("PocketBoot v4.9.0", style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary)
+                            Text("PocketBoot v4.10.0", style = MaterialTheme.typography.titleMedium, color = PocketColors.textPrimary)
                             Text(
                                 text = "${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE}",
                                 style = MaterialTheme.typography.bodySmall,
@@ -929,7 +929,7 @@ fun SettingsScreen(
                         }
                         Surface(
                             modifier = Modifier.bounceClick {
-                                val info = "PocketBoot v4.9.0\nDevice: ${Build.MANUFACTURER} ${Build.MODEL}\nAndroid: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\nRoot: ${status.rootManager}\nSELinux: ${status.selinuxMode}\nUDC: ${status.udcName}\nKernel: ${status.kernelVersion}"
+                                val info = "PocketBoot v4.10.0\nDevice: ${Build.MANUFACTURER} ${Build.MODEL}\nAndroid: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\nRoot: ${status.rootManager}\nSELinux: ${status.selinuxMode}\nUDC: ${status.udcName}\nKernel: ${status.kernelVersion}"
                                 val cm = context.getSystemService(ClipboardManager::class.java)
                                 cm?.setPrimaryClip(ClipData.newPlainText("Device Info", info))
                                 Toast.makeText(context, "Device info copied.", Toast.LENGTH_SHORT).show()
@@ -988,7 +988,7 @@ fun SettingsScreen(
                             onClick = {
                                 scope.launch {
                                     checkingUpdate = true
-                                    val res = AppUpdateChecker.checkForUpdate("4.9.0")
+                                    val res = AppUpdateChecker.checkForUpdate("4.10.0")
                                     checkingUpdate = false
                                     if (res.success && res.updateAvailable && res.release != null) {
                                         availableRelease = res.release
@@ -1041,7 +1041,7 @@ fun SettingsScreen(
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text("Update Available · ${rel.tagName}", color = PocketColors.textPrimary)
                     if (rel.publishedAt.isNotBlank()) {
-                        Text("Published ${rel.publishedAt} · Current v4.9.0", style = PocketColors.monoStyle, color = PocketColors.textMuted)
+                        Text("Published ${rel.publishedAt} · Current v4.10.0", style = PocketColors.monoStyle, color = PocketColors.textMuted)
                     }
                 }
             },
@@ -1347,6 +1347,7 @@ fun SettingsScreen(
                     Text("• chntpw / reged (GPLv2) — Offline Windows registry editor", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
                     Text("• libsu (Apache 2.0) — Root shell execution", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
                     Text("• Chris Titus Tech WinUtil (MIT) — Windows system tweak catalog & presets", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
+                    Text("• NTriver.org (WindowsAddict, CC-BY-4.0) — Archival Windows RTM ISO catalog & SHA-256 checksums", style = MaterialTheme.typography.bodySmall, color = PocketColors.textPrimary)
                 }
             },
             confirmButton = {

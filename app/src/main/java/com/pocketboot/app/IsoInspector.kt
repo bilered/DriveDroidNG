@@ -71,7 +71,8 @@ object IsoInspector {
             "win_11", "win_10", "win_8", "win_7", "win-11", "win-10", "win-8", "win-7",
             "tiny11", "tiny10", "ltsc", "winpe", "w11", "w10", "en-us_windows",
             "cccoma", "26h2", "26h1", "25h2", "24h2", "23h2", "22h2",
-            "server2019", "server2022", "server2025", "server_2019", "server_2022", "server_2025"
+            "server2019", "server2022", "server2025", "server_2019", "server_2022", "server_2025",
+            "windows_server", "serverdc", "_server_"
         )
         if (winHints.any { low.contains(it) }) return IsoOsType.WINDOWS
 

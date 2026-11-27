@@ -33,28 +33,70 @@ enum class WindowsCatalogFamily(
     val title: String,
     val subtitle: String,
     val badgeLabel: String,
-    val sizeHint: String
+    val sizeHint: String,
+    val supportsMicrosoftCdn: Boolean,
+    val ntriverKey: String,
+    val searchTags: String = ""
 ) {
     WIN11(
         id = "win11",
         title = "Windows 11",
-        subtitle = "Official Microsoft Retail ISO (26H2 / 25H2 / 24H2)",
-        badgeLabel = "Official Direct ISO",
-        sizeHint = "~5.5–8.5 GB"
+        subtitle = "Latest Monthly MVS & Retail ISO (26H2 / 25H2 / 24H2)",
+        badgeLabel = "Archive + MS CDN",
+        sizeHint = "~5.5–8.5 GB",
+        supportsMicrosoftCdn = true,
+        ntriverKey = "win11",
+        searchTags = "win11 26h2 25h2 24h2 consumer business arm64"
     ),
     WIN10(
         id = "win10",
         title = "Windows 10",
-        subtitle = "Official Microsoft 22H2 Retail ISO (x64 & x86)",
-        badgeLabel = "Official Direct ISO",
-        sizeHint = "~4.8–6 GB"
+        subtitle = "Latest 22H2 Consumer & Business ISO (x64 & x86)",
+        badgeLabel = "Archive + MS CDN",
+        sizeHint = "~4.8–6.0 GB",
+        supportsMicrosoftCdn = true,
+        ntriverKey = "win10",
+        searchTags = "win10 22h2 consumer business x86 x64"
+    ),
+    WIN_LTSC(
+        id = "win_ltsc",
+        title = "Windows 10 / 11 LTSC",
+        subtitle = "Enterprise & IoT LTSC 2024 / 2021 / 2019 (x64, ARM64, x86)",
+        badgeLabel = "Archive Direct ISO",
+        sizeHint = "~4.2–5.6 GB",
+        supportsMicrosoftCdn = false,
+        ntriverKey = "ltsc",
+        searchTags = "ltsc iot enterprise 2024 2021 2019 win11 win10"
     ),
     WIN81(
         id = "win81",
         title = "Windows 8.1",
-        subtitle = "Official Microsoft Retail ISO (x64 & x86)",
-        badgeLabel = "Official Direct ISO",
-        sizeHint = "~3.6–4.3 GB"
+        subtitle = "Windows 8.1 RTM & Update 3 ISO (x64 & x86)",
+        badgeLabel = "Archive + MS CDN",
+        sizeHint = "~3.6–4.3 GB",
+        supportsMicrosoftCdn = true,
+        ntriverKey = "win81",
+        searchTags = "win8.1 win81 8.1 update 3"
+    ),
+    WIN7(
+        id = "win7",
+        title = "Windows 7 SP1",
+        subtitle = "Windows 7 SP1 Ultimate / Pro / Home ISO (x64 & x86)",
+        badgeLabel = "Archive Direct ISO",
+        sizeHint = "~2.4–3.2 GB",
+        supportsMicrosoftCdn = false,
+        ntriverKey = "win7",
+        searchTags = "win7 win 7 sp1 ultimate professional"
+    ),
+    WIN_SERVER(
+        id = "win_server",
+        title = "Windows Server",
+        subtitle = "Windows Server 2025 / 2022 / 2019 RTM ISO (x64)",
+        badgeLabel = "Archive Direct ISO",
+        sizeHint = "~4.5–6.2 GB",
+        supportsMicrosoftCdn = false,
+        ntriverKey = "server",
+        searchTags = "server 2025 2022 2019 datacenter standard"
     )
 }
 
@@ -169,7 +211,13 @@ object WindowsDirectCatalog {
 
     suspend fun fetchReleases(family: WindowsCatalogFamily, forceRefresh: Boolean = false): List<DirectWindowsRelease> =
         withContext(Dispatchers.IO) {
-            val famKey = when (family) { WindowsCatalogFamily.WIN11 -> "win11"; WindowsCatalogFamily.WIN81 -> "win81"; else -> "win10" }
+            if (!family.supportsMicrosoftCdn) return@withContext emptyList()
+            val famKey = when (family) {
+                WindowsCatalogFamily.WIN11 -> "win11"
+                WindowsCatalogFamily.WIN10 -> "win10"
+                WindowsCatalogFamily.WIN81 -> "win81"
+                else -> return@withContext emptyList()
+            }
             if (!forceRefresh) {
                 releasesCache[famKey]?.takeIf { it.isNotEmpty() }?.let { return@withContext it }
             }

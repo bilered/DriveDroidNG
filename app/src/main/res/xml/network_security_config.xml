@@ -11,5 +11,6 @@
         <domain includeSubdomains="true">microsoft.com</domain>
         <domain includeSubdomains="true">github.com</domain>
         <domain includeSubdomains="true">githubusercontent.com</domain>
+        <domain includeSubdomains="true">ntriver.org</domain>
     </domain-config>
 </network-security-config>

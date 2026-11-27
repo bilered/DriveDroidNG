@@ -565,8 +565,8 @@ object WindowsCustomizationEngine {
             low.contains("server") -> WindowsOsKind.SERVER
             low.contains("win11") || low.contains("win 11") || low.contains("windows 11") || low.contains("windows_11") || low.contains("26h2") || low.contains("26h1") || low.contains("25h2") || low.contains("24h2") || low.contains("23h2") || low.contains("22621") || low.contains("22631") || low.contains("26100") || low.contains("26200") || low.contains("26300") || low.contains("28000") || low.contains("tiny11") -> WindowsOsKind.WIN11
             low.contains("win10") || low.contains("win 10") || low.contains("windows 10") || low.contains("windows_10") || low.contains("19045") || low.contains("19044") || low.contains("19043") || low.contains("18363") || low.contains("tiny10") -> WindowsOsKind.WIN10
-            low.contains("win8") || low.contains("win 8") || low.contains("windows 8") || low.contains("8.1") || low.contains("9600") -> WindowsOsKind.WIN81
-            low.contains("win7") || low.contains("win 7") || low.contains("windows 7") || low.contains("7601") || low.contains("7600") -> WindowsOsKind.WIN7
+            low.contains("win8") || low.contains("win 8") || low.contains("win_8") || low.contains("windows 8") || low.contains("windows_8") || low.contains("8.1") || low.contains("9600") -> WindowsOsKind.WIN81
+            low.contains("win7") || low.contains("win 7") || low.contains("win_7") || low.contains("windows 7") || low.contains("windows_7") || low.contains("7601") || low.contains("7600") -> WindowsOsKind.WIN7
             else -> WindowsOsKind.UNKNOWN
         }
     }
@@ -574,7 +574,7 @@ object WindowsCustomizationEngine {
         val low = nameOrLabel.lowercase()
         return when {
             low.contains("arm64") || low.contains("aarch64") -> "arm64"
-            (low.contains("x86") && !low.contains("x86_64") && !low.contains("x86-64")) || low.contains("32bit") || low.contains("32-bit") || low.contains("i386") || low.contains("i686") -> "x86"
+            (low.contains("x86") && !low.contains("x86_64") && !low.contains("x86-64")) || low.contains("_x32") || low.contains("-x32") || low.contains(" x32") || low.contains("32bit") || low.contains("32-bit") || low.contains("i386") || low.contains("i686") -> "x86"
             else -> "amd64"
         }
     }
@@ -590,7 +590,7 @@ object WindowsCustomizationEngine {
         sb.appendLine("if exist \"%PB_FLAG%\" exit /b 0")
         sb.appendLine("mkdir \"C:\\Windows\\Setup\\Scripts\" >nul 2>&1")
         sb.appendLine("echo [PocketBoot] Specialize configuration started...")
-        sb.appendLine("echo [PocketBoot v4.9.0] Specialize started %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.10.0] Specialize started %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("set \"PB_BUILD=0\"")
         sb.appendLine("for /f \"tokens=3\" %%B in ('reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\" /v CurrentBuildNumber 2^>nul ^| findstr /i CurrentBuildNumber') do set \"PB_BUILD=%%B\"")
 
@@ -870,7 +870,7 @@ object WindowsCustomizationEngine {
         // OEM BIOS-keyed laptop safeguard: register SetupComplete.cmd under FirstBoot\PostOobe
         sb.appendLine("if exist \"C:\\Windows\\Setup\\Scripts\\SetupComplete.cmd\" reg add \"HKLM\\SYSTEM\\Setup\\FirstBoot\\PostOobe\" /v \"00\" /t REG_SZ /d \"cmd.exe /c C:\\Windows\\Setup\\Scripts\\SetupComplete.cmd & exit /b 0\" /f >> \"%PB_LOG%\" 2>&1")
         sb.appendLine("echo done > \"%PB_FLAG%\"")
-        sb.appendLine("echo [PocketBoot v4.9.0] Specialize finished %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.10.0] Specialize finished %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("exit /b 0")
         return sb.toString().replace("\r\n", "\n").replace("\n", "\r\n")
     }
@@ -922,7 +922,7 @@ object WindowsCustomizationEngine {
             }
         }
         sb.appendLine("if exist \"C:\\Windows\\Setup\\Custom\" rmdir /s /q \"C:\\Windows\\Setup\\Custom\" >nul 2>&1")
-        sb.appendLine("echo [PocketBoot v4.9.0] SetupComplete finished %DATE% %TIME% >> \"%PB_LOG%\"")
+        sb.appendLine("echo [PocketBoot v4.10.0] SetupComplete finished %DATE% %TIME% >> \"%PB_LOG%\"")
         sb.appendLine("start \"\" /b cmd /c \"ping -n 4 127.0.0.1 >nul & rmdir /s /q C:\\Windows\\Setup\\Scripts >nul 2>&1\"")
         sb.appendLine("exit /b 0")
         return sb.toString().replace("\r\n", "\n").replace("\n", "\r\n")
@@ -938,7 +938,7 @@ object WindowsCustomizationEngine {
         sb.appendLine("  exit /b 0")
         sb.appendLine(")")
         sb.appendLine("echo =======================================================")
-        sb.appendLine("echo   PocketBoot v4.9.0 - Revert Applied System Tweaks")
+        sb.appendLine("echo   PocketBoot v4.10.0 - Revert Applied System Tweaks")
         sb.appendLine("echo =======================================================")
         sb.appendLine("echo.")
         if (winUtil.disableConsumerFeatures || experience.disableSponsoredApps) {
