@@ -148,10 +148,10 @@ class Wave4FeaturesTest {
 
     @Test
     fun otgSha256RangeCommand_usesSectorAlignedDdForIsoSizesWithoutOneByteReads() {
-        // 4,700,372,992 bytes = 4482 MiB + 1296 sectors (typical Windows ISO, 2048-byte aligned)
+        // 4,700,372,992 bytes = 4482 MiB (4,699,717,632 B) + 1280 sectors (655,360 B)
         val cmd = OtgUsbFlasher.buildSha256RangeCommand("/dev/block/sdg", 4_700_372_992L)
         assertTrue(cmd.contains("bs=1048576 count=4482"))
-        assertTrue(cmd.contains("bs=512 skip=9179136 count=1296"))
+        assertTrue(cmd.contains("bs=512 skip=9179136 count=1280"))
         assertFalse(cmd.contains("bs=1 "))
     }
 }
