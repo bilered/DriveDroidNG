@@ -150,8 +150,7 @@ fun RootFileBrowserSheet(
         val q = searchQuery.trim().lowercase()
         entries.filter { item ->
             val isSupported = item.isDirectory ||
-                item.name.endsWith(".iso", true) ||
-                item.name.endsWith(".img", true)
+                IsoInspector.isSupportedDriveFileName(item.name)
             val passesType = if (showOnlySupported) isSupported else true
             val passesSearch = q.isEmpty() || item.name.lowercase().contains(q)
             passesType && passesSearch
@@ -334,7 +333,7 @@ fun RootFileBrowserSheet(
                 Box(modifier = Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Text(
-                            text = if (entries.isEmpty()) "This folder is empty" else "No .iso or .img files here",
+                            text = if (entries.isEmpty()) "This folder is empty" else "No .iso, .img, or compressed images here",
                             style = MaterialTheme.typography.titleMedium,
                             color = PocketColors.textPrimary
                         )
@@ -353,7 +352,8 @@ fun RootFileBrowserSheet(
                     items(visibleEntries, key = { it.path }) { item ->
                         val isIso = !item.isDirectory && item.name.endsWith(".iso", true)
                         val isImg = !item.isDirectory && item.name.endsWith(".img", true)
-                        val isImageFile = isIso || isImg
+                        val isCompressed = !item.isDirectory && IsoInspector.isCompressedImageName(item.name)
+                        val isImageFile = isIso || isImg || isCompressed
                         val isSelectable = item.isDirectory || isImageFile
                         val isAlreadyAdded = isImageFile && normalizedAdded.contains(UsbGadgetEngine.resolveDirectPath(item.path))
                         val isChecked = selectedPaths.contains(item.path)
@@ -423,6 +423,7 @@ fun RootFileBrowserSheet(
                                                     isAlreadyAdded -> PocketColors.successBg
                                                     isWindows -> PocketColors.infoBlueBg
                                                     isLinux -> PocketColors.successBg
+                                                    isCompressed -> PocketColors.infoBlueBg
                                                     isImageFile -> PocketColors.accentBg
                                                     else -> PocketColors.surfaceCard
                                                 }
@@ -436,6 +437,7 @@ fun RootFileBrowserSheet(
                                                 isLinux -> Icons.Rounded.Terminal
                                                 isIso -> Icons.Rounded.Album
                                                 isImg -> Icons.Rounded.Storage
+                                                isCompressed -> Icons.Rounded.FolderOpen
                                                 else -> Icons.AutoMirrored.Rounded.InsertDriveFile
                                             },
                                             contentDescription = null,
@@ -444,6 +446,7 @@ fun RootFileBrowserSheet(
                                                 isAlreadyAdded -> PocketColors.success
                                                 isWindows -> PocketColors.infoBlue
                                                 isLinux -> PocketColors.success
+                                                isCompressed -> PocketColors.infoBlue
                                                 isImageFile -> PocketColors.accentSoft
                                                 else -> PocketColors.textMuted
                                             },
@@ -466,16 +469,26 @@ fun RootFileBrowserSheet(
                                             overflow = TextOverflow.Ellipsis,
                                             modifier = Modifier.weight(1f, fill = false)
                                         )
-                                        if (isWindows || isLinux) {
+                                        if (isWindows || isLinux || isCompressed) {
                                             Surface(
                                                 shape = RoundedCornerShape(6.dp),
-                                                color = if (isWindows) PocketColors.infoBlueBg else PocketColors.successBg
+                                                color = when {
+                                                    isWindows || isCompressed -> PocketColors.infoBlueBg
+                                                    else -> PocketColors.successBg
+                                                }
                                             ) {
                                                 Text(
-                                                    text = if (isWindows) "Windows" else "Linux",
+                                                    text = when {
+                                                        isWindows -> "Windows"
+                                                        isLinux -> "Linux"
+                                                        else -> "Compressed"
+                                                    },
                                                     modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.5.dp),
                                                     style = MaterialTheme.typography.labelSmall,
-                                                    color = if (isWindows) PocketColors.infoBlue else PocketColors.success
+                                                    color = when {
+                                                        isWindows || isCompressed -> PocketColors.infoBlue
+                                                        else -> PocketColors.success
+                                                    }
                                                 )
                                             }
                                         }
@@ -771,6 +784,12 @@ fun RootFileBrowserSheet(
     renameTarget?.let { item ->
         val isMounted = mountedPaths.contains(item.path)
         val ext = when {
+            item.name.endsWith(".img.xz", true) -> ".img.xz"
+            item.name.endsWith(".img.gz", true) -> ".img.gz"
+            item.name.endsWith(".img.zst", true) -> ".img.zst"
+            item.name.endsWith(".iso.xz", true) -> ".iso.xz"
+            item.name.endsWith(".iso.gz", true) -> ".iso.gz"
+            item.name.endsWith(".iso.zst", true) -> ".iso.zst"
             item.name.endsWith(".iso", true) -> ".iso"
             item.name.endsWith(".img", true) -> ".img"
             else -> ""

@@ -700,7 +700,7 @@ object UsbGadgetEngine {
             val quotedDirs = resolvedDirs.joinToString(" ") { shellQuote(it) }
             if (quotedDirs.isNotBlank()) {
                 val cmd = """
-                    find $quotedDirs -maxdepth 3 -not -path '*/.*' -type f \( -iname '*.iso' -o -iname '*.img' \) 2>/dev/null | while IFS= read -r f; do
+                    find $quotedDirs -maxdepth 3 -not -path '*/.*' -type f \( -iname '*.iso' -o -iname '*.img' -o -iname '*.img.xz' -o -iname '*.img.gz' -o -iname '*.img.zst' -o -iname '*.iso.xz' -o -iname '*.iso.gz' -o -iname '*.iso.zst' \) 2>/dev/null | while IFS= read -r f; do
                         info=${'$'}(stat -c '%s|%b' "${'$'}f" 2>/dev/null || echo '0|0')
                         printf '%s|%s\n' "${'$'}info" "${'$'}f"
                     done | sort -t'|' -k3
@@ -758,7 +758,7 @@ object UsbGadgetEngine {
             if (!Shell.getShell().isRoot) return@withContext 0
             val qDir = shellQuote(resolveDirectPath(dir))
             val out = Shell.cmd(
-                "find $qDir -maxdepth 3 -not -path '*/.*' -type f \\( -iname '*.iso' -o -iname '*.img' \\) 2>/dev/null | wc -l"
+                "find $qDir -maxdepth 3 -not -path '*/.*' -type f \\( -iname '*.iso' -o -iname '*.img' -o -iname '*.img.xz' -o -iname '*.img.gz' -o -iname '*.img.zst' -o -iname '*.iso.xz' -o -iname '*.iso.gz' -o -iname '*.iso.zst' \\) 2>/dev/null | wc -l"
             ).exec().out.firstOrNull()?.trim()?.toIntOrNull()
             out ?: 0
         }.getOrDefault(0)
@@ -794,12 +794,18 @@ object UsbGadgetEngine {
             val parentDir = resolvedOld.substringBeforeLast('/')
             val oldName = resolvedOld.substringAfterLast('/')
             val oldExt = when {
+                oldName.endsWith(".img.xz", ignoreCase = true) -> ".img.xz"
+                oldName.endsWith(".img.gz", ignoreCase = true) -> ".img.gz"
+                oldName.endsWith(".img.zst", ignoreCase = true) -> ".img.zst"
+                oldName.endsWith(".iso.xz", ignoreCase = true) -> ".iso.xz"
+                oldName.endsWith(".iso.gz", ignoreCase = true) -> ".iso.gz"
+                oldName.endsWith(".iso.zst", ignoreCase = true) -> ".iso.zst"
                 oldName.endsWith(".iso", ignoreCase = true) -> ".iso"
                 oldName.endsWith(".img", ignoreCase = true) -> ".img"
                 else -> ""
             }
             val finalName = if (oldExt.isNotEmpty()) {
-                sanitizeOutputFileName(cleanInput, oldExt, oldName.substringBeforeLast('.').ifBlank { "pocketboot" })
+                sanitizeOutputFileName(cleanInput, oldExt, oldName.dropLast(oldExt.length).ifBlank { "pocketboot" })
             } else {
                 cleanInput.replace(Regex("[\\x00-\\x1F:*?\"<>|]"), "").trim().trim('.')
             }
@@ -1108,6 +1114,13 @@ object UsbGadgetEngine {
         val entries = mutableListOf<LogEntry>()
         return@withContext runCatching {
             val img = resolveDirectPath(path)
+            if (IsoInspector.isCompressedImageName(img.substringAfterLast('/'))) {
+                return@withContext ActionResult(
+                    false,
+                    "Compressed images (.xz / .gz / .zst) cannot be mounted directly to a PC. Extract it first or stream-flash it to a USB-C OTG pen drive.",
+                    entries = entries
+                )
+            }
             val mode = requestedMode.resolveForFile(img, settings.fileModes)
             val qImg = shellQuote(img)
             val targetLun = if (lunIndex == 1) 1 else 0
@@ -1317,6 +1330,9 @@ object UsbGadgetEngine {
         val p1 = resolveDirectPath(lun1Path).trim()
         if (p0.isEmpty() || p1.isEmpty()) return "Select both a LUN 0 and a LUN 1 image."
         if (p0 == p1) return "LUN 0 and LUN 1 must be two different image files."
+        if (IsoInspector.isCompressedImageName(p0.substringAfterLast('/')) || IsoInspector.isCompressedImageName(p1.substringAfterLast('/'))) {
+            return "Compressed archives (.xz/.gz/.zst) cannot be paired in Dual-LUN Combos. Decompress first."
+        }
         return null
     }
 

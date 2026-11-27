@@ -23,7 +23,9 @@ import java.util.concurrent.atomic.AtomicLong
 enum class UsbBuildKind(val label: String) {
     WINDOWS("Windows USB"),
     LINUX("Linux USB"),
-    MULTIBOOT("Multi-Boot Drive")
+    MULTIBOOT("Multi-Boot Drive"),
+    DECOMPRESS("Decompress Image"),
+    OTG_FLASH("USB-C OTG Flash")
 }
 
 data class UsbBuildState(
@@ -256,6 +258,33 @@ object UsbBuildManager {
         }
     }
 
+    fun startDecompress(context: Context, config: DecompressConfig): Boolean {
+        val appCtx = context.applicationContext
+        val mountMode = if (CompressedImageEngine.targetExtensionFor(config.sourceFile.name) == ".iso") MountMode.AUTO else MountMode.USB_RW
+        return launchBuild(
+            context = appCtx,
+            kind = UsbBuildKind.DECOMPRESS,
+            targetName = config.outputName.ifBlank { config.sourceFile.name },
+            autoMountAfterBuild = config.autoMountAfter,
+            autoMountMode = mountMode
+        ) { onProgress ->
+            CompressedImageEngine.decompressImage(appCtx, config, onProgress)
+        }
+    }
+
+    fun startOtgFlash(context: Context, config: OtgFlashConfig): Boolean {
+        val appCtx = context.applicationContext
+        return launchBuild(
+            context = appCtx,
+            kind = UsbBuildKind.OTG_FLASH,
+            targetName = "${config.sourceFile.name} -> ${config.targetDevice.devName}",
+            autoMountAfterBuild = false,
+            autoMountMode = MountMode.AUTO
+        ) { onProgress ->
+            OtgUsbFlasher.flashImageToOtg(appCtx, config, onProgress)
+        }
+    }
+
     fun cancelActiveBuild(context: Context? = null) {
         val activeKind = _state.value?.kind
         cancelRequested.set(true)
@@ -266,6 +295,8 @@ object UsbBuildManager {
                 UsbBuildKind.WINDOWS -> WindowsImageBuilder.cancelActiveBuild()
                 UsbBuildKind.LINUX -> LinuxImageBuilder.cancelActiveBuild()
                 UsbBuildKind.MULTIBOOT -> VentoyImageBuilder.cancelActiveBuild()
+                UsbBuildKind.DECOMPRESS -> CompressedImageEngine.cancelActiveDecompress()
+                UsbBuildKind.OTG_FLASH -> OtgUsbFlasher.cancelActiveFlash()
                 null -> BuildThermalHelper.cancelActiveBuildProcess()
             }
         }

@@ -1,4 +1,4 @@
-# PocketBoot v4.7.2
+# PocketBoot v4.8.0
 
 Rooted Android USB Gadget ISO/IMG boot utility, multi-boot Ventoy drive manager, official OS downloader, and Rufus-style Windows & Linux bootable USB builder.
 
@@ -10,3 +10,5 @@ Rooted Android USB Gadget ISO/IMG boot utility, multi-boot Ventoy drive manager,
 - **Foreground USB Build Service & Thermal Control (`UsbBuildService.kt`, `BuildThermalHelper.kt`):** Background-safe foreground service with wake lock, live notification + Cancel action, and Cool / Balanced / Max Speed CPU core-affinity & Auto Thermal Cooldown.
 - **In-App Release Updater & Automated JVM Tests (`AppUpdateChecker.kt`, `app/src/test`):** HTTPS-enforced GitHub release checks against `bilered/PocketBoot` and JUnit regression tests in CI.
 - **Ventoy Multi-Boot & Disk Tools (`VentoyImageBuilder.kt`, `VentoyPersistenceHelper.kt`, `VentoyThemeCatalog.kt`, `ImageLoopExplorer.kt`, `DiskPartitioner.kt`):** Create, resize, reclaim sparse space, attach per-ISO Linux ext4 persistence `.dat` volumes, customize boot menu aliases/timeouts/GRUB themes, assign per-ISO multi-template Windows tweak profiles, and explore/edit Partition 1 of any `.img` directly on-phone.
+- **Compressed Image Engine (`CompressedImageEngine.kt`):** Detect, inspect, and atomically extract `.img.xz`, `.img.gz`, `.img.zst`, `.iso.xz`, `.iso.gz`, and `.iso.zst` archives using bundled static ARM64 `lib7zzs.so` and `libzstd.so` with gzip 4 GiB wrap protection and live storage floor guards.
+- **Physical USB-C OTG Pen Drive Flasher (`OtgUsbFlasher.kt`):** Write raw `.iso`/`.img` or stream-flash compressed images directly onto physical USB-C OTG pen drives with a 7-layer anti-brick sysfs safety lock, clean `vold` unmount, `/sys/block/<dev>/stat` live progress, and read-back block/SHA-256 verification.

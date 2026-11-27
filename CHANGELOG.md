@@ -1,3 +1,15 @@
+## v4.8.0 (2026-11-27) — Wave 4: Compressed Image Engine & Physical USB-C OTG Pen Drive Flasher
+- **Compressed Image Engine (`CompressedImageEngine.kt`, `IsoInspector.kt`, `UsbGadgetEngine.kt`, `BrowseAndBrowserSheets.kt`, `build-apk.yml`):**
+  - Cross-compiled and bundled static ARM64 **`zstd`** (`libzstd.so`, stripped ELF, zero `PT_INTERP`) in GitHub Actions CI alongside `lib7zzs.so`.
+  - Added full detection and on-phone background extraction (`UsbBuildKind.DECOMPRESS`) for `.img.xz`, `.img.gz`, `.img.zst`, `.iso.xz`, `.iso.gz`, and `.iso.zst` images with uncompressed-size probing, gzip 32-bit `ISIZE` wrap detection, live `256 MB` phone storage floor guard, atomic temp-file replacement, optional post-verify archive deletion, and auto-mount.
+  - Enforced strict isolation blocking compressed archives from direct ConfigFS LUN mounting, Dual-LUN Combos, and `.img` File Explorer.
+- **Physical USB-C OTG Pen Drive Flasher (`OtgUsbFlasher.kt`, `UsbBuildService.kt`, `MainActivity.kt`):**
+  - Added direct raw (`dd bs=4M conv=fsync`) and streaming compressed flashing (`UsbBuildKind.OTG_FLASH`) onto physical USB-C OTG pen drives directly from **Home → OTG Flash** or any file's tap sheet.
+  - Built a **7-Layer Anti-Brick Hardware Safety Lock** verifying whole-disk `sd[a-z]+`, strict canonical sysfs `/usb[0-9]+/` bus path + internal UFS/eMMC/NVMe/loop/dm/zram denylist, `/proc/mounts` system-path cross-check, writable & minimum capacity check, source-fit check, ConfigFS mutual-exclusion guard, clean Android `vold` unmount gate, and typed **`FLASH`** confirmation.
+  - Added Toybox-universal `/sys/block/<dev>/stat` progress polling and post-flash read-back verification (Head `16 MB` + Tail `16 MB` or optional Full SHA-256).
+- **Wave 4 JVM Unit Tests (`Wave4FeaturesTest.kt`):**
+  - Added comprehensive tests covering `.xz`/`.gz`/`.zst` format & size parsing, gzip wrap detection, Dual-LUN compressed-file rejection, and a 10-case anti-brick sysfs + `/proc/mounts` safety matrix.
+
 ## v4.7.2 (2026-11-27) — Wave 3: Driver Pack Library & Dual-LUN Quick-Mount Combos
 - **Storage & Wi-Fi Driver Pack Manager (`DriverPackManager.kt`, `WindowsImageBuilder.kt`, `VentoyImageBuilder.kt`, `SettingsScreen.kt`):**
   - Added a reusable **Driver Pack Library** (`<defaultDir>/PocketBoot_Drivers/`) reachable from **Settings → Driver Pack Library** and directly inside **Windows USB Builder** and **Multi-Boot Builder / Manager**.

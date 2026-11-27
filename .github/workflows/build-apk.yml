@@ -272,10 +272,33 @@ jobs:
             fi
           ) || echo "::warning::Could not bundle static chntpw/reged"
 
+          # 8b. Cross-compile STATIC ARM64 zstd -> libzstd.so (Compressed Image Engine & OTG Streaming Flasher)
+          (
+            set -e
+            curl -fSL "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz" -o /tmp/zstd.tar.gz || \
+              curl -fSL "https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz" -o /tmp/zstd.tar.gz
+            mkdir -p /tmp/zstd-src
+            tar -xzf /tmp/zstd.tar.gz --strip-components=1 -C /tmp/zstd-src
+            cd /tmp/zstd-src
+            make -j"$(nproc)" -C programs zstd \
+              CC=aarch64-linux-gnu-gcc \
+              AR=aarch64-linux-gnu-ar \
+              HAVE_ZLIB=0 HAVE_LZMA=0 HAVE_LZ4=0 HAVE_PTHREAD=1 \
+              MOREFLAGS="-O2 -static" \
+              LDFLAGS="-static"
+            file programs/zstd
+            if ! aarch64-linux-gnu-readelf -l programs/zstd 2>/dev/null | grep -q INTERP; then
+              aarch64-linux-gnu-strip programs/zstd
+              cp programs/zstd "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libzstd.so"
+              chmod 755 "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libzstd.so"
+            fi
+          ) || echo "::warning::Could not bundle static zstd"
+
           # 9. Verify bundled static ARM64 binaries are present and executable
           test -x "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/lib7zzs.so"
           test -x "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libwimlib_imagex.so"
           test -x "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libchntpw.so"
+          test -x "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libzstd.so"
 
           ls -lh app/src/main/assets/uefi-ntfs.img app/src/main/jniLibs/arm64-v8a/
           file app/src/main/jniLibs/arm64-v8a/*.so

@@ -238,6 +238,9 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
     var imageExplorerTarget by remember { mutableStateOf<ImageFile?>(null) }
     var imageExplorerBusy by remember { mutableStateOf(false) }
     var showDualLunCombosSheet by remember { mutableStateOf(false) }
+    var decompressTarget by remember { mutableStateOf<ImageFile?>(null) }
+    var showOtgFlasherSheet by remember { mutableStateOf(false) }
+    var otgFlashInitialSource by remember { mutableStateOf<ImageFile?>(null) }
     var selectedInfoFile by remember { mutableStateOf<ImageFile?>(null) }
     var renameTargetFile by remember { mutableStateOf<ImageFile?>(null) }
     var confirmDeleteFile by remember { mutableStateOf<ImageFile?>(null) }
@@ -374,10 +377,10 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
     fun addBrowsedFiles(paths: List<String>) {
         val valid = paths.filter {
             val n = it.substringAfterLast('/')
-            n.endsWith(".iso", true) || n.endsWith(".img", true)
+            IsoInspector.isSupportedDriveFileName(n)
         }.distinct()
         if (valid.isEmpty()) {
-            showFeedback("Only .iso and .img files are supported.", true)
+            showFeedback("Only .iso, .img, and compressed (.xz/.gz/.zst) images are supported.", true)
             return
         }
         val updated = settings.copy(
@@ -550,6 +553,10 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
         logs.addAll(res.entries)
         if (evt.cancelled) {
             showFeedback(res.userMessage, false)
+        } else if (res.success && evt.kind == UsbBuildKind.OTG_FLASH) {
+            showOtgFlasherSheet = false
+            otgFlashInitialSource = null
+            showFeedback(res.userMessage, false)
         } else if (res.success && res.createdPath != null) {
             when (evt.kind) {
                 UsbBuildKind.WINDOWS -> windowsBuilderTarget = null
@@ -558,6 +565,13 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
                     showVentoyBuilder = false
                     ventoyBuilderInitialIso = null
                     isoTypes[res.createdPath] = IsoOsType.VENTOY_IMAGE
+                }
+                UsbBuildKind.DECOMPRESS -> {
+                    decompressTarget = null
+                }
+                UsbBuildKind.OTG_FLASH -> {
+                    showOtgFlasherSheet = false
+                    otgFlashInitialSource = null
                 }
             }
             val updated = settings.copy(
@@ -786,6 +800,11 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
                                 showVentoyBuilder = true
                             },
                             onOpenBrowse = { showRootBrowserSheet = true },
+                            onOpenOtgFlasher = {
+                                otgFlashInitialSource = null
+                                showOtgFlasherSheet = true
+                            },
+                            onOpenDecompress = { img -> decompressTarget = img },
                             dualLunCombos = settings.dualLunCombos,
                             onMountDualLunCombo = { combo -> mountCombo(combo) },
                             onOpenDualLunCombos = { showDualLunCombosSheet = true },
@@ -1091,7 +1110,7 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
         if (showDualLunCombosSheet) {
             DualLunCombosSheet(
                 combos = settings.dualLunCombos,
-                images = images,
+                images = images.filterNot { IsoInspector.isCompressedImageName(it.name) },
                 multiLunSupported = status.multiLunSupported,
                 busy = busy,
                 onDismiss = { showDualLunCombosSheet = false },
@@ -1108,6 +1127,49 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
                     val updated = settings.dualLunCombos.filterNot { it.id == comboId }
                     updateSettings(settings.copy(dualLunCombos = updated), rescan = false)
                     showFeedback("Removed Dual-LUN combo.")
+                }
+            )
+        }
+
+        decompressTarget?.let { compFile ->
+            val isDecompActive = activeUsbBuild?.kind == UsbBuildKind.DECOMPRESS
+            val decompProgress = if (isDecompActive) activeUsbBuild?.progress ?: WindowsBuildProgress() else WindowsBuildProgress()
+            CompressedImageSheet(
+                sourceFile = compFile,
+                defaultDir = settings.defaultDir,
+                building = isDecompActive,
+                progress = decompProgress,
+                onDismiss = { if (!isDecompActive) decompressTarget = null },
+                onCancelBuild = { UsbBuildManager.cancelActiveBuild(context) },
+                onStartDecompress = { cfg ->
+                    if (!UsbBuildManager.startDecompress(context, cfg)) {
+                        showFeedback("Another build or flash job is already running.", true)
+                    }
+                }
+            )
+        }
+
+        if (showOtgFlasherSheet) {
+            val isOtgActive = activeUsbBuild?.kind == UsbBuildKind.OTG_FLASH
+            val otgProgress = if (isOtgActive) activeUsbBuild?.progress ?: WindowsBuildProgress() else WindowsBuildProgress()
+            OtgFlasherSheet(
+                initialSource = otgFlashInitialSource,
+                availableImages = images,
+                isAnyVirtualDriveMounted = status.isAnyMounted,
+                flashing = isOtgActive,
+                progress = otgProgress,
+                onDismiss = {
+                    if (!isOtgActive) {
+                        showOtgFlasherSheet = false
+                        otgFlashInitialSource = null
+                    }
+                },
+                onUnmountAllVirtual = { unmountSlot(null) },
+                onCancelFlash = { UsbBuildManager.cancelActiveBuild(context) },
+                onStartFlash = { cfg ->
+                    if (!UsbBuildManager.startOtgFlash(context, cfg)) {
+                        showFeedback("Another build or flash job is already running.", true)
+                    }
                 }
             )
         }
@@ -1281,6 +1343,15 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
                     selectedInfoFile = null
                     imageExplorerTarget = file
                 },
+                onOpenDecompress = {
+                    selectedInfoFile = null
+                    decompressTarget = file
+                },
+                onOpenOtgFlasherForFile = {
+                    selectedInfoFile = null
+                    otgFlashInitialSource = file
+                    showOtgFlasherSheet = true
+                },
                 onClearRememberedMode = {
                     updateSettings(settings.copy(fileModes = settings.fileModes - file.path), rescan = false)
                     showFeedback("Cleared 1-tap quick mount mode for ${file.name}.")
@@ -1309,6 +1380,12 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
         renameTargetFile?.let { file ->
             val isMounted = status.mountedLunFor(file.path) != null
             val ext = when {
+                file.name.endsWith(".img.xz", true) -> ".img.xz"
+                file.name.endsWith(".img.gz", true) -> ".img.gz"
+                file.name.endsWith(".img.zst", true) -> ".img.zst"
+                file.name.endsWith(".iso.xz", true) -> ".iso.xz"
+                file.name.endsWith(".iso.gz", true) -> ".iso.gz"
+                file.name.endsWith(".iso.zst", true) -> ".iso.zst"
                 file.name.endsWith(".iso", true) -> ".iso"
                 file.name.endsWith(".img", true) -> ".img"
                 else -> ""
@@ -1349,12 +1426,27 @@ fun PocketBootApp(shortcutRequest: Pair<String, Int>? = null) {
                                 if (res.success && res.createdPath != null) {
                                     val newPath = res.createdPath
                                     UsbGadgetEngine.fixUserStoragePermissions(context, newPath, isDir = false)
-                                    val updatedPinned = settings.pinnedFiles.map { if (it == file.path) newPath else it }
+                                    val oldResolved = UsbGadgetEngine.resolveDirectPath(file.path)
+                                    val updatedPinned = settings.pinnedFiles.map { if (UsbGadgetEngine.resolveDirectPath(it) == oldResolved) newPath else it }
                                     val updatedModes = settings.fileModes.toMutableMap().apply {
                                         remove(file.path)?.let { put(newPath, it) }
                                     }
+                                    val updatedCombos = settings.dualLunCombos.map { c ->
+                                        c.copy(
+                                            lun0Path = if (UsbGadgetEngine.resolveDirectPath(c.lun0Path) == oldResolved) newPath else c.lun0Path,
+                                            lun1Path = if (UsbGadgetEngine.resolveDirectPath(c.lun1Path) == oldResolved) newPath else c.lun1Path
+                                        )
+                                    }
+                                    val updatedFav = if (UsbGadgetEngine.resolveDirectPath(settings.favoriteQuickMountPath) == oldResolved) newPath else settings.favoriteQuickMountPath
+                                    val updatedMbTarget = if (UsbGadgetEngine.resolveDirectPath(settings.downloadTargetMultiBootPath) == oldResolved) newPath else settings.downloadTargetMultiBootPath
                                     updateSettings(
-                                        settings.copy(pinnedFiles = updatedPinned, fileModes = updatedModes),
+                                        settings.copy(
+                                            pinnedFiles = updatedPinned,
+                                            fileModes = updatedModes,
+                                            dualLunCombos = updatedCombos,
+                                            favoriteQuickMountPath = updatedFav,
+                                            downloadTargetMultiBootPath = updatedMbTarget
+                                        ),
                                         rescan = true
                                     )
                                 }
@@ -1940,6 +2032,8 @@ private fun FileInfoBottomSheet(
     onOpenLinuxBuilder: () -> Unit,
     onOpenVentoyManager: () -> Unit,
     onOpenImageExplorer: () -> Unit,
+    onOpenDecompress: () -> Unit,
+    onOpenOtgFlasherForFile: () -> Unit,
     onClearRememberedMode: () -> Unit,
     onRequestRename: () -> Unit,
     onRemoveFromList: () -> Unit,
@@ -1952,9 +2046,10 @@ private fun FileInfoBottomSheet(
     var bootReport by remember(file.path) { mutableStateOf<BootReadinessReport?>(null) }
     val isActive = mountedLun != null
     val isIso = file.name.endsWith(".iso", true)
+    val isCompressed = osType == IsoOsType.COMPRESSED_IMAGE || IsoInspector.isCompressedImageName(file.name)
 
-    LaunchedEffect(file.path) {
-        bootReport = IsoInspector.inspectBootReadiness(context, file.path, file.sizeBytes)
+    LaunchedEffect(file.path, isCompressed) {
+        bootReport = if (isCompressed) null else IsoInspector.inspectBootReadiness(context, file.path, file.sizeBytes)
     }
 
     ModalBottomSheet(
@@ -1976,6 +2071,7 @@ private fun FileInfoBottomSheet(
                     osType == IsoOsType.WINDOWS -> Icons.Rounded.Window
                     osType == IsoOsType.LINUX -> Icons.Rounded.Terminal
                     osType == IsoOsType.VENTOY_IMAGE -> Icons.Rounded.Layers
+                    isCompressed -> Icons.Rounded.FolderOpen
                     isIso -> Icons.Rounded.Album
                     else -> Icons.Rounded.Storage
                 },
@@ -1987,7 +2083,19 @@ private fun FileInfoBottomSheet(
             )
 
             // Primary Action Row
-            if (mountedLun != null) {
+            if (isCompressed) {
+                Button(
+                    onClick = onOpenDecompress,
+                    enabled = !busy && hasRoot,
+                    modifier = Modifier.fillMaxWidth().height(PocketTokens.PrimaryButtonHeight),
+                    shape = RoundedCornerShape(PocketTokens.ButtonRadius),
+                    colors = ButtonDefaults.buttonColors(containerColor = PocketColors.accent, contentColor = PocketColors.onAccent)
+                ) {
+                    Icon(Icons.Rounded.FolderOpen, null, modifier = Modifier.size(17.dp))
+                    Spacer(modifier = Modifier.width(7.dp))
+                    Text("Decompress to ${CompressedImageEngine.targetExtensionFor(file.name)}", fontWeight = FontWeight.SemiBold)
+                }
+            } else if (mountedLun != null) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -2064,7 +2172,7 @@ private fun FileInfoBottomSheet(
                 else -> {}
             }
 
-            if (file.name.endsWith(".img", ignoreCase = true)) {
+            if (!isCompressed && file.name.endsWith(".img", ignoreCase = true)) {
                 MountActionCard(
                     icon = Icons.Rounded.FolderOpen,
                     title = "Explore / Edit Files Inside .img",
@@ -2075,8 +2183,19 @@ private fun FileInfoBottomSheet(
                 )
             }
 
-            // Boot Readiness Inspector Card
-            Surface(
+            if (hasRoot) {
+                MountActionCard(
+                    icon = Icons.Rounded.Usb,
+                    title = "Flash to USB-C OTG Pen Drive",
+                    badge = if (isCompressed) "Stream" else "Physical USB",
+                    subtitle = if (isCompressed) "Decompresses on-the-fly directly onto a physical USB pen drive" else "Erase & write directly to a physical USB-C OTG drive with verification",
+                    highlighted = false,
+                    onClick = onOpenOtgFlasherForFile
+                )
+            }
+
+            // Boot Readiness Inspector Card (hidden for compressed archives)
+            if (!isCompressed) Surface(
                 shape = RoundedCornerShape(12.dp),
                 color = PocketColors.surfaceInput,
                 border = BorderStroke(0.5.dp, if (bootReport?.isBootReady == true) PocketColors.success.copy(alpha = 0.6f) else PocketColors.border)
@@ -2303,6 +2422,8 @@ private fun HomeScreen(
     onOpenCreateBlank: () -> Unit,
     onOpenCreateVentoy: () -> Unit,
     onOpenBrowse: () -> Unit,
+    onOpenOtgFlasher: () -> Unit = {},
+    onOpenDecompress: (ImageFile) -> Unit = {},
     dualLunCombos: List<DualLunCombo> = emptyList(),
     onMountDualLunCombo: (DualLunCombo) -> Unit = {},
     onOpenDualLunCombos: () -> Unit = {},
@@ -2323,7 +2444,7 @@ private fun HomeScreen(
             DriveFilter.WINDOWS -> byQuery.filter { (isoTypes[it.path] ?: IsoInspector.quickGuessByName(it.name)) == IsoOsType.WINDOWS }
             DriveFilter.LINUX -> byQuery.filter { (isoTypes[it.path] ?: IsoInspector.quickGuessByName(it.name)) == IsoOsType.LINUX }
             DriveFilter.MULTIBOOT -> byQuery.filter { (isoTypes[it.path] ?: IsoInspector.quickGuessByName(it.name)) == IsoOsType.VENTOY_IMAGE }
-            DriveFilter.IMAGES -> byQuery.filter { it.name.endsWith(".img", true) }
+            DriveFilter.IMAGES -> byQuery.filter { it.name.endsWith(".img", true) || IsoInspector.isCompressedImageName(it.name) }
         }
         when (sortBy) {
             SortBy.NAME -> byFilter.sortedBy { it.name.lowercase() }
@@ -2488,42 +2609,59 @@ private fun HomeScreen(
             onForceReconnect = onForceReconnect
         )
 
-        // Elevated 3-Column Quick Action Tiles (with color-tinted icon badges & bounce press)
+        // Elevated 2x2 Quick Action Tiles (spacious tap targets, zero text clipping on 360dp screens)
         if (status.hasRoot) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(9.dp)
-            ) {
-                CommandActionTile(
-                    icon = Icons.Rounded.Layers,
-                    label = "Multi-Boot",
-                    subtitle = "ISO hub",
-                    tint = PocketColors.violet,
-                    iconBg = PocketColors.violetBg,
-                    enabled = !busy,
-                    modifier = Modifier.weight(1f),
-                    onClick = onOpenCreateVentoy
-                )
-                CommandActionTile(
-                    icon = Icons.Rounded.AddCircleOutline,
-                    label = "Blank USB",
-                    subtitle = "New .img",
-                    tint = PocketColors.infoBlue,
-                    iconBg = PocketColors.infoBlueBg,
-                    enabled = !busy,
-                    modifier = Modifier.weight(1f),
-                    onClick = onOpenCreateBlank
-                )
-                CommandActionTile(
-                    icon = Icons.Rounded.FolderOpen,
-                    label = "Import",
-                    subtitle = "Browse",
-                    tint = PocketColors.success,
-                    iconBg = PocketColors.successBg,
-                    enabled = !busy,
-                    modifier = Modifier.weight(1f),
-                    onClick = onOpenBrowse
-                )
+            Column(verticalArrangement = Arrangement.spacedBy(9.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(9.dp)
+                ) {
+                    CommandActionTile(
+                        icon = Icons.Rounded.Layers,
+                        label = "Multi-Boot",
+                        subtitle = "ISO hub",
+                        tint = PocketColors.violet,
+                        iconBg = PocketColors.violetBg,
+                        enabled = !busy,
+                        modifier = Modifier.weight(1f),
+                        onClick = onOpenCreateVentoy
+                    )
+                    CommandActionTile(
+                        icon = Icons.Rounded.AddCircleOutline,
+                        label = "Blank USB",
+                        subtitle = "New .img",
+                        tint = PocketColors.infoBlue,
+                        iconBg = PocketColors.infoBlueBg,
+                        enabled = !busy,
+                        modifier = Modifier.weight(1f),
+                        onClick = onOpenCreateBlank
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(9.dp)
+                ) {
+                    CommandActionTile(
+                        icon = Icons.Rounded.Usb,
+                        label = "OTG Flash",
+                        subtitle = "Pen drive",
+                        tint = PocketColors.warning,
+                        iconBg = PocketColors.warningBg,
+                        enabled = !busy,
+                        modifier = Modifier.weight(1f),
+                        onClick = onOpenOtgFlasher
+                    )
+                    CommandActionTile(
+                        icon = Icons.Rounded.FolderOpen,
+                        label = "Import",
+                        subtitle = "Browse files",
+                        tint = PocketColors.success,
+                        iconBg = PocketColors.successBg,
+                        enabled = !busy,
+                        modifier = Modifier.weight(1f),
+                        onClick = onOpenBrowse
+                    )
+                }
             }
 
             // Dual-LUN Quick-Mount Combos Bar (Wave 3)
@@ -2775,6 +2913,7 @@ private fun HomeScreen(
                             osType == IsoOsType.WINDOWS -> Triple(Icons.Rounded.Window, PocketColors.infoBlue, PocketColors.infoBlueBg)
                             osType == IsoOsType.LINUX -> Triple(Icons.Rounded.Terminal, PocketColors.success, PocketColors.successBg)
                             osType == IsoOsType.VENTOY_IMAGE -> Triple(Icons.Rounded.Layers, PocketColors.violet, PocketColors.violetBg)
+                            osType == IsoOsType.COMPRESSED_IMAGE -> Triple(Icons.Rounded.FolderOpen, PocketColors.infoBlue, PocketColors.infoBlueBg)
                             isIso -> Triple(Icons.Rounded.Album, PocketColors.accentSoft, PocketColors.accentBg)
                             else -> Triple(Icons.Rounded.Storage, PocketColors.warning, PocketColors.warningBg)
                         }
@@ -2838,7 +2977,7 @@ private fun HomeScreen(
                                             overflow = TextOverflow.Ellipsis,
                                             modifier = Modifier.weight(1f, fill = false)
                                         )
-                                        if (osType == IsoOsType.WINDOWS || osType == IsoOsType.LINUX || osType == IsoOsType.VENTOY_IMAGE) {
+                                        if (osType == IsoOsType.WINDOWS || osType == IsoOsType.LINUX || osType == IsoOsType.VENTOY_IMAGE || osType == IsoOsType.COMPRESSED_IMAGE) {
                                             Surface(shape = RoundedCornerShape(6.dp), color = osBg) {
                                                 Text(
                                                     text = osType.badgeLabel,
@@ -2891,6 +3030,23 @@ private fun HomeScreen(
                                                 color = PocketColors.danger
                                             )
                                         }
+                                    }
+                                } else if (osType == IsoOsType.COMPRESSED_IMAGE || IsoInspector.isCompressedImageName(img.name)) {
+                                    Surface(
+                                        modifier = Modifier.bounceClick(enabled = !busy && status.hasRoot) {
+                                            onOpenDecompress(img)
+                                        },
+                                        shape = RoundedCornerShape(999.dp),
+                                        color = if (!busy && status.hasRoot) PocketColors.infoBlueBg else PocketColors.surfaceSubtle,
+                                        border = BorderStroke(0.75.dp, if (!busy && status.hasRoot) PocketColors.infoBlue else PocketColors.border)
+                                    ) {
+                                        Text(
+                                            text = "Extract",
+                                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                                            style = MaterialTheme.typography.labelMedium,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = if (!busy && status.hasRoot) PocketColors.infoBlue else PocketColors.textMuted
+                                        )
                                     }
                                 } else {
                                     val savedMode = rememberedModes[img.path]?.let { mName ->
@@ -3004,13 +3160,15 @@ private fun CommandActionTile(
                     text = label,
                     style = MaterialTheme.typography.labelLarge,
                     color = PocketColors.textPrimary,
-                    maxLines = 1
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
                 Text(
                     text = subtitle,
                     fontSize = 10.5.sp,
                     color = PocketColors.textMuted,
-                    maxLines = 1
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
         }

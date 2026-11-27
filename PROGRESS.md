@@ -1,6 +1,13 @@
 # PocketBoot Development Progress
 
-## Current Milestone: v4.7.2 — Wave 3 (Driver Pack Library & Dual-LUN Quick-Mount Combos)
+## Current Milestone: v4.8.0 — Wave 4 (Compressed Image Engine & Physical USB-C OTG Pen Drive Flasher)
+- **Wave 4 Complete (`v4.8.0`, `versionCode = 39`):**
+  - **Compressed Image Engine (`CompressedImageEngine.kt`, `build-apk.yml`):** Bundled static ARM64 `libzstd.so` + `lib7zzs.so` background extraction for `.img`/`.iso` `.xz`/`.gz`/`.zst` archives with gzip wrap guard, live 256 MB storage floor monitor, atomic temp-file swap, and mount/combo isolation.
+  - **Physical USB-C OTG Pen Drive Flasher (`OtgUsbFlasher.kt`, `UsbBuildService.kt`, `MainActivity.kt`):** 7-layer anti-brick sysfs + `/proc/mounts` lock, clean `vold` unmount gate, raw + streaming compressed flash, `/sys/block/<dev>/stat` progress, Head+Tail / Full SHA-256 read-back verification, and typed `FLASH` confirmation.
+  - **Wave 4 JVM Unit Tests (`Wave4FeaturesTest.kt`):** Unit tests for compressed format/size parsing and 10-case OTG anti-brick matrix.
+  - *(USB HID BIOS Hotkey Helper omitted per project owner decision.)*
+
+## Previous Milestone: v4.7.2 — Wave 3 (Driver Pack Library & Dual-LUN Quick-Mount Combos)
 - **Wave 3 Complete (`v4.7.2`, `versionCode = 38`):**
   - **Storage & Wi-Fi Driver Pack Manager (`DriverPackManager.kt`, `WindowsImageBuilder.kt`, `VentoyImageBuilder.kt`, `SettingsScreen.kt`):** Reusable folder/`.zip`/`.7z` driver library with `.inf` validation, auto-categorization, multi-pack selection in Windows USB & Multi-Boot builders, and Settings library sheet.
   - **Dual-LUN Quick-Mount Combos (`AppPrefs.kt`, `UsbGadgetEngine.kt`, `MainActivity.kt`):** Atomic single-rebind `mountDualLunCombo()`, backup JSON persistence, and Home quick-mount bar + combo creator sheet.
@@ -22,4 +29,3 @@
   - **In-App Release Update Checker (`AppUpdateChecker.kt`, `SettingsScreen.kt`, `DownloadScreen.kt`):** Fixed repo URLs to `https://github.com/bilered/PocketBoot` (`DISTROS_MANIFEST_URL`, GitHub button, and GitHub Releases API updater with SemVer check + release notes dialog).
   - **Automated JVM Unit Tests & CI Gate (`app/src/test`, `app/build.gradle.kts`, `build-apk.yml`):** 4 JUnit test classes (`DiskPartitionerTest`, `WindowsCustomizationTest`, `AppPrefsBackupTest`, `FilenameAndVersionTest`) running via `gradle testDebugUnitTest` before `assembleDebug`.
 - **Upcoming Planned Waves:**
-  - **Wave 4 (`v4.8.0`):** Compressed Image Engine (`.xz`/`.gz`/`.zst`), Physical USB-C OTG Pen Drive Flasher, and USB HID BIOS Hotkey Helper (`f_hid`).

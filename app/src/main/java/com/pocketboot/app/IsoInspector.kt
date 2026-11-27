@@ -13,7 +13,8 @@ enum class IsoOsType(val badgeLabel: String, val displayType: String) {
     LINUX("Linux", "Linux / Live ISO"),
     UTILITY("Bootable ISO", "Bootable Utility ISO"),
     VENTOY_IMAGE("Multi-Boot", "PocketBoot Multi-Boot Drive (.img)"),
-    DISK_IMAGE("Disk Image", "Disk Image (.img)")
+    DISK_IMAGE("Disk Image", "Disk Image (.img)"),
+    COMPRESSED_IMAGE("Compressed", "Compressed Image (.xz / .gz / .zst)")
 }
 
 data class BootReadinessReport(
@@ -40,8 +41,26 @@ object IsoInspector {
         cache.keys.filter { it.startsWith(prefix) }.forEach { cache.remove(it) }
     }
 
+    private val COMPRESSED_SUFFIXES = listOf(
+        ".img.xz", ".img.gz", ".img.zst",
+        ".iso.xz", ".iso.gz", ".iso.zst"
+    )
+
+    fun isCompressedImageName(fileName: String): Boolean {
+        val low = fileName.trim().lowercase(Locale.US)
+        return COMPRESSED_SUFFIXES.any { low.endsWith(it) }
+    }
+
+    fun isSupportedDriveFileName(fileName: String): Boolean {
+        val low = fileName.trim().lowercase(Locale.US)
+        return low.endsWith(".iso") || low.endsWith(".img") || isCompressedImageName(low)
+    }
+
     fun quickGuessByName(fileName: String): IsoOsType {
         val low = fileName.lowercase()
+        if (isCompressedImageName(low)) {
+            return IsoOsType.COMPRESSED_IMAGE
+        }
         if (low.endsWith(".img")) {
             return if (low.contains("multiboot") || low.contains("multi boot") || low.contains("multi-boot") || low.contains("multi iso") || low.contains("multi-iso") || low.contains("ventoy")) IsoOsType.VENTOY_IMAGE else IsoOsType.DISK_IMAGE
         }
@@ -71,6 +90,11 @@ object IsoInspector {
         val name = path.substringAfterLast('/')
         val cacheKey = "$path|$sizeBytes"
         cache[cacheKey]?.let { return@withContext it }
+
+        if (isCompressedImageName(name)) {
+            cache[cacheKey] = IsoOsType.COMPRESSED_IMAGE
+            return@withContext IsoOsType.COMPRESSED_IMAGE
+        }
 
         if (name.endsWith(".img", ignoreCase = true)) {
             val isVentoy = if (sizeBytes >= 64L * 1024L * 1024L) {
